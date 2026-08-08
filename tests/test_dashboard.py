@@ -12,7 +12,9 @@ from kaggriculture_lab.dashboard import (
     DashboardNotFound,
     DashboardUnavailable,
     _episode_page,
+    _generation_page,
     _load_replay,
+    _round_panel,
     make_server,
 )
 from kaggriculture_lab.storage import ExperimentStore
@@ -70,17 +72,18 @@ def _seed_dashboard(database: Path) -> dict:
             "INSERT INTO league_pairings VALUES ('pair-1', ?, 0, 'population', 17, 'revision-a', 'revision-b', 'COMPLETE')",
             ["session/one:g0000"],
         )
-        store.add_match("match-1", "session/one", "league:g0000", ("alpha", "beta"), ("alpha", "beta"), result)
+        # `league.py` hands `add_match` the seat-correct revision ids, not strategy ids.
+        store.add_match("match-1", "session/one", "league:g0000", ("revision-a", "revision-b"), ("alpha", "beta"), result)
         store.add_replay_payload("match-1", replay)
         connection.execute("INSERT INTO pairing_episodes VALUES ('pair-1', 0, 'match-1')")
         reverse_result = MatchResult(
             seed=17,
             seats=[result.seats[1], result.seats[0]],
-            steps=result.steps,
-            wallclock=result.wallclock,
+            steps=30,
+            wallclock=0.75,
             replay=replay,
         )
-        store.add_match("match-2", "session/one", "league:g0000", ("beta", "alpha"), ("beta", "alpha"), reverse_result)
+        store.add_match("match-2", "session/one", "league:g0000", ("revision-b", "revision-a"), ("beta", "alpha"), reverse_result)
         store.add_replay_payload("match-2", replay)
         connection.execute("INSERT INTO pairing_episodes VALUES ('pair-1', 1, 'match-2')")
         connection.execute("INSERT INTO pairing_results VALUES ('pair-1', 400, 1, false, 2, '{}')")
@@ -97,7 +100,8 @@ def _seed_dashboard(database: Path) -> dict:
             INSERT INTO episode_evaluations (
                 evaluation_id, match_id, revision_id, seat, evaluator_path,
                 evaluator_fingerprint, status, result_json
-            ) VALUES ('eval-1', 'match-1', 'revision-a', 0, 'agent:evaluate', 'fp', 'SUCCESS', '{"score": 1}')
+            ) VALUES ('eval-1', 'match-1', 'revision-a', 0, 'agent:evaluate', 'fp', 'SUCCESS', '{"score": 1}'),
+                     ('eval-2', 'match-2', 'revision-b', 1, 'agent:evaluate', 'fp', 'COMPLETE', '{"should_reevaluate": true}')
             """
         )
     return replay
@@ -207,6 +211,95 @@ def test_dashboard_health_head_and_error_responses(dashboard):
         urlopen(Request(base + "/", data=b"", method="POST"))
     assert method.value.code == 405
     assert method.value.headers["Allow"] == "GET, HEAD"
+
+
+def test_generation_page_reports_performance_statistics(dashboard):
+    base, _ = dashboard
+    _, _, body = _get(base + "/generations/session%2Fone%3Ag0000")
+    document = body.decode()
+
+    for heading in ("Performance", "Match outcomes", "Rounds", "Agent money and behaviour",
+                    "Runtime cost", "Evaluation hooks"):
+        assert heading in document
+
+    # pair-1 is the only settled pairing, margin +400 for revision-a.
+    assert "Settled pairings" in document
+    assert "Mean margin" in document
+
+    # Both seat orders are played, so the seats must come out even.
+    assert "Seat-order bias" in document
+    assert "50.0%" in document
+
+    # Per-agent rows resolve through episode_players.strategy_id -> agent_revisions.
+    assert "revision-a" in document
+    assert "3,200" in document and "2,800" in document
+    assert "100.0%" in document and "0.0%" in document
+    assert "40.0%" in document  # revision-b productive action percentage
+
+    # 0.25s + 0.75s over two episodes, the slower one listed first.
+    assert "Episode wall clock" in document
+    assert "1.0s" in document
+    assert "Slowest episodes" in document
+    assert document.index("0.8s") < document.index("0.2s")
+
+    assert "Re-evaluation requests" in document
+
+
+def test_performance_section_renders_for_a_generation_with_no_episodes(tmp_path: Path):
+    database = tmp_path / "empty-generation.duckdb"
+    _seed_dashboard(database)
+    with ExperimentStore(database) as store:
+        store.connection.execute(
+            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (?, 'session/one', 1, 'OPEN')",
+            ["session/one:g0001"],
+        )
+        document = _generation_page(store.connection, "session/one:g0001", 1, "all", "all")
+
+    assert "Performance" in document
+    assert "No pairings have been settled yet." in document
+    assert "No rounds have been scheduled yet." in document
+    assert "Timings appear once episodes run." in document
+    assert "No post-episode evaluations were recorded." in document
+
+
+def test_round_panel_averages_margin_per_pairing_not_per_episode(tmp_path: Path):
+    """A pairing contributes its margin once, however many episodes it produced."""
+    database = tmp_path / "round-margins.duckdb"
+    _seed_dashboard(database)
+    with ExperimentStore(database) as store:
+        connection = store.connection
+        # Round 1: one pairing settled over two episodes, one over a single episode.
+        for pairing, margin in (("pair-2", 400.0), ("pair-3", 1000.0)):
+            connection.execute(
+                "INSERT INTO league_pairings VALUES (?, ?, 1, 'population', 17, 'revision-a', 'revision-b', 'COMPLETE')",
+                [pairing, "session/one:g0000"],
+            )
+            connection.execute(
+                "INSERT INTO pairing_results VALUES (?, ?, 1, false, 2, '{}')",
+                [pairing, margin],
+            )
+        for match_id, pairing, orientation in (
+            ("match-3", "pair-2", 0), ("match-4", "pair-2", 1), ("match-5", "pair-3", 0),
+        ):
+            connection.execute(
+                """
+                INSERT INTO episodes (
+                    match_id, run_id, stage, seed, seat0_id, seat1_id, seat0_spec,
+                    seat1_spec, steps, wallclock, failed
+                ) VALUES (?, 'session/one', 'league:g0000', 17, 'revision-a', 'revision-b',
+                          'alpha', 'beta', 24, 0.5, false)
+                """,
+                [match_id],
+            )
+            connection.execute(
+                "INSERT INTO pairing_episodes VALUES (?, ?, ?)", [pairing, orientation, match_id]
+            )
+        document = _round_panel(connection, "session/one:g0000")
+
+    # Unweighted mean of 400 and 1000. Fanning pairings out across their episodes would
+    # weight pair-2 twice and yield 600.
+    assert "700.0" in document
+    assert "600.0" not in document
 
 
 def test_episode_page_hides_replay_actions_when_payload_is_missing(tmp_path: Path):

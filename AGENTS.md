@@ -31,6 +31,17 @@ offered at most once per round per model, so it is safe to resume an interrupted
 run without repeating expensive work. Which sessions drive which trainers is
 declared by `training_manifests` in the league config, not in code.
 
+The constants-driven runners may refine those manifests into named training
+instances. Each `(type, name)` pair owns independent model IDs, batches,
+checkpoints, and active weights under `artifacts/<type>/<name>/`. A roster entry
+with `train = false` is locked: it remains addressable and may serve as the
+primary breeding surrogate, but receives no round hooks or updates.
+
+`league run` is the normal collection and update loop. Model-specific status,
+retry, and release commands belong in that strategy's `cli.py`; do not add a
+generic model command group to `kaglab`. Manual round collection is not a public
+CLI operation.
+
 For full game rules, the crop / animal / shop tables, the price function, and turn-processing order, see [README.md](README.md).
 
 ## Game Overview

@@ -1,7 +1,7 @@
 # Getting started
 
-How to run rounds in this repo. `README.md` is the competition's own rules document — game
-mechanics, crop tables, the price function — and is left alone; this file is the workflow.
+How to run rounds in this repo. `README.md` contains the competition rules and the concise
+strategy-lab reference; this file walks through the workflow in more detail.
 
 Every command below has been run as written.
 
@@ -20,7 +20,7 @@ uv sync --python 3.12
 | --- | --- | --- |
 | Compare two agents head-to-head | `sim.arena` | one seed, played in both seats |
 | Evolve a population of strategies | `kaglab league` | one pass of pairings within a generation |
-| Train the DQN | league trainer hook or `agents.dqn_job_scorer.training.train` | collect episodes, then take gradient steps |
+| Train the DQN | league trainer hook or `agents.dqn_job_scorer.training.loop` | collect episodes, then take gradient steps |
 
 ---
 
@@ -81,6 +81,11 @@ DB=artifacts/experiments.duckdb
   --session-id demo --database $DB --artifacts artifacts
 ```
 
+`league run` is also the normal model update call. After every closed round it invokes
+the `on_round` hooks selected by the config's `training_manifests`, then checks each
+model's independent batch threshold and invokes `on_batch` when eligible. Generation
+hooks run after rating snapshots have been committed.
+
 ```json
 {"generation_id": "demo:g0000", "hook_evaluations": {"COMPLETE": 48},
  "pairings": {"COMPLETE": 15}, "status": "COMPLETE"}
@@ -123,18 +128,61 @@ Re-run hooks over stored replays without replaying anything:
 .venv/bin/python -m kaggriculture_lab.cli league evaluate --session-id demo --database $DB --force
 ```
 
-## 3. Training rounds — the DQN
+### Model learning across sessions
 
-One round = collect N episodes in parallel, then take gradient steps against the replay buffer.
+Episode evaluators do not train models. A trainable `agent.toml` instead declares a
+single object such as `trainer = "agents.dqn_job_scorer.train:trainer"` with two calls:
+
+- `on_round(context, reader, writer)` decides whether a closed league round or generation
+  should become one or more persisted training batches.
+- `on_batch(context, reader)` receives all batches through a stable cutoff, the active
+  checkpoint, and model config; it returns a gated candidate checkpoint.
+
+DuckDB stores the hook ledger, batches, batch watermark, update attempts, evaluations,
+and active checkpoint pointer by `model_id`. Therefore restarting the process, resuming
+the same league, or creating another session against the same database preserves what
+the model learned. Using another database starts an isolated history. Completed hooks
+are idempotent on resume; the agent CLIs deliberately do not expose manual round
+collection.
+
+`train_all.py` supplies a `TRAINING_AGENTS` roster. A `(type, name)` pair is an independent
+model instance under `artifacts/<type>/<name>/`; `train = false` locks its weights while
+leaving status, export, and primary-surrogate use available. Reusing the pair resumes it,
+while a new name gets independent state and a reproducible name-derived seed. Only entries
+with training enabled are driven. Anchor agents are opponents, not automatically trained,
+and the runner discovers every other agent manifest as an anchor by default. The selection
+can be changed safely on an existing session:
 
 ```bash
-.venv/bin/python -u -m agents.dqn_job_scorer.training.train \
-  --rounds 250 --episodes-per-round 16 --gradient-steps 400 \
-  --eval-every 10 --eval-seeds 40 --duel-seeds 60 --jobs 8 \
-  --output runs/dqn04 --ship
+.venv/bin/python -m kaggriculture_lab.cli league trainers \
+  --session-id demo --database $DB --config configs/league.toml
+
+.venv/bin/python -m agents.configurable_crop_surrogate.cli model status --database $DB
+.venv/bin/python -m agents.dqn_job_scorer.cli model status --name dqn05 --database $DB
 ```
 
-Roughly 18 s per round; every 10th round runs a real arena evaluation. Watch it with:
+## 3. Training rounds — the DQN
+
+The primary persistent path is the league hook. In `configs/league.toml`, each closed
+league round buys one 16-episode DQN rollout batch. The current twenty-batch threshold
+fits and gates the network once per twenty-round generation. `league run` performs the
+collection and eligible update automatically:
+
+```bash
+.venv/bin/python -m kaggriculture_lab.cli league run \
+  --session-id demo --database $DB --artifacts artifacts
+```
+
+For an isolated research run that does not use the league database, the standalone loop
+remains available:
+
+```bash
+.venv/bin/python -u -m agents.dqn_job_scorer.training.loop \
+  --rounds 250 --jobs 8 --ship
+```
+
+For the standalone loop, roughly 18 s per round is typical; every `--eval-every` rounds
+the current snapshot runs a real arena evaluation. Watch a redirected run with:
 
 ```bash
 tail -f runs_dqn04.log | grep --line-buffered '"eval"'
@@ -191,7 +239,8 @@ without breaking the others.
 sim/                 game-agnostic match runner and paired statistics
 kaggriculture_lab/   league, DuckDB storage, hooks, episode analysis
 agents/<name>/       one self-contained agent each
-  training/          that agent's trainer (never bundled)
+  train.py           the lab-facing on_round/on_batch trainer object
+  training/          model implementation and replay code (never bundled)
 tests/               layering, game-facts, bundle and behaviour guards
 runs/                training output; runs/best/ holds proven checkpoints
 ```

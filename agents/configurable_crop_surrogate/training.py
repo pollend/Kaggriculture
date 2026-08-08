@@ -69,6 +69,7 @@ class ConfigurableCropAdapter:
         parents: list[AgentRevision],
         rng: random.Random,
         reader: ModelTrainingReader,
+        model_id: str | None = None,
         candidate_pool: int = 2_000,
     ) -> list[Strategy]:
         """Rank a random candidate pool with this family's surrogate model.
@@ -81,6 +82,8 @@ class ConfigurableCropAdapter:
         Returns an empty list when no checkpoint is active yet; the league falls
         back to mutation.
         """
+        if model_id is None:
+            return []
         row = reader.fetchone(
             """
             SELECT mtc.inference_artifact_path
@@ -89,7 +92,7 @@ class ConfigurableCropAdapter:
               ON mtc.checkpoint_id = tm.active_checkpoint_id
             WHERE tm.model_id = ?
             """,
-            [f"{self.family_id}.surrogate"],
+            [model_id],
         )
         if not row:
             return []
@@ -140,7 +143,7 @@ class CropSurrogateUpdater:
                         n_estimators=int(config.get("n_estimators", 300)),
                         min_samples_leaf=int(config.get("min_samples_leaf", 2)),
                         n_jobs=-1,
-                        random_state=42,
+                        random_state=int(config.get("seed", 42)),
                     ),
                 ),
             ]
@@ -227,7 +230,7 @@ class CropSurrogateUpdater:
         checkpoint_id = hashlib.sha256(
             f"{context.model_id}\0{context.update_id}\0{context.dataset_sha256}".encode()
         ).hexdigest()[:24]
-        destination = context.artifacts / "model_checkpoints" / context.model_id
+        destination = context.artifacts / "checkpoints"
         destination.mkdir(parents=True, exist_ok=True)
         artifact = destination / f"{checkpoint_id}.joblib"
         joblib.dump(

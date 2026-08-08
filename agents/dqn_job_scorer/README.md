@@ -18,6 +18,7 @@ The agent is self-contained: standard library plus numpy, no imports from `kaggr
 | `market.py` | selling, hiring, seed buying (rules, not learned) |
 | `rules.py` | this agent's private crop tables and geometry |
 | `evaluation.py` | post-episode league hook |
+| `train.py` | lab-facing `on_round` collector and `on_batch` updater |
 | `weights.npz` | trained parameters |
 | `training/` | torch trainer — **never** imported by `main.py`, never bundled |
 | `MODEL.html` | illustrated guide to inference, features, training, and deployment |
@@ -42,6 +43,31 @@ derails almost every walk before it completes.
 
 ## Training
 
+The normal persistent workflow is driven by a league session whose
+`training_manifests` includes this agent. Each closed league round calls `train.py`,
+which collects one 16-episode rollout batch. After twenty new batches, `on_batch`
+trains and gates a checkpoint. Batches, replay artifacts, watermarks, and the active
+checkpoint remain available when the process or session resumes against the same
+DuckDB catalog.
+
+```bash
+python -m kaggriculture_lab.cli league run \
+  --session-id all-agents-training \
+  --database artifacts/experiments.duckdb --artifacts artifacts
+
+python -m agents.dqn_job_scorer.cli model status \
+  --name default \
+  --database artifacts/experiments.duckdb
+```
+
+The constants-driven runner can keep several named DQN instances in the same catalog.
+Each name has independent rollout batches, checkpoints, random seed, and active pointer
+under `artifacts/dqn_job_scorer/<name>/`. Set that roster entry's `train` flag to `False`
+to freeze it without deleting or exporting anything.
+
+The standalone research loop is still useful when an experiment should not share the
+league database:
+
 ```bash
 python -m agents.dqn_job_scorer.training.loop --rounds 250 --jobs 8 --ship
 ```
@@ -60,6 +86,11 @@ Two things to know before changing it:
   93.8% wins) and collapsed to −21,496 by round 75, so shipping the last checkpoint ships the
   collapse. `--ship` is required to touch the live weights at all; without it, promotion only
   writes `runs/<name>/best.npz`.
+
+For league training, promotion changes the catalog's active-checkpoint pointer and does
+not overwrite `weights.npz`. Copy a reviewed active checkpoint into the submission only
+with `python -m agents.dqn_job_scorer.cli model export-active --output
+agents/dqn_job_scorer/weights.npz --confirm-release`.
 
 ## Evaluating
 

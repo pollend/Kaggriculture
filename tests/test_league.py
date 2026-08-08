@@ -5,8 +5,22 @@ import pytest
 
 from agents.configurable_crop_surrogate.strategy import Strategy
 from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader
-from kaggriculture_lab.identity import AgentManifest, build_revision
-from kaggriculture_lab.league import LeagueConfig, _run_hook, create_session, schedule_generation
+from kaggriculture_lab.identity import (
+    AgentManifest,
+    TrainingAgentSpec,
+    build_revision,
+    effective_model_id,
+    training_artifact_root,
+    training_instance_seed,
+)
+from kaggriculture_lab.league import (
+    LeagueConfig,
+    _primary_training_model_id,
+    _run_hook,
+    _training_model_ids,
+    create_session,
+    schedule_generation,
+)
 from kaggriculture_lab.model_trainers import load_trainer
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
 from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
@@ -127,6 +141,51 @@ def test_manifest_file_is_valid():
     assert manifest.episode_evaluator
     assert manifest.models[0].min_new_batches == 2
     assert json.loads(build_revision(manifest, Strategy()).params_json) == Strategy().to_dict()
+
+
+def test_named_training_identity_is_stable_and_scopes_artifacts(tmp_path: Path):
+    first = training_instance_seed("dqn_job_scorer", "dqn05")
+    assert first == training_instance_seed("dqn_job_scorer", "dqn05")
+    assert first != training_instance_seed("dqn_job_scorer", "dqn06")
+    assert effective_model_id("dqn_job_scorer.q_network", "default") == (
+        "dqn_job_scorer.q_network"
+    )
+    assert effective_model_id("dqn_job_scorer.q_network", "dqn05") == (
+        "dqn_job_scorer.q_network@dqn05"
+    )
+    assert training_artifact_root(
+        tmp_path, {"agent_type": "dqn_job_scorer", "name": "dqn05"}
+    ) == tmp_path / "dqn_job_scorer" / "dqn05"
+
+
+def test_named_roster_selects_exact_trainable_models_and_locked_primary():
+    config = LeagueConfig(
+        training_manifests=("agents/configurable_crop_surrogate/agent.toml",),
+        training_agents=(
+            TrainingAgentSpec(
+                "configurable_crop_surrogate", "crop01", primary=True, train=False
+            ),
+            TrainingAgentSpec("configurable_crop_surrogate", "crop02"),
+        ),
+    )
+    config.validate()
+    assert _training_model_ids(config) == (
+        "configurable_crop_surrogate.surrogate@crop02",
+    )
+    assert _primary_training_model_id(config, "configurable_crop_surrogate") == (
+        "configurable_crop_surrogate.surrogate@crop01"
+    )
+
+
+def test_duplicate_named_surrogates_require_one_primary():
+    config = LeagueConfig(
+        training_agents=(
+            TrainingAgentSpec("configurable_crop_surrogate", "one"),
+            TrainingAgentSpec("configurable_crop_surrogate", "two"),
+        )
+    )
+    with pytest.raises(ValueError, match="exactly one primary"):
+        config.validate()
 
     dqn = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
     # The DQN collects per closed round, so its update threshold is expressed in

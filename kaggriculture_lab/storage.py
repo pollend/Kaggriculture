@@ -9,10 +9,17 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from kaggriculture_lab.identity import AgentManifest, AgentRevision
+from kaggriculture_lab.identity import (
+    DEFAULT_AGENT_NAME,
+    AgentManifest,
+    AgentRevision,
+    TrainingAgentSpec,
+    effective_model_id,
+    training_instance_seed,
+)
 from sim.runner import MatchResult
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ExperimentStore:
@@ -87,6 +94,28 @@ class ExperimentStore:
     def register_family(
         self, manifest: AgentManifest, manifest_path: str | Path
     ) -> None:
+        """Register a family and its backward-compatible default model instance."""
+
+        self.register_training_agent(
+            manifest,
+            manifest_path,
+            TrainingAgentSpec(type=manifest.family_id, name=DEFAULT_AGENT_NAME),
+        )
+
+    def register_training_agent(
+        self,
+        manifest: AgentManifest,
+        manifest_path: str | Path,
+        instance: TrainingAgentSpec,
+    ) -> tuple[str, ...]:
+        """Register one independently trained instance of a manifest's models."""
+
+        instance.validate()
+        if instance.type != manifest.family_id:
+            raise ValueError(
+                f"training agent type {instance.type!r} does not match manifest "
+                f"family_id {manifest.family_id!r}"
+            )
         self.connection.execute(
             """
             INSERT OR REPLACE INTO agent_families VALUES (
@@ -103,27 +132,45 @@ class ExperimentStore:
                 manifest.parameter_schema_version,
             ],
         )
+        identifiers: list[str] = []
         for model in manifest.models:
+            identifier = effective_model_id(model.model_id, instance.name)
+            identifiers.append(identifier)
+            config = dict(model.config or {})
+            config["agent_type"] = instance.type
+            config["name"] = instance.name
+            if instance.seed is not None:
+                config["seed"] = instance.seed
+            elif instance.name != DEFAULT_AGENT_NAME:
+                config["seed"] = training_instance_seed(instance.type, instance.name)
             self.connection.execute(
                 """
                 INSERT INTO training_models (
-                    model_id, family_id, trainer_path, min_new_batches, config_json
-                ) VALUES (?, ?, ?, ?, ?)
+                    model_id, family_id, agent_type, agent_name, declared_model_id,
+                    trainer_path, min_new_batches, config_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (model_id) DO UPDATE SET
                     family_id = excluded.family_id,
+                    agent_type = excluded.agent_type,
+                    agent_name = excluded.agent_name,
+                    declared_model_id = excluded.declared_model_id,
                     trainer_path = excluded.trainer_path,
                     min_new_batches = excluded.min_new_batches,
                     config_json = excluded.config_json,
                     updated_at = now()
                 """,
                 [
-                    model.model_id,
+                    identifier,
                     manifest.family_id,
+                    instance.type,
+                    instance.name,
+                    model.model_id,
                     model.trainer,
                     model.min_new_batches,
-                    json.dumps(model.config or {}, sort_keys=True),
+                    json.dumps(config, sort_keys=True),
                 ],
             )
+        return tuple(identifiers)
 
     def add_agent_revisions(self, revisions: Iterable[AgentRevision]) -> None:
         rows = [
@@ -367,4 +414,3 @@ class ExperimentStore:
             )
             written.append(path)
         return written
-

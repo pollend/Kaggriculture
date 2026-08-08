@@ -26,8 +26,16 @@ SYNC_ENVIRONMENT = True
 
 SESSION_ID = "receding-horizon-planner-training"
 DATABASE = Path("artifacts/planner_experiments.duckdb")
-ARTIFACTS = Path("artifacts/planner")
+ARTIFACTS = Path("artifacts")
 LEAGUE_CONFIG = Path("configs/planner_league.toml")
+TRAINING_AGENTS = [
+    {
+        "type": "receding_horizon_planner",
+        "name": "default",
+        "primary": True,
+        "train": True,
+    }
+]
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -74,12 +82,21 @@ def _effective_config() -> Path:
         jobs=TRAINING_JOBS,
         seed=TRAINING_SEED,
         candidate_pool=CANDIDATE_POOL,
+        training_agents=TRAINING_AGENTS,
     )
     lines = ["[league]"]
     for name, value in values.items():
         if isinstance(value, list):
             lines.append(f"{name} = [")
-            lines.extend(f"  {json.dumps(item)}," for item in value)
+            for item in value:
+                if isinstance(item, dict):
+                    fields = ", ".join(
+                        f"{key} = {json.dumps(field) if isinstance(field, str) else str(field).lower() if isinstance(field, bool) else field}"
+                        for key, field in item.items()
+                    )
+                    lines.append(f"  {{ {fields} }},")
+                else:
+                    lines.append(f"  {json.dumps(item)},")
             lines.append("]")
         elif isinstance(value, str):
             lines.append(f"{name} = {json.dumps(value)}")
@@ -92,6 +109,7 @@ def _effective_config() -> Path:
 
 
 def _ensure_session(python: Path) -> None:
+    config = _effective_config()
     status = _kaglab(
         python,
         "league",
@@ -105,13 +123,24 @@ def _ensure_session(python: Path) -> None:
     )
     if status.returncode == 0:
         print(f"Resuming planner session: {SESSION_ID}", flush=True)
+        _kaglab(
+            python,
+            "league",
+            "trainers",
+            "--session-id",
+            SESSION_ID,
+            "--database",
+            str(DATABASE),
+            "--config",
+            str(config),
+        )
         return
     _kaglab(
         python,
         "league",
         "init",
         "--config",
-        str(_effective_config()),
+        str(config),
         "--session-id",
         SESSION_ID,
         "--database",

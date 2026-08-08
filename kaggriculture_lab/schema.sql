@@ -252,6 +252,9 @@ CREATE TABLE IF NOT EXISTS lineage (
 CREATE TABLE IF NOT EXISTS training_models (
     model_id VARCHAR PRIMARY KEY,
     family_id VARCHAR NOT NULL,
+    agent_type VARCHAR,
+    agent_name VARCHAR,
+    declared_model_id VARCHAR,
     trainer_path VARCHAR NOT NULL,
     min_new_batches INTEGER NOT NULL,
     config_json JSON NOT NULL,

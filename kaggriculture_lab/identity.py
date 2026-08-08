@@ -4,11 +4,75 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
+
+DEFAULT_AGENT_NAME = "default"
+SAFE_AGENT_NAME = re.compile(r"[a-z][a-z0-9_-]*")
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingAgentSpec:
+    """One independently persisted training instance of an agent family."""
+
+    type: str
+    name: str = DEFAULT_AGENT_NAME
+    primary: bool = False
+    train: bool = True
+    seed: int | None = None
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> TrainingAgentSpec:
+        return cls(
+            type=str(values["type"]),
+            name=str(values.get("name", DEFAULT_AGENT_NAME)),
+            primary=bool(values.get("primary", False)),
+            train=bool(values.get("train", True)),
+            seed=(None if values.get("seed") is None else int(values["seed"])),
+        )
+
+    def validate(self) -> None:
+        if not SAFE_AGENT_NAME.fullmatch(self.type):
+            raise ValueError(f"invalid training agent type: {self.type!r}")
+        if not SAFE_AGENT_NAME.fullmatch(self.name):
+            raise ValueError(f"invalid training agent name: {self.name!r}")
+        if self.seed is not None and self.seed < 0:
+            raise ValueError("training agent seed must be non-negative")
+
+
+def effective_model_id(declared_model_id: str, agent_name: str) -> str:
+    """Namespace a manifest model ID while preserving legacy default IDs."""
+
+    if agent_name == DEFAULT_AGENT_NAME:
+        return declared_model_id
+    return f"{declared_model_id}@{agent_name}"
+
+
+def training_instance_seed(agent_type: str, agent_name: str) -> int:
+    """Return a reproducible, distinct seed for a named training instance."""
+
+    digest = hashlib.sha256(f"{agent_type}\0{agent_name}".encode()).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFF_FFFF
+
+
+def training_artifact_root(
+    artifacts: str | Path, config: dict[str, Any]
+) -> Path:
+    """Scope model artifacts to a validated type/name directory when present."""
+
+    agent_type = config.get("agent_type")
+    agent_name = config.get("name")
+    if agent_type is None or agent_name is None:
+        return Path(artifacts)
+    if not SAFE_AGENT_NAME.fullmatch(str(agent_type)):
+        raise ValueError(f"invalid configured training agent type: {agent_type!r}")
+    if not SAFE_AGENT_NAME.fullmatch(str(agent_name)):
+        raise ValueError(f"invalid configured training agent name: {agent_name!r}")
+    return Path(artifacts) / str(agent_type) / str(agent_name)
 
 
 @dataclass(frozen=True, slots=True)

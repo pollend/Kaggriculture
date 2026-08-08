@@ -71,9 +71,12 @@ class PlannerTrainingAdapter:
         parents: list[AgentRevision],
         rng: random.Random,
         reader: ModelTrainingReader,
+        model_id: str | None = None,
         candidate_pool: int = 10_000,
     ) -> list[Strategy]:
         del parents
+        if model_id is None:
+            return []
         row = reader.fetchone(
             """
             SELECT mtc.inference_artifact_path
@@ -82,7 +85,7 @@ class PlannerTrainingAdapter:
               ON mtc.checkpoint_id = tm.active_checkpoint_id
             WHERE tm.model_id = ?
             """,
-            [MODEL_ID],
+            [model_id],
         )
         if not row:
             return []
@@ -111,7 +114,7 @@ class PlannerSurrogateTrainer:
             n_estimators=int(config.get("n_estimators", 300)),
             min_samples_leaf=int(config.get("min_samples_leaf", 2)),
             n_jobs=-1,
-            random_state=42,
+            random_state=int(config.get("seed", 42)),
         )
         return model, columns
 
@@ -182,7 +185,7 @@ class PlannerSurrogateTrainer:
         checkpoint_id = hashlib.sha256(
             f"{context.model_id}\0{context.update_id}\0{context.dataset_sha256}".encode()
         ).hexdigest()[:24]
-        destination = context.artifacts / "model_checkpoints" / context.model_id
+        destination = context.artifacts / "checkpoints"
         destination.mkdir(parents=True, exist_ok=True)
         artifact = destination / f"{checkpoint_id}.joblib"
         joblib.dump(

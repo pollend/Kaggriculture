@@ -92,7 +92,7 @@ def test_episode_batch_round_trips_without_pickle(episode, tmp_path):
         )
 
 
-def test_persistent_dqn_updater_resumes_from_eight_batches(
+def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
     episode, tmp_path, monkeypatch
 ):
     from agents.dqn_job_scorer.training import updater as updater_module
@@ -137,7 +137,8 @@ def test_persistent_dqn_updater_resumes_from_eight_batches(
             "UPDATE training_models SET config_json = ? WHERE model_id = ?",
             [json.dumps(config), "dqn_job_scorer.q_network"],
         )
-        for index in range(8):
+        # Derived, not hardcoded: the threshold tracks the league's round count.
+        for index in range(manifest.models[0].min_new_batches):
             record_training_batch(
                 store,
                 "dqn_job_scorer.q_network",
@@ -900,6 +901,101 @@ def test_self_play_is_off_before_its_threshold():
     config = Config(rounds=100, self_play_after=0.5, self_play_pool=5)
     snapshots = [pathlib.Path("runs/x/snapshots/round0010.npz")]
     assert all("weights=" not in item for item in opponents_for(40, config, snapshots))
+
+
+def test_league_path_holds_the_self_play_ratio_against_a_wide_base():
+    """Same failure mode as the standalone trainer, different arithmetic.
+
+    `opponents_for` repeats a *single* benchmark to dilute the pool. The league
+    collector starts from a base of 15 static opponents plus ~20 evolved league
+    revisions, so diluting by repetition would need a fractional count and round
+    to zero. It solves for pool slots instead.
+    """
+    from agents.dqn_job_scorer.training.updater import compose_opponents
+
+    pool = [f"agents/dqn_job_scorer/main.py?weights=c{n}.npz" for n in range(5)]
+    for base_size in (1, 15, 35):
+        base = [f"opponent{n}.py" for n in range(base_size)]
+        for ratio in (0.25, 0.3, 0.5):
+            mixed = compose_opponents(base, pool, ratio)
+            share = sum(1 for item in mixed if "weights=" in item) / len(mixed)
+            assert abs(share - ratio) < 0.1, (base_size, ratio, share)
+
+
+def test_league_path_self_play_disabled_and_empty_pool():
+    from agents.dqn_job_scorer.training.updater import compose_opponents
+
+    base = ["a.py", "b.py"]
+    pool = ["agents/dqn_job_scorer/main.py?weights=c.npz"]
+    assert compose_opponents(base, pool, 0.0) == base
+    assert compose_opponents(base, [], 0.3) == base
+    # A ratio above 0.9 is clamped rather than allowed to starve the benchmark.
+    assert 0 < sum(1 for i in compose_opponents(base, pool, 1.0) if "weights=" in i)
+
+
+def test_rotation_covers_every_opponent_across_batches():
+    """`collect_batch` plays `opponents[i % len]` for 16 seeds only.
+
+    Once league revisions join, the list is longer than a batch, so a fixed
+    start would mean the tail never plays at all.
+    """
+    from agents.dqn_job_scorer.training.updater import rotate_opponents
+
+    opponents = [f"o{n}.py" for n in range(35)]
+    episodes = 16
+    played: set[str] = set()
+    for batch_index in range(3):
+        rotated = rotate_opponents(opponents, batch_index * episodes)
+        played.update(rotated[index % len(rotated)] for index in range(episodes))
+    assert played == set(opponents), sorted(set(opponents) - played)
+    assert rotate_opponents([], 5) == []
+
+
+def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
+    from agents.dqn_job_scorer.training.updater import SELF_SPEC, self_play_pool
+    from kaggriculture_lab.model_updates import ModelTrainingReader
+    from kaggriculture_lab.storage import ExperimentStore
+
+    manifest_path = Path("agents/dqn_job_scorer/agent.toml")
+    manifest = AgentManifest.load(manifest_path)
+    present = tmp_path / "present.npz"
+    present.write_bytes(b"weights")
+    missing = tmp_path / "gone.npz"
+
+    class Context:
+        model_id = "dqn_job_scorer.q_network"
+        family_id = "dqn_job_scorer"
+
+    with ExperimentStore(tmp_path / "pool.duckdb") as store:
+        store.register_family(manifest, manifest_path)
+        for index, (path, promoted) in enumerate(
+            ((present, True), (missing, True), (present, False))
+        ):
+            store.connection.execute(
+                """
+                INSERT INTO model_updates (
+                    update_id, model_id, cutoff_batch_seq, new_batch_count,
+                    dataset_sha256, status
+                ) VALUES (?, 'dqn_job_scorer.q_network', ?, 1, 'd', 'PROMOTED')
+                """,
+                [f"update{index}", index + 1],
+            )
+            store.connection.execute(
+                """
+                INSERT INTO model_training_checkpoints (
+                    checkpoint_id, model_id, update_id, trainer_artifact_path,
+                    inference_artifact_path, artifact_sha256, dataset_sha256,
+                    metrics_json, gate_json, promoted
+                ) VALUES (?, 'dqn_job_scorer.q_network', ?, ?, ?, 'a', 'd', '{}', '{}', ?)
+                """,
+                [f"checkpoint{index}", f"update{index}", str(path), str(path), promoted],
+            )
+        pool = self_play_pool(Context(), ModelTrainingReader(store), 5)
+
+    # Rejected challengers are not opponents, and a checkpoint whose artifact has
+    # been swept would fail to resolve mid-episode rather than at selection.
+    assert pool == [f"{SELF_SPEC}?weights={present}"]
+    assert self_play_pool(Context(), None, 0) == []
 
 
 def test_duel_decides_promotion_not_benchmark_margin(tmp_path):

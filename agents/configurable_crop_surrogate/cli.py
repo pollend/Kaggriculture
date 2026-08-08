@@ -18,11 +18,13 @@ from pathlib import Path
 from agents.configurable_crop_surrogate.analysis import analyze_run, propose_strategies
 from agents.configurable_crop_surrogate.experiment import ExperimentConfig, run_experiment
 from agents.configurable_crop_surrogate.strategy import generate_population
+from kaggriculture_lab.model_admin import add_model_commands
 from kaggriculture_lab.storage import ExperimentStore
 
 DEFAULT_DATABASE = "artifacts/experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts"
 STRATEGY_FOLDER = Path("agents/configurable_crop_surrogate")
+MANIFEST = Path(__file__).with_name("agent.toml")
 SAFE_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
 
@@ -120,7 +122,8 @@ def _cmd_promote(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="configurable-crop", description=__doc__,
+        prog="configurable-crop",
+        description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -162,6 +165,13 @@ def main(argv: list[str] | None = None) -> int:
     promote.add_argument("--force", action="store_true")
     promote.add_argument("--database", default=DEFAULT_DATABASE)
     promote.set_defaults(func=_cmd_promote)
+
+    add_model_commands(
+        commands,
+        manifest_path=MANIFEST,
+        default_database=DEFAULT_DATABASE,
+        default_artifacts=DEFAULT_ARTIFACTS,
+    )
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -35,7 +35,7 @@ uv sync --locked --python 3.12
 ./run-sim.ps1                 # PowerShell / Windows
 ./run-sim.sh competitors      # Round-robin against every imported competitor
 
-# Run the resumable all-agent crop + DQN training loop, then a large arena.
+# Run the resumable crop-surrogate + DQN training loop, then a large arena.
 # Edit the constants at the top of train_all.py to change its scale.
 python train_all.py
 
@@ -67,6 +67,16 @@ SESSION=$(.venv/bin/kaglab league init --config configs/league.toml)
 .venv/bin/kaglab league next-generation --session-id "$SESSION"
 .venv/bin/kaglab league run --session-id "$SESSION"
 ```
+
+`TRAINING_AGENTS` at the top of `train_all.py` lists every manifest-backed agent. Each
+`{"type": ..., "name": ...}` pair has independent DuckDB history and writes beneath
+`artifacts/<type>/<name>/`. Rename an entry to start a reproducible fresh attempt, reuse
+the name to resume it, or set `"train": False` to lock its current weights without
+removing it. Named attempts get a stable seed derived from type + name unless the entry
+provides `"seed"`. When several surrogate instances share a type, exactly one is marked
+`"primary": True` for breeding. Agents without trainable models are listed with
+`"train": False`; by default the runner discovers every other `agents/*/agent.toml`
+as a fixed league anchor.
 
 The canonical catalog is `artifacts/experiments.duckdb`. Each run also exports portable
 Parquet tables under `artifacts/parquet/<run-id>/`; use `kaglab export --csv` for CSV.
@@ -119,40 +129,65 @@ fingerprint after code changes—with:
 .venv/bin/kaglab league evaluate --session-id "$SESSION" --force
 ```
 
-Hooks derive features only; model checkpoints and new candidates are created after a
-generation closes. The submitted Kaggle agent does not open DuckDB.
+Episode-evaluator hooks derive diagnostics only. Trainer hooks are a separate seam that
+may collect model-specific data and create checkpoints. Neither hook runs inside the
+submitted Kaggle agent, and submission-time inference never opens DuckDB.
 
 ## Incremental model updates
 
 Trainable families share the catalog at `artifacts/experiments.duckdb`, while large
-rollout and checkpoint files remain under `artifacts/`. Each manifest names one
-trainer object: its optional `on_round` hook records family-specific batches, and
-its `on_batch` hook fits and gates a candidate after the declared threshold. The
-crop surrogate waits for two closed generations; the DQN waits for eight persisted
-16-episode rollout batches.
+rollout and checkpoint files remain under `artifacts/`. Each `[[models]]` manifest
+entry names one `trainer = "agents.<name>.train:trainer"` object. Its optional
+`on_round(context, reader, writer)` hook records family-specific batches; once the
+model's `min_new_batches` threshold is met, `on_batch(context, reader)` fits, evaluates,
+and returns a candidate checkpoint.
+
+```text
+closed league round or generation
+        -> trainer.on_round records zero or more batches
+        -> the lab checks that model's new-batch threshold
+        -> trainer.on_batch trains and applies its model-specific gate
+        -> the lab persists the candidate and, when promoted, changes the active pointer
+        -> later rounds, updates, and generations receive that active checkpoint
+```
+
+This is also how an agent learns from previous sessions. Batches, per-model watermarks,
+round-hook ledgers, candidates, and active checkpoint pointers are keyed by `model_id` in
+DuckDB rather than kept in Python globals. A new or resumed league using the same database
+continues from that state. A different database is an intentionally isolated training
+history, as used by `train_planner.py`.
+
+`training_manifests` in the league config controls which families receive trainer hooks.
+Being present as an `anchor_manifest` does not train that family. Completed round hooks
+are ledgered and skipped when an interrupted league resumes, so expensive collection is
+not repeated. The current crop and planner surrogates each wait for two
+closed-generation batches; the DQN waits for twenty 16-episode rollout batches.
 
 ```bash
-# Inspect independent model thresholds and active checkpoints.
-.venv/bin/kaglab models status
+# Inspect each agent's batch threshold and active checkpoint.
+.venv/bin/python -m agents.configurable_crop_surrogate.cli model status
+.venv/bin/python -m agents.dqn_job_scorer.cli model status
+.venv/bin/python -m agents.receding_horizon_planner.cli model status
 
-# `league run` drives the models listed in the session's training_manifests.
-# This is the manual/resume equivalent for one DQN round hook.
-.venv/bin/kaglab models round --session-id "$SESSION" \
-  --model-id dqn_job_scorer.q_network --round-index 0
+# Safely change which trainers an existing session drives.
+.venv/bin/kaglab league trainers --session-id "$SESSION" \
+  --config configs/league.toml
 
-# Check one model, or omit the ID to check every registered model.
-.venv/bin/kaglab models update dqn_job_scorer.q_network
-.venv/bin/kaglab models update
+# Manually retry one agent's eligible update. Normal training does this
+# automatically inside `league run`.
+.venv/bin/python -m agents.dqn_job_scorer.cli model update
 
 # Promotion changes only the catalog pointer. Export for a submission explicitly.
-.venv/bin/kaglab models export-active dqn_job_scorer.q_network \
+.venv/bin/python -m agents.dqn_job_scorer.cli model export-active \
   --output agents/dqn_job_scorer/weights.npz --confirm-release
 ```
 
 An update below its threshold reports `deferred`. A trained challenger is retained
 even when its model-specific gate rejects it, and only promoted checkpoints become
 active. Rejected attempts advance their batch watermark; errored attempts remain
-retryable. Recreate the disposable catalog from the single authoritative SQL file
+retryable. An agent's `model update --force` bypasses the batch-count threshold but
+still requires at least one new batch; it does not replay a completed update. Recreate
+the disposable catalog from the single authoritative SQL file
 with `python scripts/rebuild_experiments_db.py --force`; an existing database is
 moved to a timestamped backup before replacement.
 

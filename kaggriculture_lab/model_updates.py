@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from kaggriculture_lab.identity import training_artifact_root
 from kaggriculture_lab.read_only import fetchall_select
 from kaggriculture_lab.storage import ExperimentStore
 
@@ -344,7 +345,7 @@ def update_model_in_store(
         all_batches=selected,
         active_checkpoint=_active_checkpoint(store, active_id),
         config=json.loads(config_json),
-        artifacts=Path(artifacts),
+        artifacts=training_artifact_root(artifacts, json.loads(config_json)),
         dataset_sha256=dataset_digest,
     )
     try:

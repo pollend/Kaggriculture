@@ -28,6 +28,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from kaggriculture_lab.identity import training_artifact_root
 from kaggriculture_lab.model_updates import (
     ActiveCheckpoint,
     ModelTrainingReader,
@@ -148,7 +149,10 @@ def load_trainer(path: str) -> Any:
 
 
 def session_training_models(
-    store: ExperimentStore, family_ids: Sequence[str]
+    store: ExperimentStore,
+    family_ids: Sequence[str] = (),
+    *,
+    model_ids: Sequence[str] | None = None,
 ) -> list[tuple[str, str, str, dict[str, Any], str | None]]:
     """Every registered model belonging to one of `family_ids`.
 
@@ -157,15 +161,17 @@ def session_training_models(
     driving its trainer.
     """
 
-    if not family_ids:
+    selected = tuple(model_ids) if model_ids is not None else tuple(family_ids)
+    if not selected:
         return []
-    placeholders = ",".join("?" for _ in family_ids)
+    placeholders = ",".join("?" for _ in selected)
+    column = "model_id" if model_ids is not None else "family_id"
     rows = store.connection.execute(
         f"""
         SELECT model_id, family_id, trainer_path, config_json, active_checkpoint_id
-        FROM training_models WHERE family_id IN ({placeholders}) ORDER BY model_id
+        FROM training_models WHERE {column} IN ({placeholders}) ORDER BY model_id
         """,
-        list(family_ids),
+        list(selected),
     ).fetchall()
     return [
         (str(row[0]), str(row[1]), str(row[2]), json.loads(row[3]), row[4])
@@ -256,7 +262,8 @@ def run_round_hooks(
     generation_index: int,
     scope: RoundScope,
     round_index: int,
-    family_ids: Sequence[str],
+    family_ids: Sequence[str] = (),
+    model_ids: Sequence[str] | None = None,
     artifacts: str | Path = "artifacts",
     model_id: str | None = None,
     force: bool = False,
@@ -275,7 +282,7 @@ def run_round_hooks(
 
     reports: list[RoundReport] = []
     for identifier, family_id, trainer_path, config, active_id in session_training_models(
-        store, family_ids
+        store, family_ids, model_ids=model_ids
     ):
         if model_id is not None and identifier != model_id:
             continue
@@ -317,7 +324,7 @@ def run_round_hooks(
                 round_index=round_index,
                 active_checkpoint=_active_checkpoint(store, active_id),
                 config=config,
-                artifacts=Path(artifacts),
+                artifacts=training_artifact_root(artifacts, config),
             )
             hook(context, ModelTrainingReader(store), writer)
         except Exception as error:

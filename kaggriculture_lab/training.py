@@ -43,6 +43,7 @@ def propose(
     parents: list[Any],
     rng: random.Random,
     reader: Any,
+    model_id: str | None = None,
 ) -> list[Any]:
     """Ask the adapter for `count` model-guided candidates, best first.
 
@@ -54,7 +55,15 @@ def propose(
     hook = getattr(adapter, "propose", None)
     if hook is None:
         return []
-    return list(hook(count=count, parents=parents, rng=rng, reader=reader))
+    return list(
+        hook(
+            count=count,
+            parents=parents,
+            rng=rng,
+            reader=reader,
+            model_id=model_id,
+        )
+    )
 
 
 def load_training_adapter(manifest: AgentManifest) -> TrainingAdapter | None:

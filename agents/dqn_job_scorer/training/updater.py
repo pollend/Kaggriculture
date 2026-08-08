@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -36,6 +37,93 @@ def _incumbent_path(config: dict[str, Any]) -> Path:
 
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def league_opponents(context, reader) -> list[str]:
+    """Agent specs of everyone competing in the round that just closed.
+
+    The league breeds a fresh population every generation, so these specs carry
+    parameters that the checked-in `main.py` files do not. Training only against
+    those files would pin the opponent distribution to whatever happened to be
+    committed, while the league is busy generating variation right next door.
+
+    The learner's own family is excluded -- facing itself is self-play, which is
+    mixed in separately and under an explicit ratio.
+    """
+
+    rows = reader.fetchall(
+        """
+        SELECT DISTINCT ar.agent_spec
+        FROM generation_members gm
+        JOIN agent_revisions ar USING (revision_id)
+        WHERE gm.generation_id = ? AND ar.agent_spec IS NOT NULL
+          AND ar.family_id != ?
+        ORDER BY ar.agent_spec
+        """,
+        [context.generation_id, context.family_id],
+    )
+    return [str(row[0]) for row in rows]
+
+
+def self_play_pool(context, reader, limit: int) -> list[str]:
+    """The most recent promoted checkpoints, addressed as agent specs.
+
+    A snapshot is reached through the agent's `weights` config key rather than as
+    a bare `.npz` path: the registry resolves agent modules, not weight files.
+    """
+
+    if limit < 1:
+        return []
+    rows = reader.fetchall(
+        """
+        SELECT inference_artifact_path FROM model_training_checkpoints
+        WHERE model_id = ? AND promoted
+        ORDER BY created_at DESC, checkpoint_id DESC LIMIT ?
+        """,
+        [context.model_id, limit],
+    )
+    return [
+        f"{SELF_SPEC}?weights={row[0]}" for row in rows if Path(str(row[0])).is_file()
+    ]
+
+
+def compose_opponents(base: list[str], pool: list[str], ratio: float) -> list[str]:
+    """Mix self-play into `base` so it lands on `ratio` of the episodes.
+
+    `collect_batch` walks the returned list round-robin, so its composition *is*
+    the sampling distribution. This used to be `[*base, *pool]`, which with a
+    single benchmark and a pool of five made self-play 5 of every 6 episodes
+    while evaluation stayed on the benchmark; dqn04 fell from +2,269 to -22,154
+    on the round that switched on. Solve for the slot count instead:
+    `slots / (len(base) + slots) == ratio`.
+    """
+
+    ratio = min(max(ratio, 0.0), 0.9)
+    if not pool or not base or ratio <= 0.0:
+        return list(base) or list(pool)
+    # A narrow base cannot express a small ratio in whole slots -- one static
+    # opponent at ratio 0.25 wants a third of a slot, which rounds to zero and
+    # silently disables self-play. Repeat the base until one slot is
+    # representable, then solve as usual.
+    repeats = max(1, math.ceil((1 - ratio) / (ratio * len(base))))
+    widened = base * repeats
+    slots = max(1, round(len(widened) * ratio / (1 - ratio)))
+    return [*widened, *(pool[index % len(pool)] for index in range(slots))]
+
+
+def rotate_opponents(opponents: list[str], offset: int) -> list[str]:
+    """Start each batch where the previous one stopped.
+
+    `collect_batch` plays `episodes_per_batch` episodes against
+    `opponents[i % len(opponents)]`. Once the list is longer than a batch --
+    which it is as soon as league revisions join -- a fixed start would mean the
+    tail never plays at all.
+    """
+
+    if not opponents:
+        return opponents
+    start = offset % len(opponents)
+    return [*opponents[start:], *opponents[:start]]
 
 
 class DQNCollector:
@@ -96,7 +184,7 @@ class DQNCollector:
                 )
             ]
             configured_opponents = config.get("opponents")
-            opponents = (
+            base = (
                 [str(item) for item in configured_opponents]
                 if configured_opponents
                 else [
@@ -104,6 +192,20 @@ class DQNCollector:
                     if checkpoint is not None
                     else "starter"
                 ]
+            )
+            if config.get("league_opponents", True):
+                base += league_opponents(context, reader)
+            # Dedupe: the league's anchors are the same competitor snapshots the
+            # static list already names, and a duplicate is a doubled weight.
+            base = list(dict.fromkeys(base))
+            pool = (
+                self_play_pool(context, reader, int(config.get("self_play_pool", 5)))
+                if batch_index >= int(config.get("self_play_after", 20))
+                else []
+            )
+            opponents = rotate_opponents(
+                compose_opponents(base, pool, float(config.get("self_play_ratio", 0.3))),
+                batch_index * len(seeds),
             )
             records = collect_batch(
                 network.layers,
@@ -119,7 +221,6 @@ class DQNCollector:
             path = (
                 Path(context.artifacts)
                 / "training_batches"
-                / context.model_id
                 / f"{source_id}.npz"
             )
             save_episode_batch(records, path)
@@ -141,6 +242,16 @@ class DQNCollector:
                     "session_id": context.session_id,
                     "generation_id": context.generation_id,
                     "round_index": context.round_index,
+                    # Which opponents actually played, so a collapse like dqn04's
+                    # can be traced to the mix rather than guessed at.
+                    "opponents": [
+                        opponents[index % len(opponents)] for index in range(len(seeds))
+                    ],
+                    "self_play_episodes": sum(
+                        1
+                        for index in range(len(seeds))
+                        if opponents[index % len(opponents)].startswith(SELF_SPEC)
+                    ),
                 },
             )
             total_transitions += transitions
@@ -272,7 +383,7 @@ class DQNUpdater:
         checkpoint_id = hashlib.sha256(
             f"{context.model_id}\0{context.update_id}\0{context.dataset_sha256}".encode()
         ).hexdigest()[:24]
-        destination = context.artifacts / "model_checkpoints" / context.model_id
+        destination = context.artifacts / "checkpoints"
         destination.mkdir(parents=True, exist_ok=True)
         trainer_path = destination / f"{checkpoint_id}.pt"
         inference_path = destination / f"{checkpoint_id}.npz"

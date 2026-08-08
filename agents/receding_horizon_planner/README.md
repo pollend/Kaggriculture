@@ -30,8 +30,9 @@ python -m sim.arena match \
 
 ## Parameter tuning
 
-The separate constants-driven runner does not touch the crop/DQN training
-database:
+The separate constants-driven runner uses
+`artifacts/planner_experiments.duckdb`, so it does not touch the crop/DQN training
+history:
 
 ```bash
 python train_planner.py
@@ -41,7 +42,17 @@ Edit the constants at the top of `train_planner.py` to change the population,
 rounds, generations, episode length, parallel jobs, candidate pool, final arena,
 or environment synchronization. The league automatically tries the model's
 `on_batch` update after each `on_round` hook; two closed generations are needed
-before the first surrogate checkpoint can be trained.
+before the first surrogate checkpoint can be trained. Re-running the script with the
+same session ID and database resumes its hook ledger, batches, update watermark, and
+active checkpoint. Pointing it at another database intentionally starts a new learning
+history.
+
+Inspect or manually retry the planner's sole model without affecting other families:
+
+```bash
+python -m agents.receding_horizon_planner.cli model status
+python -m agents.receding_horizon_planner.cli model update
+```
 
 ## Submission
 

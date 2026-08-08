@@ -99,6 +99,19 @@ def _percent(value: Any, digits: int = 1) -> str:
     return f"{100 * float(value):.{digits}f}%"
 
 
+def _duration(value: Any) -> str:
+    if value is None:
+        return "—"
+    seconds = float(value)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remainder:.0f}s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}h {minutes}m"
+
+
 def _status(value: Any) -> str:
     label = str(value or "UNKNOWN")
     kind = "good" if label in {"COMPLETE", "DONE", "SUCCESS"} else "bad" if label in {"ERROR", "FAILED"} else "warn"
@@ -150,6 +163,7 @@ a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}hea
 background:#0e1828;position:sticky;top:0;z-index:2}.bar{max-width:1200px;margin:auto;padding:14px 22px;display:flex;
 align-items:center;justify-content:space-between;gap:20px}.brand{font-weight:750;color:var(--ink);letter-spacing:.02em}
 main{max-width:1200px;margin:auto;padding:28px 22px 60px}h1{font-size:29px;margin:0 0 8px}h2{font-size:20px;margin:32px 0 12px}
+h3{font-size:16px;margin:18px 0 8px}
 .muted{color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin:20px 0}
 .card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px}.card{padding:14px}.card b{font-size:22px;display:block}
 .panel{padding:18px;margin:14px 0;overflow:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px}
@@ -415,6 +429,268 @@ def _session_page(connection: Any, session_id: str) -> str:
     return _layout(str(session["name"]), body)
 
 
+def _outcome_panel(connection: Any, generation_id: str) -> str:
+    """Margin distribution over settled pairings, plus the seat-order bias check."""
+    margins = _row(
+        connection,
+        """
+        SELECT count(*) AS scored, avg(pr.paired_margin) AS mean_margin,
+               median(pr.paired_margin) AS median_margin,
+               stddev_samp(pr.paired_margin) AS margin_stddev,
+               min(pr.paired_margin) AS min_margin, max(pr.paired_margin) AS max_margin,
+               avg(pr.outcome_a) AS mean_outcome_a,
+               count(*) FILTER (WHERE pr.paired_margin = 0) AS drawn
+        FROM league_pairings lp JOIN pairing_results pr USING (pairing_id)
+        WHERE lp.generation_id = ? AND NOT pr.failed
+        """,
+        [generation_id],
+    ) or {}
+    if not int(margins.get("scored") or 0):
+        return '<div class="panel empty">No pairings have been settled yet.</div>'
+    seats = _rows(
+        connection,
+        """
+        SELECT ep.seat, count(*) AS episodes, avg(ep.money_difference) AS mean_margin,
+               avg(ep.win) AS win_rate, avg(ep.final_money) AS mean_money
+        FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
+        JOIN episodes e USING (match_id) JOIN episode_players ep USING (match_id)
+        WHERE lp.generation_id = ? AND NOT e.failed
+        GROUP BY ep.seat ORDER BY ep.seat
+        """,
+        [generation_id],
+    )
+    # Every pairing is played in both orientations, so a standing seat-to-seat gap is the
+    # environment talking, not the agents.
+    seat_rows = "".join(
+        f'<tr><td>Seat {int(row["seat"])}</td><td>{int(row["episodes"] or 0):,}</td>'
+        f'<td>{_number(row["mean_money"])}</td><td>{_number(row["mean_margin"], 1)}</td>'
+        f'<td>{_percent(row["win_rate"])}</td></tr>'
+        for row in seats
+    )
+    cards = _cards([
+        ("Settled pairings", f"{int(margins['scored']):,}"),
+        ("Mean margin", _number(margins["mean_margin"], 1)),
+        ("Median margin", _number(margins["median_margin"], 1)),
+        ("Margin spread", f"± {_number(margins['margin_stddev'], 1)}"),
+        ("Margin range", f"{_number(margins['min_margin'])} to {_number(margins['max_margin'])}"),
+        ("Drawn", f"{int(margins.get('drawn') or 0):,}"),
+    ])
+    seat_table = (
+        '<table><thead><tr><th>Seat</th><th>Episodes</th><th>Mean money</th>'
+        '<th>Mean margin</th><th>Win rate</th></tr></thead>'
+        f"<tbody>{seat_rows}</tbody></table>"
+        if seats
+        else '<div class="empty">No completed episodes yet.</div>'
+    )
+    return (
+        f'{cards}<div class="panel"><h3>Seat-order bias</h3>'
+        f'<p class="muted">Each pairing is played in both seat orders. A persistent gap here is '
+        f'environment asymmetry rather than agent skill.</p>{seat_table}</div>'
+    )
+
+
+def _round_panel(connection: Any, generation_id: str) -> str:
+    """Per-round rollup. Pairings and episodes are aggregated apart, then joined.
+
+    Counting both in one FROM would fan each pairing out across its episodes and skew
+    the mean margin, because a failed pairing does not contribute the usual two.
+    """
+    rounds = _rows(
+        connection,
+        """
+        WITH pairing_counts AS (
+            SELECT lp.round_index, count(*) AS pairings,
+                   count(*) FILTER (WHERE lp.status = 'COMPLETE') AS completed,
+                   avg(pr.paired_margin) FILTER (WHERE NOT coalesce(pr.failed, true)) AS mean_margin
+            FROM league_pairings lp LEFT JOIN pairing_results pr USING (pairing_id)
+            WHERE lp.generation_id = ? GROUP BY lp.round_index
+        ), episode_counts AS (
+            SELECT lp.round_index, count(pe.match_id) AS episodes,
+                   count(*) FILTER (WHERE e.failed) AS failed_episodes,
+                   sum(e.wallclock) AS wallclock, avg(e.steps) AS mean_steps
+            FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
+            JOIN episodes e USING (match_id)
+            WHERE lp.generation_id = ? GROUP BY lp.round_index
+        )
+        SELECT pc.round_index, pc.pairings, pc.completed, pc.mean_margin,
+               coalesce(ec.episodes, 0) AS episodes,
+               coalesce(ec.failed_episodes, 0) AS failed_episodes,
+               ec.wallclock, ec.mean_steps
+        FROM pairing_counts pc LEFT JOIN episode_counts ec USING (round_index)
+        ORDER BY pc.round_index
+        """,
+        [generation_id, generation_id],
+    )
+    if not rounds:
+        return '<div class="panel empty">No rounds have been scheduled yet.</div>'
+    body = "".join(
+        f'<tr><td>{int(row["round_index"])}</td>'
+        f'<td>{_progress(int(row["completed"] or 0), int(row["pairings"] or 0))}</td>'
+        f'<td>{int(row["episodes"] or 0):,}</td><td>{int(row["failed_episodes"] or 0):,}</td>'
+        f'<td>{_number(row["mean_margin"], 1)}</td><td>{_number(row["mean_steps"])}</td>'
+        f'<td>{_duration(row["wallclock"])}</td></tr>'
+        for row in rounds
+    )
+    return (
+        '<div class="panel"><table><thead><tr><th>Round</th><th>Pairings</th><th>Episodes</th>'
+        '<th>Failures</th><th>Mean margin</th><th>Mean steps</th><th>Episode wall clock</th>'
+        f"</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def _agent_panel(connection: Any, generation_id: str) -> str:
+    """Per-agent money and behaviour mix.
+
+    `episode_players.strategy_id` already carries the seat-correct revision id for league
+    episodes -- `league.py` swaps the pair by orientation before handing it to `add_match`
+    -- so the seat needs no remapping here.
+    """
+    agents = _rows(
+        connection,
+        """
+        SELECT ep.strategy_id AS revision_id,
+               coalesce(af.name, ar.family_id, ep.strategy_id) AS display_name,
+               count(*) AS episodes, avg(ep.final_money) AS mean_money,
+               median(ep.final_money) AS median_money, avg(ep.money_difference) AS mean_margin,
+               avg(ep.reward) AS mean_reward, avg(ep.win) AS win_rate,
+               avg(ep.productive_action_percentage) AS productive,
+               avg(ep.movement_percentage) AS movement, avg(ep.idle_percentage) AS idle,
+               avg(ep.plants_lost_inferred) AS plants_lost,
+               avg(ep.final_shed_items + ep.final_carried_items) AS unsold,
+               max(rs.rating - 2 * rs.deviation) AS conservative
+        FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
+        JOIN episodes e USING (match_id) JOIN episode_players ep USING (match_id)
+        LEFT JOIN agent_revisions ar ON ar.revision_id = ep.strategy_id
+        LEFT JOIN agent_families af USING (family_id)
+        LEFT JOIN rating_snapshots rs
+               ON rs.generation_id = lp.generation_id AND rs.revision_id = ep.strategy_id
+        WHERE lp.generation_id = ? AND NOT e.failed
+        GROUP BY ep.strategy_id, display_name
+        ORDER BY conservative DESC NULLS LAST, mean_margin DESC NULLS LAST, revision_id
+        """,
+        [generation_id],
+    )
+    if not agents:
+        return '<div class="panel empty">Per-agent statistics appear once episodes complete.</div>'
+    body = "".join(
+        f'<tr><td><b>{_escape(row["display_name"])}</b><br><small>{_escape(row["revision_id"])}</small></td>'
+        f'<td>{int(row["episodes"] or 0):,}</td><td>{_number(row["mean_money"])}</td>'
+        f'<td>{_number(row["median_money"])}</td><td>{_number(row["mean_margin"], 1)}</td>'
+        f'<td>{_percent(row["win_rate"])}</td><td>{_number(row["mean_reward"], 1)}</td>'
+        f'<td>{_percent(row["productive"])}</td><td>{_percent(row["movement"])}</td>'
+        f'<td>{_percent(row["idle"])}</td><td>{_number(row["plants_lost"], 1)}</td>'
+        f'<td>{_number(row["unsold"], 1)}</td></tr>'
+        for row in agents
+    )
+    return (
+        '<div class="panel"><table><thead><tr><th>Agent</th><th>Episodes</th><th>Mean money</th>'
+        '<th>Median money</th><th>Mean margin</th><th>Win rate</th><th>Mean reward</th>'
+        '<th>Productive</th><th>Movement</th><th>Idle</th><th>Plants lost</th><th>Unsold</th>'
+        f"</tr></thead><tbody>{body}</tbody></table></div>"
+    )
+
+
+def _runtime_panel(connection: Any, generation_id: str) -> str:
+    """Episode wall clock and step counts.
+
+    Per-agent-call latency (`calls`, `time_p99`) is measured by `sim.runner` but never
+    persisted by `storage.add_match`, so episode wall clock is all that is available.
+    """
+    timing = _row(
+        connection,
+        """
+        SELECT count(*) AS episodes, count(*) FILTER (WHERE e.failed) AS failed,
+               sum(e.wallclock) AS total_wallclock, avg(e.wallclock) AS mean_wallclock,
+               median(e.wallclock) AS median_wallclock,
+               quantile_cont(e.wallclock, 0.95) AS p95_wallclock,
+               max(e.wallclock) AS max_wallclock,
+               avg(e.steps) AS mean_steps, max(e.steps) AS max_steps
+        FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
+        JOIN episodes e USING (match_id) WHERE lp.generation_id = ?
+        """,
+        [generation_id],
+    ) or {}
+    episodes = int(timing.get("episodes") or 0)
+    if not episodes:
+        return '<div class="panel empty">Timings appear once episodes run.</div>'
+    slowest = _rows(
+        connection,
+        """
+        SELECT e.match_id, e.wallclock, e.steps, e.failed, lp.round_index
+        FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
+        JOIN episodes e USING (match_id) WHERE lp.generation_id = ?
+        ORDER BY e.wallclock DESC LIMIT 5
+        """,
+        [generation_id],
+    )
+    failed = int(timing.get("failed") or 0)
+    cards = _cards([
+        ("Episode wall clock", _duration(timing["total_wallclock"])),
+        ("Mean episode", _duration(timing["mean_wallclock"])),
+        ("Median episode", _duration(timing["median_wallclock"])),
+        ("95th percentile", _duration(timing["p95_wallclock"])),
+        ("Slowest episode", _duration(timing["max_wallclock"])),
+        ("Failure rate", _percent(failed / episodes)),
+        ("Mean steps", _number(timing["mean_steps"])),
+    ])
+    slow_rows = "".join(
+        f'<tr><td>{int(row["round_index"])}</td>'
+        f'<td><a href="{_escape(_id_path("episodes", row["match_id"]))}"><small>{_escape(row["match_id"])}</small></a></td>'
+        f'<td>{_duration(row["wallclock"])}</td><td>{_number(row["steps"])}</td>'
+        f'<td>{_status("FAILED" if row["failed"] else "COMPLETE")}</td></tr>'
+        for row in slowest
+    )
+    return (
+        f'{cards}<div class="panel"><h3>Slowest episodes</h3><table><thead><tr><th>Round</th>'
+        '<th>Episode</th><th>Wall clock</th><th>Steps</th><th>Status</th></tr></thead>'
+        f"<tbody>{slow_rows}</tbody></table></div>"
+    )
+
+
+def _hook_panel(connection: Any, generation_id: str) -> str:
+    evaluation = _row(
+        connection,
+        """
+        SELECT count(*) AS evaluations,
+               count(*) FILTER (WHERE ee.status = 'ERROR') AS errors,
+               count(*) FILTER (
+                   WHERE ee.status = 'COMPLETE'
+                     AND coalesce(
+                           CAST(json_extract(ee.result_json, '$.should_reevaluate') AS BOOLEAN),
+                           false
+                         )
+               ) AS reevaluation_requests
+        FROM episode_evaluations ee
+        JOIN pairing_episodes pe USING (match_id)
+        JOIN league_pairings lp USING (pairing_id)
+        WHERE lp.generation_id = ?
+        """,
+        [generation_id],
+    ) or {}
+    evaluations = int(evaluation.get("evaluations") or 0)
+    if not evaluations:
+        return '<div class="panel empty">No post-episode evaluations were recorded.</div>'
+    errors = int(evaluation.get("errors") or 0)
+    return _cards([
+        ("Evaluations", f"{evaluations:,}"),
+        ("Errors", f"{errors:,}"),
+        ("Error rate", _percent(errors / evaluations)),
+        ("Re-evaluation requests", f"{int(evaluation.get('reevaluation_requests') or 0):,}"),
+    ])
+
+
+def _performance_section(connection: Any, generation_id: str) -> str:
+    """Everything the league already records about this generation, summarised in one place."""
+    return (
+        "<h2>Performance</h2>"
+        f"<h3>Match outcomes</h3>{_outcome_panel(connection, generation_id)}"
+        f"<h3>Rounds</h3>{_round_panel(connection, generation_id)}"
+        f"<h3>Agent money and behaviour</h3>{_agent_panel(connection, generation_id)}"
+        f"<h3>Runtime cost</h3>{_runtime_panel(connection, generation_id)}"
+        f"<h3>Evaluation hooks</h3>{_hook_panel(connection, generation_id)}"
+    )
+
+
 def _generation_page(connection: Any, generation_id: str, page: int, status_filter: str, kind_filter: str) -> str:
     generation = _row(
         connection,
@@ -548,6 +824,7 @@ def _generation_page(connection: Any, generation_id: str, page: int, status_filt
           ("Episodes", f"{int(episode_summary.get('episodes') or 0):,}"), ("Episode failures", f"{int(episode_summary.get('failed_episodes') or 0):,}"),
           ("Ranked agents", f"{len(leaderboard):,}")])}
 <h2>Leaderboard</h2><div class="panel">{('<table><thead><tr><th>#</th><th>Agent</th><th>Role</th><th>Conservative</th><th>Rating</th><th>W–D–L</th><th>Score</th><th>Mean margin</th><th>Opponents</th></tr></thead><tbody>'+leaderboard_rows+'</tbody></table>') if leaderboard else '<div class="empty">Ratings appear after this generation closes.</div>'}</div>
+{_performance_section(connection, generation_id)}
 <h2>Pairings and episodes</h2><div class="panel"><form class="filters" method="get"><label>Status<select name="status">{status_options}</select></label>
 <label>Kind<select name="kind">{kind_options}</select></label><button class="button" type="submit">Apply filters</button></form>
 {('<table><thead><tr><th>Round</th><th>Pairing</th><th>Kind</th><th>Agents</th><th>Status</th><th>Margin A</th><th>Episodes</th></tr></thead><tbody>'+''.join(pairing_rows)+'</tbody></table>') if pairings else '<div class="empty">No pairings match these filters.</div>'}

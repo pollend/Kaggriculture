@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from kaggriculture_lab.identity import AgentManifest, TrainingAgentSpec
 from kaggriculture_lab.league import (
     LeagueConfig,
     _training_family_ids,
@@ -237,12 +238,10 @@ def test_generation_hook_sees_closed_ratings_and_never_refires(tmp_path: Path):
     with ExperimentStore(database) as store:
         store.connection.execute(
             """
-            INSERT INTO training_models (
-                model_id, family_id, trainer_path, min_new_batches, config_json
-            ) VALUES (?, 'configurable_crop_surrogate',
-                      'test_model_trainers:recording', 1, '{}')
-            """,
-            [MODEL_ID],
+            UPDATE training_models
+            SET trainer_path = 'test_model_trainers:recording', min_new_batches = 1
+            WHERE model_id = 'configurable_crop_surrogate.surrogate'
+            """
         )
     run_generation(session_id, database, tmp_path / "artifacts")
 
@@ -289,3 +288,87 @@ def test_record_training_batch_still_rejects_unknown_models(tmp_path: Path):
             record_training_batch(
                 store, "nope.model", source_kind="unit", source_id="one", sample_count=1
             )
+
+
+def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
+    manifest = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
+    with ExperimentStore(tmp_path / "named.duckdb") as store:
+        first = store.register_training_agent(
+            manifest,
+            "agents/dqn_job_scorer/agent.toml",
+            TrainingAgentSpec("dqn_job_scorer", "dqn05"),
+        )
+        second = store.register_training_agent(
+            manifest,
+            "agents/dqn_job_scorer/agent.toml",
+            TrainingAgentSpec("dqn_job_scorer", "dqn06"),
+        )
+        rows = store.connection.execute(
+            """
+            SELECT model_id, agent_type, agent_name, declared_model_id, config_json
+            FROM training_models ORDER BY model_id
+            """
+        ).fetchall()
+
+    assert first == ("dqn_job_scorer.q_network@dqn05",)
+    assert second == ("dqn_job_scorer.q_network@dqn06",)
+    assert [(row[1], row[2], row[3]) for row in rows] == [
+        ("dqn_job_scorer", "dqn05", "dqn_job_scorer.q_network"),
+        ("dqn_job_scorer", "dqn06", "dqn_job_scorer.q_network"),
+    ]
+    configs = [json.loads(row[4]) for row in rows]
+    assert [item["name"] for item in configs] == ["dqn05", "dqn06"]
+    assert configs[0]["seed"] != configs[1]["seed"]
+
+
+def test_schema_migration_preserves_existing_model_as_default(tmp_path: Path):
+    import duckdb
+
+    database = tmp_path / "version4.duckdb"
+    connection = duckdb.connect(str(database))
+    connection.execute(
+        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMP)"
+    )
+    connection.execute("INSERT INTO schema_migrations VALUES (4, current_timestamp)")
+    connection.execute(
+        """
+        CREATE TABLE training_models (
+            model_id VARCHAR PRIMARY KEY,
+            family_id VARCHAR NOT NULL,
+            trainer_path VARCHAR NOT NULL,
+            min_new_batches INTEGER NOT NULL,
+            config_json JSON NOT NULL,
+            active_checkpoint_id VARCHAR,
+            last_attempted_batch_seq BIGINT NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT current_timestamp,
+            updated_at TIMESTAMP DEFAULT current_timestamp
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO training_models (
+            model_id, family_id, trainer_path, min_new_batches, config_json,
+            active_checkpoint_id, last_attempted_batch_seq
+        ) VALUES ('dqn_job_scorer.q_network', 'dqn_job_scorer', 'trainer:path',
+                  20, '{}', 'checkpoint', 17)
+        """
+    )
+    connection.close()
+
+    with ExperimentStore(database) as store:
+        row = store.connection.execute(
+            """
+            SELECT model_id, agent_type, agent_name, declared_model_id,
+                   active_checkpoint_id, last_attempted_batch_seq
+            FROM training_models
+            """
+        ).fetchone()
+    assert row == (
+        "dqn_job_scorer.q_network",
+        "dqn_job_scorer",
+        "default",
+        "dqn_job_scorer.q_network",
+        "checkpoint",
+        17,
+    )

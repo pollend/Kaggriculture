@@ -24,8 +24,10 @@ from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader, load_eval
 from kaggriculture_lab.identity import (
     AgentManifest,
     AgentRevision,
+    TrainingAgentSpec,
     build_revision,
     builtin_revision,
+    effective_model_id,
 )
 from kaggriculture_lab.model_trainers import (
     GENERATION_ROUND_INDEX,
@@ -49,6 +51,9 @@ class LeagueConfig:
     #: another family as an anchor opponent without also running its trainer --
     #: and what lets a session drive a model, like the DQN, that no league breeds.
     training_manifests: tuple[str, ...] = ()
+    #: Independently named model instances. Empty keeps the legacy behavior of
+    #: training the default instance of each `training_manifests` family.
+    training_agents: tuple[TrainingAgentSpec, ...] = ()
     population_size: int = 20
     rounds_per_generation: int = 20
     hall_of_fame_rounds: int = 4
@@ -65,6 +70,10 @@ class LeagueConfig:
         values = dict(raw.get("league", raw))
         values["anchor_manifests"] = tuple(values.get("anchor_manifests", ()))
         values["training_manifests"] = tuple(values.get("training_manifests", ()))
+        values["training_agents"] = tuple(
+            TrainingAgentSpec.from_dict(item)
+            for item in values.get("training_agents", ())
+        )
         return cls(**values)
 
     def validate(self) -> None:
@@ -78,6 +87,28 @@ class LeagueConfig:
             raise ValueError("episode_steps must be positive")
         if self.jobs < 0:
             raise ValueError("jobs must be zero (automatic) or positive")
+        seen: set[tuple[str, str]] = set()
+        by_type: dict[str, list[TrainingAgentSpec]] = {}
+        for instance in self.training_agents:
+            instance.validate()
+            identity = (instance.type, instance.name)
+            if identity in seen:
+                raise ValueError(f"duplicate training agent: {instance.type}/{instance.name}")
+            seen.add(identity)
+            by_type.setdefault(instance.type, []).append(instance)
+        for agent_type, instances in by_type.items():
+            primaries = sum(item.primary for item in instances)
+            if primaries > 1:
+                raise ValueError(
+                    f"training agent type {agent_type!r} has multiple primary names"
+                )
+        bred_type = AgentManifest.load(self.manifest).family_id
+        bred_instances = by_type.get(bred_type, [])
+        if len(bred_instances) > 1 and sum(item.primary for item in bred_instances) != 1:
+            raise ValueError(
+                f"training agent type {bred_type!r} must have exactly one primary "
+                "when multiple names are configured"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -191,6 +222,7 @@ def create_session(
         store.register_family(manifest, manifest_path)
         for anchor_manifest, anchor_path in zip(anchor_manifests, anchor_manifest_paths):
             store.register_family(anchor_manifest, anchor_path)
+        _register_training_agents(store, config, workspace=workspace)
         store.add_agent_revisions([*revisions, *anchors, *competitor_anchors])
         store.add_strategies(strategies, "league-random", session_id)
         config_json = json.dumps(asdict(config), sort_keys=True)
@@ -224,6 +256,9 @@ def _load_session(store: ExperimentStore, session_id: str) -> LeagueConfig:
     values = json.loads(row[0])
     values["anchor_manifests"] = tuple(values.get("anchor_manifests", ()))
     values["training_manifests"] = tuple(values.get("training_manifests", ()))
+    values["training_agents"] = tuple(
+        TrainingAgentSpec.from_dict(item) for item in values.get("training_agents", ())
+    )
     return LeagueConfig(**values)
 
 
@@ -248,11 +283,39 @@ def set_training_manifests(
             raise ValueError(f"unknown training session: {session_id}")
         values = json.loads(row[0])
         values["training_manifests"] = list(manifests)
+        values["training_agents"] = []
         store.connection.execute(
             "UPDATE training_sessions SET config_json = ? WHERE session_id = ?",
             [json.dumps(values, sort_keys=True), session_id],
         )
     return families
+
+
+def set_training_agents(
+    session_id: str,
+    database: str | Path,
+    config: LeagueConfig,
+    *,
+    workspace: str | Path = ".",
+) -> tuple[str, ...]:
+    """Synchronize a session's named training roster without deleting history."""
+
+    config.validate()
+    with ExperimentStore(database) as store:
+        row = store.connection.execute(
+            "SELECT config_json FROM training_sessions WHERE session_id = ?", [session_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown training session: {session_id}")
+        identifiers = _register_training_agents(store, config, workspace=workspace)
+        values = json.loads(row[0])
+        values["training_manifests"] = list(config.training_manifests)
+        values["training_agents"] = [asdict(item) for item in config.training_agents]
+        store.connection.execute(
+            "UPDATE training_sessions SET config_json = ? WHERE session_id = ?",
+            [json.dumps(values, sort_keys=True), session_id],
+        )
+    return identifiers
 
 
 def _current_generation(store: ExperimentStore, session_id: str) -> tuple[str, int, str]:
@@ -597,18 +660,111 @@ def _finish_pairing(store: ExperimentStore, pairing_id: str, revision_a: str) ->
     )
 
 
-def _training_family_ids(config: LeagueConfig) -> tuple[str, ...]:
-    """Families whose trainers this session drives, from its declared manifests.
+def _training_manifest_paths(
+    config: LeagueConfig, *, workspace: str | Path = "."
+) -> dict[str, str]:
+    """Known trainable manifests keyed by their declared family/type."""
 
-    Reading them from the config rather than from the generation's membership is
-    deliberate: a session may train a family it does not breed (an off-policy
-    learner riding the league's clock), and it must *not* train a family that is
-    only present as an anchor opponent.
-    """
+    paths = tuple(
+        dict.fromkeys(
+            (config.manifest, *config.training_manifests, *config.anchor_manifests)
+        )
+    )
+    return {
+        AgentManifest.load(Path(workspace) / path).family_id: path for path in paths
+    }
 
+
+def _configured_training_agents(
+    config: LeagueConfig, *, workspace: str | Path = "."
+) -> tuple[TrainingAgentSpec, ...]:
+    """Return explicit instances, or legacy manifests as default instances."""
+
+    if config.training_agents:
+        return config.training_agents
     paths = config.training_manifests or (config.manifest,)
     return tuple(
-        dict.fromkeys(AgentManifest.load(path).family_id for path in paths)
+        TrainingAgentSpec(type=family_id, primary=True)
+        for family_id in dict.fromkeys(
+            AgentManifest.load(Path(workspace) / path).family_id for path in paths
+        )
+    )
+
+
+def _manifest_for_training_type(
+    config: LeagueConfig, agent_type: str, *, workspace: str | Path = "."
+) -> tuple[AgentManifest, Path]:
+    configured = _training_manifest_paths(config, workspace=workspace)
+    path = Path(configured.get(agent_type, f"agents/{agent_type}/agent.toml"))
+    resolved = (Path(workspace) / path).resolve()
+    manifest = AgentManifest.load(resolved)
+    if manifest.family_id != agent_type:
+        raise ValueError(
+            f"training type {agent_type!r} resolves to manifest family "
+            f"{manifest.family_id!r}"
+        )
+    return manifest, resolved
+
+
+def _register_training_agents(
+    store: ExperimentStore,
+    config: LeagueConfig,
+    *,
+    workspace: str | Path = ".",
+) -> tuple[str, ...]:
+    identifiers: list[str] = []
+    for instance in _configured_training_agents(config, workspace=workspace):
+        manifest, path = _manifest_for_training_type(
+            config, instance.type, workspace=workspace
+        )
+        identifiers.extend(store.register_training_agent(manifest, path, instance))
+    return tuple(identifiers)
+
+
+def _training_model_ids(
+    config: LeagueConfig,
+    *,
+    train_only: bool = True,
+    workspace: str | Path = ".",
+) -> tuple[str, ...]:
+    identifiers: list[str] = []
+    for instance in _configured_training_agents(config, workspace=workspace):
+        if train_only and not instance.train:
+            continue
+        manifest, _ = _manifest_for_training_type(
+            config, instance.type, workspace=workspace
+        )
+        identifiers.extend(
+            effective_model_id(model.model_id, instance.name)
+            for model in manifest.models
+        )
+    return tuple(dict.fromkeys(identifiers))
+
+
+def _primary_training_model_id(
+    config: LeagueConfig, family_id: str, *, workspace: str | Path = "."
+) -> str | None:
+    instances = [
+        item
+        for item in _configured_training_agents(config, workspace=workspace)
+        if item.type == family_id
+    ]
+    if not instances:
+        return None
+    primary = next((item for item in instances if item.primary), instances[0])
+    manifest, _ = _manifest_for_training_type(config, family_id, workspace=workspace)
+    if not manifest.models:
+        return None
+    return effective_model_id(manifest.models[0].model_id, primary.name)
+
+
+def _training_family_ids(config: LeagueConfig) -> tuple[str, ...]:
+    """Backward-compatible view of the train-enabled families in a session."""
+
+    return tuple(
+        dict.fromkeys(
+            item.type for item in _configured_training_agents(config) if item.train
+        )
     )
 
 
@@ -692,7 +848,7 @@ def run_generation(
 
     with ExperimentStore(database) as store:
         config = _load_session(store, session_id)
-        family_ids = _training_family_ids(config)
+        model_ids = _training_model_ids(config)
         generation_id, generation_index, status = _current_generation(store, session_id)
         if status == "COMPLETE":
             _close_generation_training(
@@ -700,7 +856,7 @@ def run_generation(
                 session_id,
                 generation_id,
                 generation_index,
-                family_ids,
+                model_ids,
                 artifacts,
                 update_models,
             )
@@ -740,11 +896,11 @@ def run_generation(
                     generation_index=generation_index,
                     scope="round",
                     round_index=round_index,
-                    family_ids=family_ids,
+                    model_ids=model_ids,
                     artifacts=artifacts,
                 )
                 if update_models:
-                    _update_session_models(store, family_ids, artifacts)
+                    _update_session_models(store, model_ids, artifacts)
         finally:
             if pool is not None:
                 pool.shutdown()
@@ -754,7 +910,7 @@ def run_generation(
             session_id,
             generation_id,
             generation_index,
-            family_ids,
+            model_ids,
             artifacts,
             update_models,
         )
@@ -773,7 +929,7 @@ def _close_generation_training(
     session_id: str,
     generation_id: str,
     generation_index: int,
-    family_ids: Sequence[str],
+    model_ids: Sequence[str],
     artifacts: str | Path,
     update_models: bool,
 ) -> None:
@@ -791,17 +947,19 @@ def _close_generation_training(
         generation_index=generation_index,
         scope="generation",
         round_index=GENERATION_ROUND_INDEX,
-        family_ids=family_ids,
+        model_ids=model_ids,
         artifacts=artifacts,
     )
     if update_models:
-        _update_session_models(store, family_ids, artifacts)
+        _update_session_models(store, model_ids, artifacts)
 
 
 def _update_session_models(
-    store: ExperimentStore, family_ids: Sequence[str], artifacts: str | Path
+    store: ExperimentStore,
+    model_ids: Sequence[str],
+    artifacts: str | Path,
 ) -> None:
-    for model in session_training_models(store, family_ids):
+    for model in session_training_models(store, model_ids=model_ids):
         update_model_in_store(store, model[0], artifacts=artifacts)
 
 
@@ -1040,6 +1198,9 @@ def create_next_generation(
             parents=elite_pool,
             rng=rng,
             reader=ModelTrainingReader(store),
+            model_id=_primary_training_model_id(
+                config, manifest.family_id, workspace=workspace
+            ),
         )
         surrogate_iter = iter(proposed)
         while sum(item[1] == "surrogate" for item in selected) < allocation["surrogate"]:
