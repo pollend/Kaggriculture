@@ -1,0 +1,15 @@
+{
+  "author": "Roman Tamrazov",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "00e8ab594a39779e808dd351d0973260f4c90ddc1370e684fa46eaa184ae4546",
+  "kaggle_handle": "romantamrazov/kaggriculture-hamburger",
+  "last_run_time": "2026-08-04T06:55:18.630000",
+  "license": "Apache-2.0",
+  "notebook_file": "kaggriculture-hamburger.ipynb",
+  "notebook_sha256": "21b03bab1b349a889c6d2dee86dd78783aa1e33a138f02e1a2c7f6dfe912a5f8",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/romantamrazov/kaggriculture-hamburger",
+  "title": "Kaggriculture | Hamburger",
+  "votes_at_import": 124
+}

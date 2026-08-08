@@ -1,0 +1,27 @@
+{
+  "id": "avikdas567/kaggriculture-microeconomic-dynamic-policy-engine",
+  "id_no": 129350114,
+  "title": "Kaggriculture: Microeconomic Dynamic Policy Engine",
+  "code_file": "kaggriculture-microeconomic-dynamic-policy-engine.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": false,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "keywords": [
+    "simulations",
+    "artificial intelligence",
+    "lightgbm",
+    "feature engineering",
+    "optimization"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [
+    "kaggriculture"
+  ],
+  "model_sources": [],
+  "docker_image": "gcr.io/kaggle-private-byod/python@sha256:37c64f7dd9c54116ecd1bcc88817c5469b88387388fade02bfa8bf3fc647d461",
+  "machine_shape": "NvidiaTeslaT4"
+}

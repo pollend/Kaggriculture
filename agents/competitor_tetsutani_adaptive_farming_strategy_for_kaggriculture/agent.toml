@@ -1,0 +1,5 @@
+family_id = "competitor_tetsutani_adaptive_farming"
+name = "Competitor: Adaptive Farming Strategy"
+entry_point = "agents.competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/main.py"]

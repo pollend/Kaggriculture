@@ -1,0 +1,15 @@
+{
+  "author": "Kaito Fukami",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "62fb5a5f66f0011092a2b51e3192879ba583d5d815d761f176091c615657147a",
+  "kaggle_handle": "kaitofukami/44-46-strict-future-top-30-v22-price-impact",
+  "last_run_time": "2026-08-06T17:59:21.537000",
+  "license": "Apache-2.0",
+  "notebook_file": "44-46-strict-future-top-30-v22-price-impact.ipynb",
+  "notebook_sha256": "be57f757aaaafa37a1aab1eb5fe827925144ec7f3825a6236053329c15f2e859",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/kaitofukami/44-46-strict-future-top-30-v22-price-impact",
+  "title": "44/46 Strict-Future Top-30 | v22 Price Impact",
+  "votes_at_import": 92
+}

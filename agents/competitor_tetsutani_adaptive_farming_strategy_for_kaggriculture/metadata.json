@@ -1,0 +1,15 @@
+{
+  "author": "tetsu2131",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "2281e22d6673c4e3e7cb62c530fb30e96d8ed632e471c37e52316cdd8e5c5c85",
+  "kaggle_handle": "tetsutani/adaptive-farming-strategy-for-kaggriculture",
+  "last_run_time": "2026-08-07T16:57:04.843000",
+  "license": "Apache-2.0",
+  "notebook_file": "adaptive-farming-strategy-for-kaggriculture.ipynb",
+  "notebook_sha256": "c7e552e7f22e2c72dafc1dd562489efa42eac70b2164e0af518b423ecb705760",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/tetsutani/adaptive-farming-strategy-for-kaggriculture",
+  "title": "Adaptive Farming Strategy for Kaggriculture",
+  "votes_at_import": 19
+}

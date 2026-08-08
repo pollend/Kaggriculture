@@ -1,0 +1,330 @@
+"""DuckDB experiment catalog and portable exports."""
+
+from __future__ import annotations
+
+import gzip
+import hashlib
+import json
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+from kaggriculture_lab.identity import AgentManifest, AgentRevision
+from sim.runner import MatchResult
+
+
+class ExperimentStore:
+    def __init__(self, path: str | Path):
+        import duckdb
+
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.connection = duckdb.connect(str(self.path))
+        self._initialize()
+
+    def close(self) -> None:
+        self.connection.close()
+
+    def __enter__(self) -> ExperimentStore:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def _initialize(self) -> None:
+        schema_path = Path(__file__).with_name("schema.sql")
+        self.connection.execute(schema_path.read_text())
+        version = self.connection.execute(
+            "SELECT max(version) FROM schema_migrations"
+        ).fetchone()[0]
+        if version != 3:
+            raise RuntimeError(
+                f"unsupported experiment schema version {version!r}; expected 3"
+            )
+    def register_family(
+        self, manifest: AgentManifest, manifest_path: str | Path
+    ) -> None:
+        self.connection.execute(
+            """
+            INSERT OR REPLACE INTO agent_families VALUES (
+                ?, ?, ?, ?, ?, ?, ?, current_timestamp
+            )
+            """,
+            [
+                manifest.family_id,
+                manifest.name,
+                str(manifest_path),
+                manifest.entry_point,
+                manifest.training_adapter,
+                manifest.episode_evaluator,
+                manifest.parameter_schema_version,
+            ],
+        )
+        for model in manifest.models:
+            self.connection.execute(
+                """
+                INSERT INTO training_models (
+                    model_id, family_id, updater_path, collector_path,
+                    min_new_batches, config_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (model_id) DO UPDATE SET
+                    family_id = excluded.family_id,
+                    updater_path = excluded.updater_path,
+                    collector_path = excluded.collector_path,
+                    min_new_batches = excluded.min_new_batches,
+                    config_json = excluded.config_json,
+                    updated_at = now()
+                """,
+                [
+                    model.model_id,
+                    manifest.family_id,
+                    model.updater,
+                    model.collector,
+                    model.min_new_batches,
+                    json.dumps(model.config or {}, sort_keys=True),
+                ],
+            )
+
+    def add_agent_revisions(self, revisions: Iterable[AgentRevision]) -> None:
+        rows = [
+            [
+                item.revision_id,
+                item.family_id,
+                item.strategy_id,
+                item.entry_point,
+                item.agent_spec,
+                item.code_fingerprint,
+                item.parameter_schema_version,
+                item.params_json,
+                item.checkpoint_id,
+                item.checkpoint_digest,
+                item.source,
+                item.episode_evaluator,
+            ]
+            for item in revisions
+        ]
+        if rows:
+            self.connection.executemany(
+                """
+                INSERT OR IGNORE INTO agent_revisions (
+                    revision_id, family_id, strategy_id, entry_point, agent_spec,
+                    code_fingerprint, parameter_schema_version, params_json,
+                    checkpoint_id, checkpoint_digest, source, episode_evaluator
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+
+    def add_replay_payload(self, match_id: str, replay: Any) -> str:
+        raw = json.dumps(replay, sort_keys=True, separators=(",", ":")).encode()
+        digest = hashlib.sha256(raw).hexdigest()
+        payload = gzip.compress(raw, compresslevel=6)
+        self.connection.execute(
+            "INSERT OR REPLACE INTO episode_payloads VALUES (?, ?, ?)",
+            [match_id, payload, digest],
+        )
+        return digest
+
+    def begin_run(
+        self,
+        run_id: str,
+        name: str,
+        seed: int,
+        config: dict[str, Any],
+        versions: dict[str, str],
+        git_commit: str | None,
+    ) -> None:
+        self.connection.execute(
+            "INSERT OR REPLACE INTO runs VALUES (?, ?, current_timestamp, 'RUNNING', ?, ?, ?, ?)",
+            [run_id, name, seed, json.dumps(config), json.dumps(versions), git_commit],
+        )
+
+    def finish_run(self, run_id: str, status: str = "COMPLETE") -> None:
+        self.connection.execute("UPDATE runs SET status = ? WHERE run_id = ?", [status, run_id])
+
+    def add_strategies(
+        self, strategies: Iterable[Any], source: str, run_id: str | None = None
+    ) -> None:
+        """Persist family parameter sets. Only `strategy_id` and `canonical_json()`
+        are read, so the store never needs to know the parameter type."""
+        rows = [
+            [strategy.strategy_id, strategy.canonical_json(), source, run_id]
+            for strategy in strategies
+        ]
+        if rows:
+            self.connection.executemany(
+                "INSERT OR IGNORE INTO strategies VALUES (?, ?, ?, ?)", rows
+            )
+
+    def completed_match_ids(self, run_id: str) -> set[str]:
+        rows = self.connection.execute(
+            "SELECT match_id FROM episodes WHERE run_id = ?", [run_id]
+        ).fetchall()
+        return {row[0] for row in rows}
+
+    def add_match(
+        self,
+        match_id: str,
+        run_id: str,
+        stage: str,
+        strategy_ids: tuple[str, str],
+        specs: tuple[str, str],
+        result: MatchResult,
+        replay_path: str | None = None,
+    ) -> None:
+        self.connection.execute("BEGIN")
+        try:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO episodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    match_id,
+                    run_id,
+                    stage,
+                    result.seed,
+                    strategy_ids[0],
+                    strategy_ids[1],
+                    specs[0],
+                    specs[1],
+                    result.steps,
+                    result.wallclock,
+                    result.failed,
+                    replay_path,
+                ],
+            )
+            money = [seat.final_money for seat in result.seats]
+            for seat_index, seat in enumerate(result.seats):
+                opponent_money = money[1 - seat_index]
+                difference = (
+                    seat.final_money - opponent_money
+                    if seat.final_money is not None and opponent_money is not None
+                    else None
+                )
+                win = None if difference is None else (1.0 if difference > 0 else 0.0 if difference < 0 else 0.5)
+                metrics = seat.metrics
+                self.connection.execute(
+                    """
+                    INSERT OR IGNORE INTO episode_players VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    [
+                        match_id,
+                        run_id,
+                        stage,
+                        result.seed,
+                        seat_index,
+                        strategy_ids[seat_index],
+                        strategy_ids[1 - seat_index],
+                        seat.status,
+                        seat.failed,
+                        seat.reward,
+                        seat.final_money,
+                        opponent_money,
+                        difference,
+                        win,
+                        metrics.get("total_unit_actions", 0),
+                        metrics.get("productive_actions", 0),
+                        metrics.get("movement_actions", 0),
+                        metrics.get("idle_actions", 0),
+                        metrics.get("productive_action_percentage", 0.0),
+                        metrics.get("movement_percentage", 0.0),
+                        metrics.get("idle_percentage", 0.0),
+                        metrics.get("plants_lost_inferred", 0),
+                        metrics.get("final_shed_items", 0),
+                        metrics.get("final_carried_items", 0),
+                        json.dumps(metrics, sort_keys=True),
+                    ],
+                )
+            self.connection.execute("COMMIT")
+        except Exception:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def ranked_strategy_ids(self, run_id: str, stage: str, limit: int) -> list[str]:
+        rows = self.connection.execute(
+            """
+            SELECT strategy_id, avg(money_difference) AS score
+            FROM episode_players
+            WHERE run_id = ? AND stage = ? AND strategy_id NOT LIKE 'builtin:%' AND NOT failed
+            GROUP BY strategy_id
+            ORDER BY score DESC, strategy_id
+            LIMIT ?
+            """,
+            [run_id, stage, limit],
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def load_strategies(self, strategy_ids: Iterable[str] | None = None) -> dict[str, dict[str, Any]]:
+        """Return raw parameter dicts keyed by strategy id.
+
+        Deliberately does not decode into a family type -- that would make the
+        generic store depend on one agent's dataclass. Callers that own the
+        family decode with their own `from_dict`."""
+        if strategy_ids is None:
+            rows = self.connection.execute("SELECT strategy_id, params_json FROM strategies").fetchall()
+        else:
+            ids = list(strategy_ids)
+            if not ids:
+                return {}
+            placeholders = ",".join("?" for _ in ids)
+            rows = self.connection.execute(
+                f"SELECT strategy_id, params_json FROM strategies WHERE strategy_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+        return {row[0]: json.loads(row[1]) for row in rows}
+
+    def save_ratings(self, run_id: str, ratings: dict[str, tuple[float, int]]) -> None:
+        self.connection.execute("DELETE FROM ratings WHERE run_id = ?", [run_id])
+        rows = [[run_id, key, value[0], value[1]] for key, value in ratings.items()]
+        if rows:
+            self.connection.executemany("INSERT INTO ratings VALUES (?, ?, ?, ?)", rows)
+
+    def save_model(
+        self,
+        model_id: str,
+        run_id: str,
+        kind: str,
+        artifact_path: str,
+        report: dict[str, Any],
+    ) -> None:
+        self.connection.execute(
+            "INSERT OR REPLACE INTO models VALUES (?, ?, ?, ?, ?, current_timestamp)",
+            [model_id, run_id, kind, artifact_path, json.dumps(report, sort_keys=True)],
+        )
+
+    def save_proposals(self, run_id: str, rows: list[dict[str, Any]]) -> None:
+        self.connection.execute("DELETE FROM proposals WHERE run_id = ?", [run_id])
+        self.connection.executemany(
+            "INSERT INTO proposals VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                [
+                    run_id,
+                    row["strategy_id"],
+                    row["rank"],
+                    row["acquisition"],
+                    row.get("predicted_quality"),
+                    row.get("predicted_matchup"),
+                    row.get("uncertainty"),
+                ]
+                for row in rows
+            ],
+        )
+
+    def export(self, run_id: str, directory: str | Path, csv: bool = False) -> list[Path]:
+        destination = Path(directory)
+        destination.mkdir(parents=True, exist_ok=True)
+        tables = ("runs", "strategies", "episodes", "episode_players", "ratings", "models", "proposals")
+        written: list[Path] = []
+        for table in tables:
+            run_filter = "run_id = ?" if table != "strategies" else "created_run_id = ?"
+            extension = "csv" if csv else "parquet"
+            path = destination / f"{table}.{extension}"
+            escaped = str(path).replace("'", "''")
+            options = "(HEADER, DELIMITER ',')" if csv else "(FORMAT PARQUET, COMPRESSION ZSTD)"
+            self.connection.execute(
+                f"COPY (SELECT * FROM {table} WHERE {run_filter}) TO '{escaped}' {options}",
+                [run_id],
+            )
+            written.append(path)
+        return written
+

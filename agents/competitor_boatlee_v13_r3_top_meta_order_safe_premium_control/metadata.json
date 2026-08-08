@@ -1,0 +1,15 @@
+{
+  "author": "boatlee",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "6f52902081fed08bb5da08d575b796437e645c5320662b448b81eb079f185cfb",
+  "kaggle_handle": "boatlee/v13-r3-top-meta-order-safe-premium-control",
+  "last_run_time": "2026-08-06T08:14:29.773000",
+  "license": "Apache-2.0",
+  "notebook_file": "v13-r3-top-meta-order-safe-premium-control.ipynb",
+  "notebook_sha256": "8d9eb13340c3cd55dd87babde024f2760b542ac0f705c438b6e98bdaa3f7921e",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/boatlee/v13-r3-top-meta-order-safe-premium-control",
+  "title": "V13-R3 | Top-Meta Order-Safe Premium Control",
+  "votes_at_import": 13
+}

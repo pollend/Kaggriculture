@@ -1,0 +1,5 @@
+family_id = "competitor_jek1wantaufik_building_agent"
+name = "Competitor: Building a Kaggriculture AI Agent"
+entry_point = "agents.competitor_jek1wantaufik_building_a_kaggriculture_ai_agent.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_jek1wantaufik_building_a_kaggriculture_ai_agent/main.py"]

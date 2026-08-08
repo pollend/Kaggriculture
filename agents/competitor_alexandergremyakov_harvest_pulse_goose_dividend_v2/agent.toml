@@ -1,0 +1,5 @@
+family_id = "competitor_alexandergremyakov_goose_dividend_v2"
+name = "Competitor: Harvest Pulse Goose Dividend v2"
+entry_point = "agents.competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py"]

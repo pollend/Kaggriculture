@@ -1,0 +1,15 @@
+{
+  "author": "prvsiyan",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "868e095cc2c415a4d3ea5062681db5624b34734650b5d55f3737be373ccf67e8",
+  "kaggle_handle": "prvsiyan/kaggriculture-frontier-the-moon-counts-melons",
+  "last_run_time": "2026-08-04T23:16:52.667000",
+  "license": "Apache-2.0",
+  "notebook_file": "kaggriculture-frontier-the-moon-counts-melons.ipynb",
+  "notebook_sha256": "6427bc1ecc040e2fa89acd5ec6a68e64eea5fce594b69691f94f8a9712bfe90e",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/prvsiyan/kaggriculture-frontier-the-moon-counts-melons",
+  "title": "Kaggriculture Frontier | The Moon Counts Melons",
+  "votes_at_import": 71
+}

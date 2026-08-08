@@ -1,0 +1,15 @@
+{
+  "author": "Jeki Wan Taufik",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "37a4bb1c87cd1153773b97d8438b015393a85e472718e208e34f2669ee1df70d",
+  "kaggle_handle": "jek1wantaufik/building-a-kaggriculture-ai-agent",
+  "last_run_time": "2026-08-04T07:09:58.897000",
+  "license": "Apache-2.0",
+  "notebook_file": "building-a-kaggriculture-ai-agent.ipynb",
+  "notebook_sha256": "ef4a3801752ad999903f6b61f02b5abe5028e60b8c49d131c9ff96d8f617a739",
+  "original_entrypoint_file": "submission.py",
+  "source_url": "https://www.kaggle.com/code/jek1wantaufik/building-a-kaggriculture-ai-agent",
+  "title": "Building a Kaggriculture AI Agent",
+  "votes_at_import": 37
+}

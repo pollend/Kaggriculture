@@ -1,0 +1,15 @@
+{
+  "author": "Alexander Gremyakov",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "8f3f216a39d5ce0c383d19c31f317dbad85422fc5b86d3c311eee756f3fb15e9",
+  "kaggle_handle": "alexandergremyakov/harvest-pulse-goose-dividend-v2",
+  "last_run_time": "2026-07-31T22:05:54.090000",
+  "license": "Apache-2.0",
+  "notebook_file": "harvest-pulse-goose-dividend-v2.ipynb",
+  "notebook_sha256": "a3599a6c54cfa7d8eda62f8c0c84e17aa0591a4ecb21a16e12af214063c1b359",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/alexandergremyakov/harvest-pulse-goose-dividend-v2",
+  "title": "Harvest Pulse | Goose Dividend | v2",
+  "votes_at_import": 23
+}

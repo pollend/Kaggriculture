@@ -1,0 +1,5 @@
+family_id = "competitor_pilkwang_structured_economic_policy"
+name = "Competitor: Structured Economic Policy"
+entry_point = "agents.competitor_pilkwang_kaggriculture_structured_economic_policy.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"]

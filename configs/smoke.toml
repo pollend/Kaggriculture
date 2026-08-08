@@ -1,0 +1,15 @@
+name = "smoke"
+seed = 42
+jobs = 2
+episode_steps = 120
+population_size = 12
+replay_policy = "failures"
+stage1_seeds = 1
+stage1_keep = 6
+stage2_opponents = 3
+stage2_seeds = 1
+stage2_keep = 4
+stage3_seeds = 1
+candidate_pool = 1000
+proposal_count = 20
+

@@ -1,0 +1,5 @@
+family_id = "competitor_prvsiyan_moon_counts_melons"
+name = "Competitor: The Moon Counts Melons"
+entry_point = "agents.competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/main.py"]

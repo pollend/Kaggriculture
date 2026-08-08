@@ -1,0 +1,5 @@
+family_id = "competitor_romantamrazov_kaggriculture_hamburger"
+name = "Competitor: Kaggriculture Hamburger"
+entry_point = "agents.competitor_romantamrazov_kaggriculture_hamburger.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_romantamrazov_kaggriculture_hamburger/main.py"]

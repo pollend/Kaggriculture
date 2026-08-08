@@ -1,0 +1,43 @@
+family_id = "dqn_job_scorer"
+name = "DQN Job Scorer"
+entry_point = "agents.dqn_job_scorer.main:agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_job_scorer.main:evaluate_episode"
+
+# Inference only. `training/` is torch and is deliberately absent, so a bundle
+# built from this allowlist is submission-safe by construction.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_job_scorer/__init__.py",
+  "agents/dqn_job_scorer/main.py",
+  "agents/dqn_job_scorer/features.py",
+  "agents/dqn_job_scorer/jobs.py",
+  "agents/dqn_job_scorer/market.py",
+  "agents/dqn_job_scorer/policy.py",
+  "agents/dqn_job_scorer/rules.py",
+  "agents/dqn_job_scorer/weights.npz",
+]
+
+[[models]]
+model_id = "dqn_job_scorer.q_network"
+updater = "agents.dqn_job_scorer.training.updater:updater"
+collector = "agents.dqn_job_scorer.training.updater:collector"
+min_new_batches = 8
+
+[models.config]
+episodes_per_batch = 16
+gradient_steps_per_batch = 400
+batch_size = 512
+learning_rate = 0.0001
+gamma = 0.997
+n_step = 3
+buffer_episodes = 200
+target_sync = 2000
+warmup_episodes = 16
+eval_seeds = 24
+jobs = 8
+seed = 0
+epsilon_start = 1.0
+epsilon_end = 0.05
+epsilon_decay_transitions = 200000
+benchmark = "agents/configurable_crop_surrogate/main.py"

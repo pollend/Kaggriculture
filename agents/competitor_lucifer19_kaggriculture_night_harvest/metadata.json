@@ -1,0 +1,15 @@
+{
+  "author": "Krizso Gergely",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "25bc5e4e0dcb9d059e61d52d1d725609e2f61af30bf047257187da32e1332768",
+  "kaggle_handle": "lucifer19/kaggriculture-night-harvest",
+  "last_run_time": "2026-08-07T07:50:20.830000",
+  "license": "Apache-2.0",
+  "notebook_file": "kaggriculture-night-harvest.ipynb",
+  "notebook_sha256": "ae78dd90ae992ac46f873b1c03a2f1a87a3ab4c240b2a8bac41b806e9d72d85d",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/lucifer19/kaggriculture-night-harvest",
+  "title": "Kaggriculture: Night Harvest",
+  "votes_at_import": 39
+}

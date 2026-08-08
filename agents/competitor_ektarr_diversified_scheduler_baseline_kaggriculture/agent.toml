@@ -1,0 +1,5 @@
+family_id = "competitor_ektarr_diversified_scheduler"
+name = "Competitor: Diversified Scheduler Baseline"
+entry_point = "agents.competitor_ektarr_diversified_scheduler_baseline_kaggriculture.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_ektarr_diversified_scheduler_baseline_kaggriculture/main.py"]

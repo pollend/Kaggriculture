@@ -1,0 +1,5 @@
+"""Price-aware harvesting and selling variant."""
+
+from agents.configurable_crop_surrogate._profile import named_agent
+
+agent = named_agent("market_timer")

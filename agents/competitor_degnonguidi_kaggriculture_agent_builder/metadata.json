@@ -1,0 +1,15 @@
+{
+  "author": "renji_starfall",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "32ce3d57a994edfc5856383da074a059cad4117e7ea84012398316f68aad048e",
+  "kaggle_handle": "degnonguidi/kaggriculture-agent-builder",
+  "last_run_time": "2026-08-02T06:41:27.733000",
+  "license": "Apache-2.0",
+  "notebook_file": "kaggriculture-agent-builder.ipynb",
+  "notebook_sha256": "988eff68c9af25c21d5433e14aa061d421ef802b6639f75052ad6be55ff8eb46",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/degnonguidi/kaggriculture-agent-builder",
+  "title": "kaggriculture-agent-builder",
+  "votes_at_import": 43
+}

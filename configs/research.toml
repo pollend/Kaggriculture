@@ -1,0 +1,15 @@
+name = "research-1000"
+seed = 20260807
+jobs = 0
+episode_steps = 720
+population_size = 1000
+replay_policy = "failures"
+stage1_seeds = 3
+stage1_keep = 500
+stage2_opponents = 20
+stage2_seeds = 2
+stage2_keep = 50
+stage3_seeds = 3
+candidate_pool = 100000
+proposal_count = 1000
+

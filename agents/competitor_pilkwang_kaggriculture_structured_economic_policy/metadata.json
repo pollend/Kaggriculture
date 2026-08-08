@@ -1,0 +1,15 @@
+{
+  "author": "Pilkwang Kim",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "407b2fa7725f976df88995751ab17386aad0ce75c2cfa89df274561bc11289fa",
+  "kaggle_handle": "pilkwang/kaggriculture-structured-economic-policy",
+  "last_run_time": "2026-08-07T02:14:15.913000",
+  "license": "Apache-2.0",
+  "notebook_file": "kaggriculture-structured-economic-policy.ipynb",
+  "notebook_sha256": "12c25351a5319bb7b8e185563f03ffd45e34727a843ed39f7bfde24d32e887b0",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/pilkwang/kaggriculture-structured-economic-policy",
+  "title": "Kaggriculture: Structured Economic Policy",
+  "votes_at_import": 84
+}

@@ -1,0 +1,5 @@
+family_id = "competitor_avikdas567_microeconomic_policy"
+name = "Competitor: Microeconomic Dynamic Policy Engine"
+entry_point = "agents.competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine/main.py"]

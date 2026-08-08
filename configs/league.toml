@@ -1,0 +1,25 @@
+[league]
+name = "configurable-crop-training"
+manifest = "agents/configurable_crop_surrogate/agent.toml"
+anchor_manifests = [
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/agent.toml",
+  "agents/competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine/agent.toml",
+  "agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/agent.toml",
+  "agents/competitor_degnonguidi_kaggriculture_agent_builder/agent.toml",
+  "agents/competitor_ektarr_diversified_scheduler_baseline_kaggriculture/agent.toml",
+  "agents/competitor_jek1wantaufik_building_a_kaggriculture_ai_agent/agent.toml",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/agent.toml",
+  "agents/competitor_lucifer19_kaggriculture_night_harvest/agent.toml",
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/agent.toml",
+  "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/agent.toml",
+  "agents/competitor_romantamrazov_kaggriculture_hamburger/agent.toml",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/agent.toml",
+]
+population_size = 20
+rounds_per_generation = 20
+hall_of_fame_rounds = 4
+episode_steps = 720
+seed = 42
+jobs = 0
+tau = 0.5
+candidate_pool = 10000

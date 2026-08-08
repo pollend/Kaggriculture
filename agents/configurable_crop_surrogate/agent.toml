@@ -1,0 +1,26 @@
+family_id = "configurable_crop_surrogate"
+name = "Configurable Crop Surrogate"
+entry_point = "agents.configurable_crop_surrogate.agent:make_agent"
+parameter_schema_version = 1
+training_adapter = "agents.configurable_crop_surrogate.training:adapter"
+episode_evaluator = "agents.configurable_crop_surrogate.main:evaluate_episode"
+# Inference only; `training.py` needs scikit-learn and is deliberately absent.
+code_paths = [
+  "agents/__init__.py",
+  "agents/configurable_crop_surrogate/__init__.py",
+  "agents/configurable_crop_surrogate/main.py",
+  "agents/configurable_crop_surrogate/agent.py",
+  "agents/configurable_crop_surrogate/strategy.py",
+  "agents/configurable_crop_surrogate/_profile.py",
+  "agents/configurable_crop_surrogate/profiles/balanced.json",
+]
+
+[[models]]
+model_id = "configurable_crop_surrogate.surrogate"
+updater = "agents.configurable_crop_surrogate.training:updater"
+min_new_batches = 2
+
+[models.config]
+n_estimators = 300
+min_samples_leaf = 2
+candidate_pool = 10000

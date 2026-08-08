@@ -1,0 +1,5 @@
+family_id = "competitor_kaitofukami_v22_price_impact"
+name = "Competitor: Strict-Future v22 Price Impact"
+entry_point = "agents.competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py"]

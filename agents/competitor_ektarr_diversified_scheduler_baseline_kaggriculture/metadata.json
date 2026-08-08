@@ -1,0 +1,15 @@
+{
+  "author": "Maxim",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "fad8a5b0bd89dba0318ebd1f4b470f6347f84905a559c251536bb6fb934b2f7e",
+  "kaggle_handle": "ektarr/diversified-scheduler-baseline-kaggriculture",
+  "last_run_time": "2026-07-30T17:12:53.980000",
+  "license": "Apache-2.0",
+  "notebook_file": "diversified-scheduler-baseline-kaggriculture.ipynb",
+  "notebook_sha256": "e1b4928471f2eccd0a020f50f0732f74800ccbd6299adf805025e0dcee668566",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/ektarr/diversified-scheduler-baseline-kaggriculture",
+  "title": "Diversified Scheduler Baseline | Kaggriculture",
+  "votes_at_import": 16
+}

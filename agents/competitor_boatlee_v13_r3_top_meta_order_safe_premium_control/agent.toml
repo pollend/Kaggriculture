@@ -1,0 +1,5 @@
+family_id = "competitor_boatlee_v13_r3_premium_control"
+name = "Competitor: V13-R3 Order-Safe Premium Control"
+entry_point = "agents.competitor_boatlee_v13_r3_top_meta_order_safe_premium_control.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/main.py"]

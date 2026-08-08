@@ -1,0 +1,129 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader
+from kaggriculture_lab.identity import AgentManifest, build_revision
+from kaggriculture_lab.league import LeagueConfig, _run_hook, create_session, schedule_generation
+from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
+from kaggriculture_lab.storage import ExperimentStore
+from agents.configurable_crop_surrogate.strategy import Strategy
+from kaggriculture_lab.training import allocate_generation
+from sim.runner import MatchResult, SeatResult
+
+
+def test_glicko2_matches_published_example():
+    updated = update_glicko2(
+        GlickoRating(1500, 200, 0.06),
+        [
+            RatingGame(GlickoRating(1400, 30), 1.0),
+            RatingGame(GlickoRating(1550, 100), 0.0),
+            RatingGame(GlickoRating(1700, 300), 0.0),
+        ],
+    )
+    assert updated.rating == pytest.approx(1464.06, abs=0.02)
+    assert updated.deviation == pytest.approx(151.52, abs=0.02)
+    assert updated.volatility == pytest.approx(0.059996, abs=0.000001)
+
+
+def test_generation_allocation_is_exact():
+    assert allocate_generation(20) == {
+        "elite": 4,
+        "evolution": 10,
+        "surrogate": 4,
+        "random": 2,
+    }
+    assert sum(allocate_generation(7).values()) == 7
+
+
+def test_revision_identity_tracks_behavior_code(tmp_path: Path):
+    code = tmp_path / "agent.py"
+    code.write_text("def agent(obs): return {}\n")
+    manifest = AgentManifest(
+        family_id="test",
+        name="Test",
+        entry_point="agent:agent",
+        parameter_schema_version=1,
+        code_paths=("agent.py",),
+    )
+    first = build_revision(manifest, Strategy(), workspace=tmp_path)
+    same = build_revision(manifest, Strategy(), workspace=tmp_path)
+    code.write_text("def agent(obs): return {'market': []}\n")
+    changed = build_revision(manifest, Strategy(), workspace=tmp_path)
+    assert first.revision_id == same.revision_id
+    assert first.revision_id != changed.revision_id
+
+
+def test_replay_is_compressed_in_duckdb_and_read_through_narrow_reader(tmp_path: Path):
+    result = MatchResult(
+        seed=7,
+        seats=[
+            SeatResult("a", 0, 20, "DONE", False, None, None, 1, 0, 0, 0, 20, {"productive_actions": 1}),
+            SeatResult("b", 1, 10, "DONE", False, None, None, 1, 0, 0, 0, 10, {"productive_actions": 0}),
+        ],
+        steps=1,
+        wallclock=0.1,
+        replay={"steps": [[{"observation": {"step": 0}}]]},
+    )
+    with ExperimentStore(tmp_path / "episodes.duckdb") as store:
+        store.add_match("match", "run", "league:test", ("a", "b"), ("a", "b"), result)
+        store.add_replay_payload("match", result.replay)
+        reader = EpisodeReader(store.connection, "match", 0)
+        assert reader.summary()["money_difference"] == 10
+        assert reader.replay() == result.replay
+        assert store.connection.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 3
+
+        context = EpisodeHookContext("run", "generation", "pair", "match", "a", "b", 0)
+        _run_hook(store, context, "missing_episode_evaluator:hook")
+        status = store.connection.execute(
+            "SELECT status FROM episode_evaluations WHERE match_id = 'match'"
+        ).fetchone()[0]
+        assert status == "ERROR"
+
+
+def test_scheduler_gives_every_member_each_round_and_avoids_self_play(tmp_path: Path):
+    database = tmp_path / "league.duckdb"
+    config = LeagueConfig(
+        population_size=6,
+        rounds_per_generation=4,
+        hall_of_fame_rounds=1,
+        episode_steps=24,
+    )
+    session_id = create_session(config, database, session_id="schedule")
+    with ExperimentStore(database) as store:
+        assert schedule_generation(store, session_id) == 15
+        generation_id = "schedule:g0000"
+        members = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT revision_id FROM generation_members WHERE generation_id = ?", [generation_id]
+            ).fetchall()
+        }
+        rows = store.connection.execute(
+            "SELECT revision_a, revision_b, pairing_kind FROM league_pairings WHERE generation_id = ?",
+            [generation_id],
+        ).fetchall()
+        assert all(left != right for left, right, _ in rows)
+        population_pairs = {
+            tuple(sorted((left, right))) for left, right, kind in rows if kind == "population"
+        }
+        assert len(population_pairs) == 9
+        appearances = {member: 0 for member in members}
+        for left, right, _ in rows:
+            if left in appearances:
+                appearances[left] += 1
+            if right in appearances:
+                appearances[right] += 1
+        assert set(appearances.values()) == {4}
+
+
+def test_manifest_file_is_valid():
+    manifest = AgentManifest.load("agents/configurable_crop_surrogate/agent.toml")
+    assert manifest.family_id == "configurable_crop_surrogate"
+    assert manifest.episode_evaluator
+    assert manifest.models[0].min_new_batches == 2
+    assert json.loads(build_revision(manifest, Strategy()).params_json) == Strategy().to_dict()
+
+    dqn = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
+    assert dqn.models[0].min_new_batches == 8

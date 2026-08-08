@@ -1,0 +1,5 @@
+family_id = "competitor_degnonguidi_agent_builder"
+name = "Competitor: Kaggriculture Agent Builder"
+entry_point = "agents.competitor_degnonguidi_kaggriculture_agent_builder.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_degnonguidi_kaggriculture_agent_builder/main.py"]

@@ -1,0 +1,15 @@
+{
+  "author": "Avik Das",
+  "downloaded_at": "2026-08-08T02:47:53Z",
+  "entrypoint_file": "main.py",
+  "entrypoint_sha256": "b82b6ce149ed13078ccf0704038248929e7d670e7333cc388187bfc90ca0e8b7",
+  "kaggle_handle": "avikdas567/kaggriculture-microeconomic-dynamic-policy-engine",
+  "last_run_time": "2026-08-01T06:06:43.200000",
+  "license": "Apache-2.0",
+  "notebook_file": "kaggriculture-microeconomic-dynamic-policy-engine.ipynb",
+  "notebook_sha256": "1b1b119569e643522db9f0e49bb7dca17decc5406ffa72ac9b342888391963e3",
+  "original_entrypoint_file": "main.py",
+  "source_url": "https://www.kaggle.com/code/avikdas567/kaggriculture-microeconomic-dynamic-policy-engine",
+  "title": "Kaggriculture: Microeconomic Dynamic Policy Engine",
+  "votes_at_import": 16
+}

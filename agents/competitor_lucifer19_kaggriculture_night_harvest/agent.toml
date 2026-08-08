@@ -1,0 +1,5 @@
+family_id = "competitor_lucifer19_night_harvest"
+name = "Competitor: Night Harvest"
+entry_point = "agents.competitor_lucifer19_kaggriculture_night_harvest.main:agent"
+parameter_schema_version = 1
+code_paths = ["agents/competitor_lucifer19_kaggriculture_night_harvest/main.py"]
