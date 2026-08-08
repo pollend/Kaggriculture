@@ -22,7 +22,14 @@ LOCAL_PACKAGES = {"sim", "kaggriculture_lab", "agents"}
 # plugs into `model_updates`/`hooks` and evaluates with `sim.arena` by design.
 # It is never part of a submission bundle, which the manifest's `code_paths`
 # allowlist enforces separately.
-INFRA_ALLOWED_SUFFIXES = ("training.py", "analysis.py", "experiment.py", "cli.py", "evaluation.py")
+INFRA_ALLOWED_SUFFIXES = (
+    "train.py",
+    "training.py",
+    "analysis.py",
+    "experiment.py",
+    "cli.py",
+    "evaluation.py",
+)
 INFRA_ALLOWED_DIRS = ("training",)
 
 

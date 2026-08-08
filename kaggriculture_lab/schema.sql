@@ -252,8 +252,7 @@ CREATE TABLE IF NOT EXISTS lineage (
 CREATE TABLE IF NOT EXISTS training_models (
     model_id VARCHAR PRIMARY KEY,
     family_id VARCHAR NOT NULL,
-    updater_path VARCHAR NOT NULL,
-    collector_path VARCHAR,
+    trainer_path VARCHAR NOT NULL,
     min_new_batches INTEGER NOT NULL,
     config_json JSON NOT NULL,
     active_checkpoint_id VARCHAR,
@@ -320,4 +319,28 @@ CREATE TABLE IF NOT EXISTS model_evaluations (
     created_at TIMESTAMP DEFAULT current_timestamp
 );
 
-INSERT OR IGNORE INTO schema_migrations (version) VALUES (3);
+-- One row per round hook a model's trainer has been offered. The league fires
+-- `on_round` once per closed round and once per closed generation; the hook may
+-- roll out episodes for minutes, so "already done" cannot be re-derived from
+-- pairing status -- resuming a half-finished generation would re-fire every
+-- earlier round. `round_index` uses -1 for generation scope rather than NULL:
+-- DuckDB's UNIQUE does not dedupe NULL-bearing keys, so a nullable column would
+-- silently admit two generation rows.
+CREATE TABLE IF NOT EXISTS model_round_hooks (
+    hook_id VARCHAR PRIMARY KEY,
+    model_id VARCHAR NOT NULL,
+    session_id VARCHAR NOT NULL,
+    generation_id VARCHAR NOT NULL,
+    scope VARCHAR NOT NULL,
+    round_index INTEGER NOT NULL,
+    status VARCHAR NOT NULL,
+    batches_recorded INTEGER NOT NULL DEFAULT 0,
+    error_text VARCHAR,
+    started_at TIMESTAMP DEFAULT current_timestamp,
+    completed_at TIMESTAMP,
+    UNIQUE (model_id, scope, generation_id, round_index)
+);
+
+-- The version stamp lives in `ExperimentStore._initialize`, not here: this file
+-- describes the current shape and is replayed on every open, so stamping from
+-- inside it would mark an unmigrated database as current.

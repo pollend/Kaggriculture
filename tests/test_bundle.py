@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from agents.dqn_job_scorer.export_submission import build_submission
 from kaggriculture_lab.cli import main as cli_main
 from kaggriculture_lab.identity import AgentManifest
 
@@ -25,6 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 OWNED_AGENTS = [
     "agents/configurable_crop_surrogate/agent.toml",
     "agents/dqn_job_scorer/agent.toml",
+    "agents/receding_horizon_planner/agent.toml",
 ]
 
 # Anything here in a bundled submission means it would fail on Kaggle, or drag
@@ -97,3 +99,51 @@ def test_bundle_excludes_training_code(tmp_path):
     """`code_paths` is an allowlist, so the trainer is excluded by construction."""
     unpacked = _build("agents/dqn_job_scorer/agent.toml", tmp_path)
     assert not (unpacked / "agents/dqn_job_scorer/training").exists()
+
+
+def test_dqn_submission_exporter_creates_matching_minimal_folder_and_archive(tmp_path):
+    output_dir = tmp_path / "submission"
+    archive_path = tmp_path / "dqn_job_scorer_submission.tgz"
+
+    built_dir, built_archive = build_submission(output_dir, archive_path)
+    manifest = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
+    expected = {"main.py", *manifest.code_paths}
+    unpacked_files = {path.relative_to(built_dir).as_posix() for path in built_dir.rglob("*") if path.is_file()}
+
+    with tarfile.open(built_archive, "r:gz") as archive:
+        archived_files = {member.name for member in archive.getmembers() if member.isfile()}
+
+    assert unpacked_files == expected
+    assert archived_files == expected
+    assert not any("training" in Path(path).parts for path in archived_files)
+
+
+def test_agent_owned_exporter_matches_the_manifest_allowlist(tmp_path):
+    """`export_submission.py` is a second path to a submission.
+
+    It bypasses `kaglab bundle`, so without this the two could drift and the
+    agent-owned one could ship a file the manifest never vetted -- or miss one it
+    needs. Both must produce exactly the manifest's allowlist plus `main.py`.
+    """
+    import subprocess
+    import sys
+    import tarfile
+
+    script = REPO / "agents/dqn_job_scorer/export_submission.py"
+    if not script.is_file():
+        pytest.skip("agent does not ship its own exporter")
+
+    subprocess.run([sys.executable, str(script)], cwd=REPO, check=True, capture_output=True)
+    archive = REPO / "agents/dqn_job_scorer/dqn_job_scorer_submission.tgz"
+    assert archive.is_file()
+
+    with tarfile.open(archive) as handle:
+        names = {name for name in handle.getnames() if not name.endswith("/")}
+
+    manifest = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
+    assert names == {*manifest.code_paths, "main.py"}, (
+        f"exporter and manifest disagree: "
+        f"only-in-archive={sorted(names - {*manifest.code_paths, 'main.py'})} "
+        f"only-in-manifest={sorted({*manifest.code_paths} - names)}"
+    )
+    assert not any("training" in name for name in names)

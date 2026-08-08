@@ -19,13 +19,25 @@ Third-party Kaggle snapshots always use the `agents/competitor_` prefix, include
 source/provenance hashes, and are excluded from our submission archive.
 
 ```bash
-# Install the locked Python 3.12 environment.
-uv sync --python 3.12
+# Install the locked Python 3.12 environment and enter an activated shell.
+./setup.sh                   # Bash / macOS / Linux
+./setup.ps1                  # PowerShell / Windows
+
+# Prepare .venv without opening a child shell (useful for CI and editors).
+./setup.sh --sync-only
+./setup.ps1 -SyncOnly
+
+# Equivalent manual setup.
+uv sync --locked --python 3.12
 
 # Or prepare the environment and run a quick match through the convenience wrapper.
 ./run-sim.sh                  # Bash / macOS / Linux
 ./run-sim.ps1                 # PowerShell / Windows
 ./run-sim.sh competitors      # Round-robin against every imported competitor
+
+# Run the resumable all-agent crop + DQN training loop, then a large arena.
+# Edit the constants at the top of train_all.py to change its scale.
+python train_all.py
 
 # Compare named profiles directly.
 .venv/bin/python -m sim.arena league \
@@ -59,6 +71,24 @@ SESSION=$(.venv/bin/kaglab league init --config configs/league.toml)
 The canonical catalog is `artifacts/experiments.duckdb`. Each run also exports portable
 Parquet tables under `artifacts/parquet/<run-id>/`; use `kaglab export --csv` for CSV.
 Large research runs are never launched by tests or default commands.
+
+Review every persistent league session in the read-only local dashboard:
+
+```bash
+.venv/bin/kaglab web
+# Or select another catalog or address.
+.venv/bin/kaglab web --database artifacts/experiments.duckdb \
+  --host 127.0.0.1 --port 8000
+```
+
+Open `http://127.0.0.1:8000/` to inspect generations, ratings, pairings, episodes,
+hook evaluations, and stored replays. Pairings identify each agent family, strategy,
+revision, and behavior-model checkpoint when present. Episode pages can open the full
+visual replay with play/pause and turn controls or download its JSON. Refreshing a page
+re-queries DuckDB. A
+separate dashboard process cannot read the catalog while `league run` owns DuckDB's
+write lock; the dashboard reports that state and can be refreshed once the run pauses
+or completes. The server binds to loopback by default and has no authentication.
 
 The smoke configuration validates plumbing, not model quality: its tiny population and
 short season can produce noisy or negative held-out R². Use the research configuration
@@ -94,17 +124,21 @@ generation closes. The submitted Kaggle agent does not open DuckDB.
 
 ## Incremental model updates
 
-Both trainable families share the catalog at `artifacts/experiments.duckdb`, while
-large rollout and checkpoint files remain under `artifacts/`. Training thresholds
-are declared per model: the crop surrogate waits for two closed generations and the
-DQN waits for eight persisted 16-episode rollout batches.
+Trainable families share the catalog at `artifacts/experiments.duckdb`, while large
+rollout and checkpoint files remain under `artifacts/`. Each manifest names one
+trainer object: its optional `on_round` hook records family-specific batches, and
+its `on_batch` hook fits and gates a candidate after the declared threshold. The
+crop surrogate waits for two closed generations; the DQN waits for eight persisted
+16-episode rollout batches.
 
 ```bash
 # Inspect independent model thresholds and active checkpoints.
 .venv/bin/kaglab models status
 
-# Crop generations are registered by `league run`. DQN batches are explicit.
-.venv/bin/kaglab models collect dqn_job_scorer.q_network --count 8
+# `league run` drives the models listed in the session's training_manifests.
+# This is the manual/resume equivalent for one DQN round hook.
+.venv/bin/kaglab models round --session-id "$SESSION" \
+  --model-id dqn_job_scorer.q_network --round-index 0
 
 # Check one model, or omit the ID to check every registered model.
 .venv/bin/kaglab models update dqn_job_scorer.q_network
@@ -112,7 +146,7 @@ DQN waits for eight persisted 16-episode rollout batches.
 
 # Promotion changes only the catalog pointer. Export for a submission explicitly.
 .venv/bin/kaglab models export-active dqn_job_scorer.q_network \
-  --output agents/dqn_job_scorer/weights.npz
+  --output agents/dqn_job_scorer/weights.npz --confirm-release
 ```
 
 An update below its threshold reports `deferred`. A trained challenger is retained

@@ -12,6 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from kaggriculture_lab.read_only import fetchall_select
+
 
 @dataclass(frozen=True, slots=True)
 class EpisodeHookContext:
@@ -72,10 +74,9 @@ class EpisodeReader:
         from a single match. Guarded to SELECT/WITH so a hook cannot mutate the
         league it is reporting on, the same rule `ModelTrainingReader` applies.
         """
-        statement = sql.lstrip().upper()
-        if not (statement.startswith("SELECT") or statement.startswith("WITH")):
-            raise ValueError("episode reader only permits SELECT/WITH queries")
-        return self._connection.execute(sql, parameters).fetchall()
+        return fetchall_select(
+            self._connection, sql, parameters, reader_name="episode reader"
+        )
 
     def fetchone(
         self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()
@@ -89,17 +90,58 @@ class EpisodeReader:
         Excludes the current match so a caller can compare "now" against "before"
         without double-counting it.
         """
-        rows = self.fetchall(
+        current = self.fetchone(
             """
-            SELECT ep.match_id, ep.seed, ep.seat, ep.failed, ep.final_money,
-                   ep.opponent_money, ep.money_difference, ep.win
-            FROM episode_players ep
-            WHERE ep.strategy_id = ? AND ep.match_id != ?
-            ORDER BY ep.match_id DESC
-            LIMIT ?
+            SELECT g.session_id, g.generation_index, lp.round_index,
+                   lp.pairing_id, pe.orientation
+            FROM pairing_episodes pe
+            JOIN league_pairings lp USING (pairing_id)
+            JOIN generations g USING (generation_id)
+            WHERE pe.match_id = ?
             """,
-            [revision_id, self.match_id, limit],
+            [self.match_id],
         )
+        if current is None:
+            # Non-league runs have no scheduling metadata. Keep their stable
+            # legacy ordering, but league hooks always use schedule chronology.
+            rows = self.fetchall(
+                """
+                SELECT ep.match_id, ep.seed, ep.seat, ep.failed, ep.final_money,
+                       ep.opponent_money, ep.money_difference, ep.win
+                FROM episode_players ep
+                WHERE ep.strategy_id = ? AND ep.match_id != ?
+                ORDER BY ep.match_id DESC
+                LIMIT ?
+                """,
+                [revision_id, self.match_id, limit],
+            )
+        else:
+            session_id, generation_index, round_index, pairing_id, orientation = current
+            rows = self.fetchall(
+                """
+                SELECT ep.match_id, ep.seed, ep.seat, ep.failed, ep.final_money,
+                       ep.opponent_money, ep.money_difference, ep.win
+                FROM episode_players ep
+                JOIN pairing_episodes pe USING (match_id)
+                JOIN league_pairings lp USING (pairing_id)
+                JOIN generations g USING (generation_id)
+                WHERE ep.strategy_id = ? AND g.session_id = ?
+                  AND (g.generation_index, lp.round_index, lp.pairing_id, pe.orientation)
+                      < (?, ?, ?, ?)
+                ORDER BY g.generation_index DESC, lp.round_index DESC,
+                         lp.pairing_id DESC, pe.orientation DESC
+                LIMIT ?
+                """,
+                [
+                    revision_id,
+                    session_id,
+                    generation_index,
+                    round_index,
+                    pairing_id,
+                    orientation,
+                    limit,
+                ],
+            )
         keys = ("match_id", "seed", "seat", "failed", "final_money",
                 "opponent_money", "money_difference", "win")
         return [dict(zip(keys, row)) for row in rows]

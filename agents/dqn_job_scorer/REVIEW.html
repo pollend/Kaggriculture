@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Architecture and training review of the Kaggriculture DQN job scorer agent.">
+  <title>DQN Job Scorer — Technical Review</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #5d6a62;
+      --paper: #fbfcf8;
+      --panel: #ffffff;
+      --line: #dce4dc;
+      --green: #17633a;
+      --green-soft: #e8f3eb;
+      --amber: #8a5700;
+      --amber-soft: #fff2d2;
+      --red: #9c2f2f;
+      --red-soft: #fdeaea;
+      --blue: #245a85;
+      --blue-soft: #e8f2fb;
+      --shadow: 0 16px 42px rgba(23, 33, 27, 0.08);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 8% 0%, rgba(90, 148, 91, 0.13), transparent 27rem),
+        linear-gradient(180deg, #f4f8f1 0, var(--paper) 34rem);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.62;
+    }
+
+    a { color: var(--green); text-underline-offset: 0.18em; }
+    a:hover { text-decoration-thickness: 2px; }
+
+    code {
+      padding: 0.12em 0.38em;
+      border: 1px solid #d8e1d8;
+      border-radius: 5px;
+      background: #f2f5f0;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 0.9em;
+    }
+
+    .page {
+      width: min(1120px, calc(100% - 36px));
+      margin: 0 auto;
+      padding: 54px 0 80px;
+    }
+
+    .hero {
+      padding: clamp(28px, 5vw, 58px);
+      overflow: hidden;
+      position: relative;
+      border: 1px solid rgba(43, 99, 58, 0.2);
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.88);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::after {
+      content: "";
+      width: 250px;
+      height: 250px;
+      position: absolute;
+      right: -75px;
+      top: -100px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, rgba(53, 128, 73, 0.18), rgba(224, 174, 58, 0.15));
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--green);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.18; }
+    h1 { margin: 0; font-size: clamp(2.1rem, 6vw, 4rem); letter-spacing: -0.045em; }
+    h2 { margin: 0 0 18px; font-size: clamp(1.55rem, 3vw, 2.15rem); letter-spacing: -0.025em; }
+    h3 { margin: 0 0 9px; font-size: 1.08rem; }
+
+    .lede {
+      max-width: 790px;
+      margin: 18px 0 0;
+      color: #344139;
+      font-size: clamp(1.05rem, 2vw, 1.24rem);
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 24px;
+    }
+
+    .pill, .severity {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.035em;
+      text-transform: uppercase;
+    }
+
+    .pill { padding: 7px 11px; color: var(--green); background: var(--green-soft); }
+    .severity { padding: 4px 8px; }
+    .severity.high { color: var(--red); background: var(--red-soft); }
+    .severity.medium { color: var(--amber); background: var(--amber-soft); }
+    .severity.note { color: var(--blue); background: var(--blue-soft); }
+
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px 18px;
+      margin: 22px 0 0;
+      padding: 17px 20px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    nav a { font-size: 0.9rem; font-weight: 700; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+
+    section { margin-top: 58px; scroll-margin-top: 24px; }
+
+    .summary-grid, .cards, .two-column {
+      display: grid;
+      gap: 18px;
+    }
+
+    .summary-grid { grid-template-columns: repeat(3, 1fr); }
+    .cards { grid-template-columns: repeat(2, 1fr); }
+    .two-column { grid-template-columns: 1fr 1fr; }
+
+    .stat, .card, .finding, .callout {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: 0 8px 24px rgba(23, 33, 27, 0.045);
+    }
+
+    .stat { padding: 22px; }
+    .stat strong { display: block; color: var(--green); font-size: 1.85rem; line-height: 1; }
+    .stat span { display: block; margin-top: 9px; color: var(--muted); font-size: 0.9rem; }
+
+    .card { padding: 23px; }
+    .card p:last-child, .finding p:last-child { margin-bottom: 0; }
+    .card ul, .finding ul { padding-left: 1.25rem; }
+
+    .finding {
+      display: grid;
+      grid-template-columns: 38px 1fr;
+      gap: 15px;
+      margin-top: 14px;
+      padding: 22px;
+    }
+
+    .finding-number {
+      display: grid;
+      width: 36px;
+      height: 36px;
+      place-items: center;
+      border-radius: 10px;
+      color: #fff;
+      background: var(--ink);
+      font-weight: 800;
+    }
+
+    .finding-head {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-bottom: 6px;
+    }
+
+    .finding-head h3 { margin: 0; }
+    .source { color: var(--muted); font-size: 0.86rem; }
+    .recommendation { color: #23442e; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 28px;
+      align-items: stretch;
+      margin-top: 24px;
+    }
+
+    .flow-step {
+      display: grid;
+      min-height: 116px;
+      position: relative;
+      place-content: center;
+      padding: 18px;
+      border: 1px solid #cbdaca;
+      border-radius: 13px;
+      background: linear-gradient(145deg, #fff, #f2f8f1);
+      text-align: center;
+    }
+
+    .flow-step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -22px;
+      top: 50%;
+      color: var(--green);
+      font-size: 1.55rem;
+      font-weight: 800;
+      transform: translateY(-50%);
+    }
+
+    .flow-step strong { display: block; font-size: 0.93rem; }
+    .flow-step small { display: block; margin-top: 6px; color: var(--muted); line-height: 1.35; }
+
+    .network {
+      margin: 22px 0 0;
+      padding: 20px;
+      border: 1px dashed #abc4ae;
+      border-radius: 13px;
+      color: #21482d;
+      background: var(--green-soft);
+      font: 700 clamp(1rem, 3vw, 1.35rem)/1.5 "SFMono-Regular", Consolas, monospace;
+      text-align: center;
+    }
+
+    .callout { padding: 24px; border-left: 5px solid var(--green); }
+    .callout.warning { border-left-color: var(--amber); background: #fffdf6; }
+
+    .priority-list { margin: 0; padding-left: 1.5rem; }
+    .priority-list li { margin: 0.62rem 0; padding-left: 0.3rem; }
+
+    footer {
+      margin-top: 64px;
+      padding-top: 25px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    @media (max-width: 840px) {
+      .summary-grid { grid-template-columns: 1fr; }
+      .cards, .two-column { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; gap: 24px; }
+      .flow-step { min-height: 88px; }
+      .flow-step:not(:last-child)::after {
+        content: "↓";
+        right: 50%;
+        top: auto;
+        bottom: -27px;
+        transform: translateX(50%);
+      }
+    }
+
+    @media (max-width: 520px) {
+      .page { width: min(100% - 22px, 1120px); padding-top: 18px; }
+      .hero { padding: 25px 21px; border-radius: 17px; }
+      .finding { grid-template-columns: 1fr; }
+      .finding-number { width: 32px; height: 32px; }
+    }
+
+    @media print {
+      body { background: #fff; font-size: 10.5pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, .stat, .card, .finding, .callout { box-shadow: none; break-inside: avoid; }
+      nav { display: none; }
+      section { margin-top: 30px; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Kaggriculture agent review</p>
+      <h1>DQN Job Scorer</h1>
+      <p class="lede">
+        A technical review of the crop-focused hybrid agent, covering inference architecture,
+        training flow, correctness risks, operational gaps, and the recommended path to reliable
+        long-running training.
+      </p>
+      <div class="meta" aria-label="Review metadata">
+        <span class="pill">72 input features</span>
+        <span class="pill">128 × 128 MLP</span>
+        <span class="pill">NumPy inference</span>
+        <span class="pill">Double DQN training</span>
+      </div>
+    </header>
+
+    <nav aria-label="Report sections">
+      <a href="#assessment">Assessment</a>
+      <a href="#findings">Findings</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#training">Training</a>
+      <a href="#scope">Scope</a>
+      <a href="#strengths">Strengths</a>
+      <a href="#recommendations">Recommendations</a>
+    </nav>
+
+    <section id="assessment">
+      <h2>Executive assessment</h2>
+      <p>
+        The agent has a sound core design: rules enumerate field work and manage navigation and
+        markets, while a small neural network ranks unit/job pairs. That keeps inference fast,
+        makes Kaggle packaging straightforward, and reduces the learning problem to a tractable
+        action-selection task. The submission boundary and feature parity tests are especially
+        strong.
+      </p>
+      <p>
+        Before a multi-hour training run, three issues deserve priority: replay does not preserve
+        the action mask used at inference, a fresh persistent store does not initialize from the
+        shipped model, and persistent training uses exploration and replay settings that the
+        standalone trainer documents as unstable.
+      </p>
+      <div class="summary-grid" aria-label="Review summary">
+        <article class="stat">
+          <strong>4</strong>
+          <span>high-priority correctness or training-safety findings</span>
+        </article>
+        <article class="stat">
+          <strong>45</strong>
+          <span>focused DQN, bundle, and game-fact tests passing</span>
+        </article>
+        <article class="stat">
+          <strong>7</strong>
+          <span>crop-oriented job types currently scored by the network</span>
+        </article>
+      </div>
+    </section>
+
+    <section id="findings">
+      <h2>Prioritized findings</h2>
+
+      <article class="finding">
+        <div class="finding-number">1</div>
+        <div>
+          <div class="finding-head">
+            <h3>Farm hands can move when the policy selects <code>PASS</code></h3>
+            <span class="severity high">High</span>
+          </div>
+          <p>
+            The only pass candidate targets the main farmer's position. For a hired hand, the
+            routing layer sees a remote target and moves the hand toward the farmer instead of
+            doing nothing.
+          </p>
+          <p class="source">
+            Sources: <a href="jobs.py">jobs.py, lines 73–75</a> ·
+            <a href="main.py">main.py, lines 141–149</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> bypass routing for <code>PASS</code>, or generate a
+            pass candidate at each acting unit's current position.
+          </p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-number">2</div>
+        <div>
+          <div class="finding-head">
+            <h3>Bellman targets can use jobs unavailable to the acting unit</h3>
+            <span class="severity high">High</span>
+          </div>
+          <p>
+            Inference masks jobs already reserved by earlier units and jobs owned by another unit.
+            The rollout does not store that per-unit mask, so replay treats every real candidate
+            row as eligible when maximizing the next-state Q-value. This can overestimate contested
+            jobs and owner-specific actions such as <code>DROP</code>.
+          </p>
+          <p class="source">
+            Sources: <a href="main.py">main.py, lines 97–137</a> ·
+            <a href="training/replay.py">training/replay.py, lines 145–159</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> persist the exact allowed mask for each unit decision
+            and apply it during online selection and target-network maximization.
+          </p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-number">3</div>
+        <div>
+          <div class="finding-head">
+            <h3>A fresh persistent database ignores the shipped checkpoint</h3>
+            <span class="severity high">High</span>
+          </div>
+          <p>
+            The persistent updater creates a random network when the database has no active DQN
+            checkpoint. Its first evaluated candidate can then become active without competing
+            against <code>weights.npz</code>, allowing a new training store to replace a stronger
+            shipped model.
+          </p>
+          <p class="source">
+            Sources: <a href="training/updater.py">training/updater.py, lines 48–57 and 255–264</a> ·
+            safer standalone behavior in <a href="training/train.py">training/train.py, lines 134–142</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> import <code>weights.npz</code> as the initial active
+            checkpoint and measured incumbent when creating a new experiment store.
+          </p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-number">4</div>
+        <div>
+          <div class="finding-head">
+            <h3>Persistent defaults restore settings associated with collapse</h3>
+            <span class="severity high">High</span>
+          </div>
+          <p>
+            The manifest uses a 200-episode replay buffer and a 0.05 epsilon floor. The standalone
+            trainer documents catastrophic forgetting with the smaller buffer and policy
+            degeneration with the lower exploration floor; it uses 800 and 0.15 instead.
+          </p>
+          <p class="source">
+            Sources: <a href="agent.toml">agent.toml, lines 34 and 41</a> ·
+            <a href="training/train.py">training/train.py, lines 41–52</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> begin persistent training with
+            <code>buffer_episodes = 800</code> and <code>epsilon_end = 0.15</code>, then tune from
+            measured arena results.
+          </p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-number">5</div>
+        <div>
+          <div class="finding-head">
+            <h3>Opponent identity is correlated with player seat</h3>
+            <span class="severity medium">Medium</span>
+          </div>
+          <p>
+            Opponent selection and learner seat both derive from the episode index. With an even
+            opponent list, each opponent repeatedly sees the learner in the same seat, allowing
+            seat effects to become entangled with opponent identity.
+          </p>
+          <p class="source">
+            Source: <a href="training/collect.py">training/collect.py, lines 293–309</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> collect both orientations for each opponent or
+            independently shuffle seat assignment every batch.
+          </p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-number">6</div>
+        <div>
+          <div class="finding-head">
+            <h3>Some generated <code>FERTILIZE</code> jobs are impossible</h3>
+            <span class="severity medium">Medium</span>
+          </div>
+          <p>
+            Candidate generation counts fertilizer in the shed and across every unit inventory,
+            but execution consumes fertilizer from the acting unit. A unit can therefore select a
+            fertilize job when the item is in the shed or held by someone else, producing a silent
+            no-op.
+          </p>
+          <p class="source">
+            Source: <a href="jobs.py">jobs.py, lines 79–105</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> bind fertilizer availability to the acting unit, or
+            add explicit pickup and transport jobs.
+          </p>
+        </div>
+      </article>
+
+      <article class="finding">
+        <div class="finding-number">7</div>
+        <div>
+          <div class="finding-head">
+            <h3>The two training entry points have materially different behavior</h3>
+            <span class="severity medium">Medium</span>
+          </div>
+          <p>
+            The standalone trainer and persistent updater differ in replay size, exploration,
+            opponents, checkpoint formats, incumbent initialization, and promotion gates. The
+            effective meaning of “trained DQN” therefore depends on which command launched it.
+          </p>
+          <p class="source">
+            Sources: <a href="training/train.py">training/train.py</a> ·
+            <a href="training/updater.py">training/updater.py</a> ·
+            <a href="agent.toml">agent.toml</a>
+          </p>
+          <p class="recommendation">
+            <strong>Recommendation:</strong> share one configuration, trainer core, incumbent
+            bootstrap, and promotion policy between both workflows.
+          </p>
+        </div>
+      </article>
+    </section>
+
+    <section id="architecture">
+      <h2>Inference architecture</h2>
+      <p>
+        This is a hybrid controller rather than end-to-end reinforcement learning. Deterministic
+        code owns job enumeration, routing, commitment, and market orders. The neural network only
+        ranks candidate field jobs for each unit.
+      </p>
+      <div class="flow" role="img" aria-label="Observation flows through job enumeration, feature construction, DQN scoring, availability masks, and routing or execution">
+        <div class="flow-step"><strong>Observation</strong><small>Farm, time, inventory, market</small></div>
+        <div class="flow-step"><strong>Enumerate jobs</strong><small>Crop and maintenance candidates</small></div>
+        <div class="flow-step"><strong>Build features</strong><small>Global + job + unit context</small></div>
+        <div class="flow-step"><strong>Score and mask</strong><small>Q-value for every unit/job pair</small></div>
+        <div class="flow-step"><strong>Commit and act</strong><small>Route to target or execute</small></div>
+      </div>
+      <div class="network" aria-label="Network dimensions">
+        43 global + 26 job + 3 unit = 72 → 128 → 128 → 1 Q-value
+      </div>
+      <div class="two-column" style="margin-top: 18px">
+        <article class="card">
+          <h3>Sequential assignment</h3>
+          <p>
+            Units choose one at a time. Earlier selections reserve their jobs, and later units
+            receive an updated mask. This helps prevent two workers from targeting the same tile,
+            but makes storing the exact replay mask essential.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Sticky commitments</h3>
+          <p>
+            A selected remote job remains active until arrival, invalidation, or the commitment
+            timeout. Commitment state is included in the feature vector, preventing the policy
+            from changing destinations on every movement step.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="training">
+      <h2>Training workflow</h2>
+      <div class="flow" role="img" aria-label="Epsilon-greedy games flow into rollout artifacts, replay sampling, Double DQN updates, and measured promotion">
+        <div class="flow-step"><strong>Collect games</strong><small>Epsilon-greedy curriculum play</small></div>
+        <div class="flow-step"><strong>Store rollouts</strong><small>Compact candidate transitions</small></div>
+        <div class="flow-step"><strong>Sample replay</strong><small>Episode, time, and unit</small></div>
+        <div class="flow-step"><strong>Update DQN</strong><small>n-step Double DQN target</small></div>
+        <div class="flow-step"><strong>Evaluate</strong><small>Paired arena margin and promotion</small></div>
+      </div>
+      <div class="cards" style="margin-top: 22px">
+        <article class="card">
+          <h3>Reward</h3>
+          <p>
+            Training combines money changes, potential-based shaping, and a terminal outcome bonus.
+            The shaped return gives the learner denser feedback than season-end money alone.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Replay and targets</h3>
+          <p>
+            The trainer uses a recent-plus-reservoir episode buffer, n-step returns, Double DQN,
+            and a target network. Serialization uses compact arrays rather than pickle.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Curriculum</h3>
+          <p>
+            Standalone training progresses from starter opponents to a crop heuristic and frozen
+            self-play snapshots. Persistent collection can draw from the larger configured league.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Evaluation</h3>
+          <p>
+            Promotion is based on paired score margin rather than raw money, which is important
+            because opponent production changes the shared market and depresses both players'
+            absolute earnings.
+          </p>
+        </article>
+      </div>
+      <div class="callout warning" style="margin-top: 20px">
+        <strong>Credit-assignment caveat.</strong> Step-level joint reward is assigned to sampled
+        transitions for individual units, and committed movement turns are represented like fresh
+        choices. Recording only selection points—or using option-duration returns—would align the
+        learning data more closely with deployed behavior.
+      </div>
+    </section>
+
+    <section id="scope">
+      <h2>Learned scope and strategic ceiling</h2>
+      <div class="two-column">
+        <article class="card">
+          <h3>Currently scored</h3>
+          <ul>
+            <li><code>PASS</code></li>
+            <li><code>WATER</code></li>
+            <li><code>HARVEST</code></li>
+            <li><code>PLANT</code></li>
+            <li><code>DIG</code></li>
+            <li><code>FERTILIZE</code></li>
+            <li><code>DROP</code></li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Outside the current policy</h3>
+          <ul>
+            <li>Buying and exploiting additional land</li>
+            <li>Coops, pastures, and animal placement</li>
+            <li>Feeding, care, and animal production</li>
+            <li>Collecting animal fertilizer</li>
+            <li>General inventory pickup and delivery</li>
+            <li>Learned market purchasing and liquidation</li>
+          </ul>
+        </article>
+      </div>
+      <p>
+        The crop-only boundary is appropriate for an initial DQN and reduces exploration cost, but
+        the README's phrase “every legal job” is broader than the implemented action space. Animals,
+        land expansion, and richer logistics will eventually set the performance ceiling.
+      </p>
+    </section>
+
+    <section id="strengths">
+      <h2>What is already strong</h2>
+      <div class="cards">
+        <article class="card">
+          <h3>Clean submission boundary</h3>
+          <p>
+            Inference uses NumPy and local code only. Training and PyTorch are excluded from the
+            submission allowlist, and bundle tests import the unpacked agent away from the repo.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Single-sourced features</h3>
+          <p>
+            Training and inference share feature construction, while tests verify parity between
+            the PyTorch and NumPy network implementations.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Practical movement behavior</h3>
+          <p>
+            Sticky commitments address target oscillation, and the commitment state is visible to
+            the model instead of becoming hidden controller state.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Measured promotion</h3>
+          <p>
+            The project recognizes that training is non-monotonic and evaluates checkpoints before
+            shipping. Immutable checkpoints and rollout artifacts improve reproducibility.
+          </p>
+        </article>
+      </div>
+      <div class="callout" style="margin-top: 20px">
+        <strong>Validation status.</strong> The focused DQN, bundle, and game-fact tests pass. The
+        existing tests do not currently cover farm-hand pass behavior, replay availability masks,
+        or fresh-database checkpoint bootstrapping.
+      </div>
+    </section>
+
+    <section id="recommendations">
+      <h2>Recommended implementation order</h2>
+      <ol class="priority-list">
+        <li>Store and enforce per-unit action-availability masks in replay.</li>
+        <li>Bootstrap a new persistent store from the shipped <code>weights.npz</code>.</li>
+        <li>Raise persistent replay capacity to 800 episodes and epsilon floor to 0.15.</li>
+        <li>Make <code>PASS</code> unit-local so hired hands remain stationary.</li>
+        <li>Balance every opponent across both player seats.</li>
+        <li>Make fertilizer candidates aware of the acting unit's inventory.</li>
+        <li>Unify standalone and persistent configuration, training, and promotion logic.</li>
+        <li>Optimize historical artifact loading before the database grows large.</li>
+      </ol>
+      <p>
+        With the first six items resolved, this architecture is a credible foundation for long
+        crop-policy training runs. Expanding into animals and land should come afterward so action
+        correctness and checkpoint safety are stable before the search space grows.
+      </p>
+    </section>
+
+    <footer>
+      <p>
+        Review snapshot for <a href="README.md"><code>agents/dqn_job_scorer</code></a> ·
+        Source links are relative so this report remains portable with the repository.
+      </p>
+    </footer>
+  </main>
+</body>
+</html>

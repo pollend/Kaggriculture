@@ -3,12 +3,13 @@ from pathlib import Path
 
 import pytest
 
+from agents.configurable_crop_surrogate.strategy import Strategy
 from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader
 from kaggriculture_lab.identity import AgentManifest, build_revision
 from kaggriculture_lab.league import LeagueConfig, _run_hook, create_session, schedule_generation
+from kaggriculture_lab.model_trainers import load_trainer
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
-from kaggriculture_lab.storage import ExperimentStore
-from agents.configurable_crop_surrogate.strategy import Strategy
+from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
 from kaggriculture_lab.training import allocate_generation
 from sim.runner import MatchResult, SeatResult
 
@@ -72,7 +73,9 @@ def test_replay_is_compressed_in_duckdb_and_read_through_narrow_reader(tmp_path:
         reader = EpisodeReader(store.connection, "match", 0)
         assert reader.summary()["money_difference"] == 10
         assert reader.replay() == result.replay
-        assert store.connection.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 3
+        assert store.connection.execute(
+            "SELECT max(version) FROM schema_migrations"
+        ).fetchone()[0] == SCHEMA_VERSION
 
         context = EpisodeHookContext("run", "generation", "pair", "match", "a", "b", 0)
         _run_hook(store, context, "missing_episode_evaluator:hook")
@@ -126,4 +129,55 @@ def test_manifest_file_is_valid():
     assert json.loads(build_revision(manifest, Strategy()).params_json) == Strategy().to_dict()
 
     dqn = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
-    assert dqn.models[0].min_new_batches == 8
+    # The DQN collects per closed round, so its update threshold is expressed in
+    # rounds: one update per generation means matching the league's round count.
+    league = LeagueConfig.from_toml("configs/league.toml")
+    model = dqn.models[0]
+    assert model.min_new_batches == (
+        league.rounds_per_generation * int(model.config["batches_per_round"])
+    )
+
+
+def test_every_trainable_agent_declares_a_loadable_trainer():
+    """A stale manifest should fail here, not part-way through a training run."""
+
+    found = 0
+    for path in sorted(Path("agents").glob("*/agent.toml")):
+        for model in AgentManifest.load(path).models:
+            trainer = load_trainer(model.trainer)
+            assert callable(getattr(trainer, "on_batch", None)), model.model_id
+            found += 1
+    assert found >= 3
+
+
+def test_second_generation_schedules_with_a_hall_of_fame(tmp_path: Path):
+    """Generation 1 is the first to query the hall of fame.
+
+    Generation 0 returns before that query, so a smoke test that ran only the
+    first generation passed while `league run` crashed on every subsequent one
+    with an ambiguous `generation_id`. This exercises the path that broke.
+    """
+    from kaggriculture_lab.league import _hall_of_fame, create_next_generation, run_generation
+
+    database = tmp_path / "generations.duckdb"
+    config = LeagueConfig(
+        population_size=4,
+        rounds_per_generation=2,
+        hall_of_fame_rounds=1,
+        episode_steps=24,
+        seed=11,
+    )
+    session_id = create_session(config, database, session_id="gen2")
+
+    run_generation(session_id, database, tmp_path / "artifacts")
+    assert create_next_generation(session_id, database) == "gen2:g0001"
+
+    with ExperimentStore(database) as store:
+        # The query that used to raise BinderException.
+        hall = _hall_of_fame(store, session_id, generation_index=1, limit=3)
+        assert hall, "generation 1 must have a hall of fame to draw opponents from"
+        assert schedule_generation(store, session_id) > 0
+
+    result = run_generation(session_id, database, tmp_path / "artifacts")
+    assert result["status"] == "COMPLETE"
+    assert result["generation_index"] == 1

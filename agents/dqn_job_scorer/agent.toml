@@ -20,24 +20,53 @@ code_paths = [
 
 [[models]]
 model_id = "dqn_job_scorer.q_network"
-updater = "agents.dqn_job_scorer.training.updater:updater"
-collector = "agents.dqn_job_scorer.training.updater:collector"
-min_new_batches = 8
+trainer = "agents.dqn_job_scorer.train:trainer"
+# One update per generation: the league schedules `rounds_per_generation` rounds
+# and each buys `batches_per_round`, so matching their product fires the update
+# on the last round. Total gradient steps per generation do not depend on this
+# threshold -- they are `gradient_steps_per_batch * new_batches` either way -- so
+# a smaller value buys extra promotion checks at the cost of extra arena gating.
+min_new_batches = 20
 
 [models.config]
+# Rollout batches bought per closed league round. The league schedules
+# `rounds_per_generation` of them, so this and `min_new_batches` together set
+# how often the learner sees fresh data.
+batches_per_round = 1
 episodes_per_batch = 16
 gradient_steps_per_batch = 400
 batch_size = 512
 learning_rate = 0.0001
 gamma = 0.997
 n_step = 3
-buffer_episodes = 200
+buffer_episodes = 800
+reservoir_fraction = 0.35
 target_sync = 2000
 warmup_episodes = 16
-eval_seeds = 24
+eval_seeds = 40
+promotion_seeds = 60
+promotion_seed_base = 1000000
+promotion_seed_stride = 10000
 jobs = 8
 seed = 0
 epsilon_start = 1.0
-epsilon_end = 0.05
+epsilon_end = 0.15
 epsilon_decay_transitions = 200000
+incumbent_weights = "runs/dqn03/snapshots/round0060.npz"
 benchmark = "agents/configurable_crop_surrogate/main.py"
+opponents = [
+  "starter",
+  "agents/configurable_crop_surrogate/main.py",
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
+  "agents/competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine/main.py",
+  "agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/main.py",
+  "agents/competitor_degnonguidi_kaggriculture_agent_builder/main.py",
+  "agents/competitor_ektarr_diversified_scheduler_baseline_kaggriculture/main.py",
+  "agents/competitor_jek1wantaufik_building_a_kaggriculture_ai_agent/main.py",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",
+  "agents/competitor_lucifer19_kaggriculture_night_harvest/main.py",
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+  "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/main.py",
+  "agents/competitor_romantamrazov_kaggriculture_hamburger/main.py",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/main.py",
+]

@@ -23,8 +23,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 from agents.configurable_crop_surrogate.experiment import ExperimentConfig
-from kaggriculture_lab.storage import ExperimentStore
 from agents.configurable_crop_surrogate.strategy import Strategy, sample_strategy
+from kaggriculture_lab.storage import ExperimentStore
 
 
 def calculate_elo(store: ExperimentStore, run_id: str, k_factor: float = 24.0) -> dict[str, tuple[float, int]]:

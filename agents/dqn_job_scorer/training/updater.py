@@ -11,19 +11,27 @@ import numpy as np
 import torch
 from torch import nn
 
-from agents.dqn_job_scorer.policy import QNetwork
+from agents.dqn_job_scorer.policy import WEIGHTS_PATH, QNetwork
+from agents.dqn_job_scorer.training import network as net_module
+from agents.dqn_job_scorer.training.collect import (
+    EpisodeFormatError,
+    collect_batch,
+    load_episode_batch,
+    save_episode_batch,
+)
+from agents.dqn_job_scorer.training.replay import ReplayBuffer
 from kaggriculture_lab.model_updates import (
     ModelEvaluation,
     ModelTrainingReader,
     ModelUpdateContext,
     ModelUpdateResult,
-    record_training_batch,
 )
-from agents.dqn_job_scorer.training import network as net_module
-from agents.dqn_job_scorer.training.collect import collect_batch, load_episode_batch, save_episode_batch
-from agents.dqn_job_scorer.training.replay import ReplayBuffer
 
 SELF_SPEC = "agents/dqn_job_scorer/main.py"
+
+
+def _incumbent_path(config: dict[str, Any]) -> Path:
+    return Path(str(config.get("incumbent_weights", WEIGHTS_PATH)))
 
 
 def _file_digest(path: Path) -> str:
@@ -31,39 +39,36 @@ def _file_digest(path: Path) -> str:
 
 
 class DQNCollector:
-    """Collect one or more model-defined rollout batches into the shared store."""
+    """Roll out exploration episodes for one closed league round.
 
-    def collect(self, store, model_id: str, count: int, artifacts: str | Path) -> list[str]:
+    Off-policy, so the league's population is irrelevant -- only its clock is.
+    The round hook supplies the resolved config and active checkpoint, reads go
+    through the SELECT-only reader, and the one write goes through the writer,
+    which is already bound to this model.
+    """
+
+    def collect(self, context, reader, writer) -> list[str]:
+        config = context.config
+        count = int(config.get("batches_per_round", 1))
         if count < 1:
-            raise ValueError("collection count must be positive")
-        row = store.connection.execute(
-            "SELECT config_json, active_checkpoint_id FROM training_models WHERE model_id = ?",
-            [model_id],
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown training model: {model_id}")
-        import json
-
-        config = json.loads(row[0])
-        checkpoint = None
-        if row[1]:
-            checkpoint = store.connection.execute(
-                "SELECT inference_artifact_path FROM model_training_checkpoints WHERE checkpoint_id = ?",
-                [row[1]],
-            ).fetchone()
-        if checkpoint:
-            network = QNetwork.load(checkpoint[0])
+            raise ValueError("batches_per_round must be positive")
+        checkpoint = context.active_checkpoint
+        if checkpoint is not None:
+            network = QNetwork.load(checkpoint.inference_artifact_path)
         else:
-            network = net_module.to_numpy(net_module.build())
+            incumbent = _incumbent_path(config)
+            if not incumbent.is_file():
+                raise FileNotFoundError(f"configured DQN incumbent is missing: {incumbent}")
+            network = QNetwork.load(incumbent)
 
         total_transitions = int(
-            store.connection.execute(
+            reader.fetchone(
                 """
                 SELECT coalesce(sum(CAST(json_extract(metadata_json, '$.transitions') AS BIGINT)), 0)
                 FROM training_batches WHERE model_id = ?
                 """,
-                [model_id],
-            ).fetchone()[0]
+                [context.model_id],
+            )[0]
         )
         seed = int(config.get("seed", 0))
         rng = np.random.default_rng(seed + total_transitions)
@@ -77,9 +82,10 @@ class DQNCollector:
                 float(config.get("epsilon_end", 0.05)) - float(config.get("epsilon_start", 1.0))
             )
             batch_index = int(
-                store.connection.execute(
-                    "SELECT count(*) FROM training_batches WHERE model_id = ?", [model_id]
-                ).fetchone()[0]
+                reader.fetchone(
+                    "SELECT count(*) FROM training_batches WHERE model_id = ?",
+                    [context.model_id],
+                )[0]
             )
             seeds = [
                 int(value)
@@ -89,10 +95,19 @@ class DQNCollector:
                     size=int(config.get("episodes_per_batch", 16)),
                 )
             ]
-            benchmark = str(config.get("benchmark", "starter"))
+            configured_opponents = config.get("opponents")
+            opponents = (
+                [str(item) for item in configured_opponents]
+                if configured_opponents
+                else [
+                    str(config.get("benchmark", "starter"))
+                    if checkpoint is not None
+                    else "starter"
+                ]
+            )
             records = collect_batch(
                 network.layers,
-                [benchmark if row[1] else "starter"],
+                opponents,
                 seeds,
                 epsilon,
                 float(config.get("gamma", 0.997)),
@@ -101,12 +116,15 @@ class DQNCollector:
             if not records:
                 raise RuntimeError("every DQN rollout episode failed")
             source_id = f"rollout-{batch_index:08d}"
-            path = Path(artifacts) / "training_batches" / model_id / f"{source_id}.npz"
+            path = (
+                Path(context.artifacts)
+                / "training_batches"
+                / context.model_id
+                / f"{source_id}.npz"
+            )
             save_episode_batch(records, path)
             transitions = sum(int(record.unit_mask.sum()) for record in records)
-            record_training_batch(
-                store,
-                model_id,
+            writer.record(
                 source_kind="dqn_rollout",
                 source_id=source_id,
                 sample_count=len(records),
@@ -117,7 +135,12 @@ class DQNCollector:
                     "transitions": transitions,
                     "epsilon": epsilon,
                     "seeds": seeds,
-                    "behavior_checkpoint_id": row[1],
+                    "behavior_checkpoint_id": (
+                        checkpoint.checkpoint_id if checkpoint is not None else None
+                    ),
+                    "session_id": context.session_id,
+                    "generation_id": context.generation_id,
+                    "round_index": context.round_index,
                 },
             )
             total_transitions += transitions
@@ -125,12 +148,18 @@ class DQNCollector:
         return written
 
 
-def _arena_evaluate(weights_path: Path, opponent: str, seeds: int, jobs: int) -> dict[str, Any]:
+def _arena_evaluate(
+    weights_path: Path,
+    opponent: str,
+    seeds: int,
+    jobs: int,
+    seed_start: int = 0,
+) -> dict[str, Any]:
     from sim.arena import play_series
     from sim.metrics import summarize
 
     spec = f"{SELF_SPEC}?weights={weights_path}"
-    results = play_series(spec, opponent, range(seeds), {}, jobs)
+    results = play_series(spec, opponent, range(seed_start, seed_start + seeds), {}, jobs)
     summary = summarize(spec, opponent, results)
     return {
         "opponent": opponent,
@@ -154,14 +183,24 @@ class DQNUpdater:
             float(config.get("gamma", 0.997)),
             int(config.get("n_step", 3)),
             int(config.get("seed", 0)),
+            float(config.get("reservoir_fraction", 0.35)),
         )
+        skipped_legacy_batches = 0
         for batch in context.all_batches:
             if batch.source_kind != "dqn_rollout" or not batch.artifact_path:
                 continue
             path = Path(batch.artifact_path)
             if batch.artifact_sha256 and _file_digest(path) != batch.artifact_sha256:
                 raise ValueError(f"rollout artifact digest mismatch: {path}")
-            buffer.add(load_episode_batch(path))
+            try:
+                records = load_episode_batch(path)
+            except EpisodeFormatError:
+                # Format 1 did not record the live action mask. Treating every
+                # job as legal would reintroduce the corruption this migration
+                # fixes, so old batches remain auditable but are not trainable.
+                skipped_legacy_batches += 1
+                continue
+            buffer.add(records)
         warmup = int(config.get("warmup_episodes", 16))
         if len(buffer.episodes) < warmup:
             raise ValueError(f"DQN requires at least {warmup} replay episodes")
@@ -187,6 +226,10 @@ class DQNUpdater:
             if "replay_rng_state" in state:
                 buffer.rng.bit_generator.state = state["replay_rng_state"]
         else:
+            incumbent = _incumbent_path(config)
+            if not incumbent.is_file():
+                raise FileNotFoundError(f"configured DQN incumbent is missing: {incumbent}")
+            net_module.from_numpy(QNetwork.load(incumbent), online)
             target.load_state_dict(online.state_dict())
 
         loss_fn = nn.SmoothL1Loss()
@@ -247,56 +290,76 @@ class DQNUpdater:
         )
         net_module.to_numpy(online).save(inference_path)
 
-        eval_seeds = int(config.get("eval_seeds", 24))
+        eval_seeds = int(config.get("eval_seeds", 40))
+        promotion_seeds = int(config.get("promotion_seeds", 60))
+        seed_base = int(config.get("promotion_seed_base", 1_000_000))
+        seed_stride = int(config.get("promotion_seed_stride", 10_000))
+        seed_start = seed_base + context.cutoff_batch_seq * seed_stride
         jobs = int(config.get("jobs", 1))
         benchmark = str(config.get("benchmark", "agents/configurable_crop_surrogate/main.py"))
-        challenger_benchmark = _arena_evaluate(inference_path, benchmark, eval_seeds, jobs)
+        challenger_benchmark = _arena_evaluate(
+            inference_path, benchmark, eval_seeds, jobs, seed_start
+        )
         evaluations: list[ModelEvaluation] = []
-        promote = not challenger_benchmark["errors"]
+        promote = False
+        incumbent_path = (
+            Path(context.active_checkpoint.inference_artifact_path)
+            if context.active_checkpoint is not None
+            else _incumbent_path(config)
+        )
+        if not incumbent_path.is_file():
+            raise FileNotFoundError(f"DQN promotion incumbent is missing: {incumbent_path}")
         gate: dict[str, Any] = {
-            "kind": "non_inferior_incumbent_and_benchmark",
+            "kind": "significant_incumbent_improvement_and_benchmark_non_regression",
+            "seed_start": seed_start,
             "challenger_benchmark": challenger_benchmark,
         }
-        if context.active_checkpoint is not None:
-            incumbent_spec = f"{SELF_SPEC}?weights={context.active_checkpoint.inference_artifact_path}"
-            head_to_head = _arena_evaluate(inference_path, incumbent_spec, eval_seeds, jobs)
-            incumbent_benchmark = _arena_evaluate(
-                Path(context.active_checkpoint.inference_artifact_path),
-                benchmark,
-                eval_seeds,
-                jobs,
+        incumbent_spec = f"{SELF_SPEC}?weights={incumbent_path}"
+        head_to_head = _arena_evaluate(
+            inference_path, incumbent_spec, promotion_seeds, jobs, seed_start
+        )
+        incumbent_benchmark = _arena_evaluate(
+            incumbent_path, benchmark, eval_seeds, jobs, seed_start
+        )
+        # Promotion is a release decision, not an absence-of-proof-of-harm
+        # decision. The paired lower bound must clear zero.
+        head_to_head_ok = (
+            not head_to_head["errors"] and float(head_to_head["margin_ci"][0]) > 0.0
+        )
+        benchmark_ok = (
+            not challenger_benchmark["errors"]
+            and not incumbent_benchmark["errors"]
+            and float(challenger_benchmark["margin_ci"][1])
+            >= float(incumbent_benchmark["margin_ci"][0])
+        )
+        promote = head_to_head_ok and benchmark_ok
+        gate.update(
+            {
+                "head_to_head": head_to_head,
+                "incumbent_benchmark": incumbent_benchmark,
+                "head_to_head_significantly_better": head_to_head_ok,
+                "benchmark_non_regression": benchmark_ok,
+            }
+        )
+        evaluations.append(
+            ModelEvaluation(
+                "incumbent_head_to_head",
+                head_to_head,
+                head_to_head_ok,
+                (
+                    context.active_checkpoint.checkpoint_id
+                    if context.active_checkpoint is not None
+                    else "packaged_incumbent"
+                ),
             )
-            # A candidate is non-inferior unless the paired interval proves it
-            # loses, and the fixed benchmark proves a regression.
-            head_to_head_ok = not head_to_head["errors"] and float(head_to_head["margin_ci"][1]) >= 0.0
-            benchmark_ok = (
-                not incumbent_benchmark["errors"]
-                and float(challenger_benchmark["margin_ci"][1])
-                >= float(incumbent_benchmark["margin_ci"][0])
-            )
-            promote = promote and head_to_head_ok and benchmark_ok
-            gate.update(
-                {
-                    "head_to_head": head_to_head,
-                    "incumbent_benchmark": incumbent_benchmark,
-                    "head_to_head_non_inferior": head_to_head_ok,
-                    "benchmark_non_regression": benchmark_ok,
-                }
-            )
-            evaluations.append(
-                ModelEvaluation(
-                    "incumbent_head_to_head",
-                    head_to_head,
-                    head_to_head_ok,
-                    context.active_checkpoint.checkpoint_id,
-                )
-            )
+        )
         gate["passed"] = promote
         evaluations.append(
             ModelEvaluation("fixed_benchmark", challenger_benchmark, promote)
         )
         metrics = {
             "episodes_in_buffer": len(buffer.episodes),
+            "skipped_legacy_batches": skipped_legacy_batches,
             "transitions_in_buffer": buffer.transitions,
             "gradient_steps": gradient_steps,
             "gradient_steps_this_update": steps_to_run,
@@ -318,5 +381,5 @@ class DQNUpdater:
         )
 
 
-collector = DQNCollector()
-updater = DQNUpdater()
+# The manifest names `train.py`, which constructs these itself. Nothing outside
+# this agent resolves `training.updater` by path any more.

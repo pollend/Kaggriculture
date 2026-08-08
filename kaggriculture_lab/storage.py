@@ -12,6 +12,8 @@ from typing import Any
 from kaggriculture_lab.identity import AgentManifest, AgentRevision
 from sim.runner import MatchResult
 
+SCHEMA_VERSION = 4
+
 
 class ExperimentStore:
     def __init__(self, path: str | Path):
@@ -32,15 +34,56 @@ class ExperimentStore:
         self.close()
 
     def _initialize(self) -> None:
+        """Build missing tables, then migrate an older database forward.
+
+        `schema.sql` is `CREATE TABLE IF NOT EXISTS` only, so replaying it adds
+        new tables but never reshapes existing ones. That is why an unstamped
+        database can be treated as current -- the file always describes the
+        current shape, an invariant every schema change has to maintain -- while
+        a stamped one has to walk `migrations/` to get there.
+        """
+
         schema_path = Path(__file__).with_name("schema.sql")
         self.connection.execute(schema_path.read_text())
-        version = self.connection.execute(
-            "SELECT max(version) FROM schema_migrations"
-        ).fetchone()[0]
-        if version != 3:
-            raise RuntimeError(
-                f"unsupported experiment schema version {version!r}; expected 3"
+        version = int(
+            self.connection.execute(
+                "SELECT coalesce(max(version), 0) FROM schema_migrations"
+            ).fetchone()[0]
+        )
+        if version == 0:
+            self.connection.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?)", [SCHEMA_VERSION]
             )
+            return
+        while version < SCHEMA_VERSION:
+            self._apply_migration(version + 1)
+            applied = int(
+                self.connection.execute(
+                    "SELECT max(version) FROM schema_migrations"
+                ).fetchone()[0]
+            )
+            if applied <= version:
+                raise RuntimeError(
+                    f"migration to schema version {version + 1} did not stamp itself"
+                )
+            version = applied
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported experiment schema version {version!r}; "
+                f"expected {SCHEMA_VERSION}"
+            )
+
+    def _apply_migration(self, version: int) -> None:
+        matches = sorted(
+            (Path(__file__).parent / "migrations").glob(f"{version:03d}_*.sql")
+        )
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"expected exactly one migration script for schema version {version}, "
+                f"found {len(matches)}"
+            )
+        self.connection.execute(matches[0].read_text())
+
     def register_family(
         self, manifest: AgentManifest, manifest_path: str | Path
     ) -> None:
@@ -64,13 +107,11 @@ class ExperimentStore:
             self.connection.execute(
                 """
                 INSERT INTO training_models (
-                    model_id, family_id, updater_path, collector_path,
-                    min_new_batches, config_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    model_id, family_id, trainer_path, min_new_batches, config_json
+                ) VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT (model_id) DO UPDATE SET
                     family_id = excluded.family_id,
-                    updater_path = excluded.updater_path,
-                    collector_path = excluded.collector_path,
+                    trainer_path = excluded.trainer_path,
                     min_new_batches = excluded.min_new_batches,
                     config_json = excluded.config_json,
                     updated_at = now()
@@ -78,8 +119,7 @@ class ExperimentStore:
                 [
                     model.model_id,
                     manifest.family_id,
-                    model.updater,
-                    model.collector,
+                    model.trainer,
                     model.min_new_batches,
                     json.dumps(model.config or {}, sort_keys=True),
                 ],

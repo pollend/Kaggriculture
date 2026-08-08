@@ -52,7 +52,13 @@ def evaluate_episode(context: EpisodeHookContext, reader: EpisodeReader) -> dict
     margins = [float(row["money_difference"] or 0.0) for row in played]
     wins = [float(row["win"] or 0.0) for row in played]
 
-    recent, older = margins[:WINDOW], margins[WINDOW:]
+    # Split whatever history we have down the middle rather than at a fixed
+    # offset. Slicing at WINDOW left `older` empty for anything under 41
+    # episodes, so the check silently reported "insufficient history" well past
+    # the MIN_HISTORY it advertises -- it would never have fired in a short
+    # league. WINDOW now only caps how much history is pulled.
+    half = len(margins) // 2
+    recent, older = margins[:half], margins[half:]
     recent_mean, older_mean = _mean(recent), _mean(older)
     regression = older_mean - recent_mean
 
@@ -69,9 +75,11 @@ def evaluate_episode(context: EpisodeHookContext, reader: EpisodeReader) -> dict
         "productive_action_percentage": metrics.get("productive_action_percentage", 0.0),
         "movement_percentage": metrics.get("movement_percentage", 0.0),
         "plants_lost_inferred": metrics.get("plants_lost_inferred", 0),
-        # The candidate cap silently bounds what the policy may choose, so it is
-        # surfaced rather than left to be discovered in a training log.
-        "job_truncations": metrics.get("job_truncations", 0),
+        # Candidate-set truncation is deliberately absent. It is an internal
+        # count from the agent's own enumerator, and the league's metrics are
+        # derived from the replay, which cannot see it. Reporting
+        # `metrics.get("job_truncations", 0)` here would emit a constant zero
+        # that reads like data. It is logged per round by the trainer instead.
         # Accumulated evidence.
         "episodes_seen": len(played),
         "rolling_win_rate": _mean(wins),

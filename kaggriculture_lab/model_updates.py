@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from kaggriculture_lab.read_only import fetchall_select
 from kaggriculture_lab.storage import ExperimentStore
 
 
@@ -75,7 +76,17 @@ class ModelUpdateResult:
 
 
 class ModelUpdater(Protocol):
-    def update(self, context: ModelUpdateContext, reader: ModelTrainingReader) -> ModelUpdateResult: ...
+    """The batch hook: one call, one candidate checkpoint.
+
+    Everything around it -- which batches are new, whether there are enough of
+    them, and whether the result is promoted -- stays here. The agent decides
+    only what training on them means. `kaggriculture_lab.model_trainers` defines
+    the round hook that feeds it.
+    """
+
+    def on_batch(
+        self, context: ModelUpdateContext, reader: ModelTrainingReader
+    ) -> ModelUpdateResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,10 +112,9 @@ class ModelTrainingReader:
         self._connection = store.connection
 
     def fetchall(self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-        statement = sql.lstrip().upper()
-        if not (statement.startswith("SELECT") or statement.startswith("WITH")):
-            raise ValueError("model training reader only permits SELECT/WITH queries")
-        return self._connection.execute(sql, parameters).fetchall()
+        return fetchall_select(
+            self._connection, sql, parameters, reader_name="model training reader"
+        )
 
     def fetchone(self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
         rows = self.fetchall(sql, parameters)
@@ -236,7 +246,7 @@ def update_model_in_store(
 ) -> UpdateReport:
     row = store.connection.execute(
         """
-        SELECT family_id, updater_path, min_new_batches, config_json,
+        SELECT family_id, trainer_path, min_new_batches, config_json,
                active_checkpoint_id, last_attempted_batch_seq
         FROM training_models WHERE model_id = ?
         """,
@@ -244,7 +254,7 @@ def update_model_in_store(
     ).fetchone()
     if row is None:
         raise ValueError(f"unknown training model: {model_id}")
-    family_id, updater_path, minimum, config_json, active_id, watermark = row
+    family_id, trainer_path, minimum, config_json, active_id, watermark = row
     batch_rows = store.connection.execute(
         """
         SELECT model_id, batch_seq, batch_id, source_kind, source_id,
@@ -338,10 +348,10 @@ def update_model_in_store(
         dataset_sha256=dataset_digest,
     )
     try:
-        updater = _load_object(str(updater_path))
-        result = updater.update(context, ModelTrainingReader(store))
+        trainer = _load_object(str(trainer_path))
+        result = trainer.on_batch(context, ModelTrainingReader(store))
         if not isinstance(result, ModelUpdateResult):
-            raise TypeError("model updater must return ModelUpdateResult")
+            raise TypeError("trainer.on_batch must return ModelUpdateResult")
         status = "PROMOTED" if result.promote else "REJECTED"
         store.connection.execute("BEGIN")
         try:

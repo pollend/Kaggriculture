@@ -3,20 +3,21 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+from agents.configurable_crop_surrogate.strategy import generate_population
 from kaggriculture_lab.identity import AgentManifest, build_revision
 from kaggriculture_lab.model_updates import (
+    ModelTrainingReader,
     ModelUpdateContext,
     ModelUpdateResult,
     record_training_batch,
     update_model_in_store,
 )
-from kaggriculture_lab.storage import ExperimentStore
-from agents.configurable_crop_surrogate.strategy import generate_population
+from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
 from scripts.rebuild_experiments_db import rebuild
 
 
-class FakeUpdater:
-    def update(self, context: ModelUpdateContext, reader) -> ModelUpdateResult:
+class FakeTrainer:
+    def on_batch(self, context: ModelUpdateContext, reader) -> ModelUpdateResult:
         destination = context.artifacts / f"{context.update_id}.txt"
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(context.dataset_sha256)
@@ -34,15 +35,31 @@ class FakeUpdater:
         )
 
 
-updater = FakeUpdater()
+trainer = FakeTrainer()
+
+
+def test_model_training_reader_rejects_multi_statement_bypass(tmp_path: Path):
+    with ExperimentStore(tmp_path / "reader.duckdb") as store:
+        reader = ModelTrainingReader(store)
+        assert reader.fetchone("WITH value AS (SELECT 1 AS n) SELECT n FROM value") == (1,)
+        for sql in (
+            "DELETE FROM training_models",
+            "SELECT 1; DELETE FROM training_models",
+        ):
+            try:
+                reader.fetchall(sql)
+            except ValueError as error:
+                assert "only permits SELECT/WITH" in str(error)
+            else:
+                raise AssertionError(f"mutating SQL was accepted: {sql}")
 
 
 def _register(store: ExperimentStore, model_id: str, promote: bool = True) -> None:
     store.connection.execute(
         """
         INSERT INTO training_models (
-            model_id, family_id, updater_path, min_new_batches, config_json
-        ) VALUES (?, 'test', 'test_model_updates:updater', 2, ?)
+            model_id, family_id, trainer_path, min_new_batches, config_json
+        ) VALUES (?, 'test', 'test_model_updates:trainer', 2, ?)
         """,
         [model_id, '{"promote": true}' if promote else '{"promote": false}'],
     )
@@ -113,7 +130,7 @@ def test_rebuild_uses_schema_and_backs_up_existing_database(tmp_path: Path):
     with ExperimentStore(database) as store:
         assert store.connection.execute(
             "SELECT max(version) FROM schema_migrations"
-        ).fetchone()[0] == 3
+        ).fetchone()[0] == SCHEMA_VERSION
 
 
 def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):

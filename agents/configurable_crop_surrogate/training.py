@@ -9,6 +9,7 @@ from dataclasses import fields
 from enum import StrEnum
 from typing import Any
 
+from agents.configurable_crop_surrogate.strategy import Strategy, sample_strategy
 from kaggriculture_lab.identity import AgentRevision
 from kaggriculture_lab.model_updates import (
     ModelEvaluation,
@@ -16,7 +17,6 @@ from kaggriculture_lab.model_updates import (
     ModelUpdateContext,
     ModelUpdateResult,
 )
-from agents.configurable_crop_surrogate.strategy import Strategy, sample_strategy
 
 
 class ConfigurableCropAdapter:
@@ -277,4 +277,5 @@ class CropSurrogateUpdater:
         )
 
 
-updater = CropSurrogateUpdater()
+# The manifest names `train.py`, which constructs this itself. `adapter` above
+# is a different seam -- evolution, not training -- and is still resolved by path.

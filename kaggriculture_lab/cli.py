@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import io
 import json
 import re
@@ -11,26 +10,27 @@ import shutil
 import tarfile
 from pathlib import Path
 
+from kaggriculture_lab.dashboard import serve as serve_dashboard
 from kaggriculture_lab.identity import AgentManifest
 from kaggriculture_lab.league import (
     LeagueConfig,
+    _current_generation,
+    _load_session,
+    _training_family_ids,
     create_next_generation,
     create_session,
     leaderboard,
     reevaluate_hooks,
     run_generation,
     session_status,
+    set_training_manifests,
 )
+from kaggriculture_lab.model_trainers import GENERATION_ROUND_INDEX, run_round_hooks
 from kaggriculture_lab.model_updates import update_models
 from kaggriculture_lab.storage import ExperimentStore
 
 DEFAULT_DATABASE = "artifacts/experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts"
-FIRST_STRATEGY = Path("agents/configurable_crop_surrogate")
-TRAINING_MANIFESTS = (
-    Path("agents/configurable_crop_surrogate/agent.toml"),
-    Path("agents/dqn_job_scorer/agent.toml"),
-)
 SAFE_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
 
@@ -140,7 +140,13 @@ def _cmd_league_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_league_run(args: argparse.Namespace) -> int:
-    result = run_generation(args.session_id, args.database, args.artifacts)
+    # Registration lives here rather than inside `run_generation` so the library
+    # function never discovers the working tree's agents on its own.
+    with ExperimentStore(args.database) as store:
+        _register_training_models(store)
+    result = run_generation(
+        args.session_id, args.database, args.artifacts, update_models=True
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
@@ -171,10 +177,29 @@ def _cmd_league_evaluate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_league_trainers(args: argparse.Namespace) -> int:
+    """Repoint a session's trainers without discarding its history."""
+
+    manifests = (
+        list(LeagueConfig.from_toml(args.config).training_manifests)
+        if args.config
+        else list(args.manifest)
+    )
+    families = set_training_manifests(args.session_id, args.database, manifests)
+    print(json.dumps({"training_manifests": manifests, "families": list(families)}, indent=2))
+    return 0
+
+
+def _cmd_web(args: argparse.Namespace) -> int:
+    serve_dashboard(args.database, args.host, args.port)
+    return 0
+
+
 def _register_training_models(store: ExperimentStore) -> None:
-    for path in TRAINING_MANIFESTS:
-        if path.exists():
-            store.register_family(AgentManifest.load(path), path)
+    for path in sorted(Path("agents").glob("*/agent.toml")):
+        manifest = AgentManifest.load(path)
+        if manifest.models:
+            store.register_family(manifest, path)
 
 
 def _cmd_models_update(args: argparse.Namespace) -> int:
@@ -190,24 +215,29 @@ def _cmd_models_update(args: argparse.Namespace) -> int:
     return 1 if any(item.status == "error" for item in reports) else 0
 
 
-def _cmd_models_collect(args: argparse.Namespace) -> int:
+def _cmd_models_round(args: argparse.Namespace) -> int:
+    """Hand-fire a round hook that `league run` would otherwise drive."""
+
     with ExperimentStore(args.database) as store:
         _register_training_models(store)
-        row = store.connection.execute(
-            "SELECT collector_path FROM training_models WHERE model_id = ?",
-            [args.model_id],
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown training model: {args.model_id}")
-        if not row[0]:
-            raise ValueError(f"model does not define a collector: {args.model_id}")
-        module_name, separator, attribute = str(row[0]).partition(":")
-        if not separator:
-            raise ValueError("collector path must use module:attribute syntax")
-        collector = getattr(importlib.import_module(module_name), attribute)
-        batches = collector.collect(store, args.model_id, args.count, args.artifacts)
-    print(json.dumps({"model_id": args.model_id, "batches": batches}, indent=2))
-    return 0
+        config = _load_session(store, args.session_id)
+        generation_id, generation_index, _ = _current_generation(store, args.session_id)
+        reports = run_round_hooks(
+            store,
+            session_id=args.session_id,
+            generation_id=generation_id,
+            generation_index=generation_index,
+            scope=args.scope,
+            round_index=(
+                GENERATION_ROUND_INDEX if args.scope == "generation" else args.round_index
+            ),
+            family_ids=_training_family_ids(config),
+            artifacts=args.artifacts,
+            model_id=args.model_id,
+            force=args.force,
+        )
+    print(json.dumps([item.to_dict() for item in reports], indent=2, sort_keys=True))
+    return 1 if any(item.status == "error" for item in reports) else 0
 
 
 def _cmd_models_status(args: argparse.Namespace) -> int:
@@ -240,6 +270,10 @@ def _cmd_models_status(args: argparse.Namespace) -> int:
 
 
 def _cmd_models_export_active(args: argparse.Namespace) -> int:
+    if not args.confirm_release:
+        raise ValueError(
+            "export-active is a release action; pass --confirm-release after reviewing the gate"
+        )
     with ExperimentStore(args.database) as store:
         _register_training_models(store)
         row = store.connection.execute(
@@ -293,6 +327,12 @@ def build_parser() -> argparse.ArgumentParser:
     bundle.add_argument("--output", default="artifacts/submission.tar.gz")
     bundle.set_defaults(func=_cmd_bundle)
 
+    web = commands.add_parser("web", help="review persistent league sessions in a local dashboard")
+    web.add_argument("--database", default=DEFAULT_DATABASE)
+    web.add_argument("--host", default="127.0.0.1")
+    web.add_argument("--port", type=int, default=8000)
+    web.set_defaults(func=_cmd_web)
+
     league = commands.add_parser("league", help="manage persistent paired training leagues")
     league_commands = league.add_subparsers(dest="league_command", required=True)
 
@@ -307,6 +347,19 @@ def build_parser() -> argparse.ArgumentParser:
         league_run.add_argument("--session-id", required=True)
         _add_paths(league_run)
         league_run.set_defaults(func=_cmd_league_run)
+
+    league_trainers = league_commands.add_parser(
+        "trainers",
+        help="repoint an existing session's training_manifests (the only stored "
+        "config field that is safe to rewrite)",
+    )
+    league_trainers.add_argument("--session-id", required=True)
+    league_trainers.add_argument("--config", help="read training_manifests from this league config")
+    league_trainers.add_argument(
+        "--manifest", action="append", default=[], help="path to an agent.toml; repeatable"
+    )
+    league_trainers.add_argument("--database", default=DEFAULT_DATABASE)
+    league_trainers.set_defaults(func=_cmd_league_trainers)
 
     league_status = league_commands.add_parser("status", help="show persisted generation progress")
     league_status.add_argument("--session-id", required=True)
@@ -342,11 +395,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_paths(models_update)
     models_update.set_defaults(func=_cmd_models_update)
 
-    models_collect = model_commands.add_parser("collect", help="collect persisted batches for a model")
-    models_collect.add_argument("model_id")
-    models_collect.add_argument("--count", type=int, default=1)
-    _add_paths(models_collect)
-    models_collect.set_defaults(func=_cmd_models_collect)
+    models_round = model_commands.add_parser(
+        "round",
+        help="fire a round hook by hand (batch count comes from the model's "
+        "batches_per_round, not a flag)",
+    )
+    models_round.add_argument("--session-id", required=True)
+    models_round.add_argument("--model-id")
+    models_round.add_argument("--scope", choices=("round", "generation"), default="round")
+    models_round.add_argument("--round-index", type=int, default=0)
+    models_round.add_argument("--force", action="store_true")
+    _add_paths(models_round)
+    models_round.set_defaults(func=_cmd_models_round)
 
     models_status = model_commands.add_parser("status", help="show model thresholds and active checkpoints")
     models_status.add_argument("--database", default=DEFAULT_DATABASE)
@@ -358,6 +418,7 @@ def build_parser() -> argparse.ArgumentParser:
     models_export.add_argument("model_id")
     models_export.add_argument("--output", required=True)
     models_export.add_argument("--database", default=DEFAULT_DATABASE)
+    models_export.add_argument("--confirm-release", action="store_true")
     models_export.set_defaults(func=_cmd_models_export_active)
     return parser
 

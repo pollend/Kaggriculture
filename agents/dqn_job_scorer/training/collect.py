@@ -14,6 +14,7 @@ distance columns are recomputed when a minibatch is drawn.
 
 from __future__ import annotations
 
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,7 @@ class EpisodeRecord:
     unit_mask: np.ndarray      # bool    [T, U]
     chosen: np.ndarray         # int16   [T, U]
     committed: np.ndarray      # int16   [T, U]  job index this unit was already walking to, -1 if none
+    available: np.ndarray      # bool    [T, U, J] exact live action mask for each unit
     reward: np.ndarray         # float32 [T]   shaped, ready for training
     raw_reward: np.ndarray     # float32 [T]   unshaped money delta, for diagnostics
     potential: np.ndarray      # float32 [T+1] Phi(s_t); last entry is the terminal state
@@ -58,7 +60,7 @@ class EpisodeRecord:
             array.nbytes
             for array in (
                 self.global_feats, self.job_static, self.job_targets, self.job_mask,
-                self.unit_pos, self.unit_mask, self.chosen, self.committed, self.reward,
+                self.unit_pos, self.unit_mask, self.chosen, self.committed, self.available, self.reward,
                 self.raw_reward, self.potential, self.money, self.truncated,
             )
         )
@@ -73,6 +75,7 @@ EPISODE_ARRAY_FIELDS = (
     "unit_mask",
     "chosen",
     "committed",
+    "available",
     "reward",
     "raw_reward",
     "potential",
@@ -81,13 +84,17 @@ EPISODE_ARRAY_FIELDS = (
 )
 
 
+class EpisodeFormatError(ValueError):
+    """A rollout artifact cannot be trained with the current replay semantics."""
+
+
 def save_episode_batch(records: list[EpisodeRecord], path: str | Path) -> Path:
     """Persist variable-width episode records without pickle/object arrays."""
 
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     payload: dict[str, np.ndarray] = {
-        "format_version": np.asarray([1], dtype=np.int16),
+        "format_version": np.asarray([2], dtype=np.int16),
         "episode_count": np.asarray([len(records)], dtype=np.int32),
     }
     for index, record in enumerate(records):
@@ -99,8 +106,12 @@ def save_episode_batch(records: list[EpisodeRecord], path: str | Path) -> Path:
 
 def load_episode_batch(path: str | Path) -> list[EpisodeRecord]:
     with np.load(Path(path), allow_pickle=False) as payload:
-        if int(payload["format_version"][0]) != 1:
-            raise ValueError("unsupported DQN episode batch format")
+        version = int(payload["format_version"][0])
+        if version != 2:
+            raise EpisodeFormatError(
+                f"unsupported DQN episode batch format {version}; "
+                "exact live action masks require format 2"
+            )
         count = int(payload["episode_count"][0])
         return [
             EpisodeRecord(
@@ -114,15 +125,16 @@ def load_episode_batch(path: str | Path) -> list[EpisodeRecord]:
 
 
 def potential(farm: dict, private: dict, obs: Any) -> float:
-    """Phi(s): cash plus the market value of everything not yet sold.
+    """Phi(s): liquidatable crop value, excluding cash already in the reward.
 
     Used for potential-based reward shaping. Buying seeds and hiring are
     immediately negative with a payoff dozens of turns later, so unshaped money
     delta teaches the network to sit still. Shaping of this form is
-    policy-invariant, so it buys learning speed at no cost in optimality.
+    policy-invariant when the terminal potential is forced to zero. Cash is
+    deliberately absent because the base reward already records its delta.
     """
     prices = ((get(obs, "market", {}) or {}).get("prices", {}) or {})
-    value = float(farm.get("money", 0.0))
+    value = 0.0
 
     shed = private.get("shed", {}) or {}
     for crop in CROP_ORDER:
@@ -151,6 +163,7 @@ class Recorder:
     unit_pos: list[np.ndarray] = field(default_factory=list)
     chosen: list[list[int]] = field(default_factory=list)
     committed: list[list[int]] = field(default_factory=list)
+    available: list[np.ndarray] = field(default_factory=list)
     money: list[float] = field(default_factory=list)
     potential: list[float] = field(default_factory=list)
     truncated: list[int] = field(default_factory=list)
@@ -162,23 +175,25 @@ class Recorder:
         self.unit_pos.clear()
         self.chosen.clear()
         self.committed.clear()
+        self.available.clear()
         self.money.clear()
         self.potential.clear()
         self.truncated.clear()
 
     def record(self, *, global_feats, job_static, job_targets, positions, chosen,
-               committed, money, obs, farm, private, truncated) -> None:
+               committed, available, money, obs, farm, private, truncated) -> None:
         self.global_feats.append(np.asarray(global_feats, dtype=np.float32))
         self.job_static.append(np.asarray(job_static, dtype=np.float16))
         self.job_targets.append(np.asarray(job_targets, dtype=np.int8))
         self.unit_pos.append(np.asarray(positions, dtype=np.int8))
         self.chosen.append(list(chosen))
         self.committed.append(list(committed))
+        self.available.append(np.asarray(available, dtype=bool))
         self.money.append(float(money))
         self.potential.append(potential(farm, private, obs))
         self.truncated.append(int(truncated))
 
-    def finish(self, final_money: float, final_potential: float, won: bool, gamma: float) -> EpisodeRecord:
+    def finish(self, final_money: float, outcome: float, gamma: float) -> EpisodeRecord:
         """Pad to a common width and compute shaped rewards."""
         steps = len(self.global_feats)
         if steps == 0:
@@ -194,6 +209,7 @@ class Recorder:
         unit_mask = np.zeros((steps, units), dtype=bool)
         chosen = np.zeros((steps, units), dtype=np.int16)
         committed = np.full((steps, units), -1, dtype=np.int16)
+        available = np.zeros((steps, units, width), dtype=bool)
 
         for t in range(steps):
             count = self.job_static[t].shape[0]
@@ -205,13 +221,16 @@ class Recorder:
             unit_mask[t, :n_units] = True
             chosen[t, :n_units] = self.chosen[t]
             committed[t, :n_units] = self.committed[t]
+            available[t, :n_units, :count] = self.available[t]
 
         money = np.asarray([*self.money, final_money], dtype=np.float32)
-        phi = np.asarray([*self.potential, final_potential], dtype=np.float32)
+        # The environment ends in an absorbing state. Forcing Phi(s_T)=0 keeps
+        # shaping from assigning terminal value to inventory that has no score.
+        phi = np.asarray([*self.potential, 0.0], dtype=np.float32)
 
         raw = (money[1:] - money[:-1]) / MONEY_SCALE
         shaped = raw + gamma * phi[1:] - phi[:-1]
-        shaped[-1] += WIN_BONUS if won else -WIN_BONUS
+        shaped[-1] += (2.0 * float(outcome) - 1.0) * WIN_BONUS
 
         return EpisodeRecord(
             global_feats=np.stack(self.global_feats),
@@ -222,6 +241,7 @@ class Recorder:
             unit_mask=unit_mask,
             chosen=chosen,
             committed=committed,
+            available=available,
             reward=shaped.astype(np.float32),
             raw_reward=raw.astype(np.float32),
             potential=phi,
@@ -272,16 +292,21 @@ def collect_episode(
     final = env.steps[-1]
     obs = final[learner_seat].observation
     farms = get(obs, "farms", []) or []
-    private = get(obs, "private", {}) or {}
     farm = farms[learner_seat]
 
     rewards = [state.reward or 0.0 for state in final]
-    won = rewards[learner_seat] > max(r for i, r in enumerate(rewards) if i != learner_seat)
+    opponent_reward = max(r for i, r in enumerate(rewards) if i != learner_seat)
+    outcome = (
+        1.0
+        if rewards[learner_seat] > opponent_reward
+        else 0.0
+        if rewards[learner_seat] < opponent_reward
+        else 0.5
+    )
 
     return recorder.finish(
         final_money=float(farm.get("money", 0.0)),
-        final_potential=potential(farm, private, obs),
-        won=won,
+        outcome=outcome,
         gamma=gamma,
     )
 
@@ -311,6 +336,11 @@ def collect_batch(
     if jobs == 1:
         records = [_job(task) for task in tasks]
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as pool:
+        # Torch is initialized before collection in both trainers. Forking that
+        # process can deadlock or terminate workers after the replay grows; a
+        # fresh interpreter is slower to start but stable and cross-platform.
+        with ProcessPoolExecutor(
+            max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
+        ) as pool:
             records = list(pool.map(_job, tasks, chunksize=1))
     return [record for record in records if record is not None]

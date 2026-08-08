@@ -116,6 +116,7 @@ class JobScorerAgent:
 
         chosen: list[int] = []
         committed_indices: list[int] = []
+        available_masks: list[np.ndarray] = []
         unit_actions: list[list[str]] = []
 
         for unit, position in enumerate(positions):
@@ -129,6 +130,8 @@ class JobScorerAgent:
                 # re-picks every turn are what made units oscillate instead of
                 # arriving, and epsilon applied per step derailed almost every walk.
                 index = committed
+                allowed = np.zeros(len(jobs), dtype=bool)
+                allowed[index] = True
             else:
                 # A job is available if nobody took it and it is not bound to
                 # another unit. PASS (index 0) is never consumed.
@@ -139,6 +142,7 @@ class JobScorerAgent:
                     taken[index] = True
 
             chosen.append(index)
+            available_masks.append(allowed)
             job = jobs[index]
             if position == job.target:
                 unit_actions.append(list(job.action))
@@ -161,6 +165,7 @@ class JobScorerAgent:
                 positions=positions,
                 chosen=chosen,
                 committed=committed_indices,
+                available=available_masks,
                 money=float(farm.get("money", 0.0)),
                 obs=obs,
                 farm=farm,

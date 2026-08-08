@@ -17,7 +17,7 @@ code_paths = [
 
 [[models]]
 model_id = "configurable_crop_surrogate.surrogate"
-updater = "agents.configurable_crop_surrogate.training:updater"
+trainer = "agents.configurable_crop_surrogate.train:trainer"
 min_new_batches = 2
 
 [models.config]

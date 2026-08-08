@@ -12,6 +12,7 @@ import statistics
 import tomllib
 import traceback
 import uuid
+from collections.abc import Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -26,7 +27,12 @@ from kaggriculture_lab.identity import (
     build_revision,
     builtin_revision,
 )
-from kaggriculture_lab.model_updates import ModelTrainingReader, record_training_batch
+from kaggriculture_lab.model_trainers import (
+    GENERATION_ROUND_INDEX,
+    run_round_hooks,
+    session_training_models,
+)
+from kaggriculture_lab.model_updates import ModelTrainingReader, update_model_in_store
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
 from kaggriculture_lab.storage import ExperimentStore
 from kaggriculture_lab.training import allocate_generation, load_training_adapter, propose
@@ -38,6 +44,11 @@ class LeagueConfig:
     name: str = "configurable-crop-league"
     manifest: str = "agents/configurable_crop_surrogate/agent.toml"
     anchor_manifests: tuple[str, ...] = ()
+    #: Manifests whose models this session drives round hooks for. Empty means
+    #: just `manifest`. Declaring it separately is what lets a league host
+    #: another family as an anchor opponent without also running its trainer --
+    #: and what lets a session drive a model, like the DQN, that no league breeds.
+    training_manifests: tuple[str, ...] = ()
     population_size: int = 20
     rounds_per_generation: int = 20
     hall_of_fame_rounds: int = 4
@@ -53,6 +64,7 @@ class LeagueConfig:
             raw = tomllib.load(stream)
         values = dict(raw.get("league", raw))
         values["anchor_manifests"] = tuple(values.get("anchor_manifests", ()))
+        values["training_manifests"] = tuple(values.get("training_manifests", ()))
         return cls(**values)
 
     def validate(self) -> None:
@@ -211,7 +223,36 @@ def _load_session(store: ExperimentStore, session_id: str) -> LeagueConfig:
         raise ValueError(f"unknown training session: {session_id}")
     values = json.loads(row[0])
     values["anchor_manifests"] = tuple(values.get("anchor_manifests", ()))
+    values["training_manifests"] = tuple(values.get("training_manifests", ()))
     return LeagueConfig(**values)
+
+
+def set_training_manifests(
+    session_id: str, database: str | Path, manifests: Sequence[str]
+) -> tuple[str, ...]:
+    """Repoint an existing session at a different set of trainers.
+
+    Only this one field is writable. Everything else in a stored session config
+    determines how generations were scheduled, and rewriting it would silently
+    invalidate the history already computed under it.
+    """
+
+    families = _training_family_ids(
+        LeagueConfig(training_manifests=tuple(manifests))
+    ) if manifests else ()
+    with ExperimentStore(database) as store:
+        row = store.connection.execute(
+            "SELECT config_json FROM training_sessions WHERE session_id = ?", [session_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown training session: {session_id}")
+        values = json.loads(row[0])
+        values["training_manifests"] = list(manifests)
+        store.connection.execute(
+            "UPDATE training_sessions SET config_json = ? WHERE session_id = ?",
+            [json.dumps(values, sort_keys=True), session_id],
+        )
+    return families
 
 
 def _current_generation(store: ExperimentStore, session_id: str) -> tuple[str, int, str]:
@@ -263,7 +304,12 @@ def _hall_of_fame(
                max(gs.mean_margin) AS margin
         FROM rating_snapshots rs
         JOIN generations g ON g.generation_id = rs.generation_id
-        LEFT JOIN generation_stats gs USING (generation_id, revision_id)
+        -- Explicit ON, not USING: the join above leaves both rs.generation_id and
+        -- g.generation_id in scope, so `USING (generation_id, ...)` is ambiguous
+        -- and DuckDB rejects it. Only reachable from generation 1 onward, since
+        -- generation 0 returns before this query.
+        LEFT JOIN generation_stats gs
+          ON gs.generation_id = rs.generation_id AND gs.revision_id = rs.revision_id
         WHERE g.session_id = ? AND g.generation_index < ? AND NOT rs.is_frozen
         GROUP BY rs.revision_id
         ORDER BY conservative DESC, margin DESC NULLS LAST, rs.revision_id
@@ -551,108 +597,167 @@ def _finish_pairing(store: ExperimentStore, pairing_id: str, revision_a: str) ->
     )
 
 
-def _record_generation_training_batch(
-    store: ExperimentStore, session_id: str, generation_id: str
+def _training_family_ids(config: LeagueConfig) -> tuple[str, ...]:
+    """Families whose trainers this session drives, from its declared manifests.
+
+    Reading them from the config rather than from the generation's membership is
+    deliberate: a session may train a family it does not breed (an off-policy
+    learner riding the league's clock), and it must *not* train a family that is
+    only present as an anchor opponent.
+    """
+
+    paths = config.training_manifests or (config.manifest,)
+    return tuple(
+        dict.fromkeys(AgentManifest.load(path).family_id for path in paths)
+    )
+
+
+def _run_round(
+    store: ExperimentStore,
+    session_id: str,
+    generation_id: str,
+    config: LeagueConfig,
+    round_index: int,
+    pool: ProcessPoolExecutor | None,
 ) -> None:
-    if store.connection.execute(
-        "SELECT 1 FROM training_models WHERE model_id = 'configurable_crop_surrogate.surrogate'"
-    ).fetchone() is None:
+    """Play every outstanding pairing in one round and settle its results."""
+
+    pairings = store.connection.execute(
+        """
+        SELECT pairing_id, seed, revision_a, revision_b FROM league_pairings
+        WHERE generation_id = ? AND round_index = ?
+          AND status NOT IN ('COMPLETE', 'FAILED')
+        ORDER BY pairing_id
+        """,
+        [generation_id, round_index],
+    ).fetchall()
+    if not pairings:
         return
-    sample_count = int(
-        store.connection.execute(
-            "SELECT count(*) FROM rating_snapshots WHERE generation_id = ? AND NOT is_frozen",
-            [generation_id],
-        ).fetchone()[0]
+    tasks: list[LeagueEpisodeTask] = []
+    for pairing_id, seed, revision_a, revision_b in pairings:
+        left = _get_revision(store, revision_a)
+        right = _get_revision(store, revision_b)
+        for orientation in (0, 1):
+            existing = store.connection.execute(
+                "SELECT 1 FROM pairing_episodes WHERE pairing_id = ? AND orientation = ?",
+                [pairing_id, orientation],
+            ).fetchone()
+            if existing:
+                _persist_orientation(
+                    store,
+                    session_id,
+                    generation_id,
+                    pairing_id,
+                    orientation,
+                    seed,
+                    left,
+                    right,
+                    config.episode_steps,
+                )
+                continue
+            tasks.append(
+                LeagueEpisodeTask(
+                    pairing_id, orientation, seed, left, right, config.episode_steps
+                )
+            )
+    outcomes = (
+        map(_league_worker, tasks)
+        if pool is None
+        else pool.map(_league_worker, tasks, chunksize=1)
     )
-    record_training_batch(
-        store,
-        "configurable_crop_surrogate.surrogate",
-        source_kind="league_generation",
-        source_id=generation_id,
-        sample_count=sample_count,
-        metadata={"session_id": session_id, "generation_id": generation_id},
-    )
+    for task, result in outcomes:
+        _store_orientation_result(store, session_id, generation_id, task, result)
+    for pairing_id, _, revision_a, _ in pairings:
+        _finish_pairing(store, pairing_id, revision_a)
 
 
 def run_generation(
     session_id: str,
     database: str | Path,
     artifacts: str | Path = "artifacts",
+    *,
+    update_models: bool = False,
 ) -> dict[str, Any]:
-    """Resume all missing paired episodes and close ratings as one batch."""
+    """Resume all missing paired episodes and close ratings as one batch.
+
+    Rounds are played and settled one at a time so each closed round can be
+    offered to the declared models' round hooks. The process pool is created
+    once for the whole generation -- the per-round barrier is inherent to the
+    hook's contract, but paying spawn cost per round is not.
+
+    `update_models` decides whether a closed round also attempts a model update.
+    It defaults off so that calling this as a library never pulls an agent's
+    training dependencies in; the CLI turns it on.
+    """
 
     with ExperimentStore(database) as store:
         config = _load_session(store, session_id)
-        generation_id, _, status = _current_generation(store, session_id)
+        family_ids = _training_family_ids(config)
+        generation_id, generation_index, status = _current_generation(store, session_id)
         if status == "COMPLETE":
-            _record_generation_training_batch(store, session_id, generation_id)
+            _close_generation_training(
+                store,
+                session_id,
+                generation_id,
+                generation_index,
+                family_ids,
+                artifacts,
+                update_models,
+            )
             return generation_status(store, session_id)
         schedule_generation(store, session_id)
         store.connection.execute(
             "UPDATE generations SET status = 'RUNNING' WHERE generation_id = ?",
             [generation_id],
         )
-        pairings = store.connection.execute(
-            """
-            SELECT pairing_id, seed, revision_a, revision_b FROM league_pairings
-            WHERE generation_id = ? AND status NOT IN ('COMPLETE', 'FAILED')
-            ORDER BY round_index, pairing_id
-            """,
-            [generation_id],
-        ).fetchall()
-        tasks: list[LeagueEpisodeTask] = []
-        for pairing_id, seed, revision_a, revision_b in pairings:
-            left = _get_revision(store, revision_a)
-            right = _get_revision(store, revision_b)
-            for orientation in (0, 1):
-                existing = store.connection.execute(
-                    "SELECT 1 FROM pairing_episodes WHERE pairing_id = ? AND orientation = ?",
-                    [pairing_id, orientation],
-                ).fetchone()
-                if existing:
-                    _persist_orientation(
-                        store,
-                        session_id,
-                        generation_id,
-                        pairing_id,
-                        orientation,
-                        seed,
-                        left,
-                        right,
-                        config.episode_steps,
-                    )
-                    continue
-                tasks.append(
-                    LeagueEpisodeTask(
-                        pairing_id,
-                        orientation,
-                        seed,
-                        left,
-                        right,
-                        config.episode_steps,
-                    )
-                )
+        rounds = [
+            int(row[0])
+            for row in store.connection.execute(
+                """
+                SELECT DISTINCT round_index FROM league_pairings
+                WHERE generation_id = ? ORDER BY round_index
+                """,
+                [generation_id],
+            ).fetchall()
+        ]
         jobs = config.jobs if config.jobs > 0 else max(1, (os.cpu_count() or 2) - 1)
-        if jobs == 1:
-            outcomes = map(_league_worker, tasks)
-            pool = None
-        else:
-            pool = ProcessPoolExecutor(
+        pool = (
+            None
+            if jobs == 1
+            else ProcessPoolExecutor(
                 max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
             )
-            outcomes = pool.map(_league_worker, tasks, chunksize=1)
+        )
         try:
-            for task, result in outcomes:
-                _store_orientation_result(
-                    store, session_id, generation_id, task, result
+            for round_index in rounds:
+                _run_round(
+                    store, session_id, generation_id, config, round_index, pool
                 )
+                run_round_hooks(
+                    store,
+                    session_id=session_id,
+                    generation_id=generation_id,
+                    generation_index=generation_index,
+                    scope="round",
+                    round_index=round_index,
+                    family_ids=family_ids,
+                    artifacts=artifacts,
+                )
+                if update_models:
+                    _update_session_models(store, family_ids, artifacts)
         finally:
             if pool is not None:
                 pool.shutdown()
-        for pairing_id, _, revision_a, _ in pairings:
-            _finish_pairing(store, pairing_id, revision_a)
         _close_generation(store, session_id, generation_id, config)
-        _record_generation_training_batch(store, session_id, generation_id)
+        _close_generation_training(
+            store,
+            session_id,
+            generation_id,
+            generation_index,
+            family_ids,
+            artifacts,
+            update_models,
+        )
         store.connection.execute(
             """
             UPDATE generations SET status = 'COMPLETE', completed_at = current_timestamp
@@ -661,6 +766,43 @@ def run_generation(
             [generation_id],
         )
         return generation_status(store, session_id)
+
+
+def _close_generation_training(
+    store: ExperimentStore,
+    session_id: str,
+    generation_id: str,
+    generation_index: int,
+    family_ids: Sequence[str],
+    artifacts: str | Path,
+    update_models: bool,
+) -> None:
+    """Offer the closed generation to each declared model, then let it train.
+
+    Ordering matters: `_close_generation` must already have written this
+    generation's `rating_snapshots`, because a surrogate's round hook counts them
+    to size its batch.
+    """
+
+    run_round_hooks(
+        store,
+        session_id=session_id,
+        generation_id=generation_id,
+        generation_index=generation_index,
+        scope="generation",
+        round_index=GENERATION_ROUND_INDEX,
+        family_ids=family_ids,
+        artifacts=artifacts,
+    )
+    if update_models:
+        _update_session_models(store, family_ids, artifacts)
+
+
+def _update_session_models(
+    store: ExperimentStore, family_ids: Sequence[str], artifacts: str | Path
+) -> None:
+    for model in session_training_models(store, family_ids):
+        update_model_in_store(store, model[0], artifacts=artifacts)
 
 
 def reevaluate_hooks(
@@ -959,6 +1101,21 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
             [generation_id],
         ).fetchall()
     )
+    reevaluation_requests = int(
+        store.connection.execute(
+            """
+            SELECT count(*) FROM episode_evaluations ee
+            JOIN pairing_episodes pe USING (match_id)
+            JOIN league_pairings lp USING (pairing_id)
+            WHERE lp.generation_id = ? AND ee.status = 'COMPLETE'
+              AND coalesce(
+                    CAST(json_extract(ee.result_json, '$.should_reevaluate') AS BOOLEAN),
+                    false
+                  )
+            """,
+            [generation_id],
+        ).fetchone()[0]
+    )
     return {
         "session_id": session_id,
         "generation_id": generation_id,
@@ -966,6 +1123,7 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
         "status": status,
         "pairings": counts,
         "hook_evaluations": hooks,
+        "reevaluation_requests": reevaluation_requests,
     }
 
 

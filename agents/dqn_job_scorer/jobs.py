@@ -76,9 +76,11 @@ def enumerate_jobs(
 
     seeds = private.get("seeds", {}) or {}
     plantable = [crop for crop in CROP_ORDER if int(seeds.get(crop, 0)) > 0]
-    held_fertilizer = int((private.get("shed", {}) or {}).get("FERTILIZER", 0)) + sum(
-        int((inventory or {}).get("FERTILIZER", 0)) for inventory in inventories
-    )
+    fertilizer_units = [
+        unit
+        for unit, inventory in enumerate(inventories)
+        if int((inventory or {}).get("FERTILIZER", 0)) > 0
+    ]
 
     empty: list[tuple[int, int]] = []
     for y, row in enumerate(tiles):
@@ -101,8 +103,18 @@ def enumerate_jobs(
                 jobs.append(Job("WATER", target, ("WATER",), crop=tile.get("crop"), tile=tile))
             if _plant_is_harvestable(tile, day):
                 jobs.append(Job("HARVEST", target, ("HARVEST",), crop=tile.get("crop"), tile=tile))
-            if held_fertilizer > 0 and int(tile.get("fertilized_until_day", -1)) < day:
-                jobs.append(Job("FERTILIZE", target, ("FERTILIZE",), crop=tile.get("crop"), tile=tile))
+            if int(tile.get("fertilized_until_day", -1)) < day:
+                for unit in fertilizer_units:
+                    jobs.append(
+                        Job(
+                            "FERTILIZE",
+                            target,
+                            ("FERTILIZE",),
+                            crop=tile.get("crop"),
+                            tile=tile,
+                            owner=unit,
+                        )
+                    )
 
     for crop in plantable:
         for target in empty:

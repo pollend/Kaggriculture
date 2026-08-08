@@ -1,0 +1,29 @@
+family_id = "receding_horizon_planner"
+name = "Receding Horizon Planner"
+entry_point = "agents.receding_horizon_planner.agent:make_agent"
+parameter_schema_version = 1
+training_adapter = "agents.receding_horizon_planner.training:adapter"
+episode_evaluator = "agents.receding_horizon_planner.main:evaluate_episode"
+
+# Inference only. Training depends on pandas and sklearn and is excluded.
+code_paths = [
+  "agents/__init__.py",
+  "agents/receding_horizon_planner/__init__.py",
+  "agents/receding_horizon_planner/main.py",
+  "agents/receding_horizon_planner/agent.py",
+  "agents/receding_horizon_planner/strategy.py",
+  "agents/receding_horizon_planner/planner.py",
+  "agents/receding_horizon_planner/scheduler.py",
+  "agents/receding_horizon_planner/market.py",
+  "agents/receding_horizon_planner/rules.py",
+]
+
+[[models]]
+model_id = "receding_horizon_planner.surrogate"
+trainer = "agents.receding_horizon_planner.train:trainer"
+min_new_batches = 2
+
+[models.config]
+n_estimators = 300
+min_samples_leaf = 2
+candidate_pool = 10000

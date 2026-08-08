@@ -11,25 +11,35 @@ from typing import Any
 from urllib.parse import urlencode
 
 
-
 @dataclass(frozen=True, slots=True)
 class TrainingModelManifest:
+    """One trainable model and the single object the lab enters it through.
+
+    `trainer` names an object exposing `on_batch` (required) and optionally
+    `on_round`. It replaced the earlier `updater` + `collector` pair, which split
+    one agent's training across two seams with different privileges.
+    """
+
     model_id: str
-    updater: str
+    trainer: str
     min_new_batches: int
-    collector: str | None = None
     config: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> TrainingModelManifest:
+        retired = sorted({"updater", "collector"} & set(values))
+        if retired:
+            raise ValueError(
+                f"[[models]] {', '.join(retired)} was replaced by a single "
+                "trainer = \"agents.<name>.train:trainer\""
+            )
         minimum = int(values.get("min_new_batches", 1))
         if minimum < 1:
             raise ValueError("model min_new_batches must be positive")
         return cls(
             model_id=str(values["model_id"]),
-            updater=str(values["updater"]),
+            trainer=str(values["trainer"]),
             min_new_batches=minimum,
-            collector=values.get("collector"),
             config=dict(values.get("config", {})),
         )
 

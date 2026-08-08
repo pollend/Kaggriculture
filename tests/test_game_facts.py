@@ -28,13 +28,18 @@ README_CROPS = {
 # "Max Yield" column lists the *fertilized* cap for wheat and carrot (6 and 4),
 # reachable only with FERTILIZE, so the planning values differ on purpose.
 README_UNFERTILIZED_YIELD = {
-    "WHEAT": 4, "CARROT": 3, "TOMATO": 4, "STRAWBERRY": 4, "MELON": 6,
+    "WHEAT": 4,
+    "CARROT": 3,
+    "TOMATO": 4,
+    "STRAWBERRY": 4,
+    "MELON": 6,
 }
 
 # Every agent module that keeps a private CROP_DATA copy.
 CROP_TABLES = [
     "agents.configurable_crop_surrogate.agent",
     "agents.dqn_job_scorer.rules",
+    "agents.receding_horizon_planner.rules",
 ]
 
 
@@ -75,7 +80,9 @@ def test_board_geometry_matches_across_agents():
     """The shed sits at the four centre tiles; a wrong copy strands every unit."""
     from agents.configurable_crop_surrogate.agent import _shed_tiles
     from agents.dqn_job_scorer.rules import shed_tiles
+    from agents.receding_horizon_planner.rules import shed_tiles as planner_shed_tiles
 
     for board_size in (10, 8, 6):
         assert shed_tiles(board_size) == _shed_tiles(board_size)
+        assert planner_shed_tiles(board_size) == _shed_tiles(board_size)
     assert shed_tiles(10) == ((4, 4), (5, 4), (4, 5), (5, 5))

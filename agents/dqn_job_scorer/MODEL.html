@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="How the Kaggriculture DQN Job Scorer represents, scores, trains, and deploys its policy.">
+  <title>How the DQN Job Scorer Works</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18221c;
+      --muted: #607067;
+      --paper: #f7faf5;
+      --panel: #ffffff;
+      --line: #dce6dc;
+      --green: #17613a;
+      --green-2: #2f7d4c;
+      --green-soft: #e7f3e9;
+      --gold: #976300;
+      --gold-soft: #fff3d3;
+      --blue: #245d87;
+      --blue-soft: #e9f3fb;
+      --purple: #694b8e;
+      --purple-soft: #f2ebfa;
+      --radius: 16px;
+      --shadow: 0 14px 38px rgba(32, 61, 39, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(35, 101, 55, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(35, 101, 55, 0.04) 1px, transparent 1px),
+        radial-gradient(circle at 15% 0%, rgba(75, 143, 78, 0.16), transparent 30rem),
+        var(--paper);
+      background-size: 32px 32px, 32px 32px, auto, auto;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.62;
+    }
+
+    a { color: var(--green); text-underline-offset: 0.18em; }
+    a:hover { text-decoration-thickness: 2px; }
+
+    code, .formula {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+    }
+
+    code {
+      padding: 0.12em 0.38em;
+      border: 1px solid #d7e1d7;
+      border-radius: 5px;
+      background: #f1f5ef;
+      font-size: 0.9em;
+    }
+
+    .page {
+      width: min(1120px, calc(100% - 34px));
+      margin: 0 auto;
+      padding: 46px 0 80px;
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: clamp(30px, 6vw, 64px);
+      border: 1px solid rgba(34, 105, 55, 0.25);
+      border-radius: 25px;
+      background: rgba(255, 255, 255, 0.93);
+      box-shadow: var(--shadow);
+    }
+
+    .hero::before,
+    .hero::after {
+      content: "";
+      position: absolute;
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    .hero::before {
+      width: 260px;
+      height: 260px;
+      right: -90px;
+      top: -105px;
+      background: linear-gradient(135deg, rgba(57, 139, 79, 0.22), rgba(234, 186, 72, 0.15));
+    }
+
+    .hero::after {
+      width: 120px;
+      height: 120px;
+      right: 145px;
+      bottom: -82px;
+      background: rgba(36, 93, 135, 0.09);
+    }
+
+    .eyebrow {
+      margin: 0 0 9px;
+      color: var(--green);
+      font-size: 0.78rem;
+      font-weight: 850;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.18; }
+    h1 { margin: 0; font-size: clamp(2.15rem, 6vw, 4.15rem); letter-spacing: -0.05em; }
+    h2 { margin: 0 0 18px; font-size: clamp(1.55rem, 3vw, 2.2rem); letter-spacing: -0.03em; }
+    h3 { margin: 0 0 9px; font-size: 1.08rem; }
+
+    .lede {
+      max-width: 810px;
+      margin: 18px 0 0;
+      color: #344239;
+      font-size: clamp(1.04rem, 2vw, 1.24rem);
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 24px;
+    }
+
+    .badge {
+      padding: 7px 11px;
+      border-radius: 999px;
+      color: var(--green);
+      background: var(--green-soft);
+      font-size: 0.76rem;
+      font-weight: 800;
+      letter-spacing: 0.035em;
+      text-transform: uppercase;
+    }
+
+    nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px 19px;
+      margin-top: 22px;
+      padding: 16px 20px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(255, 255, 255, 0.84);
+    }
+
+    nav a { font-size: 0.9rem; font-weight: 750; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+
+    section { margin-top: 58px; scroll-margin-top: 24px; }
+    .intro { max-width: 900px; font-size: 1.04rem; }
+
+    .cards, .two-column, .three-column, .stats {
+      display: grid;
+      gap: 18px;
+    }
+
+    .two-column, .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .three-column, .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .card, .stat, .callout, .table-wrap, .formula-box {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: 0 7px 24px rgba(32, 61, 39, 0.045);
+    }
+
+    .card { padding: 23px; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+    .card ul { padding-left: 1.2rem; }
+
+    .stat { padding: 22px; text-align: center; }
+    .stat strong { display: block; color: var(--green); font-size: 2rem; line-height: 1; }
+    .stat span { display: block; margin-top: 9px; color: var(--muted); font-size: 0.88rem; }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 25px;
+      align-items: stretch;
+      margin-top: 25px;
+    }
+
+    .flow.five { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+
+    .step {
+      display: grid;
+      min-height: 126px;
+      position: relative;
+      place-content: center;
+      padding: 17px;
+      border: 1px solid #c8d9ca;
+      border-radius: 14px;
+      background: linear-gradient(145deg, #fff, #eff7ee);
+      text-align: center;
+    }
+
+    .step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -20px;
+      top: 50%;
+      color: var(--green-2);
+      font-size: 1.45rem;
+      font-weight: 900;
+      transform: translateY(-50%);
+    }
+
+    .step strong { display: block; font-size: 0.92rem; }
+    .step small { display: block; margin-top: 6px; color: var(--muted); line-height: 1.35; }
+
+    .formula-box {
+      margin: 20px 0;
+      padding: clamp(18px, 4vw, 28px);
+      border-left: 5px solid var(--green);
+      background: linear-gradient(135deg, #fff, #f1f8f0);
+    }
+
+    .formula {
+      overflow-wrap: anywhere;
+      color: #204b2e;
+      font-size: clamp(0.95rem, 2.5vw, 1.24rem);
+      font-weight: 750;
+    }
+
+    .formula-note { margin: 10px 0 0; color: var(--muted); font-size: 0.9rem; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 14px 16px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: #385043; background: #f1f6ef; font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td:first-child { white-space: nowrap; font-weight: 800; }
+
+    .network {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 13px;
+      margin: 23px 0;
+      padding: 24px;
+      border: 1px dashed #a8c4ad;
+      border-radius: 15px;
+      background: var(--green-soft);
+    }
+
+    .layer {
+      min-width: 108px;
+      padding: 15px;
+      border: 1px solid #b7ceb9;
+      border-radius: 11px;
+      background: #fff;
+      text-align: center;
+    }
+
+    .layer strong { display: block; color: var(--green); font-size: 1.3rem; }
+    .layer small { color: var(--muted); }
+    .arrow { color: var(--green); font-size: 1.45rem; font-weight: 900; }
+
+    .callout { padding: 23px; border-left: 5px solid var(--blue); background: var(--blue-soft); }
+    .callout.gold { border-left-color: var(--gold); background: var(--gold-soft); }
+    .callout.purple { border-left-color: var(--purple); background: var(--purple-soft); }
+    .callout p:last-child { margin-bottom: 0; }
+
+    .tag {
+      display: inline-block;
+      margin: 3px 4px 3px 0;
+      padding: 4px 8px;
+      border-radius: 6px;
+      color: #285136;
+      background: var(--green-soft);
+      font: 700 0.78rem/1.2 "SFMono-Regular", Consolas, monospace;
+    }
+
+    .timeline {
+      margin: 24px 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: training-step;
+    }
+
+    .timeline li {
+      position: relative;
+      margin-left: 21px;
+      padding: 0 0 25px 34px;
+      border-left: 2px solid #bfd3c1;
+      counter-increment: training-step;
+    }
+
+    .timeline li:last-child { padding-bottom: 0; border-left-color: transparent; }
+    .timeline li::before {
+      content: counter(training-step);
+      display: grid;
+      width: 30px;
+      height: 30px;
+      position: absolute;
+      left: -16px;
+      top: -2px;
+      place-items: center;
+      border-radius: 50%;
+      color: #fff;
+      background: var(--green);
+      font-size: 0.82rem;
+      font-weight: 800;
+    }
+
+    .timeline strong { display: block; margin-bottom: 4px; }
+
+    pre {
+      overflow-x: auto;
+      margin: 16px 0 0;
+      padding: 18px;
+      border-radius: 12px;
+      color: #eaf5e9;
+      background: #1d2d22;
+      font: 0.88rem/1.55 "SFMono-Regular", Consolas, monospace;
+    }
+
+    footer {
+      margin-top: 65px;
+      padding-top: 24px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+
+    @media (max-width: 900px) {
+      .flow, .flow.five { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .step:not(:last-child)::after { display: none; }
+    }
+
+    @media (max-width: 700px) {
+      .cards, .two-column, .three-column, .stats { grid-template-columns: 1fr; }
+      .flow, .flow.five { grid-template-columns: 1fr; gap: 24px; }
+      .step { min-height: 90px; }
+      .step:not(:last-child)::after {
+        content: "↓";
+        display: block;
+        right: 50%;
+        top: auto;
+        bottom: -28px;
+        transform: translateX(50%);
+      }
+    }
+
+    @media (max-width: 500px) {
+      .page { width: min(100% - 20px, 1120px); padding-top: 16px; }
+      .hero { padding: 25px 20px; border-radius: 17px; }
+      .arrow { transform: rotate(90deg); }
+      th, td { padding: 12px; }
+    }
+
+    @media print {
+      body { background: #fff; font-size: 10.5pt; }
+      .page { width: 100%; padding: 0; }
+      .hero, .card, .stat, .callout, .table-wrap, .formula-box { box-shadow: none; break-inside: avoid; }
+      nav { display: none; }
+      section { margin-top: 30px; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <p class="eyebrow">Model guide</p>
+      <h1>How the DQN Job Scorer Works</h1>
+      <p class="lede">
+        The model does not control the entire farm directly. Rules create concrete jobs and handle
+        navigation and market orders; a compact Q-network learns which field job each unit should
+        pursue from the current state.
+      </p>
+      <div class="badges" aria-label="Model summary">
+        <span class="badge">Hybrid controller</span>
+        <span class="badge">72 features</span>
+        <span class="badge">3-layer MLP</span>
+        <span class="badge">Double DQN</span>
+        <span class="badge">NumPy deployment</span>
+      </div>
+    </header>
+
+    <nav aria-label="Guide sections">
+      <a href="#idea">Core idea</a>
+      <a href="#decision">Decision loop</a>
+      <a href="#jobs">Jobs</a>
+      <a href="#features">Features</a>
+      <a href="#network">Network</a>
+      <a href="#training">Training</a>
+      <a href="#replay">Replay</a>
+      <a href="#deployment">Deployment</a>
+    </nav>
+
+    <section id="idea">
+      <h2>The core idea</h2>
+      <p class="intro">
+        A normal DQN chooses among a fixed list of actions. Kaggriculture has a variable number of
+        possible jobs: water this plant, harvest that crop, plant a melon on one of many empty
+        tiles, or return a particular worker's inventory to the shed. Instead of producing one
+        output per fixed action, this model evaluates each candidate independently.
+      </p>
+      <div class="formula-box">
+        <div class="formula">Q<sub>θ</sub>(state, job, unit) → expected discounted return</div>
+        <p class="formula-note">
+          The same network is applied to every candidate. The highest allowed Q-value becomes the
+          unit's selected job.
+        </p>
+      </div>
+      <div class="stats">
+        <article class="stat"><strong>64</strong><span>maximum candidate jobs in one turn</span></article>
+        <article class="stat"><strong>72</strong><span>features for one state/job/unit row</span></article>
+        <article class="stat"><strong>1</strong><span>scalar Q-value produced per candidate</span></article>
+      </div>
+      <div class="callout" style="margin-top: 20px">
+        <strong>What remains rule-based:</strong> legal job construction, pathing one tile per turn,
+        job commitment, selling crops, hiring hands, buying seeds, and endgame liquidation. The
+        network learns field-job priority—not the full action dictionary.
+      </div>
+    </section>
+
+    <section id="decision">
+      <h2>One inference turn</h2>
+      <div class="flow" role="img" aria-label="Observation becomes jobs, features, Q scores, masked selections, commitments, and game actions">
+        <div class="step"><strong>Read observation</strong><small>Farm, inventory, opponent, market, time</small></div>
+        <div class="step"><strong>Enumerate jobs</strong><small>Build concrete tile targets and operations</small></div>
+        <div class="step"><strong>Featurize</strong><small>One 72-value row per unit/job pair</small></div>
+        <div class="step"><strong>Score</strong><small>Run all rows through the same MLP</small></div>
+        <div class="step"><strong>Mask and select</strong><small>Exclude reserved or unit-owned jobs</small></div>
+        <div class="step"><strong>Route or execute</strong><small>Move toward target or act on arrival</small></div>
+      </div>
+
+      <div class="two-column" style="margin-top: 22px">
+        <article class="card">
+          <h3>Units are assigned sequentially</h3>
+          <p>
+            The farmer chooses first, followed by hands in observation order. Once a non-pass job
+            is selected, it is marked as taken so another unit cannot select the same candidate in
+            that turn. Unit-owned jobs such as <code>DROP</code> are masked from everyone else.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Travel uses commitments</h3>
+          <p>
+            If the job is remote, deterministic routing emits one movement action and remembers the
+            target. The unit keeps walking until it arrives, the job disappears, or 20 turns pass.
+            Exploration happens when choosing a job, not on every travel step.
+          </p>
+        </article>
+      </div>
+
+      <div class="callout gold" style="margin-top: 20px">
+        <strong>Why commitment matters:</strong> without it, small Q-value changes can make a unit
+        alternate between two destinations and never reach either. The 3rd unit feature marks the
+        committed candidate so the network can distinguish otherwise identical board states.
+      </div>
+    </section>
+
+    <section id="jobs">
+      <h2>The candidate job space</h2>
+      <p>
+        <a href="jobs.py"><code>jobs.py</code></a> converts the variable farm state into concrete
+        candidates. <code>PASS</code> is always index 0; other jobs attach a target tile, game action,
+        optional crop, optional tile state, and optional owning unit.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Job</th><th>Created when</th><th>Network is deciding</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>PASS</td><td>Always</td><td>Whether doing nothing is preferable</td></tr>
+            <tr><td>WATER</td><td>A plant is not watered today</td><td>Which plant is most urgent</td></tr>
+            <tr><td>HARVEST</td><td>A plant has reachable yield at or after first yield day</td><td>Whether and where to harvest</td></tr>
+            <tr><td>PLANT</td><td>An empty tile and owned seed form a valid pair</td><td>Which crop and tile deserve labor</td></tr>
+            <tr><td>DIG</td><td>A tile contains a weed</td><td>When clearing space is worth the travel</td></tr>
+            <tr><td>FERTILIZE</td><td>Fertilizer exists and a plant is not currently fertilized</td><td>Which plant should receive the bonus</td></tr>
+            <tr><td>DROP</td><td>A unit carries inventory</td><td>When that specific unit should return to the shed</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Candidate count is capped at 64. If the raw set is larger, the enumerator pins
+        <code>PASS</code> and unit-owned jobs, then prioritizes endangered watering, harvesting,
+        ordinary watering, maintenance, and finally planting. Truncations are recorded for training
+        diagnostics rather than hidden.
+      </p>
+      <div class="callout purple">
+        <strong>Current strategy boundary:</strong> the learned job set is crop-focused. It does not
+        build animal structures, feed or care for animals, collect animal products, buy land, or
+        learn market orders. See <a href="REVIEW.html">the technical review</a> for limitations and
+        known correctness concerns.
+      </div>
+    </section>
+
+    <section id="features">
+      <h2>The 72-value input</h2>
+      <p>
+        Feature construction lives in <a href="features.py"><code>features.py</code></a> and is shared
+        by training and inference. A layout change invalidates old weights, so the dimensions are
+        explicit and parity-tested.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Block</th><th>Size</th><th>Contents</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Global state</td>
+              <td>43</td>
+              <td>
+                Time and season progress; own and opponent money; seed counts; shed crops and
+                fertilizer; market price and inventory signals; hands and hires; planted, empty,
+                weed, unwatered, and harvestable counts; unlocked quadrants; carried inventory; shed
+                headroom.
+              </td>
+            </tr>
+            <tr>
+              <td>Static job</td>
+              <td>26</td>
+              <td>
+                Job-kind one-hot; crop one-hot and crop-present flag; plant age, maturity, yield,
+                missed water, current water, bonus window, and fertilization; crop price ratio,
+                seed cost, ongoing flag, season feasibility; target distance from the shed.
+              </td>
+            </tr>
+            <tr>
+              <td>Unit/job relation</td>
+              <td>3</td>
+              <td>
+                Normalized Manhattan distance, already-on-target flag, and whether this candidate is
+                the unit's current commitment.
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="formula-box">
+        <div class="formula">x(state, job, unit) = [global<sub>43</sub> | job<sub>26</sub> | relation<sub>3</sub>]</div>
+        <p class="formula-note">
+          Continuous values are scaled—money, counts, time, price ratios, and Manhattan distance—so
+          the network does not receive wildly different numeric magnitudes.
+        </p>
+      </div>
+      <div class="two-column">
+        <article class="card">
+          <h3>Shared work</h3>
+          <p>
+            Global features are calculated once per turn. Static job features are calculated once
+            per candidate. Only the three relation features change from one unit to another.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Compact replay</h3>
+          <p>
+            Rollouts store globals and job statics once per time step, plus small target and unit
+            position arrays. Unit/job distance features are reconstructed when sampling, avoiding a
+            large duplicated candidate matrix for every unit transition.
+          </p>
+        </article>
+      </div>
+    </section>
+
+    <section id="network">
+      <h2>The Q-network</h2>
+      <p>
+        The model is a multilayer perceptron. It has no recurrence, convolution, attention, or
+        separate output head per action. A batch dimension simply lets it score many candidates in
+        parallel.
+      </p>
+      <div class="network" role="img" aria-label="72 inputs flow through 128 ReLU units, another 128 ReLU units, and one linear Q output">
+        <div class="layer"><strong>72</strong><small>input features</small></div>
+        <span class="arrow">→</span>
+        <div class="layer"><strong>128</strong><small>linear + ReLU</small></div>
+        <span class="arrow">→</span>
+        <div class="layer"><strong>128</strong><small>linear + ReLU</small></div>
+        <span class="arrow">→</span>
+        <div class="layer"><strong>1</strong><small>linear Q-value</small></div>
+      </div>
+      <div class="formula-box">
+        <div class="formula">Q<sub>θ</sub>(x) = W₃ · ReLU(W₂ · ReLU(W₁x + b₁) + b₂) + b₃</div>
+      </div>
+      <div class="two-column">
+        <article class="card">
+          <h3>Greedy play</h3>
+          <p>
+            Submission-time epsilon is zero. The agent takes the allowed candidate with the highest
+            Q-value. Equal values break toward the lowest candidate index, making inference
+            deterministic for a fixed observation.
+          </p>
+        </article>
+        <article class="card">
+          <h3>Exploration</h3>
+          <p>
+            During collection, epsilon-greedy selection sometimes chooses a uniformly random
+            allowed candidate. Epsilon decays by the number of observed unit transitions, not by
+            episode or wall-clock time.
+          </p>
+        </article>
+      </div>
+      <p>
+        Training uses the PyTorch mirror in
+        <a href="training/network.py"><code>training/network.py</code></a>. Deployment transposes and
+        exports its linear weights into <code>weights.npz</code>, which
+        <a href="policy.py"><code>policy.py</code></a> evaluates with NumPy. Tests pin both forward
+        passes to the same result.
+      </p>
+    </section>
+
+    <section id="training">
+      <h2>How the model learns</h2>
+      <div class="flow five" role="img" aria-label="Collect games, calculate shaped reward, add episodes to replay, perform Double DQN updates, and evaluate a checkpoint">
+        <div class="step"><strong>Collect games</strong><small>Epsilon-greedy policy versus curriculum opponents</small></div>
+        <div class="step"><strong>Shape rewards</strong><small>Cash change, farm potential, outcome</small></div>
+        <div class="step"><strong>Add to replay</strong><small>Recent FIFO plus historical reservoir</small></div>
+        <div class="step"><strong>Update network</strong><small>n-step Double DQN with Huber loss</small></div>
+        <div class="step"><strong>Evaluate</strong><small>Greedy seat-swapped arena matches</small></div>
+      </div>
+
+      <h3 style="margin-top: 28px">Reward shaping</h3>
+      <p>
+        Money alone is sparse and initially punishes useful investments. Buying a seed lowers cash
+        immediately, while its harvest may arrive many turns later. The recorder therefore adds a
+        potential term based on cash and the current market value of crops in the shed, carried by
+        units, and already available as plant yield.
+      </p>
+      <div class="formula-box">
+        <div class="formula">r<sub>t</sub> = Δmoney<sub>t</sub>/1000 + γΦ(s<sub>t+1</sub>) − Φ(s<sub>t</sub>)</div>
+        <div class="formula" style="margin-top: 12px">r<sub>terminal</sub> += +1 for a win, −1 for a loss</div>
+        <p class="formula-note">
+          Φ is also divided by 1000. Potential-based shaping gives earlier learning signals while
+          preserving the underlying policy objective when applied consistently.
+        </p>
+      </div>
+
+      <h3>Double DQN target</h3>
+      <p>
+        Replay accumulates up to <code>n_step</code> rewards. The online network chooses the next
+        candidate, while the target network supplies its value. This separates selection from
+        evaluation and reduces ordinary DQN's maximization bias.
+      </p>
+      <div class="formula-box">
+        <div class="formula">R<sub>t</sub><sup>(n)</sup> = Σ<sub>k=0..n−1</sub> γ<sup>k</sup>r<sub>t+k</sub></div>
+        <div class="formula" style="margin-top: 12px">a* = argmax<sub>a</sub> Q<sub>online</sub>(s<sub>t+n</sub>, a)</div>
+        <div class="formula" style="margin-top: 12px">y = R<sub>t</sub><sup>(n)</sup> + γ<sup>n</sup>Q<sub>target</sub>(s<sub>t+n</sub>, a*)</div>
+        <p class="formula-note">At a terminal transition, the bootstrap term is zero.</p>
+      </div>
+
+      <div class="three-column">
+        <article class="card">
+          <h3>Optimizer</h3>
+          <p><span class="tag">Adam</span> <span class="tag">lr 1e-4</span></p>
+          <p>The online network is optimized against the target using smooth L1 (Huber) loss.</p>
+        </article>
+        <article class="card">
+          <h3>Stability</h3>
+          <p><span class="tag">grad clip 10</span> <span class="tag">target sync 2000</span></p>
+          <p>Gradient norms are clipped, and the target network periodically copies online weights.</p>
+        </article>
+        <article class="card">
+          <h3>Default horizon</h3>
+          <p><span class="tag">γ 0.997</span> <span class="tag">n-step 3</span></p>
+          <p>A high discount factor reflects the long delay between farm work and realized sales.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="replay">
+      <h2>Rollouts and replay memory</h2>
+      <p>
+        Each episode is stored as a struct of NumPy arrays by
+        <a href="training/collect.py"><code>training/collect.py</code></a>. Variable candidate and
+        unit counts are padded only within an episode, with boolean masks identifying real rows.
+        Batches are serialized as compressed <code>.npz</code> without pickle.
+      </p>
+      <div class="two-column">
+        <article class="card">
+          <h3>Stored each step</h3>
+          <ul>
+            <li>43 global features</li>
+            <li>Static features and targets for candidate jobs</li>
+            <li>Unit positions and existence mask</li>
+            <li>Chosen and committed job indices</li>
+            <li>Money, potential, rewards, and truncation count</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Rebuilt when sampled</h3>
+          <ul>
+            <li>Unit-to-target Manhattan distance</li>
+            <li>Already-at-target indicator</li>
+            <li>Committed-candidate indicator</li>
+            <li>Full 72-feature candidate rows</li>
+            <li>Padded next-state candidate batch</li>
+          </ul>
+        </article>
+      </div>
+      <p>
+        <a href="training/replay.py"><code>training/replay.py</code></a> samples an episode, time,
+        and active unit. Its buffer combines recent FIFO episodes with a fixed-size reservoir sample
+        of older evictions. The recent segment follows the current policy; the reservoir keeps older
+        state distributions visible and reduces catastrophic forgetting.
+      </p>
+      <div class="callout gold">
+        <strong>Configuration note:</strong> the standalone trainer defaults to an 800-episode
+        buffer with 35% reserved for historical sampling, an epsilon floor of 0.15, 16 episodes per
+        round, and 400 gradient steps. Persistent league training reads its values from
+        <a href="agent.toml"><code>agent.toml</code></a>, so verify that manifest before a long run.
+      </div>
+    </section>
+
+    <section id="market">
+      <h2>The model and the market controller</h2>
+      <p>
+        Field choices and market choices happen in parallel, but only field choices are learned.
+        <a href="market.py"><code>market.py</code></a> deterministically builds up to ten orders per
+        turn.
+      </p>
+      <div class="three-column">
+        <article class="card">
+          <h3>Sell</h3>
+          <p>Crops are sold according to the configured immediate, price-threshold, or shed-pressure policy.</p>
+        </article>
+        <article class="card">
+          <h3>Hire</h3>
+          <p>Hands are hired early in the day up to the configured limit while preserving a cash reserve.</p>
+        </article>
+        <article class="card">
+          <h3>Buy seeds</h3>
+          <p>Crop scores combine profitability, current price, town demand, opponent supply, and season feasibility.</p>
+        </article>
+      </div>
+      <p>
+        This separation means the Q-network learns from states partly produced by a fixed economic
+        policy. Changing market rules changes the data distribution even when the neural network and
+        feature layout stay unchanged.
+      </p>
+    </section>
+
+    <section id="deployment">
+      <h2>From training to submission</h2>
+      <ol class="timeline">
+        <li>
+          <strong>Train the PyTorch online network</strong>
+          Rollouts, replay, optimization, and target-network updates run under the training package.
+        </li>
+        <li>
+          <strong>Evaluate greedily in the arena</strong>
+          Checkpoints play seat-swapped seeds. Paired score margin—not training return or raw money—
+          decides whether a candidate is worth promoting.
+        </li>
+        <li>
+          <strong>Export the inference weights</strong>
+          Linear matrices and biases are converted to NumPy orientation and stored in
+          <code>weights.npz</code>. The standalone trainer only overwrites live weights with
+          <code>--ship</code>.
+        </li>
+        <li>
+          <strong>Load once at agent import</strong>
+          <a href="main.py"><code>main.py</code></a> loads the compressed weights into the NumPy
+          network. Kaggle calls the module-level <code>agent(obs, configuration)</code> function.
+        </li>
+        <li>
+          <strong>Build the minimal archive</strong>
+          The exporter copies the inference allowlist and adds a root-level Kaggle shim. PyTorch,
+          replay data, trainers, and experiment infrastructure are excluded.
+        </li>
+      </ol>
+      <pre><span aria-hidden="true"># Standalone training; --ship promotes the measured best into weights.npz</span>
+python -m agents.dqn_job_scorer.training.train --rounds 200 --jobs 8 --ship
+
+<span aria-hidden="true"># Build submission folder and dqn_job_scorer_submission.tgz</span>
+python agents/dqn_job_scorer/export_submission.py</pre>
+      <div class="callout" style="margin-top: 20px">
+        <strong>Submission runtime:</strong> standard library plus NumPy. The PyTorch network exists
+        only for training. The deployed model performs two small hidden-layer matrix multiplications
+        for each candidate set, well inside the action timeout.
+      </div>
+    </section>
+
+    <section id="files">
+      <h2>Code map</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+          <tbody>
+            <tr><td><a href="main.py">main.py</a></td><td>Per-turn orchestration, unit assignment, commitments, routing, recorder integration</td></tr>
+            <tr><td><a href="jobs.py">jobs.py</a></td><td>Candidate job construction, ownership, cap, and truncation priorities</td></tr>
+            <tr><td><a href="features.py">features.py</a></td><td>Shared 72-value feature representation</td></tr>
+            <tr><td><a href="policy.py">policy.py</a></td><td>NumPy MLP, weight serialization, and epsilon-greedy selection</td></tr>
+            <tr><td><a href="market.py">market.py</a></td><td>Rule-based selling, hiring, and seed purchasing</td></tr>
+            <tr><td><a href="training/collect.py">training/collect.py</a></td><td>Episode recording, reward shaping, and rollout collection</td></tr>
+            <tr><td><a href="training/replay.py">training/replay.py</a></td><td>Recent/reservoir storage, reconstruction, and n-step sampling</td></tr>
+            <tr><td><a href="training/train.py">training/train.py</a></td><td>Standalone Double DQN loop, curriculum, evaluation, and promotion</td></tr>
+            <tr><td><a href="training/updater.py">training/updater.py</a></td><td>Persistent league collector, incremental updates, checkpoints, and gates</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      <p>
+        DQN Job Scorer model guide · <a href="README.md">Agent README</a> ·
+        <a href="REVIEW.html">Technical review</a>
+      </p>
+    </footer>
+  </main>
+</body>
+</html>

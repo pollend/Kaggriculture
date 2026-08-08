@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
+from agents.configurable_crop_surrogate.strategy import Strategy, generate_population
 from kaggriculture_lab.episode_metrics import episode_metrics
 from kaggriculture_lab.storage import ExperimentStore
-from agents.configurable_crop_surrogate.strategy import Strategy, generate_population
 from sim.runner import MatchResult, run_match
 
 

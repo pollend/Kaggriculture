@@ -15,6 +15,13 @@ anchor_manifests = [
   "agents/competitor_romantamrazov_kaggriculture_hamburger/agent.toml",
   "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/agent.toml",
 ]
+# Models this session drives round hooks for. The crop surrogate is the family
+# being bred; the DQN is not bred by any league and rides this one's round
+# schedule as its exploration clock.
+training_manifests = [
+  "agents/configurable_crop_surrogate/agent.toml",
+  "agents/dqn_job_scorer/agent.toml",
+]
 population_size = 20
 rounds_per_generation = 20
 hall_of_fame_rounds = 4

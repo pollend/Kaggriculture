@@ -7,7 +7,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kaggriculture_lab.storage import ExperimentStore
+from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
 
 
 def rebuild(database: Path, *, force: bool = False) -> tuple[Path, Path | None]:
@@ -30,6 +30,7 @@ def rebuild(database: Path, *, force: bool = False) -> tuple[Path, Path | None]:
                 "training_batches",
                 "model_updates",
                 "model_training_checkpoints",
+                "model_round_hooks",
             }
             present = {
                 str(row[0])
@@ -37,7 +38,7 @@ def rebuild(database: Path, *, force: bool = False) -> tuple[Path, Path | None]:
                     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
                 ).fetchall()
             }
-            if version != 3 or not required <= present:
+            if version != SCHEMA_VERSION or not required <= present:
                 raise RuntimeError("new database failed schema validation")
         if database.exists():
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

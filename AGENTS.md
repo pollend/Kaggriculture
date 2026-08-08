@@ -9,6 +9,28 @@ derive family-specific features. Keep live episode memory inside the agent calla
 reset it at the start of each episode; persistent ratings, training data, and model
 checkpoints belong to the league store, never to Kaggle submission-time globals.
 
+An agent that trains declares `[[models]]` in its manifest, each naming one
+`trainer = "agents.<name>.train:trainer"`. That object is the entire training
+surface between the lab and the agent — two calls, both optional to act on:
+
+```python
+class Trainer:
+    def on_round(self, context, reader, writer) -> None:
+        """A league round closed (`context.scope == "round"`), or the whole
+        generation did (`"generation"`). Record training data if this is a
+        moment worth learning from; `writer` is bound to your model."""
+
+    def on_batch(self, context, reader) -> ModelUpdateResult:
+        """Enough new batches accumulated. Train, and return a candidate
+        checkpoint. The lab decides whether it gets promoted."""
+```
+
+The league owns matchups, rounds, and every promotion decision; the agent owns
+what training means. `reader` accepts SELECT/WITH only, and the round hook is
+offered at most once per round per model, so it is safe to resume an interrupted
+run without repeating expensive work. Which sessions drive which trainers is
+declared by `training_manifests` in the league config, not in code.
+
 For full game rules, the crop / animal / shop tables, the price function, and turn-processing order, see [README.md](README.md).
 
 ## Game Overview
