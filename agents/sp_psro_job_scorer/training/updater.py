@@ -202,6 +202,21 @@ def _train_role(
     batch_size = int(config.get("batch_size", 512))
     loss_fn = nn.SmoothL1Loss()
     losses: list[float] = []
+    market_steps = int(config.get("market_gradient_steps_per_batch", 100)) * max(
+        1, steps // max(1, int(config.get("gradient_steps_per_batch", 400)))
+    )
+    planned_market_steps = market_steps if buffer.market_transitions else 0
+    total_steps = steps + planned_market_steps
+    completed_steps = 0
+    next_percentage = 10
+
+    def report_progress() -> None:
+        nonlocal next_percentage
+        percentage = 100 if total_steps == 0 else int(100 * completed_steps / total_steps)
+        while percentage >= next_percentage:
+            print(f"[sp-psro training] gradient progress {next_percentage}%", flush=True)
+            next_percentage += 10
+
     for _ in range(steps):
         batch = buffer.sample(batch_size)
         features = torch.from_numpy(batch.features).to(device)
@@ -227,6 +242,8 @@ def _train_role(
         gradient_steps += 1
         if gradient_steps % target_sync == 0:
             target.load_state_dict(online.state_dict())
+        completed_steps += 1
+        report_progress()
 
     market_online = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
     market_target = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
@@ -241,9 +258,6 @@ def _train_role(
     market_gradient_steps = int(role_state.get("market_gradient_steps", 0))
     market_target_sync = int(config.get("market_target_sync", 1000))
     market_batch_size = int(config.get("market_batch_size", 128))
-    market_steps = int(config.get("market_gradient_steps_per_batch", 100)) * max(
-        1, steps // max(1, int(config.get("gradient_steps_per_batch", 400)))
-    )
     market_losses: list[float] = []
     if buffer.market_transitions:
         for _ in range(market_steps):
@@ -276,6 +290,8 @@ def _train_role(
             market_gradient_steps += 1
             if market_gradient_steps % market_target_sync == 0:
                 market_target.load_state_dict(market_online.state_dict())
+            completed_steps += 1
+            report_progress()
     return (
         {
             "online": {k: v.detach().cpu() for k, v in online.state_dict().items()},
