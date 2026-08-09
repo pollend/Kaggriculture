@@ -28,17 +28,16 @@ if TYPE_CHECKING:
 class PopulationCollector:
     def collect(self, context, reader, writer) -> list[str]:
         config = context.config
-        count = int(config.get("batches_per_round", 1))
-        episodes = int(config.get("episodes_per_batch", 16))
+        count = int(config["batches_per_round"])
+        episodes = int(config["episodes_per_batch"])
         if count < 1:
             raise ValueError("batches_per_round must be positive")
         if episodes < 2 or episodes % 2:
             raise ValueError("episodes_per_batch must be a positive even number")
-        seed = int(config.get("seed", 0))
+        seed = int(config["seed"])
         state = load_state(
             context.active_checkpoint.trainer_artifact_path if context.active_checkpoint is not None else None,
             seed,
-            config.get("initial_population_weights"),
         )
         rollout_root = Path(context.artifacts) / "rollout_policies" / context.generation_id
         rollout_root.mkdir(parents=True, exist_ok=True)
@@ -61,13 +60,14 @@ class PopulationCollector:
         beta = _network_from_state(state["live"]["beta"])
         beta_path = rollout_root / f"beta-round-{context.round_index:04d}.npz"
         beta.save(beta_path)
-        total_transitions = int(
+        exploration_start = int(state["exploration_start_batch_seq"])
+        exploration_transitions = int(
             reader.fetchone(
                 """
                 SELECT coalesce(sum(CAST(json_extract(metadata_json, '$.transitions') AS BIGINT)), 0)
-                FROM training_batches WHERE model_id = ?
+                FROM training_batches WHERE model_id = ? AND batch_seq > ?
                 """,
-                [context.model_id],
+                [context.model_id, exploration_start],
             )[0]
         )
         batch_index = int(
@@ -76,23 +76,20 @@ class PopulationCollector:
                 [context.model_id],
             )[0]
         )
-        rng = np.random.default_rng(seed + total_transitions)
+        rng = np.random.default_rng(seed + batch_index)
         written = []
         for local_index in range(count):
             fraction = min(
                 1.0,
-                total_transitions / max(1, int(config.get("epsilon_decay_transitions", 200_000))),
+                exploration_transitions / max(1, int(config["epsilon_decay_transitions"])),
             )
-            epsilon = float(config.get("epsilon_start", 1.0)) + fraction * (
-                float(config.get("epsilon_end", 0.15)) - float(config.get("epsilon_start", 1.0))
+            epsilon = float(config["epsilon_start"]) + fraction * (
+                float(config["epsilon_end"]) - float(config["epsilon_start"])
             )
-            market_epsilon = float(config.get("market_epsilon_start", 1.0)) + fraction * (
-                float(config.get("market_epsilon_end", 0.15))
-                - float(config.get("market_epsilon_start", 1.0))
+            market_epsilon = float(config["market_epsilon_start"]) + fraction * (
+                float(config["market_epsilon_end"]) - float(config["market_epsilon_start"])
             )
-            paired_seeds = [
-                int(value) for value in rng.integers(0, 2**31 - 1, size=episodes // 2)
-            ]
+            paired_seeds = [int(value) for value in rng.integers(0, 2**31 - 1, size=episodes // 2)]
             seeds = [value for value in paired_seeds for _ in range(2)]
             records = collect_batch(
                 population,
@@ -100,11 +97,11 @@ class PopulationCollector:
                 beta_path,
                 seeds,
                 epsilon,
-                float(config.get("gamma", 0.997)),
-                int(config.get("jobs", 1)),
+                float(config["gamma"]),
+                int(config["jobs"]),
                 offset=(batch_index + local_index) * episodes,
                 config={
-                    "episodeSteps": int(config.get("episode_steps", 720)),
+                    "episodeSteps": int(config["episode_steps"]),
                     "trace_root": str(
                         Path(context.artifacts)
                         / "episode_traces"
@@ -127,8 +124,7 @@ class PopulationCollector:
                     writer.record_policy_episode(
                         context=context,
                         manifest_path="agents/sp_psro_job_scorer/match_agent.toml",
-                        pairing_index=(batch_index + local_index) * (episodes // 2)
-                        + episode_index // 2,
+                        pairing_index=(batch_index + local_index) * (episodes // 2) + episode_index // 2,
                         beta_seat=record.beta_seat,
                         population_revision_id=str(record.behavior_member_id),
                         beta_revision_id=beta_revision_id,
@@ -167,7 +163,7 @@ class PopulationCollector:
                 },
             )
             writer.link_artifacts(batch.batch_id, artifact_ids)
-            total_transitions += transitions
+            exploration_transitions += transitions
             written.append(source_id)
         return written
 

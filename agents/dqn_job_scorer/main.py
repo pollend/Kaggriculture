@@ -98,14 +98,12 @@ class JobScorerAgent:
         shops = tuple((get(obs, "town", {}) or {}).get("unlocked_shops", []) or [])
         if self._plan is None or day_changed:
             if self.market_network is None:
-                self._plan = choose_plan(obs, farm, self._plan.mode if self._plan else None, episode_steps, turns_per_day)
+                self._plan = choose_plan(
+                    obs, farm, self._plan.mode if self._plan else None, episode_steps, turns_per_day
+                )
             else:
-                market_candidates = enumerate_market_candidates(
-                    obs, farm, private, episode_steps, turns_per_day
-                )
-                market_decision = choose_market(
-                    market_candidates, self.market_network, self.market_epsilon, self.rng
-                )
+                market_candidates = enumerate_market_candidates(obs, farm, private, episode_steps, turns_per_day)
+                market_decision = choose_market(market_candidates, self.market_network, self.market_epsilon, self.rng)
                 self._plan = market_decision.plan
                 if self.recorder is not None:
                     self.recorder.record_market(step=step, decision=market_decision)
@@ -263,11 +261,17 @@ def _load_bundle() -> PolicyBundle:
     return PolicyBundle(QNetwork.random(seed=0), None)
 
 
-_BUNDLE = _load_bundle()
-_AGENT = JobScorerAgent(_BUNDLE.job, _BUNDLE.market)
+_AGENT: JobScorerAgent | None = None
 
 
 def agent(obs: Any, configuration: Any | None = None) -> dict[str, list]:
+    # Keep importing JobScorerAgent side-effect free.  Training-only agents
+    # reuse the runtime class while KAGG_AGENT_CONFIG points at their own
+    # artifact formats, which must not be interpreted as a DQN PolicyBundle.
+    global _AGENT
+    if _AGENT is None:
+        bundle = _load_bundle()
+        _AGENT = JobScorerAgent(bundle.job, bundle.market)
     return _AGENT(obs, configuration)
 
 

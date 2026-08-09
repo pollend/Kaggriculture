@@ -24,7 +24,7 @@ from kaggriculture_lab.league import (
 )
 from kaggriculture_lab.model_trainers import load_trainer
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
-from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
+from kaggriculture_lab.storage import ExperimentStore
 from kaggriculture_lab.training import allocate_generation
 from sim.runner import MatchResult, SeatResult
 
@@ -89,8 +89,9 @@ def test_replay_is_compressed_in_duckdb_and_read_through_narrow_reader(tmp_path:
         assert reader.summary()["money_difference"] == 10
         assert reader.replay() == result.replay
         assert store.connection.execute(
-            "SELECT max(version) FROM schema_migrations"
-        ).fetchone()[0] == SCHEMA_VERSION
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = 'main' AND table_name = 'training_sessions'"
+        ).fetchone()[0] == 1
 
         context = EpisodeHookContext("run", "generation", "pair", "match", "a", "b", 0)
         _run_hook(store, context, "missing_episode_evaluator:hook")

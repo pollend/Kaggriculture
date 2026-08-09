@@ -29,7 +29,7 @@ from agents.dqn_job_scorer.training import network as net_module
 from agents.dqn_job_scorer.training.collect import (
     EPISODE_ARRAY_FIELDS,
     MONEY_SCALE,
-    WIN_BONUS,
+    TERMINAL_MARGIN_SCALE,
     Recorder,
     collect_episode,
     load_episode_batch,
@@ -105,9 +105,7 @@ def test_explicit_network_seed_is_a_frozen_schema_current_policy(monkeypatch):
     monkeypatch.setenv("KAGG_AGENT_CONFIG", json.dumps({"network_seed": 17}))
     observed = main_module._load_network()
     expected = QNetwork.random(seed=17)
-    for (observed_w, observed_b), (expected_w, expected_b) in zip(
-        observed.layers, expected.layers
-    ):
+    for (observed_w, observed_b), (expected_w, expected_b) in zip(observed.layers, expected.layers):
         np.testing.assert_array_equal(observed_w, expected_w)
         np.testing.assert_array_equal(observed_b, expected_b)
 
@@ -117,14 +115,10 @@ def test_episode_batch_round_trips_without_pickle(episode, tmp_path):
     restored = load_episode_batch(path)
     assert len(restored) == 1
     for field_name in EPISODE_ARRAY_FIELDS:
-        np.testing.assert_array_equal(
-            getattr(restored[0], field_name), getattr(episode, field_name)
-        )
+        np.testing.assert_array_equal(getattr(restored[0], field_name), getattr(episode, field_name))
 
 
-def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
-    episode, tmp_path, monkeypatch
-):
+def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_path, monkeypatch):
     from agents.dqn_job_scorer.training import updater as updater_module
 
     manifest_path = Path("agents/dqn_job_scorer/agent.toml")
@@ -155,9 +149,7 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
         lambda _weights, opponent, *_args, **_kwargs: {
             **unresolved_evaluation,
             "margin": 10.0 if opponent.startswith(updater_module.SELF_SPEC) else 0.0,
-            "margin_ci": [1.0, 20.0]
-            if opponent.startswith(updater_module.SELF_SPEC)
-            else [-1.0, 1.0],
+            "margin_ci": [1.0, 20.0] if opponent.startswith(updater_module.SELF_SPEC) else [-1.0, 1.0],
         },
     )
 
@@ -179,9 +171,7 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
                 artifact_sha256=digest,
                 metadata={"transitions": int(episode.unit_mask.sum())},
             )
-        report = update_model_in_store(
-            store, MODEL_ID, artifacts=tmp_path
-        )
+        report = update_model_in_store(store, MODEL_ID, artifacts=tmp_path)
         assert report.status == "promoted"
         checkpoint = store.connection.execute(
             """
@@ -213,13 +203,8 @@ def test_shaping_is_potential_based(episode):
     shaping = GAMMA * phi[1:] - phi[:-1]
     terminal_bonus = float(episode.reward[-1] - episode.raw_reward[-1] - shaping[-1])
 
-    assert terminal_bonus == pytest.approx(
-        min((-WIN_BONUS, 0.0, WIN_BONUS), key=lambda value: abs(value - terminal_bonus)),
-        abs=1e-5,
-    )
-    np.testing.assert_allclose(
-        episode.reward[:-1], episode.raw_reward[:-1] + shaping[:-1], atol=1e-5
-    )
+    assert -1.0 <= terminal_bonus <= 1.0
+    np.testing.assert_allclose(episode.reward[:-1], episode.raw_reward[:-1] + shaping[:-1], atol=1e-5)
     assert float(episode.reward[-1]) == pytest.approx(
         float(episode.raw_reward[-1] + shaping[-1] + terminal_bonus), abs=1e-5
     )
@@ -238,7 +223,7 @@ def test_potential_counts_unsold_value_but_not_cash():
     assert potential(farm, private, obs) == pytest.approx((3 * 35 + 2 * 25 + 4 * 25) / MONEY_SCALE)
 
 
-def test_terminal_potential_is_zero_and_draw_bonus_is_neutral():
+def test_terminal_potential_is_zero_and_money_margin_is_rewarded():
     recorder = Recorder()
     recorder.record(
         global_feats=np.zeros(F.GLOBAL_DIM, dtype=np.float32),
@@ -257,11 +242,11 @@ def test_terminal_potential_is_zero_and_draw_bonus_is_neutral():
         private={"shed": {}, "inventories": [{}]},
         truncated=0,
     )
-    record = recorder.finish(final_money=1000.0, outcome=0.5, gamma=GAMMA)
+    record = recorder.finish(final_money=3000.0, opponent_money=1000.0, gamma=GAMMA)
 
     assert record.potential[-1] == 0.0
-    assert record.raw_reward[-1] == 0.0
-    assert record.reward[-1] == pytest.approx(-record.potential[0])
+    assert record.raw_reward[-1] == 2.0
+    assert record.reward[-1] == pytest.approx(2.0 - record.potential[0] + 2000.0 / TERMINAL_MARGIN_SCALE)
 
 
 # --- replay fidelity ---------------------------------------------------------
@@ -281,14 +266,10 @@ def test_replay_reconstructs_the_features_the_agent_saw(episode):
             expected = F.assemble(
                 episode.global_feats[t],
                 episode.job_static[t, :count].astype(np.float32),
-                F.distance_features(
-                    episode.job_targets[t, :count], position, int(episode.committed[t, unit])
-                ),
+                F.distance_features(episode.job_targets[t, :count], position, int(episode.committed[t, unit])),
             )
             np.testing.assert_array_equal(rebuilt, expected)
-            np.testing.assert_array_equal(
-                available, episode.available[t, unit, :count]
-            )
+            np.testing.assert_array_equal(available, episode.available[t, unit, :count])
             assert available[int(episode.chosen[t, unit])]
 
 
@@ -404,9 +385,7 @@ def test_fertilize_jobs_require_and_follow_the_carrier():
     jobs, _ = enumerate_jobs(farm, shed_only, 1, [(0, 0), (0, 0)], [{}, {}])
     assert not [job for job in jobs if job.kind == "FERTILIZE"]
 
-    jobs, _ = enumerate_jobs(
-        farm, shed_only, 1, [(0, 0), (0, 0)], [{}, {"FERTILIZER": 1}]
-    )
+    jobs, _ = enumerate_jobs(farm, shed_only, 1, [(0, 0), (0, 0)], [{}, {"FERTILIZER": 1}])
     fertilize = [job for job in jobs if job.kind == "FERTILIZE"]
     assert len(fertilize) == 1
     assert fertilize[0].owner == 1
@@ -490,20 +469,40 @@ def test_units_stick_to_a_job_instead_of_oscillating():
 
     tiles = [[None] * 10 for _ in range(10)]
     tiles[0][0] = {
-        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "watered_today": False,
-        "consecutive_unwatered": 0, "yield_units": 1, "max_lifespan_step": -1,
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 0,
+        "watered_today": False,
+        "consecutive_unwatered": 0,
+        "yield_units": 1,
+        "max_lifespan_step": -1,
         "fertilized_until_day": -1,
     }
     tiles[9][9] = dict(tiles[0][0])
 
     def observation(position, step):
         return {
-            "player": 0, "step": step, "day": 1, "hour": step % 24,
+            "player": 0,
+            "step": step,
+            "day": 1,
+            "hour": step % 24,
             "farms": [
-                {"money": 3000.0, "tiles": tiles, "farmer": list(position), "hands": [],
-                 "unlocked_quadrants": ["NW", "NE", "SW", "SE"], "hires_today": 0},
-                {"money": 3000.0, "tiles": [[None]], "farmer": [0, 0], "hands": [],
-                 "unlocked_quadrants": ["NW"], "hires_today": 0},
+                {
+                    "money": 3000.0,
+                    "tiles": tiles,
+                    "farmer": list(position),
+                    "hands": [],
+                    "unlocked_quadrants": ["NW", "NE", "SW", "SE"],
+                    "hires_today": 0,
+                },
+                {
+                    "money": 3000.0,
+                    "tiles": [[None]],
+                    "farmer": [0, 0],
+                    "hands": [],
+                    "unlocked_quadrants": ["NW"],
+                    "hires_today": 0,
+                },
             ],
             "market": {"inventory": {}, "prices": {}},
             "town": {"unlocked_shops": []},
@@ -532,12 +531,27 @@ def test_commitment_clears_at_day_boundary():
     agent._day = 1
 
     obs = {
-        "player": 0, "step": 24, "day": 2, "hour": 0,
+        "player": 0,
+        "step": 24,
+        "day": 2,
+        "hour": 0,
         "farms": [
-            {"money": 3000.0, "tiles": [[None]], "farmer": [0, 0], "hands": [],
-             "unlocked_quadrants": ["NW"], "hires_today": 0},
-            {"money": 3000.0, "tiles": [[None]], "farmer": [0, 0], "hands": [],
-             "unlocked_quadrants": ["NW"], "hires_today": 0},
+            {
+                "money": 3000.0,
+                "tiles": [[None]],
+                "farmer": [0, 0],
+                "hands": [],
+                "unlocked_quadrants": ["NW"],
+                "hires_today": 0,
+            },
+            {
+                "money": 3000.0,
+                "tiles": [[None]],
+                "farmer": [0, 0],
+                "hands": [],
+                "unlocked_quadrants": ["NW"],
+                "hires_today": 0,
+            },
         ],
         "market": {"inventory": {}, "prices": {}},
         "town": {"unlocked_shops": []},
@@ -594,18 +608,37 @@ def test_inference_stays_far_under_act_timeout():
     for y in range(5):
         for x in range(5):
             tiles[y][x] = {
-                "kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "watered_today": False,
-                "consecutive_unwatered": 0, "yield_units": 2, "max_lifespan_step": -1,
+                "kind": "PLANT",
+                "crop": "WHEAT",
+                "planted_day": 0,
+                "watered_today": False,
+                "consecutive_unwatered": 0,
+                "yield_units": 2,
+                "max_lifespan_step": -1,
                 "fertilized_until_day": -1,
             }
     obs = {
-        "player": 0, "step": 100, "day": 4, "hour": 4,
+        "player": 0,
+        "step": 100,
+        "day": 4,
+        "hour": 4,
         "farms": [
-            {"money": 5000.0, "tiles": tiles, "farmer": [4, 4],
-             "hands": [[i % 10, i // 10] for i in range(12)],
-             "unlocked_quadrants": ["NW", "NE", "SW", "SE"], "hires_today": 12},
-            {"money": 5000.0, "tiles": tiles, "farmer": [4, 4], "hands": [],
-             "unlocked_quadrants": ["NW"], "hires_today": 0},
+            {
+                "money": 5000.0,
+                "tiles": tiles,
+                "farmer": [4, 4],
+                "hands": [[i % 10, i // 10] for i in range(12)],
+                "unlocked_quadrants": ["NW", "NE", "SW", "SE"],
+                "hires_today": 12,
+            },
+            {
+                "money": 5000.0,
+                "tiles": tiles,
+                "farmer": [4, 4],
+                "hands": [],
+                "unlocked_quadrants": ["NW"],
+                "hires_today": 0,
+            },
         ],
         "market": {"inventory": {}, "prices": {}},
         "town": {"unlocked_shops": []},
@@ -627,10 +660,14 @@ def test_submission_agent_never_imports_torch():
     import sys
 
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import sys; import agents.dqn_job_scorer.main; "
-         "assert 'torch' not in sys.modules, 'torch leaked into the submission agent'"],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            "-c",
+            "import sys; import agents.dqn_job_scorer.main; "
+            "assert 'torch' not in sys.modules, 'torch leaked into the submission agent'",
+        ],
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
 
@@ -668,8 +705,13 @@ def _context():
     from kaggriculture_lab.hooks import EpisodeHookContext
 
     return EpisodeHookContext(
-        session_id="s", generation_id="g", pairing_id="p", match_id="m",
-        revision_id="rev1", opponent_revision_id="rev2", seat=0,
+        session_id="s",
+        generation_id="g",
+        pairing_id="p",
+        match_id="m",
+        revision_id="rev1",
+        opponent_revision_id="rev2",
+        seat=0,
     )
 
 
@@ -741,8 +783,13 @@ def test_truncation_keeps_maintenance_over_planting():
     tiles = [[None] * 10 for _ in range(10)]
     # One thirsty plant in the far corner, about to become a weed.
     tiles[9][9] = {
-        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "watered_today": False,
-        "consecutive_unwatered": 1, "yield_units": 0, "max_lifespan_step": -1,
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 0,
+        "watered_today": False,
+        "consecutive_unwatered": 1,
+        "yield_units": 0,
+        "max_lifespan_step": -1,
         "fertilized_until_day": -1,
     }
     farm = {"tiles": tiles, "farmer": [0, 0]}
@@ -772,9 +819,21 @@ def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
         return MatchResult(
             seed=1,
             seats=[
-                SeatResult("dqn", 0, mine, "DONE", False, None, None, 1, 0.0, 0.0, 0.0, mine,
-                           {"productive_action_percentage": 0.2, "movement_percentage": 0.6,
-                            "plants_lost_inferred": 3}),
+                SeatResult(
+                    "dqn",
+                    0,
+                    mine,
+                    "DONE",
+                    False,
+                    None,
+                    None,
+                    1,
+                    0.0,
+                    0.0,
+                    0.0,
+                    mine,
+                    {"productive_action_percentage": 0.2, "movement_percentage": 0.6, "plants_lost_inferred": 3},
+                ),
                 SeatResult("heur", 1, theirs, "DONE", False, None, None, 1, 0.0, 0.0, 0.0, theirs, {}),
             ],
             steps=1,
@@ -786,10 +845,17 @@ def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
         # 30 prior games: the older half strong, the recent half collapsed.
         for index in range(30):
             mine = 21_000.0 if index < 15 else 8_000.0
-            store.add_match(f"m{index:03d}", "run", "league:t", ("rev1", "rev2"), ("rev1", "rev2"),
-                            match(f"m{index:03d}", mine, 19_000.0))
-        store.add_match("current", "run", "league:t", ("rev1", "rev2"), ("rev1", "rev2"),
-                        match("current", 8_000.0, 19_000.0))
+            store.add_match(
+                f"m{index:03d}",
+                "run",
+                "league:t",
+                ("rev1", "rev2"),
+                ("rev1", "rev2"),
+                match(f"m{index:03d}", mine, 19_000.0),
+            )
+        store.add_match(
+            "current", "run", "league:t", ("rev1", "rev2"), ("rev1", "rev2"), match("current", 8_000.0, 19_000.0)
+        )
 
         reader = EpisodeReader(store.connection, "current", 0)
         history = reader.history("rev1", limit=80)
@@ -1042,9 +1108,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
 
     with ExperimentStore(tmp_path / "pool.duckdb") as store:
         store.register_family(manifest, manifest_path)
-        for index, (path, promoted) in enumerate(
-            ((present, True), (missing, True), (present, False))
-        ):
+        for index, (path, promoted) in enumerate(((present, True), (missing, True), (present, False))):
             store.connection.execute(
                 """
                 INSERT INTO model_updates (
@@ -1142,20 +1206,14 @@ def test_joint_peer_pool_finds_active_instances_and_non_active_history(tmp_path)
         add_checkpoint(MODEL_ID, "dqn-history", history_path, active=False)
 
         reader = ModelTrainingReader(store)
-        active = active_checkpoint_opponents(
-            Context(), reader, ["dqn_job_scorer", "sp_psro_job_scorer"]
-        )
-        history = historical_checkpoint_opponents(
-            Context(), reader, ["dqn_job_scorer"], 5
-        )
+        active = active_checkpoint_opponents(Context(), reader, ["dqn_job_scorer", "sp_psro_job_scorer"])
+        history = historical_checkpoint_opponents(Context(), reader, ["dqn_job_scorer"], 5)
 
     assert active == [
         f"agents.dqn_job_scorer.main:agent?weights={peer_path}",
         f"agents.sp_psro_job_scorer.main:agent?weights={sp_path}",
     ]
-    assert history == [
-        f"agents.dqn_job_scorer.main:agent?weights={history_path}"
-    ]
+    assert history == [f"agents.dqn_job_scorer.main:agent?weights={history_path}"]
 
 
 def test_duel_decides_promotion_not_benchmark_margin(tmp_path):

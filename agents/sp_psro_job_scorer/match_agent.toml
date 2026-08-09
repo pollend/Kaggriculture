@@ -16,4 +16,5 @@ code_paths = [
   "agents/sp_psro_job_scorer/__init__.py",
   "agents/sp_psro_job_scorer/match_agent.py",
   "agents/sp_psro_job_scorer/policy.py",
+  "agents/sp_psro_job_scorer/runtime.py",
 ]

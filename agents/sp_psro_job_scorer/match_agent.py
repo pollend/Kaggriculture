@@ -6,12 +6,10 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
-from agents.dqn_job_scorer.main import JobScorerAgent
 from agents.dqn_job_scorer.rules import get
 from agents.dqn_job_scorer.training.collect import Recorder, save_episode_batch
 from agents.sp_psro_job_scorer.policy import PopulationArtifact
+from agents.sp_psro_job_scorer.runtime import SPPSROAgent
 
 
 class MatchPolicyAgent:
@@ -23,24 +21,17 @@ class MatchPolicyAgent:
         self.gamma = float(config.get("gamma", 0.997))
         self.recorder = Recorder() if self.trace_path is not None else None
         seed = int(config.get("exploration_seed", 0))
-        self.rng = np.random.default_rng(seed)
         self.artifact = PopulationArtifact.load(str(config["weights"]))
-        self.inner: JobScorerAgent | None = None
+        epsilon = float(self.config.get("epsilon", 0.0))
+        self.inner = SPPSROAgent(
+            self.artifact,
+            seed,
+            epsilon=epsilon,
+            market_epsilon=float(self.config.get("market_epsilon", epsilon)),
+            recorder=self.recorder,
+        )
 
     def __call__(self, obs: Any, configuration: Any | None = None) -> dict[str, list]:
-        step = int(get(obs, "step", 0))
-        if self.inner is None or step == 0:
-            bundle = self.artifact.choose(self.rng)
-            self.inner = JobScorerAgent(
-                bundle.job,
-                market_network=bundle.market,
-                epsilon=float(self.config.get("epsilon", 0.0)),
-                market_epsilon=float(
-                    self.config.get("market_epsilon", self.config.get("epsilon", 0.0))
-                ),
-                rng=self.rng,
-                recorder=self.recorder,
-            )
         return self.inner(obs, configuration)
 
     def finalize_episode(self, steps: list, seat: int) -> dict[str, Any] | None:
@@ -49,11 +40,10 @@ class MatchPolicyAgent:
         final = steps[-1]
         obs = final[seat].observation
         farms = get(obs, "farms", []) or []
-        rewards = [float(state.reward or 0.0) for state in final]
-        opponent = rewards[1 - seat]
-        outcome = 1.0 if rewards[seat] > opponent else 0.0 if rewards[seat] < opponent else 0.5
         record = self.recorder.finish(
-            float(farms[seat].get("money", 0.0)), outcome, self.gamma
+            float(farms[seat].get("money", 0.0)),
+            float(farms[1 - seat].get("money", 0.0)),
+            self.gamma,
         )
         save_episode_batch([record], self.trace_path)
         digest = hashlib.sha256(self.trace_path.read_bytes()).hexdigest()

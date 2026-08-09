@@ -629,7 +629,7 @@
       </p>
       <div class="formula-box">
         <div class="formula">r<sub>t</sub> = Δmoney<sub>t</sub>/1000 + γΦ(s<sub>t+1</sub>) − Φ(s<sub>t</sub>)</div>
-        <div class="formula" style="margin-top: 12px">r<sub>terminal</sub> += +1 for a win, −1 for a loss</div>
+        <div class="formula" style="margin-top: 12px">r<sub>terminal</sub> += clip((my final bank − opponent final bank) / 20,000, −1, 1)</div>
         <p class="formula-note">
           Φ is also divided by 1000. Potential-based shaping gives earlier learning signals while
           preserving the underlying policy objective when applied consistently.

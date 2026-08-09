@@ -19,6 +19,7 @@ code_paths = [
   "agents/sp_psro_job_scorer/__init__.py",
   "agents/sp_psro_job_scorer/main.py",
   "agents/sp_psro_job_scorer/policy.py",
+  "agents/sp_psro_job_scorer/runtime.py",
 ]
 
 [[models]]
@@ -29,6 +30,7 @@ min_new_batches = 20
 [models.config]
 batches_per_round = 1
 episodes_per_batch = 16
+episode_steps = 720
 population_size = 10
 gradient_steps_per_batch = 400
 batch_size = 512
@@ -66,3 +68,4 @@ validation_opponents = [
   "agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/main.py",
   "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",
 ]
+validation_peer_types = []

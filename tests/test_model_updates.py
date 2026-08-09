@@ -12,7 +12,7 @@ from kaggriculture_lab.model_updates import (
     record_training_batch,
     update_model_in_store,
 )
-from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
+from kaggriculture_lab.storage import ExperimentStore
 from scripts.rebuild_experiments_db import rebuild
 
 
@@ -121,16 +121,18 @@ def test_rejection_advances_only_its_models_watermark(tmp_path: Path):
 def test_rebuild_uses_schema_and_backs_up_existing_database(tmp_path: Path):
     database = tmp_path / "experiments.duckdb"
     with ExperimentStore(database) as store:
-        store.connection.execute(
-            "INSERT INTO schema_migrations (version) VALUES (99)"
-        )
+        store.begin_run("old", "old", 1, {}, {}, None)
     rebuilt, backup = rebuild(database, force=True)
     assert rebuilt == database
     assert backup is not None and backup.exists()
     with ExperimentStore(database) as store:
-        assert store.connection.execute(
-            "SELECT max(version) FROM schema_migrations"
-        ).fetchone()[0] == SCHEMA_VERSION
+        tables = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
+            ).fetchall()
+        }
+        assert {"training_models", "model_round_hooks"} <= tables
 
 
 def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):

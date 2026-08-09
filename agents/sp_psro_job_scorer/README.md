@@ -28,5 +28,7 @@ live learners are reset, and only accepted members participate in the bounded
 recent-policy pool.
 
 The population is training-only. Each accepted member is evaluated on held-out
-seat-swapped games against the fixed validation suite, and the highest mean-win
-member becomes the single active inference artifact and submission candidate.
+seat-swapped games against the fixed validation suite. The live best response is
+evaluated by the same external release gate even before population admission, so
+an externally strong beta may become the inference artifact while it continues
+training. Population admission and submission release are deliberately separate.

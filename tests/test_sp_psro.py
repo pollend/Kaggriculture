@@ -1,7 +1,12 @@
+import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
@@ -10,6 +15,7 @@ from agents.sp_psro_job_scorer.policy import PopulationArtifact
 from agents.sp_psro_job_scorer.training import collect
 from agents.sp_psro_job_scorer.training.updater import (
     _update_restricted_distribution,
+    evaluate_member,
     initial_state,
     load_state,
     mixture_probabilities,
@@ -43,13 +49,14 @@ def test_sp_psro_league_is_trainer_only_and_has_no_surrogate_population(tmp_path
     assert config.manifest == "agents/sp_psro_job_scorer/agent.toml"
     create_session(config, tmp_path / "sp.duckdb", session_id="sp")
     with ExperimentStore(tmp_path / "sp.duckdb") as store:
-        assert store.connection.execute(
-            "SELECT count(*) FROM generation_members"
-        ).fetchone()[0] == 0
-        assert store.connection.execute(
-            "SELECT count(*) FROM agent_families WHERE family_id = ?",
-            ["configurable_crop_surrogate"],
-        ).fetchone()[0] == 0
+        assert store.connection.execute("SELECT count(*) FROM generation_members").fetchone()[0] == 0
+        assert (
+            store.connection.execute(
+                "SELECT count(*) FROM agent_families WHERE family_id = ?",
+                ["configurable_crop_surrogate"],
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_initial_state_has_one_virtual_member_and_two_live_learners():
@@ -61,18 +68,7 @@ def test_initial_state_has_one_virtual_member_and_two_live_learners():
     beta = state["live"]["beta"]["online"]
     assert any(not np.array_equal(nu[key].numpy(), beta[key].numpy()) for key in nu)
     assert "market_online" in state["live"]["nu"]
-    assert members[0][1].market is not None
-
-
-def test_initial_state_can_bootstrap_from_joint_weights(tmp_path: Path):
-    anchor = tmp_path / "anchor.npz"
-    expected = PolicyBundle.random(seed=41)
-    expected.save(anchor)
-    state = initial_state(17, anchor)
-    loaded = population_networks(state)[0][1]
-    assert np.array_equal(loaded.job.layers[0][0], expected.job.layers[0][0])
-    assert np.array_equal(loaded.market.layers[0][0], expected.market.layers[0][0])
-    assert state["initial_source"] == str(anchor)
+    assert members[0][1].market is None
 
 
 def test_release_gate_requires_profit_win_rate_and_margin():
@@ -89,24 +85,47 @@ def test_release_gate_requires_profit_win_rate_and_margin():
     assert not passes_release_gate({**good, "errors": 1}, config)
 
 
-def test_v3_state_migrates_without_reinitializing_live_learners(tmp_path: Path):
+def test_old_trainer_state_is_rejected(tmp_path: Path):
     state = initial_state(9)
-    expected = state["live"]["nu"]["online"]["0.weight"].clone()
-    state["version"] = 3
-    for key in (
-        "restricted",
-        "nu_snapshots",
-        "nu_snapshots_seen",
-        "nu_snapshot_rng_state",
-        "validation_suite",
-    ):
-        state.pop(key)
-    path = tmp_path / "v3.pt"
+    state["version"] = 4
+    path = tmp_path / "old.pt"
     torch.save(state, path)
-    migrated = load_state(path, 123)
-    assert migrated["version"] == 4
-    assert torch.equal(migrated["live"]["nu"]["online"]["0.weight"], expected)
-    assert migrated["nu_snapshots"] == []
+    with pytest.raises(ValueError, match="unsupported SP-PSRO trainer state 4"):
+        load_state(path, 123)
+
+
+def test_member_validation_distributes_games_across_mixture_components(tmp_path: Path, monkeypatch):
+    import sim.arena
+    import sim.metrics
+
+    path = tmp_path / "mixture.npz"
+    PopulationArtifact(
+        (PolicyBundle.random(seed=1), PolicyBundle.random(seed=2)),
+        np.asarray([0.5, 0.5]),
+    ).save(path)
+    calls = []
+
+    def fake_series(spec, opponent, seeds, config, jobs):
+        selected = list(seeds)
+        calls.append((spec, selected))
+        return {seed: object() for seed in selected}
+
+    summary = SimpleNamespace(
+        wins=10,
+        draws=0,
+        pairs=20,
+        margin_mean=1.0,
+        a_money_mean=3001.0,
+        errors=[],
+    )
+    monkeypatch.setattr(sim.arena, "play_series", fake_series)
+    monkeypatch.setattr(sim.metrics, "summarize", lambda *args: summary)
+
+    result = evaluate_member(path, ["starter"], 20, 100, 1)
+
+    assert {spec.rsplit("=", 1)[-1] for spec, _ in calls} == {"0", "1"}
+    assert sum(len(seeds) for _, seeds in calls) == 20
+    assert result["mean_win_rate"] == 0.5
 
 
 def test_multiplicative_weights_favors_winning_sampled_arm():
@@ -140,6 +159,27 @@ def test_population_artifact_round_trips_seeded_snapshot_mixture(tmp_path: Path)
     first = loaded.choose(np.random.default_rng(77)).job.layers[0][0]
     second = loaded.choose(np.random.default_rng(77)).job.layers[0][0]
     assert np.array_equal(first, second)
+
+
+def test_inference_import_accepts_mixture_weights_without_dqn_side_effect(tmp_path: Path):
+    path = tmp_path / "mixture.npz"
+    PopulationArtifact(
+        (PolicyBundle.random(seed=1), PolicyBundle.random(seed=2)),
+        np.asarray([0.5, 0.5]),
+    ).save(path)
+    env = {
+        **os.environ,
+        "KAGG_AGENT_CONFIG": json.dumps({"weights": str(path), "policy_seed": 7}),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", "from agents.sp_psro_job_scorer.main import _AGENT"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_collection_schedule_rotates_population_members_and_beta_seats(monkeypatch):
@@ -199,9 +239,7 @@ def test_collection_can_force_live_nu_from_weighted_distribution(monkeypatch):
     assert [call[3] for call in calls] == ["live-nu", "live-nu"]
 
 
-def test_updater_advances_both_live_learners_and_writes_resumable_state(
-    tmp_path: Path, monkeypatch
-):
+def test_updater_advances_both_live_learners_and_writes_resumable_state(tmp_path: Path, monkeypatch):
     from agents.sp_psro_job_scorer.training import updater
 
     population_path = tmp_path / "population.npz"
@@ -275,6 +313,7 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
         (batch,),
         None,
         {
+            **(AgentManifest.load("agents/sp_psro_job_scorer/agent.toml").models[0].config or {}),
             "warmup_episodes": 1,
             "gradient_steps_per_batch": 3,
             "buffer_episodes": 8,
@@ -295,7 +334,7 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
     assert result.metrics["nu_loss"] == 1.0
     assert result.metrics["beta_loss"] == 2.0
     assert result.gate["passed"] is True
-    assert saved["inference_champion"]["candidate_id"] == "beta-00000001"
+    assert saved["release_champion"]["candidate_id"] == "beta-00000001"
 
     monkeypatch.setattr(
         updater,
@@ -350,9 +389,7 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
         "dataset-2",
     )
     accepted = updater.PopulationUpdater().update(accepted_context, object())
-    accepted_state = torch.load(
-        accepted.trainer_artifact_path, map_location="cpu", weights_only=False
-    )
+    accepted_state = torch.load(accepted.trainer_artifact_path, map_location="cpu", weights_only=False)
     assert accepted_state["iteration"] == 1
     assert [member["role"] for member in accepted_state["population"][-2:]] == [
         "beta",
@@ -361,8 +398,9 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
     assert accepted_state["nu_snapshots"] == []
     assert accepted_state["live"]["nu"]["gradient_steps"] == 0
     assert accepted_state["live"]["beta"]["gradient_steps"] == 0
+    assert accepted_state["exploration_start_batch_seq"] == 2
     assert accepted.gate["passed"] is True
-    assert accepted_state["inference_champion"] is not None
+    assert accepted_state["release_champion"] is not None
 
 
 def test_inference_agent_plays_a_legal_action():
@@ -421,15 +459,20 @@ def test_manifest_rollouts_are_persisted_as_paired_episode_artifacts(tmp_path: P
         )
         writer = TrainingBatchWriter(store, "model")
         context = RoundContext(
-            "model", "sp_psro_match_policy_v3", "round", "session",
-            "session:g0000", 0, 0, None, {}, tmp_path,
+            "model",
+            "sp_psro_match_policy_v3",
+            "round",
+            "session",
+            "session:g0000",
+            0,
+            0,
+            None,
+            {},
+            tmp_path,
         )
-        weighted_id = writer.record_policy_mixture(
-            context, ["member-a", "live-nu"], max_members=2, weights=[0.8, 0.2]
-        )
+        weighted_id = writer.record_policy_mixture(context, ["member-a", "live-nu"], max_members=2, weights=[0.8, 0.2])
         assert store.connection.execute(
-            "SELECT revision_id, weight FROM policy_mixture_members "
-            "WHERE mixture_id = ? ORDER BY ordinal",
+            "SELECT revision_id, weight FROM policy_mixture_members WHERE mixture_id = ? ORDER BY ordinal",
             [weighted_id],
         ).fetchall() == [("member-a", 0.8), ("live-nu", 0.2)]
         mixture_id = writer.record_policy_mixture(context, ["member-a"], max_members=10)
@@ -444,17 +487,14 @@ def test_manifest_rollouts_are_persisted_as_paired_episode_artifacts(tmp_path: P
                 mixture_id=mixture_id,
                 result=rollout.match,
             )
-        assert store.connection.execute(
-            "SELECT status FROM league_pairings WHERE pairing_kind = 'sp_psro_training'"
-        ).fetchone()[0] == "COMPLETE"
-        assert store.connection.execute(
-            "SELECT count(*) FROM episode_training_artifacts"
-        ).fetchone()[0] == 4
-        assert store.connection.execute(
-            "SELECT count(*) FROM episode_payloads"
-        ).fetchone()[0] == 2
-        assert store.connection.execute(
-            "SELECT count(*) FROM pairing_policy_assignments"
-        ).fetchone()[0] == 1
+        assert (
+            store.connection.execute(
+                "SELECT status FROM league_pairings WHERE pairing_kind = 'sp_psro_training'"
+            ).fetchone()[0]
+            == "COMPLETE"
+        )
+        assert store.connection.execute("SELECT count(*) FROM episode_training_artifacts").fetchone()[0] == 4
+        assert store.connection.execute("SELECT count(*) FROM episode_payloads").fetchone()[0] == 2
+        assert store.connection.execute("SELECT count(*) FROM pairing_policy_assignments").fetchone()[0] == 1
     assert rollouts[0].best_response.market_state is not None
     assert rollouts[0].best_response.market_state.shape[1] + 30 == MARKET_FEATURE_DIM

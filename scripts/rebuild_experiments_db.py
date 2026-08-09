@@ -7,7 +7,7 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
-from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
+from kaggriculture_lab.storage import ExperimentStore
 
 
 def rebuild(database: Path, *, force: bool = False) -> tuple[Path, Path | None]:
@@ -22,9 +22,6 @@ def rebuild(database: Path, *, force: bool = False) -> tuple[Path, Path | None]:
     backup: Path | None = None
     try:
         with ExperimentStore(temporary) as store:
-            version = store.connection.execute(
-                "SELECT max(version) FROM schema_migrations"
-            ).fetchone()[0]
             required = {
                 "training_models",
                 "training_batches",
@@ -38,7 +35,7 @@ def rebuild(database: Path, *, force: bool = False) -> tuple[Path, Path | None]:
                     "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
                 ).fetchall()
             }
-            if version != SCHEMA_VERSION or not required <= present:
+            if not required <= present:
                 raise RuntimeError("new database failed schema validation")
         if database.exists():
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")

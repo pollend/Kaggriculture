@@ -43,7 +43,8 @@ def _population_status(args: argparse.Namespace) -> int:
         "model_id": args.model_id,
         "population": len(state.get("population", [])),
         "iteration": int(state.get("iteration", 0)),
-        "champion": state.get("champion_id"),
+        "champion": state.get("population_champion_id", state.get("champion_id")),
+        "release_champion": state.get("release_champion", state.get("inference_champion")),
         "members": state.get("population", []),
         "last_admission": state.get("last_admission"),
     }

@@ -19,6 +19,8 @@ from kaggriculture_lab.dashboard import (
     _policy_role_label,
     _replay_page,
     _round_panel,
+    _session_page,
+    _sessions_page,
     make_server,
 )
 from kaggriculture_lab.storage import ExperimentStore
@@ -234,6 +236,36 @@ def test_sp_psro_policy_role_labels_are_unambiguous():
     )
     assert _policy_role_label("{}", "revision-a") is None
     assert _policy_role_label("not-json", "revision-a") is None
+
+
+def test_trainer_only_dashboard_reports_round_progress_not_pairing_fraction(tmp_path: Path):
+    database = tmp_path / "trainer-progress.duckdb"
+    _seed_dashboard(database)
+    with ExperimentStore(database) as store:
+        connection = store.connection
+        connection.execute(
+            "UPDATE training_sessions SET config_json = ? WHERE session_id = 'session/one'",
+            [json.dumps({"pairing_mode": "trainer_only", "rounds_per_generation": 100})],
+        )
+        connection.execute(
+            """
+            INSERT INTO model_round_hooks (
+                hook_id, model_id, session_id, generation_id, scope, round_index, status
+            ) VALUES
+                ('hook-0', 'model', 'session/one', 'session/one:g0000', 'round', 0, 'COMPLETE'),
+                ('hook-1', 'model', 'session/one', 'session/one:g0000', 'round', 1, 'COMPLETE')
+            """
+        )
+        sessions = _sessions_page(connection, 1)
+        session = _session_page(connection, "session/one")
+        generation = _generation_page(connection, "session/one:g0000", 1, "all", "all")
+
+    for document in (sessions, session, generation):
+        assert "2 / 100" in document
+        assert '<span class="muted">Pairings</span><b>1 / 1</b>' not in document
+    assert "1 pairings recorded" in sessions
+    assert "Pairings recorded" in session
+    assert "Pairings recorded" in generation
 
 
 def test_sp_psro_labels_flow_to_episode_generation_and_replay(tmp_path: Path):

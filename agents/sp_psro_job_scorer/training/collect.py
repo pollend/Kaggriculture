@@ -82,9 +82,7 @@ def collect_episode(
                 "trace_path": str(trace.resolve()),
                 "epsilon": policy_epsilon,
                 "market_epsilon": (
-                    policy_epsilon
-                    if market_epsilon is None
-                    else (market_epsilon if policy_epsilon > 0 else 0.0)
+                    policy_epsilon if market_epsilon is None else (market_epsilon if policy_epsilon > 0 else 0.0)
                 ),
                 "gamma": gamma,
                 "exploration_seed": seed * salt + beta_seat,
@@ -122,9 +120,7 @@ def collect_episode(
     )
     if result.failed:
         return None
-    return RolloutArtifacts(
-        str(population_trace), str(beta_trace), str(behavior_member_id), seed, result, beta_seat
-    )
+    return RolloutArtifacts(str(population_trace), str(beta_trace), str(behavior_member_id), seed, result, beta_seat)
 
 
 def _job(args: tuple) -> RolloutArtifacts | None:
@@ -154,9 +150,7 @@ def collect_batch(
         # Backward-compatible scheduling for callers that do not provide a
         # learned restricted distribution: frozen population only.
         probabilities = np.asarray([1.0 / len(population)] * len(population) + [0.0])
-        pair_arms = np.asarray(
-            [((offset // 2) + pair) % len(population) for pair in range(len(seeds) // 2)]
-        )
+        pair_arms = np.asarray([((offset // 2) + pair) % len(population) for pair in range(len(seeds) // 2)])
     else:
         probabilities = np.asarray(mixture_weights, dtype=np.float64)
         if probabilities.shape != (len(arms),) or np.any(probabilities < 0):
@@ -228,9 +222,7 @@ def save_batch(records: list[PopulationRollout], path: str | Path) -> Path:
         "behavior_member_id": np.asarray([r.behavior_member_id or "" for r in records]),
         "seeds": np.asarray([r.seed for r in records], dtype=np.int64),
         "beta_seats": np.asarray([r.beta_seat for r in records], dtype=np.int8),
-        "sampling_probability": np.asarray(
-            [r.sampling_probability for r in records], dtype=np.float64
-        ),
+        "sampling_probability": np.asarray([r.sampling_probability for r in records], dtype=np.float64),
         "population_payoff": np.asarray([r.population_payoff for r in records], dtype=np.float32),
     }
     for index, rollout in enumerate(records):
@@ -255,10 +247,7 @@ def load_batch(path: str | Path) -> list[PopulationRollout]:
         for index in range(count):
             episodes = {}
             for role in ("nu", "beta"):
-                values = {
-                    field: payload[f"e{index}_{role}_{field}"].copy()
-                    for field in EPISODE_ARRAY_FIELDS
-                }
+                values = {field: payload[f"e{index}_{role}_{field}"].copy() for field in EPISODE_ARRAY_FIELDS}
                 for field in MARKET_ARRAY_FIELDS:
                     key = f"e{index}_{role}_{field}"
                     values[field] = payload[key].copy() if key in payload.files else None
@@ -271,18 +260,14 @@ def load_batch(path: str | Path) -> list[PopulationRollout]:
                     str(payload["behavior_kind"][index]),
                     member or None,
                     int(payload["seeds"][index]),
-                    beta_seat=(
-                        int(payload["beta_seats"][index]) if "beta_seats" in payload.files else 0
-                    ),
+                    beta_seat=(int(payload["beta_seats"][index]) if "beta_seats" in payload.files else 0),
                     sampling_probability=(
                         float(payload["sampling_probability"][index])
                         if "sampling_probability" in payload.files
                         else 1.0
                     ),
                     population_payoff=(
-                        float(payload["population_payoff"][index])
-                        if "population_payoff" in payload.files
-                        else 0.0
+                        float(payload["population_payoff"][index]) if "population_payoff" in payload.files else 0.0
                     ),
                 )
             )

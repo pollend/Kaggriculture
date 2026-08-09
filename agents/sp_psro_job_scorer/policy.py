@@ -53,10 +53,7 @@ class PopulationArtifact:
                 job_count = int(data[f"c{component}_job_count"][0])
                 market_count = int(data[f"c{component}_market_count"][0])
                 job = QNetwork(
-                    [
-                        (data[f"c{component}_job_w{i}"], data[f"c{component}_job_b{i}"])
-                        for i in range(job_count)
-                    ]
+                    [(data[f"c{component}_job_w{i}"], data[f"c{component}_job_b{i}"]) for i in range(job_count)]
                 )
                 market = QNetwork(
                     [
@@ -95,9 +92,7 @@ class PopulationArtifact:
             if bundle.market is None:
                 raise ValueError("SP-PSRO mixture components require market networks")
             payload[f"c{component}_job_count"] = np.asarray([len(bundle.job.layers)], dtype=np.int16)
-            payload[f"c{component}_market_count"] = np.asarray(
-                [len(bundle.market.layers)], dtype=np.int16
-            )
+            payload[f"c{component}_market_count"] = np.asarray([len(bundle.market.layers)], dtype=np.int16)
             for prefix, network in (("job", bundle.job), ("market", bundle.market)):
                 for index, (weight, bias) in enumerate(network.layers):
                     payload[f"c{component}_{prefix}_w{index}"] = weight
@@ -106,4 +101,9 @@ class PopulationArtifact:
 
     def choose(self, rng: np.random.Generator) -> PolicyBundle:
         index = int(rng.choice(len(self.components), p=self.weights))
+        return self.components[index]
+
+    def component(self, index: int) -> PolicyBundle:
+        if not 0 <= index < len(self.components):
+            raise ValueError(f"SP-PSRO component index {index} is out of range")
         return self.components[index]

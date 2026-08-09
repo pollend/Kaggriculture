@@ -29,27 +29,27 @@ from agents.dqn_job_scorer.policy import QNetwork
 from agents.dqn_job_scorer.rules import ANIMAL_DATA, CROP_DATA, CROPS, PRODUCT_BASE, PRODUCTS, get
 
 MONEY_SCALE = 1000.0
-WIN_BONUS = 1.0
+TERMINAL_MARGIN_SCALE = 20_000.0
 
 
 @dataclass
 class EpisodeRecord:
     """One episode, padded to a common job/unit width with masks."""
 
-    global_feats: np.ndarray   # float32 [T, GLOBAL_DIM]
-    job_static: np.ndarray     # float16 [T, J, JOB_STATIC_DIM]
-    job_targets: np.ndarray    # int8    [T, J, 2]
-    job_mask: np.ndarray       # bool    [T, J]
-    unit_pos: np.ndarray       # int8    [T, U, 2]
-    unit_mask: np.ndarray      # bool    [T, U]
-    chosen: np.ndarray         # int16   [T, U]
-    committed: np.ndarray      # int16   [T, U]  job index this unit was already walking to, -1 if none
-    available: np.ndarray      # bool    [T, U, J] exact live action mask for each unit
-    reward: np.ndarray         # float32 [T]   shaped, ready for training
-    raw_reward: np.ndarray     # float32 [T]   unshaped money delta, for diagnostics
-    potential: np.ndarray      # float32 [T+1] Phi(s_t); last entry is the terminal state
-    money: np.ndarray          # float32 [T+1]
-    truncated: np.ndarray      # int32   [T]   candidate-set overflow, counted not hidden
+    global_feats: np.ndarray  # float32 [T, GLOBAL_DIM]
+    job_static: np.ndarray  # float16 [T, J, JOB_STATIC_DIM]
+    job_targets: np.ndarray  # int8    [T, J, 2]
+    job_mask: np.ndarray  # bool    [T, J]
+    unit_pos: np.ndarray  # int8    [T, U, 2]
+    unit_mask: np.ndarray  # bool    [T, U]
+    chosen: np.ndarray  # int16   [T, U]
+    committed: np.ndarray  # int16   [T, U]  job index this unit was already walking to, -1 if none
+    available: np.ndarray  # bool    [T, U, J] exact live action mask for each unit
+    reward: np.ndarray  # float32 [T]   shaped, ready for training
+    raw_reward: np.ndarray  # float32 [T]   unshaped money delta, for diagnostics
+    potential: np.ndarray  # float32 [T+1] Phi(s_t); last entry is the terminal state
+    money: np.ndarray  # float32 [T+1]
+    truncated: np.ndarray  # int32   [T]   candidate-set overflow, counted not hidden
     market_state: np.ndarray | None = None
     market_purchase_static: np.ndarray | None = None
     market_purchase_mask: np.ndarray | None = None
@@ -66,13 +66,29 @@ class EpisodeRecord:
         return sum(
             array.nbytes
             for array in (
-                self.global_feats, self.job_static, self.job_targets, self.job_mask,
-                self.unit_pos, self.unit_mask, self.chosen, self.committed, self.available, self.reward,
-                self.raw_reward, self.potential, self.money, self.truncated,
-                self.market_state, self.market_purchase_static, self.market_purchase_mask,
-                self.market_reserve_static, self.market_reserve_mask, self.market_chosen,
+                self.global_feats,
+                self.job_static,
+                self.job_targets,
+                self.job_mask,
+                self.unit_pos,
+                self.unit_mask,
+                self.chosen,
+                self.committed,
+                self.available,
+                self.reward,
+                self.raw_reward,
+                self.potential,
+                self.money,
+                self.truncated,
+                self.market_state,
+                self.market_purchase_static,
+                self.market_purchase_mask,
+                self.market_reserve_static,
+                self.market_reserve_mask,
+                self.market_chosen,
                 self.market_step,
-            ) if array is not None
+            )
+            if array is not None
         )
 
 
@@ -133,16 +149,12 @@ def load_episode_batch(path: str | Path) -> list[EpisodeRecord]:
         version = int(payload["format_version"][0])
         if version not in (3, 4):
             raise EpisodeFormatError(
-                f"unsupported DQN episode batch format {version}; "
-                "adaptive-hybrid features require format 3"
+                f"unsupported DQN episode batch format {version}; adaptive-hybrid features require format 3"
             )
         count = int(payload["episode_count"][0])
         records = []
         for index in range(count):
-            values = {
-                field_name: payload[f"e{index}_{field_name}"].copy()
-                for field_name in EPISODE_ARRAY_FIELDS
-            }
+            values = {field_name: payload[f"e{index}_{field_name}"].copy() for field_name in EPISODE_ARRAY_FIELDS}
             for field_name in MARKET_ARRAY_FIELDS:
                 key = f"e{index}_{field_name}"
                 values[field_name] = payload[key].copy() if key in payload.files else None
@@ -159,7 +171,7 @@ def potential(farm: dict, private: dict, obs: Any) -> float:
     policy-invariant when the terminal potential is forced to zero. Cash is
     deliberately absent because the base reward already records its delta.
     """
-    prices = ((get(obs, "market", {}) or {}).get("prices", {}) or {})
+    prices = (get(obs, "market", {}) or {}).get("prices", {}) or {}
     value = 0.0
 
     shed = private.get("shed", {}) or {}
@@ -189,7 +201,9 @@ def potential(farm: dict, private: dict, obs: Any) -> float:
                 data = ANIMAL_DATA[str(animal)]
                 product = str(data["product"])
                 value += int(tile.get("yield_units", 0)) * float(prices.get(product, data["base"]))
-                value += int(bool(tile.get("fertilizer_available"))) * float(prices.get("FERTILIZER", PRODUCT_BASE["FERTILIZER"]))
+                value += int(bool(tile.get("fertilizer_available"))) * float(
+                    prices.get("FERTILIZER", PRODUCT_BASE["FERTILIZER"])
+                )
                 value += 0.5 * float(prices.get(product, data["base"]))
     return value / MONEY_SCALE
 
@@ -229,8 +243,22 @@ class Recorder:
         self.market_steps.append(int(step))
         self.market_decisions.append(decision)
 
-    def record(self, *, global_feats, job_static, job_targets, positions, chosen,
-               committed, available, money, obs, farm, private, truncated) -> None:
+    def record(
+        self,
+        *,
+        global_feats,
+        job_static,
+        job_targets,
+        positions,
+        chosen,
+        committed,
+        available,
+        money,
+        obs,
+        farm,
+        private,
+        truncated,
+    ) -> None:
         self.global_feats.append(np.asarray(global_feats, dtype=np.float32))
         self.job_static.append(np.asarray(job_static, dtype=np.float16))
         self.job_targets.append(np.asarray(job_targets, dtype=np.int8))
@@ -242,7 +270,7 @@ class Recorder:
         self.potential.append(potential(farm, private, obs))
         self.truncated.append(int(truncated))
 
-    def finish(self, final_money: float, outcome: float, gamma: float) -> EpisodeRecord:
+    def finish(self, final_money: float, opponent_money: float, gamma: float) -> EpisodeRecord:
         """Pad to a common width and compute shaped rewards."""
         steps = len(self.global_feats)
         if steps == 0:
@@ -279,7 +307,7 @@ class Recorder:
 
         raw = (money[1:] - money[:-1]) / MONEY_SCALE
         shaped = raw + gamma * phi[1:] - phi[:-1]
-        shaped[-1] += (2.0 * float(outcome) - 1.0) * WIN_BONUS
+        shaped[-1] += float(np.clip((final_money - opponent_money) / TERMINAL_MARGIN_SCALE, -1.0, 1.0))
 
         market_state = market_purchase_static = market_purchase_mask = None
         market_reserve_static = market_reserve_mask = market_chosen = market_step = None
@@ -290,7 +318,9 @@ class Recorder:
             market_state = np.zeros((decisions, MARKET_STATE_DIM), dtype=np.float32)
             market_purchase_static = np.zeros((decisions, purchase_width, MARKET_ACTION_DIM), dtype=np.float16)
             market_purchase_mask = np.zeros((decisions, purchase_width), dtype=bool)
-            market_reserve_static = np.zeros((decisions, len(PRODUCTS), reserve_width, MARKET_ACTION_DIM), dtype=np.float16)
+            market_reserve_static = np.zeros(
+                (decisions, len(PRODUCTS), reserve_width, MARKET_ACTION_DIM), dtype=np.float16
+            )
             market_reserve_mask = np.zeros((decisions, len(PRODUCTS), reserve_width), dtype=bool)
             market_chosen = np.zeros((decisions, 1 + len(PRODUCTS)), dtype=np.int16)
             for index, decision in enumerate(self.market_decisions):
@@ -379,19 +409,11 @@ def collect_episode(
     farms = get(obs, "farms", []) or []
     farm = farms[learner_seat]
 
-    rewards = [state.reward or 0.0 for state in final]
-    opponent_reward = max(r for i, r in enumerate(rewards) if i != learner_seat)
-    outcome = (
-        1.0
-        if rewards[learner_seat] > opponent_reward
-        else 0.0
-        if rewards[learner_seat] < opponent_reward
-        else 0.5
-    )
-
     return recorder.finish(
         final_money=float(farm.get("money", 0.0)),
-        outcome=outcome,
+        opponent_money=max(
+            float(other.get("money", 0.0)) for index, other in enumerate(farms) if index != learner_seat
+        ),
         gamma=gamma,
     )
 
@@ -436,8 +458,6 @@ def collect_batch(
         # Torch is initialized before collection in both trainers. Forking that
         # process can deadlock or terminate workers after the replay grows; a
         # fresh interpreter is slower to start but stable and cross-platform.
-        with ProcessPoolExecutor(
-            max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
-        ) as pool:
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
             records = list(pool.map(_job, tasks, chunksize=1))
     return [record for record in records if record is not None]

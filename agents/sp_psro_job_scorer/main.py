@@ -12,11 +12,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-
-from agents.dqn_job_scorer.main import JobScorerAgent
 from agents.dqn_job_scorer.policy import PolicyBundle, QNetwork
 from agents.sp_psro_job_scorer.policy import PopulationArtifact
+from agents.sp_psro_job_scorer.runtime import SPPSROAgent
 
 WEIGHTS_PATH = Path(__file__).with_name("weights.npz")
 
@@ -35,22 +33,12 @@ def _load_artifact(config: dict[str, Any]) -> PopulationArtifact:
     return PopulationArtifact.single(PolicyBundle(QNetwork.random(seed=0), None))
 
 
-class SPPSROAgent:
-    def __init__(self, artifact: PopulationArtifact, seed: int | None):
-        self.artifact = artifact
-        self.rng = np.random.default_rng(seed)
-        self.inner: JobScorerAgent | None = None
-
-    def __call__(self, obs: Any, configuration: Any | None = None) -> dict[str, list]:
-        step = int(obs.get("step", 0) if isinstance(obs, dict) else getattr(obs, "step", 0))
-        if self.inner is None or step == 0:
-            bundle = self.artifact.choose(self.rng)
-            self.inner = JobScorerAgent(bundle.job, bundle.market)
-        return self.inner(obs, configuration)
-
-
 _CONFIG = _config()
-_AGENT = SPPSROAgent(_load_artifact(_CONFIG), _CONFIG.get("policy_seed"))
+_AGENT = SPPSROAgent(
+    _load_artifact(_CONFIG),
+    _CONFIG.get("policy_seed"),
+    component_index=(int(_CONFIG["component_index"]) if "component_index" in _CONFIG else None),
+)
 
 
 def agent(obs: Any, configuration: Any | None = None) -> dict[str, list]:

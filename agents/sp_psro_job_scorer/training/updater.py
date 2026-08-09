@@ -29,12 +29,12 @@ from kaggriculture_lab.model_updates import (
 )
 
 SELF_SPEC = "agents/sp_psro_job_scorer/main.py"
-STATE_VERSION = 4
+STATE_VERSION = 5
 Z95 = 1.959963985
 
 
 def fresh_live(seed: int) -> dict[str, Any]:
-    """Create the legacy nu slot and the trainable beta learner state."""
+    """Create independent trainable nu and beta learner states."""
     states: dict[str, Any] = {}
     for offset, role in enumerate(("nu", "beta"), start=1):
         torch.manual_seed(seed + offset)
@@ -58,53 +58,31 @@ def fresh_live(seed: int) -> dict[str, Any]:
     return states
 
 
-def initial_state(seed: int, initial_population_weights: str | Path | None = None) -> dict[str, Any]:
-    initial = (
-        PopulationArtifact.load(initial_population_weights).components[0]
-        if initial_population_weights is not None
-        else PolicyBundle.random(seed=seed)
-    )
-    if initial.market is None:
-        raise ValueError("SP-PSRO initial population weights require a market network")
+def initial_state(seed: int) -> dict[str, Any]:
     return {
         "version": STATE_VERSION,
         "iteration": 0,
         "population": [],
-        "initial_job_network": initial.job.layers,
-        "initial_market_network": initial.market.layers,
-        "initial_source": str(initial_population_weights) if initial_population_weights else "random",
+        "initial_job_network": QNetwork.random(seed=seed).layers,
         "live": fresh_live(seed + 10_000),
-        "champion_id": "member-000000-initial",
+        "population_champion_id": "member-000000-initial",
         "last_admission": None,
         "restricted": {"arm_ids": ["member-000000-initial", "live-nu"], "log_weights": [0.0, 0.0]},
         "nu_snapshots": [],
         "nu_snapshots_seen": 0,
         "nu_snapshot_rng_state": None,
+        "exploration_start_batch_seq": 0,
         "validation_suite": None,
-        "inference_champion": None,
+        "release_champion": None,
     }
 
 
-def load_state(
-    path: str | Path | None,
-    seed: int,
-    initial_population_weights: str | Path | None = None,
-) -> dict[str, Any]:
+def load_state(path: str | Path | None, seed: int) -> dict[str, Any]:
     if path is None:
-        return initial_state(seed, initial_population_weights)
+        return initial_state(seed)
     state = torch.load(path, map_location="cpu", weights_only=False)
-    version = int(state.get("version", 0))
-    if version == 3:
-        state["version"] = STATE_VERSION
-        state.setdefault("restricted", {"arm_ids": [], "log_weights": []})
-        state.setdefault("nu_snapshots", [])
-        state.setdefault("nu_snapshots_seen", 0)
-        state.setdefault("nu_snapshot_rng_state", None)
-        state.setdefault("validation_suite", None)
-    elif version != STATE_VERSION:
+    if state["version"] != STATE_VERSION:
         raise ValueError(f"unsupported SP-PSRO trainer state {state.get('version')}")
-    state.setdefault("initial_source", "random")
-    state.setdefault("inference_champion", None)
     return state
 
 
@@ -127,20 +105,13 @@ def population_networks(state: dict[str, Any]) -> list[tuple[str, PopulationArti
         result.append(
             (
                 "member-000000-initial",
-                PopulationArtifact.single(
-                    PolicyBundle(
-                        QNetwork(state["initial_job_network"]),
-                        QNetwork(state["initial_market_network"]),
-                    )
-                ),
+                PopulationArtifact.single(PolicyBundle(QNetwork(state["initial_job_network"]), None)),
             )
         )
     return result
 
 
-def mixture_probabilities(
-    state: dict[str, Any], config: dict[str, Any]
-) -> tuple[list[str], list[float]]:
+def mixture_probabilities(state: dict[str, Any], config: dict[str, Any]) -> tuple[list[str], list[float]]:
     """Return the current Exp3 distribution over frozen members plus live nu."""
     arm_ids = [str(member["member_id"]) for member in state["population"]]
     if not arm_ids:
@@ -152,7 +123,7 @@ def mixture_probabilities(
     shifted = log_weights - float(log_weights.max())
     probabilities = np.exp(shifted)
     probabilities /= probabilities.sum()
-    exploration = float(config.get("meta_exploration", 0.1))
+    exploration = float(config["meta_exploration"])
     if not 0.0 <= exploration <= 1.0:
         raise ValueError("meta_exploration must be in [0, 1]")
     probabilities = (1.0 - exploration) * probabilities + exploration / len(arm_ids)
@@ -161,13 +132,11 @@ def mixture_probabilities(
     return arm_ids, probabilities.tolist()
 
 
-def _update_restricted_distribution(
-    state: dict[str, Any], records: list, config: dict[str, Any]
-) -> None:
+def _update_restricted_distribution(state: dict[str, Any], records: list, config: dict[str, Any]) -> None:
     arm_ids, _ = mixture_probabilities(state, config)
     log_weights = np.asarray(state["restricted"]["log_weights"], dtype=np.float64)
     index_of = {arm: index for index, arm in enumerate(arm_ids)}
-    eta = float(config.get("meta_learning_rate", 0.05))
+    eta = float(config["meta_learning_rate"])
     pairs: dict[tuple[str, int], list] = {}
     for record in records:
         arm = str(record.behavior_member_id or "")
@@ -193,17 +162,17 @@ def _train_role(
     target = net_module.build().to(device)
     online.load_state_dict(role_state["online"])
     target.load_state_dict(role_state["target"])
-    optimizer = torch.optim.Adam(online.parameters(), lr=float(config.get("learning_rate", 1e-4)))
+    optimizer = torch.optim.Adam(online.parameters(), lr=float(config["learning_rate"]))
     if role_state.get("optimizer") is not None:
         optimizer.load_state_dict(role_state["optimizer"])
         move_optimizer(optimizer, device)
     gradient_steps = int(role_state.get("gradient_steps", 0))
-    target_sync = int(config.get("target_sync", 2000))
-    batch_size = int(config.get("batch_size", 512))
+    target_sync = int(config["target_sync"])
+    batch_size = int(config["batch_size"])
     loss_fn = nn.SmoothL1Loss()
     losses: list[float] = []
-    market_steps = int(config.get("market_gradient_steps_per_batch", 100)) * max(
-        1, steps // max(1, int(config.get("gradient_steps_per_batch", 400)))
+    market_steps = int(config["market_gradient_steps_per_batch"]) * max(
+        1, steps // max(1, int(config["gradient_steps_per_batch"]))
     )
     planned_market_steps = market_steps if buffer.market_transitions else 0
     total_steps = steps + planned_market_steps
@@ -249,15 +218,13 @@ def _train_role(
     market_target = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
     market_online.load_state_dict(role_state["market_online"])
     market_target.load_state_dict(role_state["market_target"])
-    market_optimizer = torch.optim.Adam(
-        market_online.parameters(), lr=float(config.get("market_learning_rate", 1e-4))
-    )
+    market_optimizer = torch.optim.Adam(market_online.parameters(), lr=float(config["market_learning_rate"]))
     if role_state.get("market_optimizer") is not None:
         market_optimizer.load_state_dict(role_state["market_optimizer"])
         move_optimizer(market_optimizer, device)
     market_gradient_steps = int(role_state.get("market_gradient_steps", 0))
-    market_target_sync = int(config.get("market_target_sync", 1000))
-    market_batch_size = int(config.get("market_batch_size", 128))
+    market_target_sync = int(config["market_target_sync"])
+    market_batch_size = int(config["market_batch_size"])
     market_losses: list[float] = []
     if buffer.market_transitions:
         for _ in range(market_steps):
@@ -274,13 +241,9 @@ def _train_role(
                 best = online_q.masked_fill(~next_mask, float("-inf")).argmax(dim=2)
                 target_q = market_target(flat).reshape(shape)
                 factor_values = target_q.gather(2, best.unsqueeze(2)).squeeze(2)
-                factor_values = torch.where(
-                    next_mask.any(dim=2), factor_values, torch.zeros_like(factor_values)
-                )
+                factor_values = torch.where(next_mask.any(dim=2), factor_values, torch.zeros_like(factor_values))
                 goal = reward + discount * factor_values.sum(dim=1)
-            predicted = market_online(
-                features.reshape(-1, features.shape[-1])
-            ).reshape(features.shape[:2]).sum(dim=1)
+            predicted = market_online(features.reshape(-1, features.shape[-1])).reshape(features.shape[:2]).sum(dim=1)
             loss = loss_fn(predicted, goal)
             market_optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -298,12 +261,8 @@ def _train_role(
             "target": {k: v.detach().cpu() for k, v in target.state_dict().items()},
             "optimizer": optimizer.state_dict(),
             "gradient_steps": gradient_steps,
-            "market_online": {
-                k: v.detach().cpu() for k, v in market_online.state_dict().items()
-            },
-            "market_target": {
-                k: v.detach().cpu() for k, v in market_target.state_dict().items()
-            },
+            "market_online": {k: v.detach().cpu() for k, v in market_online.state_dict().items()},
+            "market_target": {k: v.detach().cpu() for k, v in market_target.state_dict().items()},
             "market_optimizer": market_optimizer.state_dict(),
             "market_gradient_steps": market_gradient_steps,
         },
@@ -318,14 +277,15 @@ def _mixture_summary(left: list[Path], right: list[Path], seeds: int, seed_start
 
     margins: list[float] = []
     errors = 0
+    if not left or not right:
+        raise ValueError("admission evaluation requires two non-empty populations")
+    rng = np.random.default_rng(seed_start)
+    left_choices = rng.integers(0, len(left), size=seeds)
+    right_choices = rng.integers(0, len(right), size=seeds)
     for index in range(seeds):
         seed = seed_start + index
-        left_spec = (
-            f"{SELF_SPEC}?weights={left[index % len(left)]}&policy_seed={seed * 2 + 1}"
-        )
-        right_spec = (
-            f"{SELF_SPEC}?weights={right[index % len(right)]}&policy_seed={seed * 2 + 2}"
-        )
+        left_spec = f"{SELF_SPEC}?weights={left[int(left_choices[index])]}&policy_seed={seed * 2 + 1}"
+        right_spec = f"{SELF_SPEC}?weights={right[int(right_choices[index])]}&policy_seed={seed * 2 + 2}"
         forward = run_match((left_spec, right_spec), seed)
         reverse = run_match((right_spec, left_spec), seed)
         if forward.failed or reverse.failed:
@@ -352,14 +312,29 @@ def evaluate_member(path: Path, opponents: list[str], seeds: int, seed_start: in
     from sim.arena import play_series
     from sim.metrics import summarize
 
+    artifact = PopulationArtifact.load(path)
     results = []
     for opponent_index, opponent in enumerate(opponents):
         start = seed_start + opponent_index * 100_000
-        spec = f"{SELF_SPEC}?weights={path}&policy_seed={start}"
+        episode_seeds = list(range(start, start + seeds))
+        rng = np.random.default_rng(start)
+        component_choices = rng.choice(len(artifact.components), size=seeds, p=artifact.weights)
+        outcomes = {}
+        for component_index in range(len(artifact.components)):
+            selected_seeds = [
+                episode_seed
+                for episode_seed, choice in zip(episode_seeds, component_choices)
+                if int(choice) == component_index
+            ]
+            if not selected_seeds:
+                continue
+            component_spec = f"{SELF_SPEC}?weights={path}&component_index={component_index}"
+            outcomes.update(play_series(component_spec, opponent, selected_seeds, {}, jobs))
+        spec = f"{SELF_SPEC}?weights={path}"
         summary = summarize(
             spec,
             opponent,
-            play_series(spec, opponent, range(start, start + seeds), {}, jobs),
+            outcomes,
         )
         effective_win_rate = (summary.wins + summary.draws / 2) / summary.pairs if summary.pairs else 0.0
         results.append(
@@ -386,31 +361,36 @@ def passes_release_gate(validation: dict[str, Any], config: dict[str, Any]) -> b
 
     return (
         not validation.get("errors")
-        and float(validation.get("mean_money", 0.0))
-        >= float(config.get("release_min_money", 3000.0))
-        and float(validation.get("mean_win_rate", 0.0))
-        >= float(config.get("release_min_win_rate", 0.5))
-        and float(validation.get("mean_margin", float("-inf")))
-        >= float(config.get("release_min_margin", 0.0))
+        and float(validation.get("mean_money", 0.0)) >= float(config["release_min_money"])
+        and float(validation.get("mean_win_rate", 0.0)) >= float(config["release_min_win_rate"])
+        and float(validation.get("mean_margin", float("-inf"))) >= float(config["release_min_margin"])
+    )
+
+
+def _candidate_rank(candidate: dict[str, Any]) -> tuple[float, float, float, str]:
+    validation = candidate["validation"]
+    return (
+        float(validation["mean_win_rate"]),
+        float(validation["mean_margin"]),
+        float(validation.get("mean_money", 0.0)),
+        str(candidate.get("candidate_id", candidate.get("member_id", ""))),
     )
 
 
 def validation_opponent_specs(context, reader, config: dict[str, Any]) -> list[str]:
     """Fixed DQN reference plus the current active DQN training instances."""
 
-    opponents = [str(item) for item in config.get("validation_opponents", ["starter"])]
+    opponents = [str(item) for item in config["validation_opponents"]]
     opponents += active_checkpoint_opponents(
         context,
         reader,
-        [str(item) for item in config.get("validation_peer_types", [])],
+        [str(item) for item in config["validation_peer_types"]],
     )
     return list(dict.fromkeys(opponents))
 
 
-def _record_nu_snapshot(
-    state: dict[str, Any], path: Path, config: dict[str, Any], seed: int
-) -> None:
-    capacity = int(config.get("nu_average_snapshots", 16))
+def _record_nu_snapshot(state: dict[str, Any], path: Path, config: dict[str, Any], seed: int) -> None:
+    capacity = int(config["nu_average_snapshots"])
     if capacity < 1:
         raise ValueError("nu_average_snapshots must be positive")
     snapshots = state.setdefault("nu_snapshots", [])
@@ -436,53 +416,126 @@ def _save_nu_average(state: dict[str, Any], path: Path) -> None:
         if digest(source) != snapshot["sha256"]:
             raise ValueError(f"nu snapshot digest mismatch: {source}")
         components.append(PolicyBundle.load(source))
-    PopulationArtifact(
-        tuple(components), np.full(len(components), 1.0 / len(components), dtype=np.float64)
-    ).save(path)
+    PopulationArtifact(tuple(components), np.full(len(components), 1.0 / len(components), dtype=np.float64)).save(path)
+
+
+def _load_training_data(
+    context: ModelUpdateContext,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    seed: int,
+) -> tuple[ReplayBuffer, ReplayBuffer, list]:
+    def make_buffer(role_seed: int) -> ReplayBuffer:
+        return ReplayBuffer(
+            int(config["buffer_episodes"]),
+            float(config["gamma"]),
+            int(config["n_step"]),
+            role_seed,
+            float(config["reservoir_fraction"]),
+        )
+
+    nu_buffer = make_buffer(seed + 1)
+    beta_buffer = make_buffer(seed + 2)
+    new_records = []
+    new_batch_ids = {batch.batch_id for batch in context.new_batches}
+    for batch in context.all_batches:
+        if batch.source_kind != "sp_psro_rollout" or not batch.artifact_path:
+            continue
+        if batch.artifact_sha256 and digest(batch.artifact_path) != batch.artifact_sha256:
+            raise ValueError(f"rollout artifact digest mismatch: {batch.artifact_path}")
+        records = load_batch(batch.artifact_path)
+        nu_buffer.add([record.new_policy for record in records])
+        beta_buffer.add([record.best_response for record in records])
+        if batch.batch_id in new_batch_ids:
+            new_records.extend(records)
+    for role, buffer in (("nu", nu_buffer), ("beta", beta_buffer)):
+        rng_state = state["live"][role].get("replay_rng_state")
+        if rng_state is not None:
+            buffer.rng.bit_generator.state = rng_state
+    warmup = int(config["warmup_episodes"])
+    if min(len(nu_buffer.episodes), len(beta_buffer.episodes)) < warmup:
+        raise ValueError(f"SP-PSRO requires at least {warmup} dual-policy episodes")
+    return nu_buffer, beta_buffer, new_records
+
+
+def _admit_candidates(
+    context: ModelUpdateContext,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    seed: int,
+    members_dir: Path,
+) -> tuple[Path, Path, dict[str, Any], bool]:
+    if not state["population"]:
+        initial_path = members_dir / "member-000000-initial.npz"
+        PolicyBundle(QNetwork(state.pop("initial_job_network")), None).save(initial_path)
+        state["population"].append(
+            {
+                "member_id": "member-000000-initial",
+                "role": "initial",
+                "path": str(initial_path),
+                "sha256": digest(initial_path),
+                "validation": None,
+            }
+        )
+
+    iteration = int(state["iteration"])
+    nu_snapshot_path = members_dir / (f"nu-snapshot-{iteration:06d}-{context.cutoff_batch_seq:08d}.npz")
+    _network_from_state(state["live"]["nu"]).save(nu_snapshot_path)
+    _record_nu_snapshot(state, nu_snapshot_path, config, seed)
+    beta_path = members_dir / (f"candidate-{iteration:06d}-beta-{context.cutoff_batch_seq}.npz")
+    nu_path = members_dir / (f"candidate-{iteration:06d}-nu-average-{context.cutoff_batch_seq}.npz")
+    _network_from_state(state["live"]["beta"]).save(beta_path)
+    _save_nu_average(state, nu_path)
+    admission = evaluate_admission(
+        [beta_path, nu_path],
+        [Path(member["path"]) for member in state["population"]],
+        int(config["admission_seeds"]),
+        seed + 2_000_000 + context.cutoff_batch_seq * 10_000,
+    )
+    admitted = admission["errors"] == 0 and admission["pairs"] > 1 and float(admission["margin_ci"][0]) > 0.0
+    if admitted:
+        new_members = []
+        for role, candidate_path in (("beta", beta_path), ("nu-average", nu_path)):
+            member_id = f"member-{iteration + 1:06d}-{role}"
+            final_path = members_dir / f"{member_id}.npz"
+            PopulationArtifact.load(candidate_path).save(final_path)
+            new_members.append(
+                {
+                    "member_id": member_id,
+                    "role": role,
+                    "path": str(final_path),
+                    "sha256": digest(final_path),
+                    "validation": None,
+                }
+            )
+        state["population"].extend(new_members)
+        state["population"] = state["population"][-int(config["population_size"]) :]
+        state["iteration"] = iteration + 1
+        state["live"] = fresh_live(seed + 10_000 + (iteration + 1) * 100)
+        # Exploration belongs to the newly created learners, not to the
+        # lifetime training session.  The collector uses this cutoff to count
+        # only decisions gathered since this reset.
+        state["exploration_start_batch_seq"] = context.cutoff_batch_seq
+        state["restricted"] = {"arm_ids": [], "log_weights": []}
+        state["nu_snapshots"] = []
+        state["nu_snapshots_seen"] = 0
+        state["nu_snapshot_rng_state"] = None
+    state["last_admission"] = {**admission, "admitted": admitted}
+    return beta_path, nu_path, admission, admitted
 
 
 class PopulationUpdater:
     def update(self, context: ModelUpdateContext, reader: ModelTrainingReader) -> ModelUpdateResult:
         config = context.config
-        seed = int(config.get("seed", 0))
+        seed = int(config["seed"])
         state = load_state(
             context.active_checkpoint.trainer_artifact_path if context.active_checkpoint is not None else None,
             seed,
-            config.get("initial_population_weights"),
         )
-        def replay(role_seed: int) -> ReplayBuffer:
-            return ReplayBuffer(
-                int(config.get("buffer_episodes", 800)),
-                float(config.get("gamma", 0.997)),
-                int(config.get("n_step", 3)),
-                role_seed,
-                float(config.get("reservoir_fraction", 0.35)),
-            )
-
-        nu_buffer = replay(seed + 1)
-        beta_buffer = replay(seed + 2)
-        new_records = []
-        new_batch_ids = {batch.batch_id for batch in context.new_batches}
-        for batch in context.all_batches:
-            if batch.source_kind != "sp_psro_rollout" or not batch.artifact_path:
-                continue
-            if batch.artifact_sha256 and digest(batch.artifact_path) != batch.artifact_sha256:
-                raise ValueError(f"rollout artifact digest mismatch: {batch.artifact_path}")
-            records = load_batch(batch.artifact_path)
-            nu_buffer.add([record.new_policy for record in records])
-            beta_buffer.add([record.best_response for record in records])
-            if batch.batch_id in new_batch_ids:
-                new_records.extend(records)
-        if state["live"]["nu"].get("replay_rng_state") is not None:
-            nu_buffer.rng.bit_generator.state = state["live"]["nu"]["replay_rng_state"]
-        if state["live"]["beta"].get("replay_rng_state") is not None:
-            beta_buffer.rng.bit_generator.state = state["live"]["beta"]["replay_rng_state"]
-        warmup = int(config.get("warmup_episodes", 16))
-        if min(len(nu_buffer.episodes), len(beta_buffer.episodes)) < warmup:
-            raise ValueError(f"SP-PSRO requires at least {warmup} dual-policy episodes")
+        nu_buffer, beta_buffer, new_records = _load_training_data(context, state, config, seed)
 
         device = resolve_device(str(config.get("device", "auto")))
-        steps = int(config.get("gradient_steps_per_batch", 400)) * len(context.new_batches)
+        steps = int(config["gradient_steps_per_batch"]) * len(context.new_batches)
         print(
             f"[sp-psro training] update started: {len(context.new_batches)} new batches, "
             f"{steps} gradient steps per role on {device}",
@@ -501,6 +554,7 @@ class PopulationUpdater:
         state["live"]["nu"]["replay_rng_state"] = nu_buffer.rng.bit_generator.state
         state["live"]["beta"]["replay_rng_state"] = beta_buffer.rng.bit_generator.state
         _update_restricted_distribution(state, new_records, config)
+        updated_arm_ids, updated_probabilities = mixture_probabilities(state, config)
 
         artifact_root = context.artifacts
         members_dir = artifact_root / "population_members"
@@ -508,103 +562,30 @@ class PopulationUpdater:
         members_dir.mkdir(parents=True, exist_ok=True)
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-        if not state["population"]:
-            initial_path = members_dir / "member-000000-initial.npz"
-            PolicyBundle(
-                QNetwork(state.pop("initial_job_network")),
-                QNetwork(state.pop("initial_market_network")),
-            ).save(initial_path)
-            state["population"].append(
-                {
-                    "member_id": "member-000000-initial",
-                    "role": "initial",
-                    "path": str(initial_path),
-                    "sha256": digest(initial_path),
-                    "validation": None,
-                }
-            )
-
-        iteration = int(state["iteration"])
-        nu_snapshot_path = members_dir / (
-            f"nu-snapshot-{iteration:06d}-{context.cutoff_batch_seq:08d}.npz"
+        beta_candidate_path, nu_candidate_path, admission, admitted = _admit_candidates(
+            context, state, config, seed, members_dir
         )
-        _network_from_state(state["live"]["nu"]).save(nu_snapshot_path)
-        _record_nu_snapshot(state, nu_snapshot_path, config, seed)
-        beta_candidate_path = members_dir / (
-            f"candidate-{iteration:06d}-beta-{context.cutoff_batch_seq}.npz"
-        )
-        nu_candidate_path = members_dir / (
-            f"candidate-{iteration:06d}-nu-average-{context.cutoff_batch_seq}.npz"
-        )
-        _network_from_state(state["live"]["beta"]).save(beta_candidate_path)
-        _save_nu_average(state, nu_candidate_path)
-        population_paths = [Path(member["path"]) for member in state["population"]]
-        admission = evaluate_admission(
-            [beta_candidate_path, nu_candidate_path],
-            population_paths,
-            int(config.get("admission_seeds", 60)),
-            seed + 2_000_000 + context.cutoff_batch_seq * 10_000,
-        )
-        admitted = admission["errors"] == 0 and admission["pairs"] > 1 and float(admission["margin_ci"][0]) > 0.0
         print(
-            f"[sp-psro training] admission evaluation complete: admitted={admitted}; "
-            "running validation",
+            f"[sp-psro training] admission evaluation complete: admitted={admitted}; running validation",
             flush=True,
         )
-        new_members: list[dict[str, Any]] = []
-        if admitted:
-            for role, candidate_path in (
-                ("beta", beta_candidate_path),
-                ("nu-average", nu_candidate_path),
-            ):
-                member_id = f"member-{iteration + 1:06d}-{role}"
-                final_path = members_dir / f"{member_id}.npz"
-                PopulationArtifact.load(candidate_path).save(final_path)
-                new_members.append(
-                    {
-                        "member_id": member_id,
-                        "role": role,
-                        "path": str(final_path),
-                        "sha256": digest(final_path),
-                        "validation": None,
-                    }
-                )
-            state["population"].extend(new_members)
-            state["population"] = state["population"][-int(config.get("population_size", 10)):]
-            state["iteration"] = iteration + 1
-            state["live"] = fresh_live(seed + 10_000 + (iteration + 1) * 100)
-            state["restricted"] = {"arm_ids": [], "log_weights": []}
-            state["nu_snapshots"] = []
-            state["nu_snapshots_seen"] = 0
-            state["nu_snapshot_rng_state"] = None
-        state["last_admission"] = {**admission, "admitted": admitted}
-
         opponents = validation_opponent_specs(context, reader, config)
         suite = hashlib.sha256("\0".join(opponents).encode()).hexdigest()
         if state.get("validation_suite") != suite:
             for member in state["population"]:
                 member["validation"] = None
             state["validation_suite"] = suite
-            state["inference_champion"] = None
-        validation_seeds = int(config.get("validation_seeds", 40))
-        jobs = int(config.get("jobs", 1))
+            state["release_champion"] = None
+        validation_seeds = int(config["validation_seeds"])
+        jobs = int(config["jobs"])
         for member in state["population"]:
             if member.get("validation") is None:
                 member["validation"] = evaluate_member(
                     Path(member["path"]), opponents, validation_seeds, seed + 4_000_000, jobs
                 )
-        population_eligible = [
-            member for member in state["population"] if not member["validation"].get("errors")
-        ]
+        population_eligible = [member for member in state["population"] if not member["validation"].get("errors")]
         if population_eligible:
-            state["champion_id"] = max(
-                population_eligible,
-                key=lambda member: (
-                    member["validation"]["mean_win_rate"],
-                    member["validation"]["mean_margin"],
-                    member["member_id"],
-                ),
-            )["member_id"]
+            state["population_champion_id"] = max(population_eligible, key=_candidate_rank)["member_id"]
         beta_validation = evaluate_member(
             beta_candidate_path,
             opponents,
@@ -633,30 +614,22 @@ class PopulationUpdater:
                     "validation": beta_validation,
                 }
             )
-        if state.get("inference_champion") is not None:
-            release_candidates.append(state["inference_champion"])
+        if state.get("release_champion") is not None:
+            release_candidates.append(state["release_champion"])
         if release_candidates:
-            selected = max(
-                release_candidates,
-                key=lambda item: (
-                    item["validation"]["mean_win_rate"],
-                    item["validation"]["mean_margin"],
-                    item["validation"]["mean_money"],
-                    item["candidate_id"],
-                ),
-            )
+            selected = max(release_candidates, key=_candidate_rank)
             if Path(selected["path"]) == beta_candidate_path:
                 released_path = members_dir / f"release-{selected['candidate_id']}.npz"
                 PopulationArtifact.load(beta_candidate_path).save(released_path)
                 selected = {**selected, "path": str(released_path)}
-            state["inference_champion"] = selected
+            state["release_champion"] = selected
 
         retained_ids = {member["member_id"] for member in state["population"]}
-        if state["champion_id"] not in retained_ids:
-            state["champion_id"] = state["population"][-1]["member_id"]
+        if state["population_champion_id"] not in retained_ids:
+            state["population_champion_id"] = state["population"][-1]["member_id"]
 
         population_champion = next(
-            member for member in state["population"] if member["member_id"] == state["champion_id"]
+            member for member in state["population"] if member["member_id"] == state["population_champion_id"]
         )
         checkpoint_id = hashlib.sha256(
             f"{context.model_id}\0{context.update_id}\0{context.dataset_sha256}".encode()
@@ -665,11 +638,9 @@ class PopulationUpdater:
         inference_path = checkpoints_dir / f"{checkpoint_id}.npz"
         state["dataset_sha256"] = context.dataset_sha256
         torch.save(state, trainer_path)
-        inference_champion = state.get("inference_champion")
+        release_champion = state.get("release_champion")
         inference_source = (
-            Path(inference_champion["path"])
-            if inference_champion is not None
-            else Path(population_champion["path"])
+            Path(release_champion["path"]) if release_champion is not None else Path(population_champion["path"])
         )
         PopulationArtifact.load(inference_source).save(inference_path)
         combined_digest = hashlib.sha256(trainer_path.read_bytes() + inference_path.read_bytes()).hexdigest()
@@ -679,34 +650,28 @@ class PopulationUpdater:
             "population_size": len(state["population"]),
             "iteration": state["iteration"],
             "admitted": admitted,
-            "champion_id": state["champion_id"],
-            "inference_champion_id": (
-                inference_champion["candidate_id"] if inference_champion is not None else None
-            ),
+            "champion_id": state["population_champion_id"],
+            "inference_champion_id": (release_champion["candidate_id"] if release_champion is not None else None),
             "beta_validation": beta_validation,
             "beta_loss": float(np.mean(beta_losses)) if beta_losses else None,
             "nu_loss": float(np.mean(nu_losses)) if nu_losses else None,
-            "beta_market_loss": (
-                float(np.mean(beta_market_losses)) if beta_market_losses else None
-            ),
-            "nu_market_loss": (
-                float(np.mean(nu_market_losses)) if nu_market_losses else None
-            ),
+            "beta_market_loss": (float(np.mean(beta_market_losses)) if beta_market_losses else None),
+            "nu_market_loss": (float(np.mean(nu_market_losses)) if nu_market_losses else None),
             "beta_market_transitions": beta_buffer.market_transitions,
             "nu_market_transitions": nu_buffer.market_transitions,
-            "restricted_distribution": dict(zip(*mixture_probabilities(state, config))),
+            "restricted_distribution": dict(zip(updated_arm_ids, updated_probabilities)),
             "gradient_steps_this_update": steps,
             "train_seconds": time.perf_counter() - started,
         }
         gate = {
             "kind": "external_submission_quality",
-            "passed": inference_champion is not None,
+            "passed": release_champion is not None,
             "population_admission": state["last_admission"],
             "beta_validation": beta_validation,
             "thresholds": {
-                "money": float(config.get("release_min_money", 3000.0)),
-                "win_rate": float(config.get("release_min_win_rate", 0.5)),
-                "margin": float(config.get("release_min_margin", 0.0)),
+                "money": float(config["release_min_money"]),
+                "win_rate": float(config["release_min_win_rate"]),
+                "margin": float(config["release_min_margin"]),
             },
         }
         evaluations = (

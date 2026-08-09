@@ -19,8 +19,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
-from kaggriculture_lab.storage import SCHEMA_VERSION
-
 PAGE_SIZE = 50
 
 
@@ -127,16 +125,19 @@ class DashboardRepository:
             )
         try:
             with self.connect() as connection:
-                row = connection.execute("SELECT max(version) FROM schema_migrations").fetchone()
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT table_name FROM information_schema.tables "
+                        "WHERE table_schema = 'main'"
+                    ).fetchall()
+                }
         except DashboardUnavailable:
             return False
         except Exception as error:
             raise ValueError(f"not a Kaggriculture experiment database: {self.path}") from error
-        version = row[0] if row else None
-        if version != SCHEMA_VERSION:
-            raise ValueError(
-                f"unsupported experiment schema version {version!r}; expected {SCHEMA_VERSION}"
-            )
+        if not {"runs", "episodes", "training_sessions"} <= tables:
+            raise ValueError(f"not a Kaggriculture experiment database: {self.path}")
         return True
 
 
@@ -453,7 +454,7 @@ def _sessions_page(connection: Any, page: int) -> str:
     sessions = _rows(
         connection,
         """
-        SELECT session_id, name, status, seed, created_at
+        SELECT session_id, name, status, seed, config_json, created_at
         FROM training_sessions ORDER BY created_at DESC, session_id LIMIT ? OFFSET ?
         """,
         [PAGE_SIZE + 1, offset],
@@ -470,15 +471,24 @@ def _sessions_page(connection: Any, page: int) -> str:
             for row in _rows(
                 connection,
                 f"""
+                WITH completed_rounds AS (
+                    SELECT generation_id, round_index
+                    FROM model_round_hooks
+                    WHERE scope = 'round'
+                    GROUP BY generation_id, round_index
+                    HAVING bool_and(status = 'COMPLETE')
+                )
                 SELECT g.session_id, count(DISTINCT g.generation_id) AS generations,
                        count(DISTINCT lp.pairing_id) AS pairings,
                        count(DISTINCT CASE WHEN lp.status = 'COMPLETE' THEN lp.pairing_id END) AS completed_pairings,
                        count(DISTINCT pe.match_id) AS episodes,
-                       count(DISTINCT CASE WHEN e.failed THEN e.match_id END) AS failed_episodes
+                       count(DISTINCT CASE WHEN e.failed THEN e.match_id END) AS failed_episodes,
+                       count(DISTINCT cr.generation_id || ':' || cr.round_index) AS completed_rounds
                 FROM generations g
                 LEFT JOIN league_pairings lp USING (generation_id)
                 LEFT JOIN pairing_episodes pe USING (pairing_id)
                 LEFT JOIN episodes e USING (match_id)
+                LEFT JOIN completed_rounds cr USING (generation_id)
                 WHERE g.session_id IN ({placeholders}) GROUP BY g.session_id
                 """,
                 session_ids,
@@ -513,15 +523,27 @@ def _sessions_page(connection: Any, page: int) -> str:
         leader = leaders.get(session_id)
         pairings = int(stats.get("pairings") or 0)
         completed = int(stats.get("completed_pairings") or 0)
+        session_config = json.loads(str(session["config_json"]))
+        trainer_only = session_config.get("pairing_mode") == "trainer_only"
+        if trainer_only:
+            planned_rounds = int(session_config.get("rounds_per_generation", 0)) * int(
+                stats.get("generations") or 0
+            )
+            progress = (
+                f'{int(stats.get("completed_rounds") or 0):,} / {planned_rounds:,} rounds'
+                f'<br><small>{completed:,} pairings recorded</small>'
+            )
+        else:
+            progress = _progress(completed, pairings)
         leader_html = "—" if not leader else f'{_escape(leader["display_name"])}<br><small>{_number(leader["conservative"], 1)}</small>'
         rows_html.append(
             f'<tr><td><a href="{_escape(_id_path("sessions", session_id))}"><b>{_escape(session["name"])}</b></a><br><small>{_escape(session_id)}</small></td>'
             f'<td>{_status(session["status"])}</td><td>{int(stats.get("generations") or 0):,}</td>'
-            f'<td>{_progress(completed, pairings)}</td><td>{int(stats.get("episodes") or 0):,}</td>'
+            f'<td>{progress}</td><td>{int(stats.get("episodes") or 0):,}</td>'
             f'<td>{int(stats.get("failed_episodes") or 0):,}</td><td>{leader_html}</td><td>{_escape(session["created_at"])}</td></tr>'
         )
     table = (
-        '<div class="panel"><table><thead><tr><th>Session</th><th>Status</th><th>Generations</th><th>Pairings</th><th>Episodes</th><th>Failures</th><th>Latest leader</th><th>Created</th></tr></thead>'
+        '<div class="panel"><table><thead><tr><th>Session</th><th>Status</th><th>Generations</th><th>Progress</th><th>Episodes</th><th>Failures</th><th>Latest leader</th><th>Created</th></tr></thead>'
         f'<tbody>{"".join(rows_html)}</tbody></table>{_pager("/", page, has_next)}</div>'
         if sessions
         else '<div class="panel empty">No league sessions have been recorded yet.</div>'
@@ -543,6 +565,14 @@ def _session_page(connection: Any, session_id: str) -> str:
         WITH member_counts AS (
             SELECT generation_id, count(*) AS members
             FROM generation_members GROUP BY generation_id
+        ), completed_rounds AS (
+            SELECT generation_id, round_index FROM model_round_hooks
+            WHERE scope = 'round'
+            GROUP BY generation_id, round_index
+            HAVING bool_and(status = 'COMPLETE')
+        ), round_counts AS (
+            SELECT generation_id, count(*) AS completed_rounds
+            FROM completed_rounds GROUP BY generation_id
         ), pairing_counts AS (
             SELECT lp.generation_id, count(DISTINCT lp.pairing_id) AS pairings,
                    count(DISTINCT CASE WHEN lp.status = 'COMPLETE' THEN lp.pairing_id END) AS completed_pairings,
@@ -557,10 +587,12 @@ def _session_page(connection: Any, session_id: str) -> str:
                coalesce(mc.members, 0) AS members, coalesce(pc.pairings, 0) AS pairings,
                coalesce(pc.completed_pairings, 0) AS completed_pairings,
                coalesce(pc.episodes, 0) AS episodes,
-               coalesce(pc.failed_episodes, 0) AS failed_episodes
+               coalesce(pc.failed_episodes, 0) AS failed_episodes,
+               coalesce(rc.completed_rounds, 0) AS completed_rounds
         FROM generations g
         LEFT JOIN member_counts mc USING (generation_id)
         LEFT JOIN pairing_counts pc USING (generation_id)
+        LEFT JOIN round_counts rc USING (generation_id)
         WHERE g.session_id = ?
         ORDER BY g.generation_index DESC
         """,
@@ -600,23 +632,46 @@ def _session_page(connection: Any, session_id: str) -> str:
     completed_pairings = sum(int(row["completed_pairings"] or 0) for row in generations)
     episodes = sum(int(row["episodes"] or 0) for row in generations)
     failures = sum(int(row["failed_episodes"] or 0) for row in generations)
+    session_config = json.loads(str(session["config_json"]))
+    trainer_only = session_config.get("pairing_mode") == "trainer_only"
+    completed_rounds = 0
+    planned_rounds = 0
+    if trainer_only:
+        completed_rounds = int(connection.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT mrh.generation_id, mrh.round_index
+                FROM model_round_hooks mrh JOIN generations g USING (generation_id)
+                WHERE g.session_id = ? AND mrh.scope = 'round'
+                GROUP BY mrh.generation_id, mrh.round_index
+                HAVING bool_and(mrh.status = 'COMPLETE')
+            )
+            """,
+            [session_id],
+        ).fetchone()[0])
+        planned_rounds = len(generations) * int(session_config.get("rounds_per_generation", 0))
     generation_rows = "".join(
         f'<tr><td><a href="{_escape(_id_path("generations", row["generation_id"]))}"><b>Generation {int(row["generation_index"])}</b></a><br><small>{_escape(row["generation_id"])}</small></td>'
         f'<td>{_status(row["status"])}</td><td>{int(row["members"] or 0):,}</td>'
-        f'<td>{_progress(int(row["completed_pairings"] or 0), int(row["pairings"] or 0))}</td>'
+        f'<td>{f"{int(row["completed_rounds"] or 0):,} / {int(session_config.get("rounds_per_generation", 0)):,} rounds<br><small>{int(row["completed_pairings"] or 0):,} pairings recorded</small>" if trainer_only else _progress(int(row["completed_pairings"] or 0), int(row["pairings"] or 0))}</td>'
         f'<td>{int(row["episodes"] or 0):,}</td><td>{int(row["failed_episodes"] or 0):,}</td>'
         f'<td>{_escape(row["completed_at"] or row["created_at"])}</td></tr>'
         for row in generations
     )
-    config = json.dumps(json.loads(str(session["config_json"])), indent=2, sort_keys=True)
+    config = json.dumps(session_config, indent=2, sort_keys=True)
+    work_cards = (
+        [("Rounds", f"{completed_rounds:,} / {planned_rounds:,}"),
+         ("Pairings recorded", f"{completed_pairings:,}")]
+        if trainer_only else [("Pairings", f"{completed_pairings:,} / {total_pairings:,}")]
+    )
     body = f'''<p><a href="/">← Sessions</a></p><h1>{_escape(session["name"])}</h1>
 <p class="muted">{_escape(session_id)} · seed {_escape(session["seed"])} · created {_escape(session["created_at"])} · {_status(session["status"])}</p>
-{_cards([("Generations", f"{len(generations):,}"), ("Pairings", f"{completed_pairings:,} / {total_pairings:,}"),
+{_cards([("Generations", f"{len(generations):,}"), *work_cards,
           ("Episodes", f"{episodes:,}"), ("Episode failures", f"{failures:,}"),
           ("Hook errors", f"{int(evaluation.get('errors') or 0):,} / {int(evaluation.get('evaluations') or 0):,}"),
           ("Re-evaluation requests", f"{int(evaluation.get('reevaluation_requests') or 0):,}")])}
 <h2>Rating trend</h2><div class="panel">{_chart(trend)}</div><h2>Generations</h2>
-<div class="panel"><table><thead><tr><th>Generation</th><th>Status</th><th>Members</th><th>Pairings</th><th>Episodes</th><th>Failures</th><th>Updated</th></tr></thead><tbody>{generation_rows}</tbody></table></div>
+<div class="panel"><table><thead><tr><th>Generation</th><th>Status</th><th>Members</th><th>Progress</th><th>Episodes</th><th>Failures</th><th>Updated</th></tr></thead><tbody>{generation_rows}</tbody></table></div>
 <details class="panel"><summary>Session configuration</summary><pre>{_escape(config)}</pre></details>'''
     return _layout(str(session["name"]), body)
 
@@ -896,7 +951,7 @@ def _generation_page(
         connection,
         """
         SELECT g.generation_id, g.generation_index, g.status, g.created_at, g.completed_at,
-               ts.session_id, ts.name AS session_name
+               ts.session_id, ts.name AS session_name, ts.config_json
         FROM generations g JOIN training_sessions ts USING (session_id) WHERE g.generation_id = ?
         """,
         [generation_id],
@@ -1050,9 +1105,28 @@ def _generation_page(
     status_options = '<option value="all">All</option>' + "".join(f'<option value="{_escape(value)}" {"selected" if value == status_filter else ""}>{_escape(value)}</option>' for value in status_values)
     kind_options = '<option value="all">All</option>' + "".join(f'<option value="{_escape(value)}" {"selected" if value == kind_filter else ""}>{_escape(value)}</option>' for value in kind_values)
     total, completed = int(summary.get("pairings") or 0), int(summary.get("completed") or 0)
+    session_config = json.loads(str(generation["config_json"]))
+    trainer_only = session_config.get("pairing_mode") == "trainer_only"
+    if trainer_only:
+        completed_rounds = int(connection.execute(
+            """
+            SELECT count(*) FROM (
+                SELECT round_index FROM model_round_hooks
+                WHERE generation_id = ? AND scope = 'round'
+                GROUP BY round_index HAVING bool_and(status = 'COMPLETE')
+            )
+            """,
+            [generation_id],
+        ).fetchone()[0])
+        work_cards = [
+            ("Rounds", f'{completed_rounds:,} / {int(session_config.get("rounds_per_generation", 0)):,}'),
+            ("Pairings recorded", f"{completed:,}"),
+        ]
+    else:
+        work_cards = [("Pairings", f"{completed:,} / {total:,}")]
     body = f'''<p><a href="{_escape(_id_path("sessions", generation["session_id"]))}">← {_escape(generation["session_name"])}</a></p>
 <h1>Generation {int(generation["generation_index"])}</h1><p class="muted">{_escape(generation_id)} · {_status(generation["status"])}</p>
-{_cards([("Pairings", f"{completed:,} / {total:,}"), ("Pairing failures", f"{int(summary.get('failed') or 0):,}"),
+{_cards([*work_cards, ("Pairing failures", f"{int(summary.get('failed') or 0):,}"),
           ("Episodes", f"{int(episode_summary.get('episodes') or 0):,}"), ("Episode failures", f"{int(episode_summary.get('failed_episodes') or 0):,}"),
           ("Ranked agents", f"{len(leaderboard):,}")])}
 <h2>Leaderboard</h2><div class="panel">{('<table><thead><tr><th>#</th><th>Agent</th><th>Role</th><th>Conservative</th><th>Rating</th><th>W–D–L</th><th>Score</th><th>Mean margin</th><th>Opponents</th></tr></thead><tbody>'+leaderboard_rows+'</tbody></table>') if leaderboard else '<div class="empty">Ratings appear after this generation closes.</div>'}</div>

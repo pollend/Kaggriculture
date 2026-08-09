@@ -88,11 +88,6 @@ CREATE TABLE IF NOT EXISTS proposals (
     PRIMARY KEY (run_id, strategy_id)
 );
 
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INTEGER PRIMARY KEY,
-    applied_at TIMESTAMP DEFAULT current_timestamp
-);
-
 CREATE TABLE IF NOT EXISTS agent_families (
     family_id VARCHAR PRIMARY KEY,
     name VARCHAR NOT NULL,
@@ -394,7 +389,3 @@ CREATE TABLE IF NOT EXISTS training_batch_artifacts (
     artifact_id VARCHAR NOT NULL,
     PRIMARY KEY (batch_id, artifact_id)
 );
-
--- The version stamp lives in `ExperimentStore._initialize`, not here: this file
--- describes the current shape and is replayed on every open, so stamping from
--- inside it would mark an unmigrated database as current.

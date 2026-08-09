@@ -19,8 +19,6 @@ from kaggriculture_lab.identity import (
 )
 from sim.runner import MatchResult
 
-SCHEMA_VERSION = 6
-
 
 class ExperimentStore:
     def __init__(self, path: str | Path):
@@ -41,55 +39,9 @@ class ExperimentStore:
         self.close()
 
     def _initialize(self) -> None:
-        """Build missing tables, then migrate an older database forward.
-
-        `schema.sql` is `CREATE TABLE IF NOT EXISTS` only, so replaying it adds
-        new tables but never reshapes existing ones. That is why an unstamped
-        database can be treated as current -- the file always describes the
-        current shape, an invariant every schema change has to maintain -- while
-        a stamped one has to walk `migrations/` to get there.
-        """
-
+        """Create every missing catalog object from the canonical schema."""
         schema_path = Path(__file__).with_name("schema.sql")
         self.connection.execute(schema_path.read_text())
-        version = int(
-            self.connection.execute(
-                "SELECT coalesce(max(version), 0) FROM schema_migrations"
-            ).fetchone()[0]
-        )
-        if version == 0:
-            self.connection.execute(
-                "INSERT INTO schema_migrations (version) VALUES (?)", [SCHEMA_VERSION]
-            )
-            return
-        while version < SCHEMA_VERSION:
-            self._apply_migration(version + 1)
-            applied = int(
-                self.connection.execute(
-                    "SELECT max(version) FROM schema_migrations"
-                ).fetchone()[0]
-            )
-            if applied <= version:
-                raise RuntimeError(
-                    f"migration to schema version {version + 1} did not stamp itself"
-                )
-            version = applied
-        if version != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"unsupported experiment schema version {version!r}; "
-                f"expected {SCHEMA_VERSION}"
-            )
-
-    def _apply_migration(self, version: int) -> None:
-        matches = sorted(
-            (Path(__file__).parent / "migrations").glob(f"{version:03d}_*.sql")
-        )
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"expected exactly one migration script for schema version {version}, "
-                f"found {len(matches)}"
-            )
-        self.connection.execute(matches[0].read_text())
 
     def register_family(
         self, manifest: AgentManifest, manifest_path: str | Path
