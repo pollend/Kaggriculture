@@ -10,6 +10,7 @@ from kaggle_environments import make
 
 from kaggriculture_lab.cli import build_parser
 from kaggriculture_lab.dashboard import (
+    ConsoleRingBuffer,
     DashboardNotFound,
     DashboardUnavailable,
     _episode_page,
@@ -142,6 +143,10 @@ def test_dashboard_drills_from_sessions_to_episode(dashboard):
     assert "Content-Security-Policy" in headers
     assert '<script src="/dashboard.js" defer></script>' in document
     assert "Refresh" not in document
+    assert '<pre id="dashboard-console">' in document
+
+    _, _, console = _get(base + "/console")
+    assert json.loads(console) == {"sequence": 0, "text": ""}
 
     _, js_headers, javascript = _get(base + "/dashboard.js")
     assert js_headers["Content-Type"].startswith("text/javascript")
@@ -152,7 +157,6 @@ def test_dashboard_drills_from_sessions_to_episode(dashboard):
     assert b"data-dashboard-nav" in javascript
     assert b"window.Alpine" not in javascript
     assert b"x-data" not in javascript
-
     _, _, body = _get(base + "/sessions/session%2Fone")
     assert "Rating trend" in body.decode()
     assert "session%2Fone%3Ag0000" in body.decode()
@@ -182,6 +186,15 @@ def test_dashboard_drills_from_sessions_to_episode(dashboard):
     beta_at = document.index("strategy beta")
     alpha_at = document.index("strategy alpha")
     assert beta_at < alpha_at
+
+
+def test_console_ring_buffer_keeps_only_the_latest_text():
+    buffer = ConsoleRingBuffer(max_chars=8)
+    buffer.write("first")
+    buffer.write("-second")
+    sequence, output = buffer.snapshot()
+    assert sequence == 2
+    assert output == "t-second"
 
 
 def test_dashboard_downloads_exact_replay_json(dashboard):

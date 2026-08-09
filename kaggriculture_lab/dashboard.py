@@ -8,7 +8,9 @@ import html
 import json
 import re
 import sys
+import threading
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http import HTTPStatus
@@ -20,6 +22,58 @@ from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from kaggriculture_lab.storage import SCHEMA_VERSION
 
 PAGE_SIZE = 50
+
+
+class ConsoleRingBuffer:
+    """Thread-safe bounded text sink for the dashboard's live console."""
+
+    def __init__(self, max_chars: int = 100_000):
+        if max_chars < 1:
+            raise ValueError("max_chars must be positive")
+        self.max_chars = max_chars
+        self._chunks: deque[str] = deque()
+        self._chars = 0
+        self._sequence = 0
+        self._lock = threading.Lock()
+
+    def write(self, value: str) -> int:
+        if not value:
+            return 0
+        with self._lock:
+            self._chunks.append(value)
+            self._chars += len(value)
+            self._sequence += 1
+            while self._chars > self.max_chars:
+                excess = self._chars - self.max_chars
+                if len(self._chunks[0]) <= excess:
+                    self._chars -= len(self._chunks.popleft())
+                else:
+                    self._chunks[0] = self._chunks[0][excess:]
+                    self._chars -= excess
+        return len(value)
+
+    def snapshot(self) -> tuple[int, str]:
+        with self._lock:
+            return self._sequence, "".join(self._chunks)
+
+
+class ConsoleTee:
+    """Mirror writes to the terminal and an in-memory console."""
+
+    def __init__(self, stream: Any, buffer: ConsoleRingBuffer):
+        self.stream = stream
+        self.buffer = buffer
+
+    def write(self, value: str) -> int:
+        written = self.stream.write(value)
+        self.buffer.write(value)
+        return written
+
+    def flush(self) -> None:
+        self.stream.flush()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.stream, name)
 
 
 class DashboardUnavailable(RuntimeError):
@@ -227,6 +281,7 @@ details{margin:8px 0}.pager{display:flex;justify-content:space-between;margin-to
 .player-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;margin:18px 0}.player-stats div{border-top:1px solid var(--line);padding-top:9px}
 .player-stats dt{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.player-stats dd{font-size:18px;font-weight:700;margin:3px 0 0}
 .replay-frame{display:block;width:100%;height:1000px;border:1px solid var(--line);border-radius:12px;background:#0a111d}
+.console{max-width:1200px;margin:auto;padding:0 22px 28px}.console pre{height:240px;max-height:none;margin:8px 0 0;color:#b9f6d2}
 @media(max-width:650px){main{padding:20px 12px}.bar{padding:12px}.grid,.players{grid-template-columns:1fr}h1{font-size:24px}.replay-frame{min-height:420px}}
 """
 
@@ -286,6 +341,24 @@ DASHBOARD_JS = r"""
   });
   window.addEventListener('popstate', () => connect(location.pathname + location.search));
   connect(location.pathname + location.search);
+
+  const consoleOutput = document.querySelector('#dashboard-console');
+  let consoleSequence = -1;
+  const refreshConsole = async () => {
+    if (!consoleOutput) return;
+    try {
+      const response = await fetch('/console');
+      if (!response.ok) return;
+      const snapshot = await response.json();
+      if (snapshot.sequence === consoleSequence) return;
+      const follow = consoleOutput.scrollHeight - consoleOutput.scrollTop - consoleOutput.clientHeight < 40;
+      consoleSequence = snapshot.sequence;
+      consoleOutput.textContent = snapshot.text || 'Waiting for console output…';
+      if (follow) consoleOutput.scrollTop = consoleOutput.scrollHeight;
+    } catch (_) {}
+  };
+  refreshConsole();
+  window.setInterval(refreshConsole, 1000);
 })();
 """.strip()
 
@@ -294,7 +367,7 @@ def _layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)} · Kaggriculture</title>
 <style>{CSS}</style><script src="/dashboard.js" defer></script></head><body><header><div class="bar"><a class="brand" href="/">Kaggriculture League</a>
-</div></header><main>{body}</main></body></html>"""
+</div></header><main>{body}</main><section class="console"><h2>Console</h2><pre id="dashboard-console">Waiting for console output…</pre></section></body></html>"""
 
 
 def _main_fragment(document: str) -> str:
@@ -1152,7 +1225,17 @@ def _replay_page(connection: Any, match_id: str) -> str:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     repository: DashboardRepository
+    console_buffer: ConsoleRingBuffer
+    http_log_stream: Any
     server_version = "KaggricultureDashboard/0.1"
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Keep HTTP access logs out of the captured training console."""
+
+        self.http_log_stream.write(
+            f'{self.address_string()} - - [{self.log_date_time_string()}] {format % args}\n'
+        )
+        self.http_log_stream.flush()
 
     def do_GET(self) -> None:  # noqa: N802
         self._handle(head=False)
@@ -1175,6 +1258,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "text/javascript; charset=utf-8",
                     head=head,
                     headers={"Cache-Control": "no-store"},
+                )
+                return
+            if path == "/console":
+                sequence, output = self.console_buffer.snapshot()
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"sequence": sequence, "text": output},
+                    head=head,
                 )
                 return
             if path == "/events/dashboard":
@@ -1356,6 +1447,7 @@ def make_server(
     port: int = 8000,
     *,
     read_only: bool = True,
+    console_buffer: ConsoleRingBuffer | None = None,
 ) -> ThreadingHTTPServer:
     repository = DashboardRepository(database, read_only=read_only)
     available = repository.validate()
@@ -1364,6 +1456,8 @@ def make_server(
         pass
 
     BoundDashboardHandler.repository = repository
+    BoundDashboardHandler.console_buffer = console_buffer or ConsoleRingBuffer()
+    BoundDashboardHandler.http_log_stream = sys.stderr
     server = ThreadingHTTPServer((host, port), BoundDashboardHandler)
     server.daemon_threads = True
     server.database_available_at_startup = available  # type: ignore[attr-defined]

@@ -5,13 +5,14 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import sys
 import threading
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-from kaggriculture_lab.dashboard import make_server
+from kaggriculture_lab.dashboard import ConsoleRingBuffer, ConsoleTee, make_server
 from kaggriculture_lab.league import (
     LeagueConfig,
     create_next_generation,
@@ -125,6 +126,9 @@ def run_generations(
         raise ValueError("generations must be positive")
     server = None
     server_thread = None
+    console_buffer = ConsoleRingBuffer()
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
     if dashboard:
         try:
             server = make_server(
@@ -132,11 +136,18 @@ def run_generations(
                 dashboard_host,
                 dashboard_port,
                 read_only=False,
+                console_buffer=console_buffer,
             )
         except OSError:
             if dashboard_port == 0:
                 raise
-            server = make_server(database, dashboard_host, 0, read_only=False)
+            server = make_server(
+                database,
+                dashboard_host,
+                0,
+                read_only=False,
+                console_buffer=console_buffer,
+            )
         actual_host, actual_port = server.server_address[:2]
         server_thread = threading.Thread(
             target=server.serve_forever,
@@ -144,6 +155,8 @@ def run_generations(
             daemon=True,
         )
         server_thread.start()
+        sys.stdout = ConsoleTee(original_stdout, console_buffer)
+        sys.stderr = ConsoleTee(original_stderr, console_buffer)
         print(
             f"[{session_id}] dashboard: http://{actual_host}:{actual_port}/",
             flush=True,
@@ -190,6 +203,8 @@ def run_generations(
             server.server_close()
         if server_thread is not None:
             server_thread.join(timeout=5)
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
     return reports
 
 
