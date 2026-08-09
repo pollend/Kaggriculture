@@ -131,6 +131,46 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
     assert output.read_bytes() == source.read_bytes()
 
 
+def test_export_rejects_active_checkpoint_that_failed_release_gate(tmp_path: Path):
+    from kaggriculture_lab.model_admin import export_active_model
+
+    database = tmp_path / "blocked-export.duckdb"
+    dqn_cli(["model", "status", "--database", str(database)])
+    source = tmp_path / "checkpoint.npz"
+    source.write_bytes(b"unreviewed weights")
+    with ExperimentStore(database) as store:
+        store.connection.execute(
+            """
+            INSERT INTO model_updates (
+                update_id, model_id, cutoff_batch_seq, new_batch_count,
+                dataset_sha256, status, candidate_checkpoint_id
+            ) VALUES ('update', 'dqn_job_scorer.adaptive_hybrid_q_v2', 1, 1,
+                      'dataset', 'PROMOTED', 'checkpoint')
+            """
+        )
+        store.connection.execute(
+            """
+            INSERT INTO model_training_checkpoints (
+                checkpoint_id, model_id, update_id, trainer_artifact_path,
+                inference_artifact_path, artifact_sha256, dataset_sha256,
+                metrics_json, gate_json, promoted
+            ) VALUES ('checkpoint', 'dqn_job_scorer.adaptive_hybrid_q_v2', 'update', ?, ?,
+                      'artifact', 'dataset', '{}', '{"passed": false}', true)
+            """,
+            [str(source), str(source)],
+        )
+        store.connection.execute(
+            "UPDATE training_models SET active_checkpoint_id = 'checkpoint'"
+        )
+    with pytest.raises(ValueError, match="release gate"):
+        export_active_model(
+            "agents/dqn_job_scorer/agent.toml",
+            database,
+            tmp_path / "released.npz",
+            confirm_release=True,
+        )
+
+
 def test_kaglab_has_no_models_command():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["models", "status"])

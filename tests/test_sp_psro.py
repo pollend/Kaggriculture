@@ -13,6 +13,7 @@ from agents.sp_psro_job_scorer.training.updater import (
     initial_state,
     load_state,
     mixture_probabilities,
+    passes_release_gate,
     population_networks,
 )
 from kaggriculture_lab.identity import AgentManifest
@@ -61,6 +62,31 @@ def test_initial_state_has_one_virtual_member_and_two_live_learners():
     assert any(not np.array_equal(nu[key].numpy(), beta[key].numpy()) for key in nu)
     assert "market_online" in state["live"]["nu"]
     assert members[0][1].market is not None
+
+
+def test_initial_state_can_bootstrap_from_joint_weights(tmp_path: Path):
+    anchor = tmp_path / "anchor.npz"
+    expected = PolicyBundle.random(seed=41)
+    expected.save(anchor)
+    state = initial_state(17, anchor)
+    loaded = population_networks(state)[0][1]
+    assert np.array_equal(loaded.job.layers[0][0], expected.job.layers[0][0])
+    assert np.array_equal(loaded.market.layers[0][0], expected.market.layers[0][0])
+    assert state["initial_source"] == str(anchor)
+
+
+def test_release_gate_requires_profit_win_rate_and_margin():
+    config = {
+        "release_min_money": 3000,
+        "release_min_win_rate": 0.5,
+        "release_min_margin": 0,
+    }
+    good = {"mean_money": 3200, "mean_win_rate": 0.6, "mean_margin": 50, "errors": 0}
+    assert passes_release_gate(good, config)
+    assert not passes_release_gate({**good, "mean_money": 2999}, config)
+    assert not passes_release_gate({**good, "mean_win_rate": 0.49}, config)
+    assert not passes_release_gate({**good, "mean_margin": -1}, config)
+    assert not passes_release_gate({**good, "errors": 1}, config)
 
 
 def test_v3_state_migrates_without_reinitializing_live_learners(tmp_path: Path):
@@ -229,6 +255,17 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
             "margin_ci": [-1.0, 1.0],
         },
     )
+    monkeypatch.setattr(
+        updater,
+        "evaluate_member",
+        lambda path, *args, **kwargs: {
+            "opponents": [],
+            "mean_win_rate": 0.6 if "candidate" in Path(path).name else 0.1,
+            "mean_margin": 100.0 if "candidate" in Path(path).name else -100.0,
+            "mean_money": 3400.0 if "candidate" in Path(path).name else 1000.0,
+            "errors": 0,
+        },
+    )
     context = ModelUpdateContext(
         "model",
         "sp_psro_job_scorer",
@@ -257,6 +294,8 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
     assert len(saved["nu_snapshots"]) == 1
     assert result.metrics["nu_loss"] == 1.0
     assert result.metrics["beta_loss"] == 2.0
+    assert result.gate["passed"] is True
+    assert saved["inference_champion"]["candidate_id"] == "beta-00000001"
 
     monkeypatch.setattr(
         updater,
@@ -277,6 +316,7 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
             "opponents": [],
             "mean_win_rate": 0.5,
             "mean_margin": 0.0,
+            "mean_money": 3000.0,
             "errors": 0,
         },
     )
@@ -321,6 +361,8 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(
     assert accepted_state["nu_snapshots"] == []
     assert accepted_state["live"]["nu"]["gradient_steps"] == 0
     assert accepted_state["live"]["beta"]["gradient_steps"] == 0
+    assert accepted.gate["passed"] is True
+    assert accepted_state["inference_champion"] is not None
 
 
 def test_inference_agent_plays_a_legal_action():

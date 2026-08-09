@@ -38,6 +38,7 @@ class PopulationCollector:
         state = load_state(
             context.active_checkpoint.trainer_artifact_path if context.active_checkpoint is not None else None,
             seed,
+            config.get("initial_population_weights"),
         )
         rollout_root = Path(context.artifacts) / "rollout_policies" / context.generation_id
         rollout_root.mkdir(parents=True, exist_ok=True)

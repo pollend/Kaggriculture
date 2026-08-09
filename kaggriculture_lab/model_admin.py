@@ -127,7 +127,7 @@ def export_active_model(
         model_id = _single_model_id(manifest, name)
         row = store.connection.execute(
             """
-            SELECT mtc.inference_artifact_path
+            SELECT mtc.inference_artifact_path, mtc.gate_json
             FROM training_models tm
             JOIN model_training_checkpoints mtc
               ON mtc.checkpoint_id = tm.active_checkpoint_id
@@ -137,6 +137,9 @@ def export_active_model(
         ).fetchone()
     if row is None:
         raise ValueError(f"model has no active checkpoint: {model_id}")
+    gate = json.loads(str(row[1] or "{}"))
+    if gate.get("passed") is not True:
+        raise ValueError(f"active checkpoint has not passed its release gate: {model_id}")
     source = Path(str(row[0]))
     if not source.is_file():
         raise FileNotFoundError(f"active inference artifact is missing: {source}")

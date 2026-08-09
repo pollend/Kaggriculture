@@ -117,6 +117,7 @@ def collect_episode(
         tuple(specs),
         seed,
         config={k: v for k, v in (config or {}).items() if k != "trace_root"},
+        keep_replay=True,
         analyzer=episode_metrics,
     )
     if result.failed:

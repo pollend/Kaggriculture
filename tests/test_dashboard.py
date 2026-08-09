@@ -169,7 +169,10 @@ def test_dashboard_drills_from_sessions_to_episode(dashboard):
 
     _, _, body = _get(base + "/episodes/match-1")
     document = body.decode()
-    assert "Watch replay" in document
+    assert '<div class="players">' in document
+    assert '<iframe class="replay-frame" src="/episodes/match-1/replay"' in document
+    assert 'scrolling="no"' in document
+    assert "<th>Seat</th>" not in document
     assert "Download replay JSON" in document
     assert "agent:evaluate" in document
     assert "3,200" in document

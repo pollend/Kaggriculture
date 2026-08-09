@@ -33,7 +33,7 @@ def test_seed_actually_changes_the_episode():
     """A seed that changed nothing would silently collapse the sample size."""
     shops = []
     for seed in (0, 1, 2):
-        match = run_match(("pass", "pass"), seed=seed)
+        match = run_match(("pass", "pass"), seed=seed, keep_replay=True)
         final = match.replay["steps"][-1][0]["observation"]
         shops.append(tuple(final["town"]["unlocked_shops"]))
     assert len(set(shops)) > 1

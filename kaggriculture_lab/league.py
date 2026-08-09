@@ -908,11 +908,14 @@ def run_generation(
                 update_models,
             )
             return generation_status(store, session_id)
-        schedule_generation(store, session_id)
-        store.connection.execute(
-            "UPDATE generations SET status = 'RUNNING' WHERE generation_id = ?",
-            [generation_id],
-        )
+        if status == "OPEN":
+            schedule_generation(store, session_id)
+            store.connection.execute(
+                "UPDATE generations SET status = 'RUNNING' WHERE generation_id = ?",
+                [generation_id],
+            )
+        elif status != "RUNNING":
+            raise ValueError(f"generation cannot be run: {generation_id} ({status})")
         rounds = [
             int(row[0])
             for row in store.connection.execute(
@@ -950,7 +953,7 @@ def run_generation(
                 _run_round(
                     store, session_id, generation_id, config, round_index, pool
                 )
-                run_round_hooks(
+                round_reports = run_round_hooks(
                     store,
                     session_id=session_id,
                     generation_id=generation_id,
@@ -960,6 +963,15 @@ def run_generation(
                     model_ids=model_ids,
                     artifacts=artifacts,
                 )
+                round_errors = [report for report in round_reports if report.status == "error"]
+                if config.pairing_mode == "trainer_only" and round_errors:
+                    details = "; ".join(
+                        f"{report.model_id}: {report.error}" for report in round_errors
+                    )
+                    raise RuntimeError(
+                        f"trainer-only round {round_index} failed; generation remains resumable: "
+                        f"{details}"
+                    )
                 if update_models:
                     _update_session_models(store, model_ids, artifacts)
         finally:

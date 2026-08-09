@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from kaggriculture_lab import runner
 from kaggriculture_lab.dashboard import DashboardRepository
 from kaggriculture_lab.storage import ExperimentStore
@@ -80,6 +82,37 @@ def test_run_generations_starts_and_stops_embedded_dashboard(monkeypatch, capsys
 
     assert calls == ["serve", "shutdown", "close"]
     assert "dashboard: http://127.0.0.1:8123/" in capsys.readouterr().out
+
+
+def test_continuous_generations_are_blocking_and_sequential(monkeypatch, capsys):
+    calls = []
+
+    monkeypatch.setattr(runner, "session_status", lambda *args: {"status": "COMPLETE"})
+    monkeypatch.setattr(
+        runner,
+        "create_next_generation",
+        lambda *args, **kwargs: calls.append("create"),
+    )
+
+    def run(*args, **kwargs):
+        calls.append("run")
+        if calls.count("run") == 3:
+            raise KeyboardInterrupt
+        return {"status": "COMPLETE"}
+
+    monkeypatch.setattr(runner, "run_generation", run)
+    with pytest.raises(KeyboardInterrupt):
+        runner.run_generations(
+            session_id="continuous",
+            database=Path("database.duckdb"),
+            artifacts=Path("artifacts"),
+            generations=5,
+            continuous=True,
+            dashboard=False,
+        )
+
+    assert calls == ["create", "run", "create", "run", "create", "run"]
+    assert "generation 1 started" in capsys.readouterr().out
 
 
 def test_embedded_dashboard_can_read_while_training_store_is_open(tmp_path):

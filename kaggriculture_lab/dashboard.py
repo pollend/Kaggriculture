@@ -223,7 +223,11 @@ pre{white-space:pre-wrap;word-break:break-word;background:#0a111d;border:1px sol
 details{margin:8px 0}.pager{display:flex;justify-content:space-between;margin-top:16px}.chart{width:100%;height:auto;min-width:500px}.empty{text-align:center;padding:42px;color:var(--muted)}
 .error{max-width:700px;margin:70px auto;padding:28px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
 .versus{color:var(--muted);font-size:12px;font-weight:700;margin:8px 0;text-transform:uppercase}
-@media(max-width:650px){main{padding:20px 12px}.bar{padding:12px}.grid{grid-template-columns:1fr}h1{font-size:24px}}
+.players{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}.player{overflow:visible}
+.player-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;margin:18px 0}.player-stats div{border-top:1px solid var(--line);padding-top:9px}
+.player-stats dt{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.player-stats dd{font-size:18px;font-weight:700;margin:3px 0 0}
+.replay-frame{display:block;width:100%;height:1000px;border:1px solid var(--line);border-radius:12px;background:#0a111d}
+@media(max-width:650px){main{padding:20px 12px}.bar{padding:12px}.grid,.players{grid-template-columns:1fr}h1{font-size:24px}.replay-frame{min-height:420px}}
 """
 
 
@@ -1041,11 +1045,18 @@ def _episode_page(connection: Any, match_id: str) -> str:
         episode["agent_b_checkpoint_id"], episode["agent_b_params_json"],
     )
     identities = [agent_a, agent_b] if orientation == 0 else [agent_b, agent_a]
-    player_rows = "".join(
-        f'<tr><td>{int(row["seat"])}</td><td>{_agent_identity_html(*identities[int(row["seat"])][:4], params_json=identities[int(row["seat"])][4])}</td>'
-        f'<td>{_status(row["status"])}</td><td>{_number(row["final_money"])}</td><td>{_number(row["money_difference"])}</td><td>{_number(row["reward"], 1)}</td>'
-        f'<td>{_percent(row["productive_action_percentage"])}</td><td>{_percent(row["movement_percentage"])}</td><td>{_percent(row["idle_percentage"])}</td>'
-        f'<td>{int(row["plants_lost_inferred"] or 0)}</td><td>{int(row["final_shed_items"] or 0)} / {int(row["final_carried_items"] or 0)}</td></tr>'
+    player_panels = "".join(
+        f'<section class="panel player"><h3>Player {int(row["seat"]) + 1} · {_status(row["status"])}</h3>'
+        f'{_agent_identity_html(*identities[int(row["seat"])][:4], params_json=identities[int(row["seat"])][4])}'
+        f'<dl class="player-stats"><div><dt>Money</dt><dd>{_number(row["final_money"])}</dd></div>'
+        f'<div><dt>Margin</dt><dd>{_number(row["money_difference"])}</dd></div>'
+        f'<div><dt>Reward</dt><dd>{_number(row["reward"], 1)}</dd></div>'
+        f'<div><dt>Productive</dt><dd>{_percent(row["productive_action_percentage"])}</dd></div>'
+        f'<div><dt>Movement</dt><dd>{_percent(row["movement_percentage"])}</dd></div>'
+        f'<div><dt>Idle</dt><dd>{_percent(row["idle_percentage"])}</dd></div>'
+        f'<div><dt>Plants lost</dt><dd>{int(row["plants_lost_inferred"] or 0)}</dd></div>'
+        f'<div><dt>Shed / carried</dt><dd>{int(row["final_shed_items"] or 0)} / {int(row["final_carried_items"] or 0)}</dd></div></dl>'
+        f'<details><summary>Full metrics</summary><pre>{_escape(json.dumps(json.loads(str(row["metrics_json"])), indent=2, sort_keys=True))}</pre></details></section>'
         for row in players
     )
     evaluation_html = "".join(
@@ -1055,18 +1066,18 @@ def _episode_page(connection: Any, match_id: str) -> str:
         for row in evaluations
     ) or '<div class="empty">No post-episode evaluations were recorded.</div>'
     replay_link = (
-        f'<a class="button" href="{_escape(_id_path("episodes", match_id) + "/replay")}" target="_blank" rel="noopener">Watch replay</a>'
         f'<a class="button" href="{_escape(_id_path("episodes", match_id) + "/replay.json")}">Download replay JSON</a>'
         if has_replay else '<span class="muted">Replay unavailable</span>'
     )
-    metrics_html = "".join(
-        f'<details><summary>Seat {int(row["seat"])} full metrics</summary><pre>{_escape(json.dumps(json.loads(str(row["metrics_json"])), indent=2, sort_keys=True))}</pre></details>'
-        for row in players
+    replay_html = (
+        f'<h2>Replay</h2><iframe class="replay-frame" src="{_escape(_id_path("episodes", match_id) + "/replay")}" '
+        'title="Episode replay" loading="eager" scrolling="no"></iframe>'
+        if has_replay else ""
     )
     body = f'''<p><a href="{_escape(_id_path("generations", episode["generation_id"]))}">← Generation</a></p><h1>Episode</h1>
 <p class="muted">{_escape(match_id)}</p>{_cards([("Seed", _escape(episode["seed"])), ("Steps", _number(episode["steps"])),
     ("Wall clock", f"{_number(episode['wallclock'], 2)}s"), ("Status", _status("FAILED" if episode["failed"] else "COMPLETE"))])}
-<div class="actions">{replay_link}</div><h2>Players</h2><div class="panel"><table><thead><tr><th>Seat</th><th>Agent</th><th>Status</th><th>Money</th><th>Margin</th><th>Reward</th><th>Productive</th><th>Movement</th><th>Idle</th><th>Plants lost</th><th>Shed / carried</th></tr></thead><tbody>{player_rows}</tbody></table>{metrics_html}</div>
+<div class="actions">{replay_link}</div><h2>Players</h2><div class="players">{player_panels}</div>{replay_html}
 <h2>Evaluations</h2><div class="panel">{evaluation_html}</div>'''
     return _layout(f"Episode {match_id}", body)
 
@@ -1328,7 +1339,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             content_security_policy
-            or "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+            or "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; frame-src 'self'; base-uri 'none'; frame-ancestors 'none'",
         )
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")

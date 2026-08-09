@@ -19,6 +19,7 @@ from kaggriculture_lab.league import (
     _run_hook,
     _training_model_ids,
     create_session,
+    run_generation,
     schedule_generation,
 )
 from kaggriculture_lab.model_trainers import load_trainer
@@ -133,6 +134,71 @@ def test_scheduler_gives_every_member_each_round_and_avoids_self_play(tmp_path: 
             if right in appearances:
                 appearances[right] += 1
         assert set(appearances.values()) == {4}
+
+
+def test_running_generation_resumes_without_being_scheduled_again(
+    tmp_path: Path, monkeypatch
+):
+    from kaggriculture_lab import league
+
+    database = tmp_path / "resume.duckdb"
+    config = LeagueConfig(
+        population_size=4,
+        rounds_per_generation=1,
+        hall_of_fame_rounds=0,
+        episode_steps=2,
+        jobs=1,
+    )
+    session_id = create_session(config, database, session_id="resume")
+    with ExperimentStore(database) as store:
+        scheduled = schedule_generation(store, session_id)
+        store.connection.execute(
+            "UPDATE generations SET status = 'RUNNING' WHERE generation_id = 'resume:g0000'"
+        )
+    monkeypatch.setattr(
+        league,
+        "schedule_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rescheduled")),
+    )
+    monkeypatch.setattr(league, "_run_round", lambda *args, **kwargs: None)
+    monkeypatch.setattr(league, "_close_generation", lambda *args, **kwargs: None)
+    report = run_generation(session_id, database, tmp_path / "artifacts")
+    assert report["status"] == "COMPLETE"
+    with ExperimentStore(database) as store:
+        assert store.connection.execute(
+            "SELECT count(*) FROM league_pairings WHERE generation_id = 'resume:g0000'"
+        ).fetchone()[0] == scheduled
+
+
+def test_trainer_only_generation_stops_on_round_hook_error(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    from kaggriculture_lab import league
+
+    database = tmp_path / "trainer-error.duckdb"
+    config = LeagueConfig(
+        pairing_mode="trainer_only",
+        population_size=0,
+        rounds_per_generation=1,
+        hall_of_fame_rounds=0,
+        episode_steps=2,
+        jobs=1,
+    )
+    session_id = create_session(config, database, session_id="trainer-error")
+    monkeypatch.setattr(league, "_run_round", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        league,
+        "run_round_hooks",
+        lambda *args, **kwargs: [
+            SimpleNamespace(model_id="broken", status="error", error="boom")
+        ],
+    )
+    with pytest.raises(RuntimeError, match="generation remains resumable"):
+        run_generation(session_id, database, tmp_path / "artifacts")
+    with ExperimentStore(database) as store:
+        assert store.connection.execute(
+            "SELECT status FROM generations WHERE generation_id = 'trainer-error:g0000'"
+        ).fetchone()[0] == "RUNNING"
 
 
 def test_manifest_file_is_valid():

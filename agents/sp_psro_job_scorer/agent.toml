@@ -55,6 +55,9 @@ admission_seeds = 60
 validation_seeds = 40
 seed = 0
 jobs = 8
+release_min_money = 3000
+release_min_win_rate = 0.5
+release_min_margin = 0
 validation_opponents = [
   "starter",
   "agents/configurable_crop_surrogate/main.py",

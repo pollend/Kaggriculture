@@ -34,14 +34,18 @@ def main() -> int:
         },
     )
     print(status)
-    run_generations(
-        session_id=SESSION_ID,
-        database=DATABASE,
-        artifacts=ARTIFACTS,
-        generations=GENERATIONS,
-        workspace=REPO_ROOT,
-        on_generation=lambda _, report: print(report),
-    )
+    try:
+        run_generations(
+            session_id=SESSION_ID,
+            database=DATABASE,
+            artifacts=ARTIFACTS,
+            generations=GENERATIONS,
+            continuous=True,
+            workspace=REPO_ROOT,
+            on_generation=lambda _, report: print(report),
+        )
+    except KeyboardInterrupt:
+        print(f"\n[{SESSION_ID}] stopped; committed work remains resumable", flush=True)
     return 0
 
 

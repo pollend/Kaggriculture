@@ -58,15 +58,21 @@ def fresh_live(seed: int) -> dict[str, Any]:
     return states
 
 
-def initial_state(seed: int) -> dict[str, Any]:
+def initial_state(seed: int, initial_population_weights: str | Path | None = None) -> dict[str, Any]:
+    initial = (
+        PopulationArtifact.load(initial_population_weights).components[0]
+        if initial_population_weights is not None
+        else PolicyBundle.random(seed=seed)
+    )
+    if initial.market is None:
+        raise ValueError("SP-PSRO initial population weights require a market network")
     return {
         "version": STATE_VERSION,
         "iteration": 0,
         "population": [],
-        "initial_job_network": QNetwork.random(seed=seed).layers,
-        "initial_market_network": QNetwork.random(
-            seed=seed + 1, feature_dim=MARKET_FEATURE_DIM
-        ).layers,
+        "initial_job_network": initial.job.layers,
+        "initial_market_network": initial.market.layers,
+        "initial_source": str(initial_population_weights) if initial_population_weights else "random",
         "live": fresh_live(seed + 10_000),
         "champion_id": "member-000000-initial",
         "last_admission": None,
@@ -75,12 +81,17 @@ def initial_state(seed: int) -> dict[str, Any]:
         "nu_snapshots_seen": 0,
         "nu_snapshot_rng_state": None,
         "validation_suite": None,
+        "inference_champion": None,
     }
 
 
-def load_state(path: str | Path | None, seed: int) -> dict[str, Any]:
+def load_state(
+    path: str | Path | None,
+    seed: int,
+    initial_population_weights: str | Path | None = None,
+) -> dict[str, Any]:
     if path is None:
-        return initial_state(seed)
+        return initial_state(seed, initial_population_weights)
     state = torch.load(path, map_location="cpu", weights_only=False)
     version = int(state.get("version", 0))
     if version == 3:
@@ -92,6 +103,8 @@ def load_state(path: str | Path | None, seed: int) -> dict[str, Any]:
         state.setdefault("validation_suite", None)
     elif version != STATE_VERSION:
         raise ValueError(f"unsupported SP-PSRO trainer state {state.get('version')}")
+    state.setdefault("initial_source", "random")
+    state.setdefault("inference_champion", None)
     return state
 
 
@@ -339,6 +352,7 @@ def evaluate_member(path: Path, opponents: list[str], seeds: int, seed_start: in
                 "pairs": summary.pairs,
                 "win_rate": effective_win_rate,
                 "margin": summary.margin_mean,
+                "money": summary.a_money_mean,
                 "errors": summary.errors,
             }
         )
@@ -346,8 +360,23 @@ def evaluate_member(path: Path, opponents: list[str], seeds: int, seed_start: in
         "opponents": results,
         "mean_win_rate": statistics.fmean(item["win_rate"] for item in results),
         "mean_margin": statistics.fmean(item["margin"] for item in results),
+        "mean_money": statistics.fmean(item["money"] for item in results),
         "errors": sum(bool(item["errors"]) for item in results),
     }
+
+
+def passes_release_gate(validation: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Require absolute external quality, not merely relative self-play progress."""
+
+    return (
+        not validation.get("errors")
+        and float(validation.get("mean_money", 0.0))
+        >= float(config.get("release_min_money", 3000.0))
+        and float(validation.get("mean_win_rate", 0.0))
+        >= float(config.get("release_min_win_rate", 0.5))
+        and float(validation.get("mean_margin", float("-inf")))
+        >= float(config.get("release_min_margin", 0.0))
+    )
 
 
 def validation_opponent_specs(context, reader, config: dict[str, Any]) -> list[str]:
@@ -403,6 +432,7 @@ class PopulationUpdater:
         state = load_state(
             context.active_checkpoint.trainer_artifact_path if context.active_checkpoint is not None else None,
             seed,
+            config.get("initial_population_weights"),
         )
         def replay(role_seed: int) -> ReplayBuffer:
             return ReplayBuffer(
@@ -437,13 +467,21 @@ class PopulationUpdater:
 
         device = resolve_device(str(config.get("device", "auto")))
         steps = int(config.get("gradient_steps_per_batch", 400)) * len(context.new_batches)
+        print(
+            f"[sp-psro training] update started: {len(context.new_batches)} new batches, "
+            f"{steps} gradient steps per role on {device}",
+            flush=True,
+        )
         started = time.perf_counter()
+        print("[sp-psro training] training nu policy", flush=True)
         state["live"]["nu"], nu_losses, nu_market_losses = _train_role(
             state["live"]["nu"], nu_buffer, config, steps, device
         )
+        print("[sp-psro training] nu policy complete; training beta policy", flush=True)
         state["live"]["beta"], beta_losses, beta_market_losses = _train_role(
             state["live"]["beta"], beta_buffer, config, steps, device
         )
+        print("[sp-psro training] beta policy complete; evaluating candidates", flush=True)
         state["live"]["nu"]["replay_rng_state"] = nu_buffer.rng.bit_generator.state
         state["live"]["beta"]["replay_rng_state"] = beta_buffer.rng.bit_generator.state
         _update_restricted_distribution(state, new_records, config)
@@ -492,6 +530,11 @@ class PopulationUpdater:
             seed + 2_000_000 + context.cutoff_batch_seq * 10_000,
         )
         admitted = admission["errors"] == 0 and admission["pairs"] > 1 and float(admission["margin_ci"][0]) > 0.0
+        print(
+            f"[sp-psro training] admission evaluation complete: admitted={admitted}; "
+            "running validation",
+            flush=True,
+        )
         new_members: list[dict[str, Any]] = []
         if admitted:
             for role, candidate_path in (
@@ -520,41 +563,85 @@ class PopulationUpdater:
             state["nu_snapshot_rng_state"] = None
         state["last_admission"] = {**admission, "admitted": admitted}
 
-        if admitted:
-            opponents = validation_opponent_specs(context, reader, config)
-            suite = hashlib.sha256("\0".join(opponents).encode()).hexdigest()
-            if state.get("validation_suite") != suite:
-                for member in state["population"]:
-                    member["validation"] = None
-                state["validation_suite"] = suite
-            validation_seeds = int(config.get("validation_seeds", 40))
-            jobs = int(config.get("jobs", 1))
+        opponents = validation_opponent_specs(context, reader, config)
+        suite = hashlib.sha256("\0".join(opponents).encode()).hexdigest()
+        if state.get("validation_suite") != suite:
             for member in state["population"]:
-                if member.get("validation") is None:
-                    member["validation"] = evaluate_member(
-                        Path(member["path"]),
-                        opponents,
-                        validation_seeds,
-                        seed + 4_000_000,
-                        jobs,
-                    )
-            eligible = [member for member in state["population"] if not member["validation"].get("errors")]
-            if eligible:
-                champion = max(
-                    eligible,
-                    key=lambda member: (
-                        member["validation"]["mean_win_rate"],
-                        member["validation"]["mean_margin"],
-                        member["member_id"],
-                    ),
+                member["validation"] = None
+            state["validation_suite"] = suite
+            state["inference_champion"] = None
+        validation_seeds = int(config.get("validation_seeds", 40))
+        jobs = int(config.get("jobs", 1))
+        for member in state["population"]:
+            if member.get("validation") is None:
+                member["validation"] = evaluate_member(
+                    Path(member["path"]), opponents, validation_seeds, seed + 4_000_000, jobs
                 )
-                state["champion_id"] = champion["member_id"]
+        population_eligible = [
+            member for member in state["population"] if not member["validation"].get("errors")
+        ]
+        if population_eligible:
+            state["champion_id"] = max(
+                population_eligible,
+                key=lambda member: (
+                    member["validation"]["mean_win_rate"],
+                    member["validation"]["mean_margin"],
+                    member["member_id"],
+                ),
+            )["member_id"]
+        beta_validation = evaluate_member(
+            beta_candidate_path,
+            opponents,
+            validation_seeds,
+            seed + 5_000_000 + context.cutoff_batch_seq * 10_000,
+            jobs,
+        )
+        print(
+            f"[sp-psro training] validation complete after {time.perf_counter() - started:.1f}s",
+            flush=True,
+        )
+        release_candidates = [
+            {
+                "candidate_id": str(member["member_id"]),
+                "path": str(member["path"]),
+                "validation": member["validation"],
+            }
+            for member in state["population"]
+            if passes_release_gate(member["validation"], config)
+        ]
+        if passes_release_gate(beta_validation, config):
+            release_candidates.append(
+                {
+                    "candidate_id": f"beta-{context.cutoff_batch_seq:08d}",
+                    "path": str(beta_candidate_path),
+                    "validation": beta_validation,
+                }
+            )
+        if state.get("inference_champion") is not None:
+            release_candidates.append(state["inference_champion"])
+        if release_candidates:
+            selected = max(
+                release_candidates,
+                key=lambda item: (
+                    item["validation"]["mean_win_rate"],
+                    item["validation"]["mean_margin"],
+                    item["validation"]["mean_money"],
+                    item["candidate_id"],
+                ),
+            )
+            if Path(selected["path"]) == beta_candidate_path:
+                released_path = members_dir / f"release-{selected['candidate_id']}.npz"
+                PopulationArtifact.load(beta_candidate_path).save(released_path)
+                selected = {**selected, "path": str(released_path)}
+            state["inference_champion"] = selected
 
         retained_ids = {member["member_id"] for member in state["population"]}
         if state["champion_id"] not in retained_ids:
             state["champion_id"] = state["population"][-1]["member_id"]
 
-        champion = next(member for member in state["population"] if member["member_id"] == state["champion_id"])
+        population_champion = next(
+            member for member in state["population"] if member["member_id"] == state["champion_id"]
+        )
         checkpoint_id = hashlib.sha256(
             f"{context.model_id}\0{context.update_id}\0{context.dataset_sha256}".encode()
         ).hexdigest()[:24]
@@ -562,7 +649,13 @@ class PopulationUpdater:
         inference_path = checkpoints_dir / f"{checkpoint_id}.npz"
         state["dataset_sha256"] = context.dataset_sha256
         torch.save(state, trainer_path)
-        PopulationArtifact.load(champion["path"]).save(inference_path)
+        inference_champion = state.get("inference_champion")
+        inference_source = (
+            Path(inference_champion["path"])
+            if inference_champion is not None
+            else Path(population_champion["path"])
+        )
+        PopulationArtifact.load(inference_source).save(inference_path)
         combined_digest = hashlib.sha256(trainer_path.read_bytes() + inference_path.read_bytes()).hexdigest()
         beta_candidate_path.unlink(missing_ok=True)
         nu_candidate_path.unlink(missing_ok=True)
@@ -571,6 +664,10 @@ class PopulationUpdater:
             "iteration": state["iteration"],
             "admitted": admitted,
             "champion_id": state["champion_id"],
+            "inference_champion_id": (
+                inference_champion["candidate_id"] if inference_champion is not None else None
+            ),
+            "beta_validation": beta_validation,
             "beta_loss": float(np.mean(beta_losses)) if beta_losses else None,
             "nu_loss": float(np.mean(nu_losses)) if nu_losses else None,
             "beta_market_loss": (
@@ -586,11 +683,24 @@ class PopulationUpdater:
             "train_seconds": time.perf_counter() - started,
         }
         gate = {
-            "kind": "resumable_population_training_state",
-            "passed": True,
+            "kind": "external_submission_quality",
+            "passed": inference_champion is not None,
             "population_admission": state["last_admission"],
+            "beta_validation": beta_validation,
+            "thresholds": {
+                "money": float(config.get("release_min_money", 3000.0)),
+                "win_rate": float(config.get("release_min_win_rate", 0.5)),
+                "margin": float(config.get("release_min_margin", 0.0)),
+            },
         }
-        evaluations = (ModelEvaluation("population_pair_admission", admission, admitted),)
+        evaluations = (
+            ModelEvaluation("population_pair_admission", admission, admitted),
+            ModelEvaluation(
+                "submission_beta_validation",
+                beta_validation,
+                passes_release_gate(beta_validation, config),
+            ),
+        )
         # The active inference artifact is always the already validated champion;
         # activating every successful checkpoint is what lets rejected live
         # learners retain optimizer state and continue training.

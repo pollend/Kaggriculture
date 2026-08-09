@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import threading
 from collections.abc import Callable
@@ -106,13 +107,19 @@ def run_generations(
     database: str | Path,
     artifacts: str | Path,
     generations: int,
+    continuous: bool = False,
     workspace: str | Path = ".",
     on_generation: Callable[[int, dict[str, Any]], None] | None = None,
     dashboard: bool = True,
     dashboard_host: str = "127.0.0.1",
     dashboard_port: int = 8000,
 ) -> list[dict[str, Any]]:
-    """Run exactly ``generations`` updates and leave the following one open."""
+    """Run a finite block, or sequential generations until interrupted.
+
+    Continuous mode keeps one dashboard and one blocking orchestration call.
+    It never queues generations: the next generation is created only after
+    ``run_generation`` has closed the current one.
+    """
 
     if generations < 1:
         raise ValueError("generations must be positive")
@@ -144,14 +151,13 @@ def run_generations(
 
     reports: list[dict[str, Any]] = []
     try:
-        for index in range(1, generations + 1):
+        indices = itertools.count(1) if continuous else range(1, generations + 1)
+        for index in indices:
             current = session_status(session_id, database)
             if current["status"] == "COMPLETE":
                 create_next_generation(session_id, database, workspace=workspace)
-            print(
-                f"[{session_id}] generation {index}/{generations} started",
-                flush=True,
-            )
+            progress_label = f"{index}" if continuous else f"{index}/{generations}"
+            print(f"[{session_id}] generation {progress_label} started", flush=True)
 
             def progress(event: dict[str, Any]) -> None:
                 if event.get("event") == "round_started":
@@ -168,14 +174,16 @@ def run_generations(
                 update_models=True,
                 on_progress=progress,
             )
-            reports.append(report)
+            if not continuous:
+                reports.append(report)
             if on_generation is not None:
                 on_generation(index, report)
-        print(
-            f"[{session_id}] training session run completed "
-            f"({generations} generation{'s' if generations != 1 else ''})",
-            flush=True,
-        )
+        if not continuous:
+            print(
+                f"[{session_id}] training session run completed "
+                f"({generations} generation{'s' if generations != 1 else ''})",
+                flush=True,
+            )
     finally:
         if server is not None:
             server.shutdown()
