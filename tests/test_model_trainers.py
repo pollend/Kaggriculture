@@ -301,7 +301,11 @@ def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
         second = store.register_training_agent(
             manifest,
             "agents/dqn_job_scorer/agent.toml",
-            TrainingAgentSpec("dqn_job_scorer", "dqn06"),
+            TrainingAgentSpec(
+                "dqn_job_scorer",
+                "dqn06",
+                model_config={"jobs": 3, "opponents": ["frozen-dqn"]},
+            ),
         )
         rows = store.connection.execute(
             """
@@ -310,15 +314,17 @@ def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
             """
         ).fetchall()
 
-    assert first == ("dqn_job_scorer.q_network@dqn05",)
-    assert second == ("dqn_job_scorer.q_network@dqn06",)
+    assert first == ("dqn_job_scorer.adaptive_hybrid_q_v2@dqn05",)
+    assert second == ("dqn_job_scorer.adaptive_hybrid_q_v2@dqn06",)
     assert [(row[1], row[2], row[3]) for row in rows] == [
-        ("dqn_job_scorer", "dqn05", "dqn_job_scorer.q_network"),
-        ("dqn_job_scorer", "dqn06", "dqn_job_scorer.q_network"),
+        ("dqn_job_scorer", "dqn05", "dqn_job_scorer.adaptive_hybrid_q_v2"),
+        ("dqn_job_scorer", "dqn06", "dqn_job_scorer.adaptive_hybrid_q_v2"),
     ]
     configs = [json.loads(row[4]) for row in rows]
     assert [item["name"] for item in configs] == ["dqn05", "dqn06"]
     assert configs[0]["seed"] != configs[1]["seed"]
+    assert configs[1]["jobs"] == 3
+    assert configs[1]["opponents"] == ["frozen-dqn"]
 
 
 def test_schema_migration_preserves_existing_model_as_default(tmp_path: Path):

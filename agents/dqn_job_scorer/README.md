@@ -1,7 +1,9 @@
 # DQN Job Scorer
 
-Strategy attempt **#2**. A Q-network replaces the hand-tuned job scoring; everything else —
-job enumeration, unit routing, market orders — stays on rules.
+Strategy attempt **#2**, schema v3. One Q-network scores crop, animal, logistics,
+fertilizer, and terrain jobs. A second, factored Q-network chooses a daily
+portfolio and per-product shed reserves; deterministic execution turns those
+targets into safe purchase and sale orders.
 
 The agent is self-contained: standard library plus numpy, no imports from `kaggriculture_lab`,
 `sim`, or any other agent. Its crop tables and board geometry are its own copy in `rules.py`
@@ -15,7 +17,9 @@ The agent is self-contained: standard library plus numpy, no imports from `kaggr
 | `jobs.py` | legal-job enumerator |
 | `features.py` | the featurizer — shared by training and inference, hence single-sourced |
 | `policy.py` | numpy MLP forward pass, ε-greedy selection |
-| `market.py` | selling, hiring, seed buying (rules, not learned) |
+| `hybrid.py` | observable-state economic regime and portfolio controller |
+| `market.py` | feed-first purchases, selling, hiring, animals, and seeds |
+| `market_policy.py` | daily purchase-plan and product-reserve Q candidates |
 | `rules.py` | this agent's private crop tables and geometry |
 | `evaluation.py` | post-episode league hook |
 | `train.py` | lab-facing `on_round` collector and `on_batch` updater |
@@ -27,8 +31,13 @@ The agent is self-contained: standard library plus numpy, no imports from `kaggr
 
 Each turn it enumerates every *legal* job — deliberately not
 `ConfigurableAgent._jobs`, whose heuristic filters would trap the policy inside the agent it
-is trying to beat — and scores each one with `Q(state, job)`. Features are 43 global + 26
-per-job + 3 per-unit = 72 dims through a 128×128 MLP.
+is trying to beat — and scores each one with `Q(state, job)`. Features are 75 global + 44
+per-job + 3 per-unit = 122 dims through a 128×128 MLP. Emergency feed and same-day water
+jobs bypass the network so exploration cannot destroy live assets.
+
+The checked-in schema-v1 `weights.npz` is treated as a legacy baseline and rejected by
+dimension validation. Until the first schema-v2 checkpoint is explicitly exported,
+inference uses a deterministic seeded fresh network.
 
 **Job commitment is load-bearing.** A unit keeps its chosen job until it arrives, the job
 becomes illegal, or 20 turns pass. Without it the policy re-picks every turn, and a small
@@ -41,11 +50,20 @@ turn into a walk west and the network cannot tell.
 Exploration therefore applies at selection points, not per step. At ε=0.87 a per-step ε
 derails almost every walk before it completes.
 
+At the first turn of each day the market network observes private shed, seed,
+and carried inventory together with planted assets, public farms, prices,
+market supply, town demand, cash, and remaining season. It chooses one purchase
+target and one reserve target for every saleable product. The executor buys
+only deficits and sells only shed stock above the learned reserve. Animal feed
+survival, affordability, the ten-order cap, and terminal liquidation cannot be
+overridden by the network. A legacy job-only checkpoint keeps the heuristic
+market controller until a joint checkpoint is promoted.
+
 ## Training
 
 The normal persistent workflow is driven by a league session whose
 `training_manifests` includes this agent. Each closed league round calls `train.py`,
-which collects one 16-episode rollout batch. After twenty new batches, `on_batch`
+which collects one 16-episode rollout batch. After twenty new schema-v4 batches, `on_batch`
 trains and gates a checkpoint. Batches, replay artifacts, watermarks, and the active
 checkpoint remain available when the process or session resumes against the same
 DuckDB catalog.
@@ -71,6 +89,20 @@ league database:
 ```bash
 python -m agents.dqn_job_scorer.training.loop --rounds 250 --jobs 8 --ship
 ```
+
+For an isolated resumable job-scorer self-play league, use:
+
+```bash
+python train_dqn.py
+```
+
+It writes to `artifacts/dqn_self_play_experiments.duckdb` and
+`artifacts/dqn_self_play/`, separate from the all-agent and planner stores. Three
+independently seeded DQNs train against a deterministic schema-current DQN and
+each other's active and historical checkpoints. The two-member, one-turn crop
+population is only a lightweight 20-round hook clock; every full 720-turn
+rollout and evaluation is DQN-versus-DQN. The final arena remains disabled
+until reviewed active checkpoints have been explicitly exported.
 
 Double DQN, potential-based reward shaping, n-step returns, opponent curriculum
 (`starter` → the crop heuristic → frozen self-play snapshots).

@@ -25,10 +25,10 @@ from sim.metrics import Summary, render, summarize
 from sim.runner import MatchResult, run_match
 
 
-def _job(args: tuple[tuple[str, str], int, dict[str, Any], bool]) -> MatchResult:
+def _job(args: tuple[tuple[str, str], int, dict[str, Any]]) -> MatchResult:
     """Worker entry point. Specs stay strings so nothing unpicklable crosses over."""
-    specs, seed, config, keep_replay = args
-    return run_match(specs, seed, config, keep_replay)
+    specs, seed, config = args
+    return run_match(specs, seed, config)
 
 
 def play_series(
@@ -37,14 +37,13 @@ def play_series(
     seeds: Iterable[int],
     config: dict[str, Any],
     jobs: int,
-    keep_replay: bool = False,
 ) -> dict[int, tuple[MatchResult, MatchResult]]:
     """Play every seed in both orientations. Returns {seed: (a_first, b_first)}."""
     seeds = list(seeds)
     tasks = []
     for seed in seeds:
-        tasks.append(((a, b), seed, config, keep_replay))
-        tasks.append(((b, a), seed, config, keep_replay))
+        tasks.append(((a, b), seed, config))
+        tasks.append(((b, a), seed, config))
 
     if jobs == 1:
         outcomes = [_job(task) for task in tasks]
@@ -91,9 +90,7 @@ def _warn_nondeterministic(specs: Iterable[str]) -> None:
 
 
 def _run_head_to_head(a: str, b: str, args: argparse.Namespace, config: dict) -> Summary:
-    results = play_series(
-        a, b, range(args.seeds), config, args.jobs, keep_replay=bool(args.replay_dir)
-    )
+    results = play_series(a, b, range(args.seeds), config, args.jobs)
     summary = summarize(a, b, results, act_timeout=config.get("actTimeout", 1.0))
     if args.replay_dir:
         saved = _save_replays(results, a, Path(args.replay_dir))

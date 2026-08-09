@@ -2,7 +2,6 @@ from pathlib import Path
 
 import train_all
 from kaggriculture_lab.identity import AgentManifest
-from kaggriculture_lab.league import LeagueConfig
 
 
 def test_training_roster_lists_every_manifest_backed_agent():
@@ -12,6 +11,11 @@ def test_training_roster_lists_every_manifest_backed_agent():
         for path in (train_all.REPO_ROOT / "agents").glob("*/agent.toml")
     }
     assert configured == discovered
+
+
+def test_root_main_config_selects_automatic_torch_device():
+    assert train_all.MAIN_CONFIG.name == "main.toml"
+    assert train_all.TRAINING_DEVICE == "auto"
 
 
 def test_effective_config_contains_named_roster_and_all_agent_anchors(
@@ -29,7 +33,7 @@ def test_effective_config_contains_named_roster_and_all_agent_anchors(
     monkeypatch.setattr(train_all, "ARTIFACTS", tmp_path)
     monkeypatch.setattr(train_all, "TRAINING_AGENTS", roster)
 
-    config = LeagueConfig.from_toml(train_all._effective_config())
+    config = train_all._effective_config()
     config.validate()
     assert [(item.type, item.name, item.train) for item in config.training_agents] == [
         ("configurable_crop_surrogate", "crop01", False),

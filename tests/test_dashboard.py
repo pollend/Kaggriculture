@@ -2,6 +2,7 @@ import json
 import threading
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pytest
@@ -14,6 +15,8 @@ from kaggriculture_lab.dashboard import (
     _episode_page,
     _generation_page,
     _load_replay,
+    _policy_role_label,
+    _replay_page,
     _round_panel,
     make_server,
 )
@@ -137,6 +140,18 @@ def test_dashboard_drills_from_sessions_to_episode(dashboard):
     assert "Test <script> League" not in document
     assert "session%2Fone" in document
     assert "Content-Security-Policy" in headers
+    assert '<script src="/dashboard.js" defer></script>' in document
+    assert "Refresh" not in document
+
+    _, js_headers, javascript = _get(base + "/dashboard.js")
+    assert js_headers["Content-Type"].startswith("text/javascript")
+    assert b"new EventSource(eventUrl)" not in javascript
+    assert b"new EventSource(url)" in javascript
+    assert b"form.filters" in javascript
+    assert b"history.pushState" in javascript
+    assert b"data-dashboard-nav" in javascript
+    assert b"window.Alpine" not in javascript
+    assert b"x-data" not in javascript
 
     _, _, body = _get(base + "/sessions/session%2Fone")
     assert "Rating trend" in body.decode()
@@ -187,6 +202,63 @@ def test_dashboard_renders_visual_replay_with_agent_names(dashboard):
     assert "window.kaggle" in document
 
 
+def test_sp_psro_policy_role_labels_are_unambiguous():
+    assert _policy_role_label('{"role":"population"}', "member-000000-initial") == (
+        "Frozen population — initial baseline"
+    )
+    assert _policy_role_label('{"role":"population"}', "live-nu") == "Live new policy — ν"
+    assert _policy_role_label('{"role":"population"}', "member-000012-beta") == (
+        "Frozen population — β member 12"
+    )
+    assert _policy_role_label('{"role":"population"}', "member-000012-nu-average") == (
+        "Frozen population — averaged ν member 12"
+    )
+    assert _policy_role_label('{"role":"best_response"}', "beta-928dc4299cc6") == (
+        "Live best response — β 928dc429"
+    )
+    assert _policy_role_label("{}", "revision-a") is None
+    assert _policy_role_label("not-json", "revision-a") is None
+
+
+def test_sp_psro_labels_flow_to_episode_generation_and_replay(tmp_path: Path):
+    database = tmp_path / "sp-labels.duckdb"
+    _seed_dashboard(database)
+    with ExperimentStore(database) as store:
+        connection = store.connection
+        connection.execute(
+            "INSERT INTO agent_families (family_id, name, manifest_path, entry_point, "
+            "parameter_schema_version) VALUES ('sp', 'SP-PSRO', 'sp.toml', 'sp:agent', 1)"
+        )
+        connection.execute(
+            """
+            INSERT INTO agent_revisions (
+                revision_id, family_id, entry_point, agent_spec, code_fingerprint,
+                parameter_schema_version, params_json, source
+            ) VALUES
+                ('member-000000-initial', 'sp', 'sp:agent', 'initial', 'fp', 1,
+                 '{"role":"population"}', 'test'),
+                ('beta-928dc4299cc6', 'sp', 'sp:agent', 'beta', 'fp', 1,
+                 '{"role":"best_response"}', 'test')
+            """
+        )
+        connection.execute(
+            "UPDATE league_pairings SET revision_a = 'member-000000-initial', "
+            "revision_b = 'beta-928dc4299cc6' WHERE pairing_id = 'pair-1'"
+        )
+        episode = _episode_page(connection, "match-1")
+        generation = _generation_page(
+            connection, "session/one:g0000", 1, "all", "all"
+        )
+        replay = _replay_page(connection, "match-1")
+
+    for document in (episode, generation):
+        assert "Frozen population — initial baseline" in document
+        assert "Live best response — β 928dc429" in document
+    assert "Seat 1 \\u00b7 Frozen population \\u2014 initial baseline" in replay
+    assert "Seat 2 \\u00b7 Live best response \\u2014 \\u03b2 928dc429" in replay
+    assert replay.count("fixed for episode") >= 2
+
+
 def test_dashboard_health_head_and_error_responses(dashboard):
     base, _ = dashboard
     status, _, body = _get(base + "/healthz")
@@ -207,10 +279,32 @@ def test_dashboard_health_head_and_error_responses(dashboard):
         urlopen(base + "/?page=zero")
     assert invalid_page.value.code == 400
 
+    with pytest.raises(HTTPError) as invalid_sort:
+        urlopen(base + "/generations/session%2Fone%3Ag0000?sort=money")
+    assert invalid_sort.value.code == 400
+
     with pytest.raises(HTTPError) as method:
         urlopen(Request(base + "/", data=b"", method="POST"))
     assert method.value.code == 405
     assert method.value.headers["Allow"] == "GET, HEAD"
+
+
+def test_dashboard_event_stream_sends_current_page_fragment(dashboard):
+    base, _ = dashboard
+    event_url = base + "/events/dashboard?" + urlencode({"path": "/sessions/session%2Fone"})
+    with urlopen(event_url, timeout=3) as response:
+        event_line = response.readline()
+        data_line = response.readline()
+        separator = response.readline()
+
+    assert response.headers["Content-Type"].startswith("text/event-stream")
+    assert event_line == b"event: dashboard.fragment\n"
+    assert data_line.startswith(b"data: ")
+    payload = json.loads(data_line.removeprefix(b"data: "))
+    assert payload["selector"] == "main"
+    assert payload["mergeMode"] == "outer"
+    assert "Rating trend" in payload["fragments"]
+    assert separator == b"\n"
 
 
 def test_generation_page_reports_performance_statistics(dashboard):
@@ -243,6 +337,32 @@ def test_generation_page_reports_performance_statistics(dashboard):
     assert document.index("0.8s") < document.index("0.2s")
 
     assert "Re-evaluation requests" in document
+
+
+def test_pairings_can_be_sorted_by_clickable_headers(tmp_path: Path):
+    database = tmp_path / "sorted-pairings.duckdb"
+    _seed_dashboard(database)
+    with ExperimentStore(database) as store:
+        store.connection.execute(
+            "INSERT INTO league_pairings VALUES ('pair-2', ?, 5, 'population', 18, "
+            "'revision-a', 'revision-b', 'OPEN')",
+            ["session/one:g0000"],
+        )
+        document = _generation_page(
+            store.connection,
+            "session/one:g0000",
+            1,
+            "all",
+            "all",
+            "round",
+            "desc",
+        )
+
+    assert document.index("pair-2") < document.index("pair-1")
+    assert 'data-dashboard-nav href="/generations/session%2Fone%3Ag0000?sort=round&amp;direction=asc"' in document
+    assert "Round ↓" in document
+    assert 'name="sort" value="round"' in document
+    assert 'name="direction" value="desc"' in document
 
 
 def test_performance_section_renders_for_a_generation_with_no_episodes(tmp_path: Path):

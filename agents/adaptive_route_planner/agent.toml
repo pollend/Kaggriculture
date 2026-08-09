@@ -1,0 +1,25 @@
+family_id = "adaptive_route_planner"
+name = "Adaptive Route Planner"
+entry_point = "agents.adaptive_route_planner.agent:make_agent"
+parameter_schema_version = 1
+training_adapter = "agents.adaptive_route_planner.training:adapter"
+episode_evaluator = "agents.adaptive_route_planner.main:evaluate_episode"
+
+code_paths = [
+  "agents/__init__.py",
+  "agents/adaptive_route_planner/__init__.py",
+  "agents/adaptive_route_planner/main.py",
+  "agents/adaptive_route_planner/agent.py",
+  "agents/adaptive_route_planner/strategy.py",
+]
+
+[[models]]
+model_id = "adaptive_route_planner.surrogate"
+trainer = "agents.adaptive_route_planner.train:trainer"
+min_new_batches = 2
+
+[models.config]
+n_estimators = 300
+min_samples_leaf = 2
+candidate_pool = 10000
+

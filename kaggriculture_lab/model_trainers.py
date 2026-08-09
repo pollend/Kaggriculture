@@ -22,13 +22,19 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import math
 import traceback
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from kaggriculture_lab.identity import training_artifact_root
+from kaggriculture_lab.identity import (
+    AgentManifest,
+    AgentRevision,
+    code_fingerprint,
+    training_artifact_root,
+)
 from kaggriculture_lab.model_updates import (
     ActiveCheckpoint,
     ModelTrainingReader,
@@ -118,6 +124,174 @@ class TrainingBatchWriter:
         )
         self._recorded.append(batch.batch_id)
         return batch
+
+    def record_policy_episode(
+        self,
+        *,
+        context: RoundContext,
+        manifest_path: str | Path,
+        pairing_index: int,
+        beta_seat: int,
+        population_revision_id: str,
+        beta_revision_id: str,
+        mixture_id: str,
+        result: Any,
+    ) -> tuple[str, ...]:
+        """Commit one already-run manifest episode to the league ledger.
+
+        The trainer supplies policy identity and the match result; the lab owns
+        stable pairing/match IDs, revision registration, and artifact linkage.
+        Calling this again during resume is idempotent.
+        """
+        from kaggriculture_lab.league import (
+            LeagueEpisodeTask,
+            _finish_pairing,
+            _store_orientation_result,
+        )
+        from kaggriculture_lab.league import (
+            _stable_id as league_id,
+        )
+
+        manifest = AgentManifest.load(manifest_path)
+        self._store.register_family(manifest, manifest_path)
+        fingerprint = code_fingerprint(manifest)
+        population_seat = 1 - beta_seat
+        orientation = 1 - beta_seat
+        specs = [seat.spec for seat in result.seats]
+
+        def revision(revision_id: str, spec: str, role: str) -> AgentRevision:
+            return AgentRevision(
+                revision_id=revision_id,
+                family_id=manifest.family_id,
+                strategy_id=None,
+                entry_point=manifest.entry_point,
+                agent_spec=spec,
+                code_fingerprint=fingerprint,
+                parameter_schema_version=manifest.parameter_schema_version,
+                params_json=json.dumps({"role": role}, sort_keys=True),
+                source="policy_matchup",
+            )
+
+        population = revision(population_revision_id, specs[population_seat], "population")
+        beta = revision(beta_revision_id, specs[beta_seat], "best_response")
+        self._store.add_agent_revisions((population, beta))
+        pairing_id = league_id(
+            "policy-pair",
+            context.generation_id,
+            context.round_index,
+            pairing_index,
+            population_revision_id,
+            beta_revision_id,
+            result.seed,
+        )
+        self._store.connection.execute(
+            """
+            INSERT OR IGNORE INTO league_pairings VALUES (
+                ?, ?, ?, 'sp_psro_training', ?, ?, ?, 'PENDING'
+            )
+            """,
+            [
+                pairing_id,
+                context.generation_id,
+                context.round_index,
+                result.seed,
+                population_revision_id,
+                beta_revision_id,
+            ],
+        )
+        task = LeagueEpisodeTask(
+            pairing_id,
+            orientation,
+            result.seed,
+            population,
+            beta,
+            result.steps,
+        )
+        _store_orientation_result(
+            self._store, context.session_id, context.generation_id, task, result
+        )
+        self._store.connection.execute(
+            """
+            INSERT OR IGNORE INTO pairing_policy_assignments VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                pairing_id,
+                mixture_id,
+                f"{mixture_id}:composite",
+                population_revision_id,
+                beta_revision_id,
+            ],
+        )
+        completed = self._store.connection.execute(
+            "SELECT count(*) FROM pairing_episodes WHERE pairing_id = ?", [pairing_id]
+        ).fetchone()[0]
+        if int(completed) == 2:
+            _finish_pairing(self._store, pairing_id, population_revision_id)
+        return tuple(
+            str(row[0])
+            for row in self._store.connection.execute(
+                """
+                SELECT eta.artifact_id FROM episode_training_artifacts eta
+                JOIN pairing_episodes pe USING (match_id)
+                WHERE pe.pairing_id = ? AND pe.orientation = ?
+                ORDER BY eta.artifact_id
+                """,
+                [pairing_id, orientation],
+            ).fetchall()
+        )
+
+    def record_policy_mixture(
+        self,
+        context: RoundContext,
+        revision_ids: Sequence[str],
+        *,
+        max_members: int,
+        weights: Sequence[float] | None = None,
+    ) -> str:
+        """Persist one immutable policy mixture; weights default to uniform."""
+        if not revision_ids:
+            raise ValueError("policy mixture cannot be empty")
+        if max_members < 1:
+            raise ValueError("max_members must be positive")
+        members = tuple(revision_ids[-max_members:])
+        if weights is None:
+            normalized = [1.0 / len(members)] * len(members)
+        else:
+            selected = list(weights[-max_members:])
+            if len(selected) != len(members) or any(
+                value < 0 or not math.isfinite(value) for value in selected
+            ):
+                raise ValueError("policy mixture weights must match members and be nonnegative")
+            total = sum(selected)
+            if total <= 0:
+                raise ValueError("policy mixture weights must have positive mass")
+            normalized = [value / total for value in selected]
+        mixture_id = _stable_id(
+            "mixture",
+            self._model_id,
+            context.generation_id,
+            *(f"{member}:{weight:.17g}" for member, weight in zip(members, normalized)),
+        )
+        self._store.connection.execute(
+            "INSERT OR IGNORE INTO policy_mixtures VALUES (?, ?, ?, ?, current_timestamp)",
+            [mixture_id, self._model_id, context.generation_index, max_members],
+        )
+        self._store.connection.executemany(
+            "INSERT OR IGNORE INTO policy_mixture_members VALUES (?, ?, ?, ?)",
+            [
+                [mixture_id, revision_id, ordinal, normalized[ordinal]]
+                for ordinal, revision_id in enumerate(members)
+            ],
+        )
+        return mixture_id
+
+    def link_artifacts(self, batch_id: str, artifact_ids: Sequence[str]) -> None:
+        """Associate immutable episode sidecars with a consolidated batch."""
+        if artifact_ids:
+            self._store.connection.executemany(
+                "INSERT OR IGNORE INTO training_batch_artifacts VALUES (?, ?)",
+                [[batch_id, artifact_id] for artifact_id in artifact_ids],
+            )
 
 
 class Trainer(Protocol):

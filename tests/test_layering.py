@@ -32,6 +32,11 @@ INFRA_ALLOWED_SUFFIXES = (
 )
 INFRA_ALLOWED_DIRS = ("training",)
 
+# SP-PSRO is deliberately an alternate training curriculum and artifact layer
+# over the DQN job scorer. Keeping that relationship explicit here preserves
+# the no-accidental-cross-agent rule for every other family.
+AGENT_EXTENSIONS = {("sp_psro_job_scorer", "dqn_job_scorer")}
+
 
 def _module_imports(path: Path) -> set[str]:
     """Top-level runtime imports. `if TYPE_CHECKING:` blocks are excluded --
@@ -90,7 +95,12 @@ def test_no_agent_imports_another_agent():
         owner = path.relative_to(REPO).parts[1]
         for module in _module_imports(path):
             parts = module.split(".")
-            if parts[0] == "agents" and len(parts) > 1 and parts[1] != owner:
+            if (
+                parts[0] == "agents"
+                and len(parts) > 1
+                and parts[1] != owner
+                and (owner, parts[1]) not in AGENT_EXTENSIONS
+            ):
                 offences.append(f"{path.relative_to(REPO)} imports {module}")
     assert not offences, "an agent imported another agent:\n" + "\n".join(offences)
 

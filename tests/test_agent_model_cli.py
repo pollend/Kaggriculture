@@ -18,7 +18,7 @@ from kaggriculture_lab.storage import ExperimentStore
     ("command", "model_id"),
     [
         (crop_cli, "configurable_crop_surrogate.surrogate"),
-        (dqn_cli, "dqn_job_scorer.q_network"),
+        (dqn_cli, "dqn_job_scorer.adaptive_hybrid_q_v2"),
         (planner_cli, "receding_horizon_planner.surrogate"),
     ],
 )
@@ -32,7 +32,7 @@ def test_agent_status_registers_only_its_model(
             "active_checkpoint_id": None,
             "last_attempted_batch_seq": 0,
             "latest_batch_seq": 0,
-            "min_new_batches": 20 if model_id == "dqn_job_scorer.q_network" else 2,
+            "min_new_batches": 20 if model_id == "dqn_job_scorer.adaptive_hybrid_q_v2" else 2,
             "model_id": model_id,
             "new_batches": 0,
         }
@@ -68,7 +68,7 @@ def test_agent_model_commands_address_a_named_instance(
         ["model", "status", "--name", "dqn05", "--database", str(database)]
     ) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload[0]["model_id"] == "dqn_job_scorer.q_network@dqn05"
+    assert payload[0]["model_id"] == "dqn_job_scorer.adaptive_hybrid_q_v2@dqn05"
     with ExperimentStore(database) as store:
         row = store.connection.execute(
             "SELECT agent_type, agent_name, config_json FROM training_models"
@@ -92,7 +92,7 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
             INSERT INTO model_updates (
                 update_id, model_id, cutoff_batch_seq, new_batch_count,
                 dataset_sha256, status, candidate_checkpoint_id
-            ) VALUES ('update', 'dqn_job_scorer.q_network', 1, 1,
+            ) VALUES ('update', 'dqn_job_scorer.adaptive_hybrid_q_v2', 1, 1,
                       'dataset', 'PROMOTED', 'checkpoint')
             """
         )
@@ -102,7 +102,7 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
                 checkpoint_id, model_id, update_id, trainer_artifact_path,
                 inference_artifact_path, artifact_sha256, dataset_sha256,
                 metrics_json, gate_json, promoted
-            ) VALUES ('checkpoint', 'dqn_job_scorer.q_network', 'update', ?, ?,
+            ) VALUES ('checkpoint', 'dqn_job_scorer.adaptive_hybrid_q_v2', 'update', ?, ?,
                       'artifact', 'dataset', '{}', '{"passed": true}', true)
             """,
             [str(source), str(source)],
@@ -110,7 +110,7 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
         store.connection.execute(
             """
             UPDATE training_models SET active_checkpoint_id = 'checkpoint'
-            WHERE model_id = 'dqn_job_scorer.q_network'
+            WHERE model_id = 'dqn_job_scorer.adaptive_hybrid_q_v2'
             """
         )
 

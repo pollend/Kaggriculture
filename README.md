@@ -36,8 +36,11 @@ uv sync --locked --python 3.12
 ./run-sim.sh competitors      # Round-robin against every imported competitor
 
 # Run the resumable crop-surrogate + DQN training loop, then a large arena.
-# Edit the constants at the top of train_all.py to change its scale.
+# Edit root main.toml to change machine-wide scale, paths, and compute settings.
 python train_all.py
+
+# Run three adaptive-hybrid DQNs in an isolated self-play store.
+python train_dqn.py
 
 # Compare named profiles directly.
 .venv/bin/python -m sim.arena league \
@@ -68,6 +71,16 @@ SESSION=$(.venv/bin/kaglab league init --config configs/league.toml)
 .venv/bin/kaglab league run --session-id "$SESSION"
 ```
 
+On Apple Silicon, `[compute] device = "auto"` in `main.toml` selects PyTorch's
+Metal (`mps`) backend when available. Set it to `"cpu"` to force CPU execution.
+This accelerates DQN gradient updates; game simulation, arena evaluation,
+DuckDB, and the scikit-learn surrogate models remain CPU workloads.
+
+The DQN candidate is an adaptive hybrid: public shop demand, prices, opponent
+supply, remaining season, feed cost, and labor capacity select crop,
+animal-dividend, or mixed mode. Its schema-v2 model ID and schema-v3 replay
+format intentionally isolate it from the former crop-only lineage.
+
 `TRAINING_AGENTS` at the top of `train_all.py` lists every manifest-backed agent. Each
 `{"type": ..., "name": ...}` pair has independent DuckDB history and writes beneath
 `artifacts/<type>/<name>/`. Rename an entry to start a reproducible fresh attempt, reuse
@@ -95,7 +108,9 @@ Open `http://127.0.0.1:8000/` to inspect generations, ratings, pairings, episode
 hook evaluations, and stored replays. Pairings identify each agent family, strategy,
 revision, and behavior-model checkpoint when present. Episode pages can open the full
 visual replay with play/pause and turn controls or download its JSON. Refreshing a page
-re-queries DuckDB. A
+re-queries DuckDB. The constants-driven `train_*.py` runners start an embedded dashboard
+automatically and print its URL; it remains available for the duration of that training
+invocation. If port 8000 is occupied, the runner selects an available local port. A
 separate dashboard process cannot read the catalog while `league run` owns DuckDB's
 write lock; the dashboard reports that state and can be refreshed once the run pauses
 or completes. The server binds to loopback by default and has no authentication.

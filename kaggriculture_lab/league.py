@@ -12,7 +12,7 @@ import statistics
 import tomllib
 import traceback
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -62,6 +62,7 @@ class LeagueConfig:
     jobs: int = 1
     tau: float = 0.5
     candidate_pool: int = 2_000
+    pairing_mode: str = "league"
 
     @classmethod
     def from_toml(cls, path: str | Path) -> LeagueConfig:
@@ -77,7 +78,9 @@ class LeagueConfig:
         return cls(**values)
 
     def validate(self) -> None:
-        if self.population_size < 2:
+        if self.pairing_mode not in {"league", "trainer_only"}:
+            raise ValueError("pairing_mode must be 'league' or 'trainer_only'")
+        if self.pairing_mode == "league" and self.population_size < 2:
             raise ValueError("population_size must be at least 2")
         if self.rounds_per_generation < 1:
             raise ValueError("rounds_per_generation must be positive")
@@ -127,7 +130,6 @@ def _league_worker(task: LeagueEpisodeTask):
         (seats[0].agent_spec, seats[1].agent_spec),
         task.seed,
         {"episodeSteps": task.episode_steps},
-        keep_replay=True,
         # The league persists per-episode metrics for agents' evaluation hooks
         # to read back, so it opts into the kaggriculture analyzer explicitly.
         analyzer=episode_metrics,
@@ -190,10 +192,14 @@ def create_session(
     ]
     anchor_manifests = [AgentManifest.load(path) for path in anchor_manifest_paths]
     adapter = load_training_adapter(manifest)
-    if adapter is None:
+    if adapter is None and config.pairing_mode == "league":
         raise ValueError(f"agent family has no training_adapter: {manifest.family_id}")
     population_rng = random.Random(config.seed)
-    strategies = [adapter.sample(population_rng) for _ in range(config.population_size)]
+    strategies = (
+        [adapter.sample(population_rng) for _ in range(config.population_size)]
+        if adapter is not None and config.pairing_mode == "league"
+        else []
+    )
     revisions = [
         build_revision(
             manifest,
@@ -204,11 +210,18 @@ def create_session(
         )
         for strategy in strategies
     ]
-    anchors = [
-        builtin_revision("starter"),
-        builtin_revision("seeded_random", f"kaggriculture_lab.opponents:make_seeded_random?seed={config.seed}"),
-        builtin_revision("pass"),
-    ]
+    anchors = (
+        [
+            builtin_revision("starter"),
+            builtin_revision(
+                "seeded_random",
+                f"kaggriculture_lab.opponents:make_seeded_random?seed={config.seed}",
+            ),
+            builtin_revision("pass"),
+        ]
+        if config.pairing_mode == "league"
+        else []
+    )
     competitor_anchors = [
         build_revision(item, workspace=workspace, source="competitor")
         for item in anchor_manifests
@@ -235,10 +248,11 @@ def create_session(
             "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (?, ?, 0, 'OPEN')",
             [generation_id, session_id],
         )
-        store.connection.executemany(
-            "INSERT INTO generation_members VALUES (?, ?, 'population', 1500, 350, 0.06)",
-            [[generation_id, revision.revision_id] for revision in revisions],
-        )
+        if revisions:
+            store.connection.executemany(
+                "INSERT INTO generation_members VALUES (?, ?, 'population', 1500, 350, 0.06)",
+                [[generation_id, revision.revision_id] for revision in revisions],
+            )
         if competitor_anchors:
             store.connection.executemany(
                 "INSERT INTO generation_members VALUES (?, ?, 'anchor', 1500, 350, 0.06)",
@@ -396,6 +410,12 @@ def schedule_generation(store: ExperimentStore, session_id: str) -> int:
         return int(existing)
     if status != "OPEN":
         raise ValueError(f"generation is not open: {generation_id} ({status})")
+    if config.pairing_mode == "trainer_only":
+        store.connection.execute(
+            "UPDATE generations SET status = 'SCHEDULED' WHERE generation_id = ?",
+            [generation_id],
+        )
+        return 0
 
     members = _member_ids(store, generation_id)
     rng = random.Random(config.seed + generation_index * 1_000_003)
@@ -592,6 +612,8 @@ def _store_orientation_result(
     task: LeagueEpisodeTask,
     result: MatchResult,
 ) -> None:
+    if result.replay is None:
+        raise ValueError("league match result is missing its required replay payload")
     pairing_id = task.pairing_id
     orientation = task.orientation
     match_id = _stable_id("match", pairing_id, orientation)
@@ -604,12 +626,36 @@ def _store_orientation_result(
         (seats[0].agent_spec, seats[1].agent_spec),
         result,
     )
-    if result.replay is not None:
-        store.add_replay_payload(match_id, result.replay)
+    store.add_replay_payload(match_id, result.replay)
     store.connection.execute(
         "INSERT OR IGNORE INTO pairing_episodes VALUES (?, ?, ?)",
         [pairing_id, orientation, match_id],
     )
+    for seat, artifact in enumerate(result.training_artifacts):
+        if artifact is None:
+            continue
+        revision = seats[seat]
+        artifact_id = _stable_id(
+            "training-artifact", match_id, revision.revision_id, artifact["role"]
+        )
+        store.connection.execute(
+            """
+            INSERT OR IGNORE INTO episode_training_artifacts (
+                artifact_id, match_id, revision_id, policy_revision_id, role,
+                artifact_path, artifact_sha256, sample_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                artifact_id,
+                match_id,
+                revision.revision_id,
+                str(artifact["policy_revision_id"]),
+                str(artifact["role"]),
+                str(artifact["artifact_path"]),
+                str(artifact["artifact_sha256"]),
+                int(artifact["sample_count"]),
+            ],
+        )
     for seat, revision in enumerate(seats):
         _run_hook(
             store,
@@ -833,6 +879,7 @@ def run_generation(
     artifacts: str | Path = "artifacts",
     *,
     update_models: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Resume all missing paired episodes and close ratings as one batch.
 
@@ -876,6 +923,8 @@ def run_generation(
                 [generation_id],
             ).fetchall()
         ]
+        if config.pairing_mode == "trainer_only":
+            rounds = list(range(config.rounds_per_generation))
         jobs = config.jobs if config.jobs > 0 else max(1, (os.cpu_count() or 2) - 1)
         pool = (
             None
@@ -885,7 +934,19 @@ def run_generation(
             )
         )
         try:
-            for round_index in rounds:
+            for round_number, round_index in enumerate(rounds, start=1):
+                if on_progress is not None:
+                    on_progress(
+                        {
+                            "event": "round_started",
+                            "session_id": session_id,
+                            "generation_id": generation_id,
+                            "generation_index": generation_index,
+                            "round_index": round_index,
+                            "round_number": round_number,
+                            "round_count": len(rounds),
+                        }
+                    )
                 _run_round(
                     store, session_id, generation_id, config, round_index, pool
                 )
@@ -1106,12 +1167,13 @@ def _close_generation(
         stat_rows.append(
             [generation_id, revision_id, len(values), wins, draws, losses, mean, median, low, high, len(opponents[revision_id])]
         )
-    store.connection.executemany(
-        "INSERT INTO rating_snapshots VALUES (?, ?, ?, ?, ?, ?, ?)", snapshot_rows
-    )
-    store.connection.executemany(
-        "INSERT INTO generation_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", stat_rows
-    )
+    if snapshot_rows:
+        store.connection.executemany(
+            "INSERT INTO rating_snapshots VALUES (?, ?, ?, ?, ?, ?, ?)", snapshot_rows
+        )
+        store.connection.executemany(
+            "INSERT INTO generation_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", stat_rows
+        )
 
 
 def create_next_generation(
@@ -1127,6 +1189,14 @@ def create_next_generation(
         current_id, current_index, status = _current_generation(store, session_id)
         if status != "COMPLETE":
             raise ValueError("current generation must be complete before breeding")
+        if config.pairing_mode == "trainer_only":
+            next_index = current_index + 1
+            generation_id = f"{session_id}:g{next_index:04d}"
+            store.connection.execute(
+                "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (?, ?, ?, 'OPEN')",
+                [generation_id, session_id, next_index],
+            )
+            return generation_id
         manifest_row = store.connection.execute(
             """
             SELECT af.manifest_path FROM generation_members gm

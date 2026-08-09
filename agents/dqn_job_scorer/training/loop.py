@@ -20,9 +20,11 @@ import numpy as np
 import torch
 from torch import nn
 
-from agents.dqn_job_scorer.policy import WEIGHTS_PATH, QNetwork
+from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
+from agents.dqn_job_scorer.policy import WEIGHTS_PATH, PolicyBundle
 from agents.dqn_job_scorer.training import network as net_module
 from agents.dqn_job_scorer.training.collect import MONEY_SCALE, collect_batch
+from agents.dqn_job_scorer.training.device import resolve_device
 from agents.dqn_job_scorer.training.replay import ReplayBuffer
 
 HEURISTIC = "agents/configurable_crop_surrogate/main.py"
@@ -31,11 +33,16 @@ SELF_SPEC = "agents/dqn_job_scorer/main.py"
 
 @dataclass
 class Config:
+    device: str = "auto"
     rounds: int = 200
     episodes_per_round: int = 16
     gradient_steps: int = 400
     batch_size: int = 512
     learning_rate: float = 1e-4
+    market_learning_rate: float = 1e-4
+    market_gradient_steps: int = 100
+    market_batch_size: int = 128
+    market_target_sync: int = 1000
     gamma: float = 0.997
     n_step: int = 3
     # 800 episodes at 16 per round is ~50 rounds of history (~1.3 GB), against
@@ -75,7 +82,6 @@ class Config:
     self_play_ratio: float = 0.25
     # The reviewed checkpoint is both the training initialization and the bar a
     # challenger must beat. A new output directory never means a blank slate.
-    incumbent_weights: str = "runs/dqn03/snapshots/round0060.npz"
     # Off by default: a training run must not overwrite the live submission
     # weights just by existing. A smoke run would otherwise ship its own
     # half-trained net over a good checkpoint.
@@ -173,18 +179,20 @@ def evaluate_head_to_head(
 
 
 def train(config: Config, output: Path) -> list[dict]:
+    device = resolve_device(config.device)
     torch.manual_seed(config.seed)
     output.mkdir(parents=True, exist_ok=True)
     snapshot_dir = output / "snapshots"
     snapshot_dir.mkdir(exist_ok=True)
 
-    packaged_incumbent = Path(config.incumbent_weights)
-    if not packaged_incumbent.is_file():
-        raise FileNotFoundError(f"configured DQN incumbent is missing: {packaged_incumbent}")
-    online = net_module.from_numpy(QNetwork.load(packaged_incumbent))
-    target = net_module.build()
+    online = net_module.build().to(device)
+    target = net_module.build().to(device)
+    market_online = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
+    market_target = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
     target.load_state_dict(online.state_dict())
+    market_target.load_state_dict(market_online.state_dict())
     optimizer = torch.optim.Adam(online.parameters(), lr=config.learning_rate)
+    market_optimizer = torch.optim.Adam(market_online.parameters(), lr=config.market_learning_rate)
     loss_fn = nn.SmoothL1Loss()
 
     buffer = ReplayBuffer(
@@ -195,18 +203,10 @@ def train(config: Config, output: Path) -> list[dict]:
     history: list[dict] = []
     snapshots: list[Path] = []
     gradient_steps = 0
+    market_gradient_steps = 0
     seen = 0
-    best_round: int | None = -1
-    QNetwork.load(packaged_incumbent).save(output / "best.npz")
-    incumbent = evaluate(
-        packaged_incumbent,
-        HEURISTIC,
-        config.eval_seeds,
-        config.jobs,
-        config.promotion_seed_base,
-    )
-    best_margin: float = incumbent["margin"]
-    print(json.dumps({"incumbent_margin": best_margin, "weights": str(packaged_incumbent)}))
+    best_round: int | None = None
+    best_margin = float("-inf")
 
     for round_index in range(config.rounds):
         weights = net_module.to_numpy(online).layers
@@ -215,7 +215,16 @@ def train(config: Config, output: Path) -> list[dict]:
         seeds = [int(value) for value in rng.integers(0, 2**31 - 1, size=config.episodes_per_round)]
 
         started = time.perf_counter()
-        records = collect_batch(weights, opponents, seeds, epsilon, config.gamma, config.jobs)
+        records = collect_batch(
+            weights,
+            opponents,
+            seeds,
+            epsilon,
+            config.gamma,
+            config.jobs,
+            market_weights=net_module.to_numpy(market_online).layers,
+            market_epsilon=epsilon,
+        )
         collect_time = time.perf_counter() - started
         if not records:
             print(f"round {round_index}: every episode errored -- stopping")
@@ -225,15 +234,16 @@ def train(config: Config, output: Path) -> list[dict]:
         seen += sum(int(record.unit_mask.sum()) for record in records)
 
         losses: list[float] = []
+        market_losses: list[float] = []
         if len(buffer.episodes) >= config.warmup_episodes:
             started = time.perf_counter()
             for _ in range(config.gradient_steps):
                 batch = buffer.sample(config.batch_size)
-                features = torch.from_numpy(batch.features)
-                next_features = torch.from_numpy(batch.next_features)
-                next_mask = torch.from_numpy(batch.next_mask)
-                reward = torch.from_numpy(batch.reward)
-                discount = torch.from_numpy(batch.discount)
+                features = torch.from_numpy(batch.features).to(device)
+                next_features = torch.from_numpy(batch.next_features).to(device)
+                next_mask = torch.from_numpy(batch.next_mask).to(device)
+                reward = torch.from_numpy(batch.reward).to(device)
+                discount = torch.from_numpy(batch.discount).to(device)
 
                 with torch.no_grad():
                     flat = next_features.reshape(-1, next_features.shape[-1])
@@ -256,6 +266,32 @@ def train(config: Config, output: Path) -> list[dict]:
                 gradient_steps += 1
                 if gradient_steps % config.target_sync == 0:
                     target.load_state_dict(online.state_dict())
+            for _ in range(config.market_gradient_steps):
+                batch = buffer.sample_market(config.market_batch_size)
+                features = torch.from_numpy(batch.features).to(device)
+                next_features = torch.from_numpy(batch.next_features).to(device)
+                next_mask = torch.from_numpy(batch.next_mask).to(device)
+                reward = torch.from_numpy(batch.reward).to(device)
+                discount = torch.from_numpy(batch.discount).to(device)
+                with torch.no_grad():
+                    flat = next_features.reshape(-1, next_features.shape[-1])
+                    shape = next_features.shape[:3]
+                    online_q = market_online(flat).reshape(shape)
+                    best = online_q.masked_fill(~next_mask, float("-inf")).argmax(dim=2)
+                    target_q = market_target(flat).reshape(shape)
+                    values = target_q.gather(2, best.unsqueeze(2)).squeeze(2)
+                    values = torch.where(next_mask.any(dim=2), values, torch.zeros_like(values))
+                    goal = reward + discount * values.sum(dim=1)
+                predicted = market_online(features.reshape(-1, features.shape[-1])).reshape(features.shape[:2]).sum(dim=1)
+                loss = loss_fn(predicted, goal)
+                market_optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                nn.utils.clip_grad_norm_(market_online.parameters(), 10.0)
+                market_optimizer.step()
+                market_losses.append(float(loss.detach()))
+                market_gradient_steps += 1
+                if market_gradient_steps % config.market_target_sync == 0:
+                    market_target.load_state_dict(market_online.state_dict())
             train_time = time.perf_counter() - started
         else:
             train_time = 0.0
@@ -272,6 +308,8 @@ def train(config: Config, output: Path) -> list[dict]:
             "buffer_recent": len(buffer.recent),
             "buffer_reservoir": len(buffer.reservoir),
             "loss": round(float(np.mean(losses)), 6) if losses else None,
+            "market_loss": round(float(np.mean(market_losses)), 6) if market_losses else None,
+            "market_transitions": buffer.market_transitions,
             "final_money": round(money, 1),
             "raw_return": round(float(np.mean([record.raw_reward.sum() for record in records])) * MONEY_SCALE, 1),
             "job_truncations": truncated,
@@ -281,7 +319,7 @@ def train(config: Config, output: Path) -> list[dict]:
 
         if round_index and round_index % config.eval_every == 0:
             snapshot = snapshot_dir / f"round{round_index:04d}.npz"
-            exported = net_module.to_numpy(online)
+            exported = PolicyBundle(net_module.to_numpy(online), net_module.to_numpy(market_online))
             exported.save(snapshot)
             snapshots.append(snapshot)
 
@@ -309,27 +347,18 @@ def train(config: Config, output: Path) -> list[dict]:
             # Equal margin against a common opponent is not equal strength. So the
             # benchmark is only a cheap filter, and the incumbent decides.
             incumbent_path = output / "best.npz"
-            incumbent_result = evaluate(
-                incumbent_path,
-                HEURISTIC,
-                config.eval_seeds,
-                config.jobs,
-                seed_start,
-            )
-            entry["incumbent_eval"] = incumbent_result
-            if result["margin"] < incumbent_result["margin"] - config.challenge_slack:
-                promote, reason = False, "benchmark margin far below incumbent"
+            if not incumbent_path.is_file():
+                promote, reason = not result["errors"], "initial valid checkpoint"
             else:
-                duel = evaluate_head_to_head(
-                    snapshot,
-                    incumbent_path,
-                    config.duel_seeds,
-                    config.jobs,
-                    seed_start,
-                )
-                entry["duel"] = duel
-                promote = duel["significant"] and duel["margin"] > 0
-                reason = "beat incumbent head to head" if promote else "did not beat incumbent"
+                incumbent_result = evaluate(incumbent_path, HEURISTIC, config.eval_seeds, config.jobs, seed_start)
+                entry["incumbent_eval"] = incumbent_result
+                if result["margin"] < incumbent_result["margin"] - config.challenge_slack:
+                    promote, reason = False, "benchmark margin far below incumbent"
+                else:
+                    duel = evaluate_head_to_head(snapshot, incumbent_path, config.duel_seeds, config.jobs, seed_start)
+                    entry["duel"] = duel
+                    promote = duel["significant"] and duel["margin"] > 0
+                    reason = "beat incumbent head to head" if promote else "did not beat incumbent"
 
             entry["promotion"] = reason
             if promote:
@@ -347,8 +376,8 @@ def train(config: Config, output: Path) -> list[dict]:
 
     # The final net is saved for resuming, but the shipped weights stay whichever
     # checkpoint actually evaluated best.
-    net_module.to_numpy(online).save(output / "final.npz")
-    torch.save(online.state_dict(), output / "online.pt")
+    PolicyBundle(net_module.to_numpy(online), net_module.to_numpy(market_online)).save(output / "final.npz")
+    torch.save({"job": online.state_dict(), "market": market_online.state_dict()}, output / "online.pt")
     print(json.dumps({
         "best_round": best_round,
         "best_margin": best_margin,

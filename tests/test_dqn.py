@@ -23,7 +23,8 @@ import torch
 from agents.dqn_job_scorer import features as F
 from agents.dqn_job_scorer.jobs import MAX_JOBS, enumerate_jobs
 from agents.dqn_job_scorer.main import JobScorerAgent
-from agents.dqn_job_scorer.policy import QNetwork, select
+from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
+from agents.dqn_job_scorer.policy import PolicyBundle, QNetwork, select
 from agents.dqn_job_scorer.training import network as net_module
 from agents.dqn_job_scorer.training.collect import (
     EPISODE_ARRAY_FIELDS,
@@ -36,12 +37,13 @@ from agents.dqn_job_scorer.training.collect import (
     save_episode_batch,
 )
 from agents.dqn_job_scorer.training.replay import ReplayBuffer
-from kaggriculture_lab.identity import AgentManifest
+from kaggriculture_lab.identity import AgentManifest, TrainingAgentSpec
 from kaggriculture_lab.model_updates import record_training_batch, update_model_in_store
 from kaggriculture_lab.storage import ExperimentStore
 from sim.runner import run_match
 
 GAMMA = 0.997
+MODEL_ID = "dqn_job_scorer.adaptive_hybrid_q_v2"
 
 
 @pytest.fixture(scope="module")
@@ -80,6 +82,34 @@ def test_export_round_trips():
     for (w1, b1), (w2, b2) in zip(original.layers, restored.layers):
         np.testing.assert_array_equal(w1, w2)
         np.testing.assert_array_equal(b1, b2)
+
+
+def test_joint_policy_bundle_round_trips_and_legacy_falls_back(tmp_path):
+    joint_path = tmp_path / "joint.npz"
+    original = PolicyBundle.random(seed=23)
+    original.save(joint_path)
+    restored = PolicyBundle.load(joint_path)
+    assert restored.market is not None
+    assert restored.job.layers[0][0].shape[0] == F.FEATURE_DIM
+    assert restored.market.layers[0][0].shape[0] == MARKET_FEATURE_DIM
+
+    legacy_path = tmp_path / "legacy.npz"
+    original.job.save(legacy_path)
+    legacy = PolicyBundle.load(legacy_path)
+    assert legacy.market is None
+
+
+def test_explicit_network_seed_is_a_frozen_schema_current_policy(monkeypatch):
+    from agents.dqn_job_scorer import main as main_module
+
+    monkeypatch.setenv("KAGG_AGENT_CONFIG", json.dumps({"network_seed": 17}))
+    observed = main_module._load_network()
+    expected = QNetwork.random(seed=17)
+    for (observed_w, observed_b), (expected_w, expected_b) in zip(
+        observed.layers, expected.layers
+    ):
+        np.testing.assert_array_equal(observed_w, expected_w)
+        np.testing.assert_array_equal(observed_b, expected_b)
 
 
 def test_episode_batch_round_trips_without_pickle(episode, tmp_path):
@@ -135,13 +165,13 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
         store.register_family(manifest, manifest_path)
         store.connection.execute(
             "UPDATE training_models SET config_json = ? WHERE model_id = ?",
-            [json.dumps(config), "dqn_job_scorer.q_network"],
+            [json.dumps(config), MODEL_ID],
         )
         # Derived, not hardcoded: the threshold tracks the league's round count.
         for index in range(manifest.models[0].min_new_batches):
             record_training_batch(
                 store,
-                "dqn_job_scorer.q_network",
+                MODEL_ID,
                 source_kind="dqn_rollout",
                 source_id=f"rollout-{index}",
                 sample_count=1,
@@ -150,7 +180,7 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
                 metadata={"transitions": int(episode.unit_mask.sum())},
             )
         report = update_model_in_store(
-            store, "dqn_job_scorer.q_network", artifacts=tmp_path
+            store, MODEL_ID, artifacts=tmp_path
         )
         assert report.status == "promoted"
         checkpoint = store.connection.execute(
@@ -277,6 +307,31 @@ def test_sampled_batch_shapes_and_terminal_discount(episode):
     assert np.all(batch.discount[~terminal] > 0)
 
 
+def test_market_replay_uses_daily_factors_and_elapsed_turn_discount():
+    market = QNetwork.random(seed=5, feature_dim=MARKET_FEATURE_DIM)
+    record = collect_episode(
+        QNetwork.random(seed=4).layers,
+        opponent_spec="pass",
+        seed=17,
+        epsilon=0.0,
+        gamma=GAMMA,
+        config={"episodeSteps": 48},
+        market_weights=market.layers,
+        market_epsilon=0.0,
+    )
+    assert record is not None and record.market_step is not None
+    np.testing.assert_array_equal(record.market_step, [0, 24])
+    buffer = ReplayBuffer(capacity=4, gamma=GAMMA, n_step=1, seed=2)
+    buffer.add([record])
+    batch = buffer.sample_market(64)
+    assert batch.features.shape == (64, 10, MARKET_FEATURE_DIM)
+    assert batch.next_features.shape[:2] == (64, 10)
+    assert batch.next_mask.shape == batch.next_features.shape[:3]
+    nonterminal = batch.discount > 0
+    assert nonterminal.any()
+    np.testing.assert_allclose(batch.discount[nonterminal], GAMMA**24, rtol=1e-5)
+
+
 def test_masked_max_ignores_padding():
     """Padding must be -inf, not zero, or a pad row wins when all Q are negative."""
     q_values = torch.tensor([[-5.0, -2.0, 0.0]])
@@ -297,13 +352,32 @@ def test_pass_is_always_available_and_first():
 
 def test_enumeration_caps_and_reports_truncation():
     tiles = [[None] * 10 for _ in range(10)]
-    farm = {"tiles": tiles, "farmer": [0, 0]}
+    farm = {"tiles": tiles, "farmer": [4, 0]}
     private = {"seeds": {crop: 5 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")}}
 
     jobs, truncated = enumerate_jobs(farm, private, 0, [(0, 0)], [{}])
     assert len(jobs) == MAX_JOBS
     # 5 crops x 100 empty tiles + PASS, minus what survived the cap.
     assert truncated == 501 - MAX_JOBS
+
+
+def test_plant_candidates_are_compact_around_the_shed():
+    from agents.dqn_job_scorer.hybrid import HybridPlan
+
+    tiles = [["LOCKED"] * 10 for _ in range(10)]
+    for y in range(5):
+        for x in range(5):
+            tiles[y][x] = None
+    farm = {"tiles": tiles, "farmer": [0, 0]}
+    private = {"seeds": {"WHEAT": 4}}
+    plan = HybridPlan("CROP", "GOOSE", 0, 4, 0)
+
+    jobs, _ = enumerate_jobs(farm, private, 0, [(4, 0)], [{}], plan)
+    targets = [job.target for job in jobs if job.kind == "PLANT"]
+
+    # The nearest NW tiles to the centre shed access at (4, 4), rather than
+    # the row-major prefix (0, 0), (1, 0), ... far from the farm centre.
+    assert targets == [(4, 4), (4, 3), (3, 4), (4, 2)]
 
 
 def test_drop_jobs_stay_with_their_carrier():
@@ -501,7 +575,7 @@ def test_epsilon_zero_play_is_deterministic(tmp_path):
 def test_agent_emits_only_legal_actions(tmp_path):
     weights = tmp_path / "w.npz"
     QNetwork.random(seed=9).save(weights)
-    match = run_match((f"agents/dqn_job_scorer/main.py?weights={weights}", "starter"), seed=2, keep_replay=True)
+    match = run_match((f"agents/dqn_job_scorer/main.py?weights={weights}", "starter"), seed=2)
     assert not match.failed
 
     for state in match.replay["steps"]:
@@ -963,7 +1037,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
     missing = tmp_path / "gone.npz"
 
     class Context:
-        model_id = "dqn_job_scorer.q_network"
+        model_id = MODEL_ID
         family_id = "dqn_job_scorer"
 
     with ExperimentStore(tmp_path / "pool.duckdb") as store:
@@ -976,7 +1050,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
                 INSERT INTO model_updates (
                     update_id, model_id, cutoff_batch_seq, new_batch_count,
                     dataset_sha256, status
-                ) VALUES (?, 'dqn_job_scorer.q_network', ?, 1, 'd', 'PROMOTED')
+                ) VALUES (?, 'dqn_job_scorer.adaptive_hybrid_q_v2', ?, 1, 'd', 'PROMOTED')
                 """,
                 [f"update{index}", index + 1],
             )
@@ -986,7 +1060,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
                     checkpoint_id, model_id, update_id, trainer_artifact_path,
                     inference_artifact_path, artifact_sha256, dataset_sha256,
                     metrics_json, gate_json, promoted
-                ) VALUES (?, 'dqn_job_scorer.q_network', ?, ?, ?, 'a', 'd', '{}', '{}', ?)
+                ) VALUES (?, 'dqn_job_scorer.adaptive_hybrid_q_v2', ?, ?, ?, 'a', 'd', '{}', '{}', ?)
                 """,
                 [f"checkpoint{index}", f"update{index}", str(path), str(path), promoted],
             )
@@ -996,6 +1070,92 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
     # been swept would fail to resolve mid-episode rather than at selection.
     assert pool == [f"{SELF_SPEC}?weights={present}"]
     assert self_play_pool(Context(), None, 0) == []
+
+
+def test_joint_peer_pool_finds_active_instances_and_non_active_history(tmp_path):
+    from agents.dqn_job_scorer.training.peers import (
+        active_checkpoint_opponents,
+        historical_checkpoint_opponents,
+    )
+    from kaggriculture_lab.model_updates import ModelTrainingReader
+
+    dqn_manifest_path = Path("agents/dqn_job_scorer/agent.toml")
+    dqn_manifest = AgentManifest.load(dqn_manifest_path)
+    sp_manifest_path = Path("agents/sp_psro_job_scorer/agent.toml")
+    sp_manifest = AgentManifest.load(sp_manifest_path)
+    peer_model = f"{MODEL_ID}@peer_a"
+    sp_model = "sp_psro_job_scorer.joint_market_population_v3"
+
+    class Context:
+        model_id = MODEL_ID
+
+    with ExperimentStore(tmp_path / "joint-pool.duckdb") as store:
+        store.register_training_agent(
+            dqn_manifest,
+            dqn_manifest_path,
+            TrainingAgentSpec("dqn_job_scorer", "default"),
+        )
+        store.register_training_agent(
+            dqn_manifest,
+            dqn_manifest_path,
+            TrainingAgentSpec("dqn_job_scorer", "peer_a"),
+        )
+        store.register_training_agent(
+            sp_manifest,
+            sp_manifest_path,
+            TrainingAgentSpec("sp_psro_job_scorer", "default"),
+        )
+
+        def add_checkpoint(model_id, checkpoint_id, path, *, active):
+            path.write_bytes(checkpoint_id.encode())
+            update_id = f"update-{checkpoint_id}"
+            store.connection.execute(
+                """
+                INSERT INTO model_updates (
+                    update_id, model_id, cutoff_batch_seq, new_batch_count,
+                    dataset_sha256, status
+                ) VALUES (?, ?, 1, 1, ?, 'PROMOTED')
+                """,
+                [update_id, model_id, checkpoint_id],
+            )
+            store.connection.execute(
+                """
+                INSERT INTO model_training_checkpoints (
+                    checkpoint_id, model_id, update_id, trainer_artifact_path,
+                    inference_artifact_path, artifact_sha256, dataset_sha256,
+                    metrics_json, gate_json, promoted
+                ) VALUES (?, ?, ?, ?, ?, 'a', ?, '{}', '{}', true)
+                """,
+                [checkpoint_id, model_id, update_id, str(path), str(path), checkpoint_id],
+            )
+            if active:
+                store.connection.execute(
+                    "UPDATE training_models SET active_checkpoint_id = ? WHERE model_id = ?",
+                    [checkpoint_id, model_id],
+                )
+
+        peer_path = tmp_path / "peer.npz"
+        sp_path = tmp_path / "sp.npz"
+        history_path = tmp_path / "history.npz"
+        add_checkpoint(peer_model, "peer-active", peer_path, active=True)
+        add_checkpoint(sp_model, "sp-active", sp_path, active=True)
+        add_checkpoint(MODEL_ID, "dqn-history", history_path, active=False)
+
+        reader = ModelTrainingReader(store)
+        active = active_checkpoint_opponents(
+            Context(), reader, ["dqn_job_scorer", "sp_psro_job_scorer"]
+        )
+        history = historical_checkpoint_opponents(
+            Context(), reader, ["dqn_job_scorer"], 5
+        )
+
+    assert active == [
+        f"agents.dqn_job_scorer.main:agent?weights={peer_path}",
+        f"agents.sp_psro_job_scorer.main:agent?weights={sp_path}",
+    ]
+    assert history == [
+        f"agents.dqn_job_scorer.main:agent?weights={history_path}"
+    ]
 
 
 def test_duel_decides_promotion_not_benchmark_margin(tmp_path):

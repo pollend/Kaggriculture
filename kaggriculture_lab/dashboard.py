@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import html
 import json
+import re
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http import HTTPStatus
@@ -45,15 +48,16 @@ def _row(connection: Any, sql: str, parameters: list[Any] | None = None) -> dict
 class DashboardRepository:
     """Narrow read-only access to the league portion of the experiment catalog."""
 
-    def __init__(self, database: str | Path):
+    def __init__(self, database: str | Path, *, read_only: bool = True):
         self.path = Path(database)
+        self.read_only = read_only
 
     @contextmanager
     def connect(self) -> Iterator[Any]:
         import duckdb
 
         try:
-            connection = duckdb.connect(str(self.path), read_only=True)
+            connection = duckdb.connect(str(self.path), read_only=self.read_only)
         except duckdb.Error as error:
             raise DashboardUnavailable("The database is temporarily unavailable.") from error
         try:
@@ -134,8 +138,12 @@ def _agent_identity_html(
     checkpoint_id: Any,
     *,
     label: str | None = None,
+    params_json: Any = None,
 ) -> str:
     heading = _escape(display_name or revision_id or "Unknown agent")
+    policy_label = _policy_role_label(params_json, revision_id)
+    if policy_label:
+        heading = f'<span class="muted">{_escape(policy_label)}</span> · {heading}'
     if label:
         heading = f'<span class="muted">{_escape(label)}</span> · {heading}'
     details = []
@@ -149,8 +157,44 @@ def _agent_identity_html(
     return f"<b>{heading}</b>" + (f"<br>{suffix}" if suffix else "")
 
 
-def _agent_replay_name(display_name: Any, strategy_id: Any, revision_id: Any, checkpoint_id: Any) -> str:
+def _policy_role_label(params_json: Any, revision_id: Any) -> str | None:
+    try:
+        params = json.loads(str(params_json)) if params_json else {}
+    except (TypeError, ValueError):
+        return None
+    role = params.get("role")
+    revision = str(revision_id or "")
+    if role == "best_response":
+        suffix = revision.removeprefix("beta-")[:8]
+        return "Live best response" + (f" — β {suffix}" if suffix else " — β")
+    if role != "population":
+        return None
+    if revision == "member-000000-initial":
+        return "Frozen population — initial baseline"
+    if revision == "live-nu":
+        return "Live new policy — ν"
+    match = re.fullmatch(r"member-(\d+)-(beta|nu-average)", revision)
+    if match:
+        iteration = int(match.group(1))
+        kind = "β" if match.group(2) == "beta" else "averaged ν"
+        return f"Frozen population — {kind} member {iteration}"
+    return "Frozen population"
+
+
+def _agent_replay_name(
+    display_name: Any,
+    strategy_id: Any,
+    revision_id: Any,
+    checkpoint_id: Any,
+    params_json: Any = None,
+    *,
+    seat: int | None = None,
+) -> str:
     name = str(display_name or "Agent")
+    policy_label = _policy_role_label(params_json, revision_id)
+    if policy_label:
+        prefix = f"Seat {seat + 1} · " if seat is not None else ""
+        return f"{prefix}{policy_label} · {name} (fixed for episode)"
     variant = strategy_id or checkpoint_id or revision_id
     return f"{name} · {variant}" if variant else name
 
@@ -169,6 +213,7 @@ h3{font-size:16px;margin:18px 0 8px}
 .panel{padding:18px;margin:14px 0;overflow:auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px}
 table{border-collapse:collapse;width:100%;min-width:680px}th,td{text-align:left;padding:10px 11px;border-bottom:1px solid var(--line);vertical-align:top}
 th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em}tr:last-child td{border-bottom:0}
+th a{color:inherit;white-space:nowrap}th a[aria-current="true"]{color:var(--accent)}
 .status{font-size:11px;font-weight:700;padding:3px 7px;border-radius:999px;background:#263650}.status.good{color:#7de3ae;background:#153b31}
 .status.bad{color:#ffaaa5;background:#482329}.status.warn{color:var(--warn);background:#473b1e}.progress{height:8px;background:#263650;border-radius:9px;overflow:hidden}
 .progress i{display:block;height:100%;background:var(--accent)}.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.button{border:1px solid var(--line);
@@ -182,12 +227,82 @@ details{margin:8px 0}.pager{display:flex;justify-content:space-between;margin-to
 """
 
 
-def _layout(title: str, body: str, *, refresh: bool = True) -> str:
-    refresh_link = '<a class="button" href="">Refresh</a>' if refresh else ""
+DASHBOARD_JS = r"""
+(() => {
+  const container = document.createElement('template');
+
+  // Adapted from https://github.com/flying-swallow/alpine-sse. Only the
+  // fragment patcher is retained; this dashboard has no Alpine dependency.
+  const mergeFragment = ({selector, mergeMode = 'outer', fragments: html}) => {
+    container.innerHTML = html.trim();
+    for (const fragment of [...container.content.children]) {
+      const targets = [...document.querySelectorAll(selector || `#${fragment.id}`)];
+      for (const target of targets) {
+        const replacement = fragment.cloneNode(true);
+        if (mergeMode === 'inner') target.innerHTML = replacement.outerHTML;
+        else if (mergeMode === 'outer') target.replaceWith(replacement);
+        else if (mergeMode === 'prepend') target.prepend(replacement);
+        else if (mergeMode === 'append') target.append(replacement);
+        else if (mergeMode === 'before') target.before(replacement);
+        else if (mergeMode === 'after') target.after(replacement);
+        else if (mergeMode === 'upsertAttributes') {
+          for (const name of replacement.getAttributeNames()) {
+            target.setAttribute(name, replacement.getAttribute(name));
+          }
+        }
+      }
+    }
+  };
+
+  let updates;
+  const connect = path => {
+    if (updates) updates.close();
+    const url = new URL('/events/dashboard', location.origin);
+    url.searchParams.set('path', path);
+    updates = new EventSource(url);
+    updates.addEventListener('dashboard.fragment', event => mergeFragment(JSON.parse(event.data)));
+  };
+
+  document.addEventListener('submit', event => {
+    const form = event.target.closest('form.filters');
+    if (!form) return;
+    event.preventDefault();
+    const target = new URL(form.action || location.href, location.href);
+    target.search = new URLSearchParams(new FormData(form)).toString();
+    history.pushState({}, '', target);
+    connect(target.pathname + target.search);
+  });
+  document.addEventListener('click', event => {
+    const link = event.target.closest('a[data-dashboard-nav]');
+    if (!link || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    const target = new URL(link.href, location.href);
+    history.pushState({}, '', target);
+    connect(target.pathname + target.search);
+  });
+  window.addEventListener('popstate', () => connect(location.pathname + location.search));
+  connect(location.pathname + location.search);
+})();
+""".strip()
+
+
+def _layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)} · Kaggriculture</title>
-<style>{CSS}</style></head><body><header><div class="bar"><a class="brand" href="/">Kaggriculture League</a>
-<div class="actions">{refresh_link}</div></div></header><main>{body}</main></body></html>"""
+<style>{CSS}</style><script src="/dashboard.js" defer></script></head><body><header><div class="bar"><a class="brand" href="/">Kaggriculture League</a>
+</div></header><main>{body}</main></body></html>"""
+
+
+def _main_fragment(document: str) -> str:
+    start = document.find("<main>")
+    end = document.rfind("</main>")
+    if start < 0 or end < start:
+        raise DashboardUnavailable("dashboard response did not contain a main element")
+    return document[start : end + len("</main>")]
+
+
+def _sse(event: str, payload: dict[str, Any]) -> bytes:
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n".encode()
 
 
 def _cards(items: list[tuple[str, str]]) -> str:
@@ -203,8 +318,8 @@ def _progress(done: int, total: int) -> str:
 
 
 def _pager(path: str, page: int, has_next: bool, **query: Any) -> str:
-    previous = f'<a class="button" href="{_escape(_href(path, page=page - 1, **query))}">← Previous</a>' if page > 1 else "<span></span>"
-    following = f'<a class="button" href="{_escape(_href(path, page=page + 1, **query))}">Next →</a>' if has_next else "<span></span>"
+    previous = f'<a class="button" data-dashboard-nav href="{_escape(_href(path, page=page - 1, **query))}">← Previous</a>' if page > 1 else "<span></span>"
+    following = f'<a class="button" data-dashboard-nav href="{_escape(_href(path, page=page + 1, **query))}">Next →</a>' if has_next else "<span></span>"
     return f'<div class="pager">{previous}<span class="muted">Page {page}</span>{following}</div>'
 
 
@@ -691,7 +806,15 @@ def _performance_section(connection: Any, generation_id: str) -> str:
     )
 
 
-def _generation_page(connection: Any, generation_id: str, page: int, status_filter: str, kind_filter: str) -> str:
+def _generation_page(
+    connection: Any,
+    generation_id: str,
+    page: int,
+    status_filter: str,
+    kind_filter: str,
+    sort: str = "round",
+    direction: str = "asc",
+) -> str:
     generation = _row(
         connection,
         """
@@ -749,6 +872,20 @@ def _generation_page(connection: Any, generation_id: str, page: int, status_filt
     if kind_filter != "all":
         conditions.append("lp.pairing_kind = ?")
         parameters.append(kind_filter)
+    sort_columns = {
+        "round": "lp.round_index",
+        "pairing": "lp.pairing_id",
+        "kind": "lp.pairing_kind",
+        "agents": "agent_a_name",
+        "status": "lp.status",
+        "margin": "pr.paired_margin",
+        "episodes": "pr.episodes_completed",
+    }
+    if sort not in sort_columns:
+        raise DashboardBadRequest("invalid pairing sort")
+    if direction not in {"asc", "desc"}:
+        raise DashboardBadRequest("invalid pairing sort direction")
+    order = f"{sort_columns[sort]} {direction.upper()} NULLS LAST, lp.pairing_id"
     offset = (page - 1) * PAGE_SIZE
     pairings = _rows(
         connection,
@@ -758,14 +895,16 @@ def _generation_page(connection: Any, generation_id: str, page: int, status_filt
                pr.episodes_completed,
                coalesce(afa.name, ara.family_id, lp.revision_a) AS agent_a_name,
                ara.strategy_id AS agent_a_strategy_id, ara.checkpoint_id AS agent_a_checkpoint_id,
+               ara.params_json AS agent_a_params_json,
                coalesce(afb.name, arb.family_id, lp.revision_b) AS agent_b_name,
-               arb.strategy_id AS agent_b_strategy_id, arb.checkpoint_id AS agent_b_checkpoint_id
+               arb.strategy_id AS agent_b_strategy_id, arb.checkpoint_id AS agent_b_checkpoint_id,
+               arb.params_json AS agent_b_params_json
         FROM league_pairings lp LEFT JOIN pairing_results pr USING (pairing_id)
         LEFT JOIN agent_revisions ara ON ara.revision_id = lp.revision_a
         LEFT JOIN agent_families afa ON afa.family_id = ara.family_id
         LEFT JOIN agent_revisions arb ON arb.revision_id = lp.revision_b
         LEFT JOIN agent_families afb ON afb.family_id = arb.family_id
-        WHERE {' AND '.join(conditions)} ORDER BY lp.round_index, lp.pairing_id LIMIT ? OFFSET ?
+        WHERE {' AND '.join(conditions)} ORDER BY {order} LIMIT ? OFFSET ?
         """,
         [*parameters, PAGE_SIZE + 1, offset],
     )
@@ -810,11 +949,27 @@ def _generation_page(connection: Any, generation_id: str, page: int, status_filt
             )
         pairing_rows.append(
             f'<tr><td>{int(row["round_index"])}</td><td><small>{_escape(row["pairing_id"])}</small></td><td>{_escape(row["pairing_kind"])}</td>'
-            f'<td>{_agent_identity_html(row["agent_a_name"], row["agent_a_strategy_id"], row["revision_a"], row["agent_a_checkpoint_id"], label="Agent A")}'
-            f'<div class="versus">vs</div>{_agent_identity_html(row["agent_b_name"], row["agent_b_strategy_id"], row["revision_b"], row["agent_b_checkpoint_id"], label="Agent B")}</td><td>{_status(row["status"])}</td>'
+            f'<td>{_agent_identity_html(row["agent_a_name"], row["agent_a_strategy_id"], row["revision_a"], row["agent_a_checkpoint_id"], label="Agent A", params_json=row["agent_a_params_json"])}'
+            f'<div class="versus">vs</div>{_agent_identity_html(row["agent_b_name"], row["agent_b_strategy_id"], row["revision_b"], row["agent_b_checkpoint_id"], label="Agent B", params_json=row["agent_b_params_json"])}</td><td>{_status(row["status"])}</td>'
             f'<td>{_number(row["paired_margin"], 1)}</td><td>{"<br>".join(links) or "—"}</td></tr>'
         )
     path = _id_path("generations", generation_id)
+    def sort_header(label: str, key: str) -> str:
+        active = sort == key
+        next_direction = "desc" if active and direction == "asc" else "asc"
+        arrow = " ↑" if active and direction == "asc" else " ↓" if active else ""
+        href = _href(
+            path,
+            status=status_filter,
+            kind=kind_filter,
+            sort=key,
+            direction=next_direction,
+        )
+        return (
+            f'<th><a data-dashboard-nav href="{_escape(href)}" '
+            f'aria-current="{"true" if active else "false"}">{_escape(label)}{arrow}</a></th>'
+        )
+
     status_options = '<option value="all">All</option>' + "".join(f'<option value="{_escape(value)}" {"selected" if value == status_filter else ""}>{_escape(value)}</option>' for value in status_values)
     kind_options = '<option value="all">All</option>' + "".join(f'<option value="{_escape(value)}" {"selected" if value == kind_filter else ""}>{_escape(value)}</option>' for value in kind_values)
     total, completed = int(summary.get("pairings") or 0), int(summary.get("completed") or 0)
@@ -826,9 +981,9 @@ def _generation_page(connection: Any, generation_id: str, page: int, status_filt
 <h2>Leaderboard</h2><div class="panel">{('<table><thead><tr><th>#</th><th>Agent</th><th>Role</th><th>Conservative</th><th>Rating</th><th>W–D–L</th><th>Score</th><th>Mean margin</th><th>Opponents</th></tr></thead><tbody>'+leaderboard_rows+'</tbody></table>') if leaderboard else '<div class="empty">Ratings appear after this generation closes.</div>'}</div>
 {_performance_section(connection, generation_id)}
 <h2>Pairings and episodes</h2><div class="panel"><form class="filters" method="get"><label>Status<select name="status">{status_options}</select></label>
-<label>Kind<select name="kind">{kind_options}</select></label><button class="button" type="submit">Apply filters</button></form>
-{('<table><thead><tr><th>Round</th><th>Pairing</th><th>Kind</th><th>Agents</th><th>Status</th><th>Margin A</th><th>Episodes</th></tr></thead><tbody>'+''.join(pairing_rows)+'</tbody></table>') if pairings else '<div class="empty">No pairings match these filters.</div>'}
-{_pager(path, page, has_next, status=status_filter, kind=kind_filter)}</div>'''
+<label>Kind<select name="kind">{kind_options}</select></label><input type="hidden" name="sort" value="{_escape(sort)}"><input type="hidden" name="direction" value="{_escape(direction)}"><button class="button" type="submit">Apply filters</button></form>
+{('<table><thead><tr>'+sort_header('Round', 'round')+sort_header('Pairing', 'pairing')+sort_header('Kind', 'kind')+sort_header('Agents', 'agents')+sort_header('Status', 'status')+sort_header('Margin A', 'margin')+sort_header('Episodes', 'episodes')+'</tr></thead><tbody>'+''.join(pairing_rows)+'</tbody></table>') if pairings else '<div class="empty">No pairings match these filters.</div>'}
+{_pager(path, page, has_next, status=status_filter, kind=kind_filter, sort=sort, direction=direction)}</div>'''
     return _layout(f"Generation {generation['generation_index']}", body)
 
 
@@ -840,8 +995,10 @@ def _episode_page(connection: Any, match_id: str) -> str:
                pe.orientation, lp.pairing_id, lp.generation_id, lp.revision_a, lp.revision_b,
                coalesce(afa.name, ara.family_id, lp.revision_a) AS agent_a_name,
                ara.strategy_id AS agent_a_strategy_id, ara.checkpoint_id AS agent_a_checkpoint_id,
+               ara.params_json AS agent_a_params_json,
                coalesce(afb.name, arb.family_id, lp.revision_b) AS agent_b_name,
-               arb.strategy_id AS agent_b_strategy_id, arb.checkpoint_id AS agent_b_checkpoint_id
+               arb.strategy_id AS agent_b_strategy_id, arb.checkpoint_id AS agent_b_checkpoint_id,
+               arb.params_json AS agent_b_params_json
         FROM episodes e JOIN pairing_episodes pe USING (match_id)
         JOIN league_pairings lp USING (pairing_id)
         LEFT JOIN agent_revisions ara ON ara.revision_id = lp.revision_a
@@ -875,11 +1032,17 @@ def _episode_page(connection: Any, match_id: str) -> str:
     )
     has_replay = connection.execute("SELECT 1 FROM episode_payloads WHERE match_id = ?", [match_id]).fetchone() is not None
     orientation = int(episode["orientation"])
-    agent_a = (episode["agent_a_name"], episode["agent_a_strategy_id"], episode["revision_a"], episode["agent_a_checkpoint_id"])
-    agent_b = (episode["agent_b_name"], episode["agent_b_strategy_id"], episode["revision_b"], episode["agent_b_checkpoint_id"])
+    agent_a = (
+        episode["agent_a_name"], episode["agent_a_strategy_id"], episode["revision_a"],
+        episode["agent_a_checkpoint_id"], episode["agent_a_params_json"],
+    )
+    agent_b = (
+        episode["agent_b_name"], episode["agent_b_strategy_id"], episode["revision_b"],
+        episode["agent_b_checkpoint_id"], episode["agent_b_params_json"],
+    )
     identities = [agent_a, agent_b] if orientation == 0 else [agent_b, agent_a]
     player_rows = "".join(
-        f'<tr><td>{int(row["seat"])}</td><td>{_agent_identity_html(*identities[int(row["seat"])])}</td>'
+        f'<tr><td>{int(row["seat"])}</td><td>{_agent_identity_html(*identities[int(row["seat"])][:4], params_json=identities[int(row["seat"])][4])}</td>'
         f'<td>{_status(row["status"])}</td><td>{_number(row["final_money"])}</td><td>{_number(row["money_difference"])}</td><td>{_number(row["reward"], 1)}</td>'
         f'<td>{_percent(row["productive_action_percentage"])}</td><td>{_percent(row["movement_percentage"])}</td><td>{_percent(row["idle_percentage"])}</td>'
         f'<td>{int(row["plants_lost_inferred"] or 0)}</td><td>{int(row["final_shed_items"] or 0)} / {int(row["final_carried_items"] or 0)}</td></tr>'
@@ -929,8 +1092,10 @@ def _replay_page(connection: Any, match_id: str) -> str:
         SELECT pe.orientation, lp.revision_a, lp.revision_b,
                coalesce(afa.name, ara.family_id, lp.revision_a) AS agent_a_name,
                ara.strategy_id AS agent_a_strategy_id, ara.checkpoint_id AS agent_a_checkpoint_id,
+               ara.params_json AS agent_a_params_json,
                coalesce(afb.name, arb.family_id, lp.revision_b) AS agent_b_name,
-               arb.strategy_id AS agent_b_strategy_id, arb.checkpoint_id AS agent_b_checkpoint_id
+               arb.strategy_id AS agent_b_strategy_id, arb.checkpoint_id AS agent_b_checkpoint_id,
+               arb.params_json AS agent_b_params_json
         FROM pairing_episodes pe JOIN league_pairings lp USING (pairing_id)
         LEFT JOIN agent_revisions ara ON ara.revision_id = lp.revision_a
         LEFT JOIN agent_families afa ON afa.family_id = ara.family_id
@@ -943,12 +1108,18 @@ def _replay_page(connection: Any, match_id: str) -> str:
     if episode is None:
         raise DashboardNotFound(f"league episode not found: {match_id}")
     _, replay = _load_replay(connection, match_id)
-    agent_a = (episode["agent_a_name"], episode["agent_a_strategy_id"], episode["revision_a"], episode["agent_a_checkpoint_id"])
-    agent_b = (episode["agent_b_name"], episode["agent_b_strategy_id"], episode["revision_b"], episode["agent_b_checkpoint_id"])
+    agent_a = (
+        episode["agent_a_name"], episode["agent_a_strategy_id"], episode["revision_a"],
+        episode["agent_a_checkpoint_id"], episode["agent_a_params_json"],
+    )
+    agent_b = (
+        episode["agent_b_name"], episode["agent_b_strategy_id"], episode["revision_b"],
+        episode["agent_b_checkpoint_id"], episode["agent_b_params_json"],
+    )
     identities = [agent_a, agent_b] if int(episode["orientation"]) == 0 else [agent_b, agent_a]
     info = dict(replay.get("info") or {})
     info["Agents"] = [
-        {"index": seat, "name": _agent_replay_name(*identity)}
+        {"index": seat, "name": _agent_replay_name(*identity, seat=seat)}
         for seat, identity in enumerate(identities)
     ]
     try:
@@ -986,6 +1157,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         path = parsed.path.rstrip("/") or "/"
         try:
+            if path == "/dashboard.js":
+                self._send(
+                    HTTPStatus.OK,
+                    DASHBOARD_JS.encode(),
+                    "text/javascript; charset=utf-8",
+                    head=head,
+                    headers={"Cache-Control": "no-store"},
+                )
+                return
+            if path == "/events/dashboard":
+                if head:
+                    self._send_text(
+                        HTTPStatus.METHOD_NOT_ALLOWED,
+                        "Method not allowed",
+                        head=True,
+                        headers={"Allow": "GET"},
+                    )
+                    return
+                self._stream_dashboard(query)
+                return
             if path == "/healthz":
                 with self.repository.connect() as connection:
                     sessions = connection.execute("SELECT count(*) FROM training_sessions").fetchone()[0]
@@ -1014,21 +1205,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     content_security_policy=replay_csp,
                 )
                 return
-            with self.repository.connect() as connection:
-                if path == "/":
-                    document = _sessions_page(connection, _parse_page(query))
-                elif path.startswith("/sessions/"):
-                    document = _session_page(connection, self._identifier(path, "/sessions/"))
-                elif path.startswith("/generations/"):
-                    status_filter = query.get("status", ["all"])[0]
-                    kind_filter = query.get("kind", ["all"])[0]
-                    if len(status_filter) > 80 or len(kind_filter) > 80:
-                        raise DashboardBadRequest("filter value is too long")
-                    document = _generation_page(connection, self._identifier(path, "/generations/"), _parse_page(query), status_filter, kind_filter)
-                elif path.startswith("/episodes/"):
-                    document = _episode_page(connection, self._identifier(path, "/episodes/"))
-                else:
-                    raise DashboardNotFound("page not found")
+            document = self._dashboard_document(path, query)
             self._send(HTTPStatus.OK, document.encode(), "text/html; charset=utf-8", head=head)
         except DashboardBadRequest as error:
             self._error(HTTPStatus.BAD_REQUEST, "Bad request", str(error), head=head)
@@ -1041,6 +1218,75 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except Exception as error:
             print(f"dashboard request failed: {error!r}", file=sys.stderr)
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "Dashboard error", "The request could not be completed. See the server log for details.", head=head)
+
+    def _dashboard_document(self, path: str, query: dict[str, list[str]]) -> str:
+        with self.repository.connect() as connection:
+            if path == "/":
+                return _sessions_page(connection, _parse_page(query))
+            if path.startswith("/sessions/"):
+                return _session_page(connection, self._identifier(path, "/sessions/"))
+            if path.startswith("/generations/"):
+                status_filter = query.get("status", ["all"])[0]
+                kind_filter = query.get("kind", ["all"])[0]
+                sort = query.get("sort", ["round"])[0]
+                direction = query.get("direction", ["asc"])[0]
+                if any(len(value) > 80 for value in (status_filter, kind_filter, sort, direction)):
+                    raise DashboardBadRequest("filter value is too long")
+                return _generation_page(
+                    connection,
+                    self._identifier(path, "/generations/"),
+                    _parse_page(query),
+                    status_filter,
+                    kind_filter,
+                    sort,
+                    direction,
+                )
+            if path.startswith("/episodes/"):
+                return _episode_page(connection, self._identifier(path, "/episodes/"))
+        raise DashboardNotFound("page not found")
+
+    def _stream_dashboard(self, query: dict[str, list[str]]) -> None:
+        target = query.get("path", ["/"])[0]
+        parsed = urlsplit(target)
+        path = parsed.path.rstrip("/") or "/"
+        if (
+            not target.startswith("/")
+            or target.startswith("//")
+            or path.startswith(("/events/", "/dashboard.js", "/healthz"))
+            or (path.startswith("/episodes/") and path.endswith(("/replay", "/replay.json")))
+        ):
+            raise DashboardBadRequest("invalid dashboard event path")
+        target_query = parse_qs(parsed.query)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        previous = ""
+        ticks = 0
+        try:
+            while True:
+                fragment = _main_fragment(self._dashboard_document(path, target_query))
+                digest = hashlib.sha256(fragment.encode()).hexdigest()
+                if digest != previous:
+                    self.wfile.write(
+                        _sse(
+                            "dashboard.fragment",
+                            {"selector": "main", "mergeMode": "outer", "fragments": fragment},
+                        )
+                    )
+                    previous = digest
+                elif ticks and ticks % 15 == 0:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                ticks += 1
+                time.sleep(1)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as error:
+            print(f"dashboard event stream failed: {error!r}", file=sys.stderr)
+            return
 
     @staticmethod
     def _identifier(path: str, prefix: str, suffix: str = "") -> str:
@@ -1057,7 +1303,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return value
 
     def _error(self, status: HTTPStatus, title: str, message: str, *, head: bool, headers: dict[str, str] | None = None) -> None:
-        body = _layout(title, f'<div class="error"><h1>{_escape(title)}</h1><p>{_escape(message)}</p><p><a href="/">Return to sessions</a></p></div>', refresh=False)
+        body = _layout(title, f'<div class="error"><h1>{_escape(title)}</h1><p>{_escape(message)}</p><p><a href="/">Return to sessions</a></p></div>')
         self._send(status, body.encode(), "text/html; charset=utf-8", head=head, headers=headers)
 
     def _send_json(self, status: HTTPStatus, value: Any, *, head: bool) -> None:
@@ -1082,7 +1328,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header(
             "Content-Security-Policy",
             content_security_policy
-            or "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+            or "default-src 'none'; script-src 'self'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
         )
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -1093,8 +1339,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
 
-def make_server(database: str | Path, host: str = "127.0.0.1", port: int = 8000) -> ThreadingHTTPServer:
-    repository = DashboardRepository(database)
+def make_server(
+    database: str | Path,
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    *,
+    read_only: bool = True,
+) -> ThreadingHTTPServer:
+    repository = DashboardRepository(database, read_only=read_only)
     available = repository.validate()
 
     class BoundDashboardHandler(DashboardHandler):

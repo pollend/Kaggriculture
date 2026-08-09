@@ -10,11 +10,13 @@ parity test pins the two together.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from agents.dqn_job_scorer.features import FEATURE_DIM
+from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
 
 HIDDEN = (128, 128)
 WEIGHTS_PATH = Path(__file__).resolve().parent / "weights.npz"
@@ -47,7 +49,11 @@ class QNetwork:
     def load(cls, path: Path | str = WEIGHTS_PATH) -> QNetwork:
         with np.load(str(path)) as data:
             count = len([key for key in data.files if key.startswith("w")])
-            return cls([(data[f"w{index}"], data[f"b{index}"]) for index in range(count)])
+            network = cls([(data[f"w{index}"], data[f"b{index}"]) for index in range(count)])
+        if not network.layers or network.layers[0][0].shape[0] != FEATURE_DIM:
+            observed = network.layers[0][0].shape[0] if network.layers else 0
+            raise ValueError(f"checkpoint feature dimension {observed} does not match schema {FEATURE_DIM}")
+        return network
 
     def save(self, path: Path | str = WEIGHTS_PATH) -> None:
         payload = {}
@@ -62,6 +68,47 @@ class QNetwork:
             activation = np.maximum(activation @ weight + bias, 0.0)
         weight, bias = self.layers[-1]
         return (activation @ weight + bias).reshape(-1)
+
+
+@dataclass(frozen=True, slots=True)
+class PolicyBundle:
+    """Submission artifact containing the field and optional market networks."""
+
+    job: QNetwork
+    market: QNetwork | None = None
+
+    @classmethod
+    def random(cls, seed: int = 0, *, with_market: bool = True) -> PolicyBundle:
+        return cls(
+            QNetwork.random(seed=seed),
+            QNetwork.random(seed=seed + 1, feature_dim=MARKET_FEATURE_DIM) if with_market else None,
+        )
+
+    @classmethod
+    def load(cls, path: Path | str = WEIGHTS_PATH) -> PolicyBundle:
+        with np.load(str(path), allow_pickle=False) as data:
+            if "bundle_version" not in data.files:
+                return cls(QNetwork.load(path), None)
+            job_count = len([key for key in data.files if key.startswith("job_w")])
+            market_count = len([key for key in data.files if key.startswith("market_w")])
+            job = QNetwork([(data[f"job_w{i}"], data[f"job_b{i}"]) for i in range(job_count)])
+            market = QNetwork([(data[f"market_w{i}"], data[f"market_b{i}"]) for i in range(market_count)])
+        if not job.layers or job.layers[0][0].shape[0] != FEATURE_DIM:
+            raise ValueError("joint checkpoint has an incompatible job feature schema")
+        if not market.layers or market.layers[0][0].shape[0] != MARKET_FEATURE_DIM:
+            raise ValueError("joint checkpoint has an incompatible market feature schema")
+        return cls(job, market)
+
+    def save(self, path: Path | str = WEIGHTS_PATH) -> None:
+        if self.market is None:
+            self.job.save(path)
+            return
+        payload: dict[str, np.ndarray] = {"bundle_version": np.asarray([1], dtype=np.int16)}
+        for prefix, network in (("job", self.job), ("market", self.market)):
+            for index, (weight, bias) in enumerate(network.layers):
+                payload[f"{prefix}_w{index}"] = weight
+                payload[f"{prefix}_b{index}"] = bias
+        np.savez_compressed(str(path), **payload)
 
 
 def select(

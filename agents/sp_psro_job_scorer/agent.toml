@@ -1,0 +1,65 @@
+family_id = "sp_psro_job_scorer"
+name = "SP-PSRO Job Scorer"
+entry_point = "agents.sp_psro_job_scorer.main:agent"
+parameter_schema_version = 2
+
+# Inference shares the stable job-scoring implementation. Training code and
+# population artifacts are deliberately excluded from submission bundles.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_job_scorer/__init__.py",
+  "agents/dqn_job_scorer/main.py",
+  "agents/dqn_job_scorer/features.py",
+  "agents/dqn_job_scorer/hybrid.py",
+  "agents/dqn_job_scorer/jobs.py",
+  "agents/dqn_job_scorer/market.py",
+  "agents/dqn_job_scorer/market_policy.py",
+  "agents/dqn_job_scorer/policy.py",
+  "agents/dqn_job_scorer/rules.py",
+  "agents/sp_psro_job_scorer/__init__.py",
+  "agents/sp_psro_job_scorer/main.py",
+  "agents/sp_psro_job_scorer/policy.py",
+]
+
+[[models]]
+model_id = "sp_psro_job_scorer.joint_market_population_v3"
+trainer = "agents.sp_psro_job_scorer.train:trainer"
+min_new_batches = 20
+
+[models.config]
+batches_per_round = 1
+episodes_per_batch = 16
+population_size = 10
+gradient_steps_per_batch = 400
+batch_size = 512
+learning_rate = 0.0001
+market_learning_rate = 0.0001
+gamma = 0.997
+n_step = 3
+buffer_episodes = 800
+reservoir_fraction = 0.35
+target_sync = 2000
+market_target_sync = 1000
+market_gradient_steps_per_batch = 100
+market_batch_size = 128
+warmup_episodes = 16
+epsilon_start = 1.0
+epsilon_end = 0.15
+epsilon_decay_transitions = 200000
+market_epsilon_start = 1.0
+market_epsilon_end = 0.15
+meta_learning_rate = 0.05
+meta_exploration = 0.1
+nu_average_snapshots = 16
+admission_seeds = 60
+validation_seeds = 40
+seed = 0
+jobs = 8
+validation_opponents = [
+  "starter",
+  "agents/configurable_crop_surrogate/main.py",
+  "agents/receding_horizon_planner/main.py",
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
+  "agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/main.py",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",
+]

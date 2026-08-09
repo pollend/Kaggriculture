@@ -77,7 +77,6 @@ class MatchSpec:
     strategy_ids: tuple[str, str]
     specs: tuple[str, str]
     environment: dict[str, Any]
-    keep_replay: bool
 
 
 def strategy_spec(strategy: Strategy, episode_steps: int) -> str:
@@ -86,9 +85,7 @@ def strategy_spec(strategy: Strategy, episode_steps: int) -> str:
 
 
 def _worker(spec: MatchSpec) -> tuple[MatchSpec, MatchResult]:
-    return spec, run_match(
-        spec.specs, spec.seed, spec.environment, spec.keep_replay, analyzer=episode_metrics
-    )
+    return spec, run_match(spec.specs, spec.seed, spec.environment, analyzer=episode_metrics)
 
 
 def _match_id(
@@ -267,7 +264,6 @@ class ExperimentRunner:
         specs: tuple[str, str],
     ) -> list[MatchSpec]:
         environment = {"episodeSteps": self.config.episode_steps, "actTimeout": 1.0}
-        keep = self.config.replay_policy != "none"
         result = []
         for orientation in (0, 1):
             ids = strategy_ids if orientation == 0 else (strategy_ids[1], strategy_ids[0])
@@ -281,7 +277,6 @@ class ExperimentRunner:
                     strategy_ids=ids,
                     specs=agent_specs,
                     environment=environment,
-                    keep_replay=keep,
                 )
             )
         return result

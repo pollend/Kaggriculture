@@ -19,7 +19,7 @@ from kaggriculture_lab.identity import (
 )
 from sim.runner import MatchResult
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 class ExperimentStore:
@@ -137,6 +137,7 @@ class ExperimentStore:
             identifier = effective_model_id(model.model_id, instance.name)
             identifiers.append(identifier)
             config = dict(model.config or {})
+            config.update(instance.model_config or {})
             config["agent_type"] = instance.type
             config["name"] = instance.name
             if instance.seed is not None:

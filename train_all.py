@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
 """Run the resumable all-agent crop and DQN training workflow.
 
-This script intentionally has no command-line configuration. Edit the constants
-below, then run `python train_all.py` from any working directory.
+Machine-level settings live in root ``main.toml``. The named training roster
+below remains code because it is part of the experiment definition.
 """
 
 from __future__ import annotations
 
-import json
+import os
 import shutil
 import subprocess
 import sys
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 
+from kaggriculture_lab.identity import TrainingAgentSpec
+from kaggriculture_lab.league import LeagueConfig
+from kaggriculture_lab.model_admin import export_active_model, model_status
+from kaggriculture_lab.runner import ensure_session, run_generations, run_round_robin
+from sim.metrics import render
+
 # ---------------------------------------------------------------------------
-# Training configuration -- edit these values.
+# Experiment defaults. Root main.toml overrides machine/workflow values.
 # ---------------------------------------------------------------------------
 
 GENERATIONS = 48
@@ -41,9 +48,19 @@ TRAINING_AGENTS = [
         "type": "configurable_crop_surrogate",
         "name": "default",
         "primary": True,
-        "train": True,
+        "train": False,
+    },
+    {
+        "type": "adaptive_route_planner",
+        "name": "default",
+        "train": False,
     },
     {"type": "dqn_job_scorer", "name": "default", "train": True},
+    {
+        "type": "sp_psro_job_scorer",
+        "name": "default",
+        "train": False,
+    },
     {
         "type": "receding_horizon_planner",
         "name": "default",
@@ -124,6 +141,41 @@ DQN_EXPORT_NAME = "default"
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parent
+MAIN_CONFIG = REPO_ROOT / "main.toml"
+
+
+def _load_main_config(path: Path = MAIN_CONFIG) -> None:
+    """Apply machine-level root settings to this constants-driven runner."""
+
+    global ARTIFACTS, DATABASE, DQN_WEIGHTS_OUTPUT, EXPORT_ACTIVE_DQN_WEIGHTS
+    global FINAL_ARENA_JOBS, FINAL_ARENA_SEEDS, GENERATIONS, INCLUDE_ALL_AGENT_ANCHORS
+    global LEAGUE_CONFIG, RUN_FINAL_ARENA, SESSION_ID, SYNC_ENVIRONMENT, TRAINING_DEVICE
+
+    with path.open("rb") as stream:
+        raw = tomllib.load(stream)
+    training = raw.get("training", {})
+    paths = raw.get("paths", {})
+    compute = raw.get("compute", {})
+    GENERATIONS = training.get("generations", GENERATIONS)
+    SESSION_ID = training.get("session_id", SESSION_ID)
+    SYNC_ENVIRONMENT = training.get("sync_environment", SYNC_ENVIRONMENT)
+    RUN_FINAL_ARENA = training.get("run_final_arena", RUN_FINAL_ARENA)
+    FINAL_ARENA_SEEDS = training.get("final_arena_seeds", FINAL_ARENA_SEEDS)
+    FINAL_ARENA_JOBS = training.get("final_arena_jobs", FINAL_ARENA_JOBS)
+    INCLUDE_ALL_AGENT_ANCHORS = training.get(
+        "include_all_agent_anchors", INCLUDE_ALL_AGENT_ANCHORS
+    )
+    EXPORT_ACTIVE_DQN_WEIGHTS = training.get(
+        "export_active_dqn_weights", EXPORT_ACTIVE_DQN_WEIGHTS
+    )
+    DATABASE = Path(paths.get("database", DATABASE))
+    ARTIFACTS = Path(paths.get("artifacts", ARTIFACTS))
+    LEAGUE_CONFIG = Path(paths.get("league_config", LEAGUE_CONFIG))
+    DQN_WEIGHTS_OUTPUT = Path(paths.get("dqn_weights_output", DQN_WEIGHTS_OUTPUT))
+    TRAINING_DEVICE = str(compute.get("device", "auto"))
+
+
+_load_main_config()
 
 
 def _validate_configuration() -> None:
@@ -146,6 +198,8 @@ def _run(
     check: bool = True,
     quiet: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["KAGGRICULTURE_TORCH_DEVICE"] = TRAINING_DEVICE
     return subprocess.run(
         command,
         cwd=REPO_ROOT,
@@ -153,6 +207,7 @@ def _run(
         text=True,
         stdout=subprocess.DEVNULL if quiet else None,
         stderr=subprocess.DEVNULL if quiet else None,
+        env=environment,
     )
 
 
@@ -173,101 +228,40 @@ def _prepare_environment() -> Path:
     return python
 
 
-def _agent_cli(python: Path, module: str, *arguments: str, check: bool = True, quiet: bool = False):
-    """Model administration is agent-owned; `kaglab` has no `models` group."""
-
-    return _run([str(python), "-m", module, *arguments], check=check, quiet=quiet)
-
-
-def _kaglab(python: Path, *arguments: str, check: bool = True, quiet: bool = False):
-    return _run(
-        [str(python), "-m", "kaggriculture_lab.cli", *arguments],
-        check=check,
-        quiet=quiet,
-    )
-
-
-def _toml_literal(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, str):
-        return json.dumps(value)
-    if isinstance(value, dict):
-        fields = ", ".join(f"{key} = {_toml_literal(item)}" for key, item in value.items())
-        return f"{{ {fields} }}"
-    return str(value)
-
-
-def _effective_config() -> Path:
-    with (REPO_ROOT / LEAGUE_CONFIG).open("rb") as stream:
-        values = dict(tomllib.load(stream)["league"])
+def _effective_config() -> LeagueConfig:
+    base = LeagueConfig.from_toml(REPO_ROOT / LEAGUE_CONFIG)
+    anchors = list(base.anchor_manifests)
     if INCLUDE_ALL_AGENT_ANCHORS:
-        bred_manifest = str(values["manifest"])
-        values["anchor_manifests"] = [
+        bred_manifest = str(base.manifest)
+        anchors = [
             str(path.relative_to(REPO_ROOT))
             for path in sorted((REPO_ROOT / "agents").glob("*/agent.toml"))
             if str(path.relative_to(REPO_ROOT)) != bred_manifest
         ]
-    values["training_agents"] = TRAINING_AGENTS
-    lines = ["[league]"]
-    for name, value in values.items():
-        if isinstance(value, list):
-            lines.append(f"{name} = [")
-            lines.extend(f"  {_toml_literal(item)}," for item in value)
-            lines.append("]")
-        else:
-            lines.append(f"{name} = {_toml_literal(value)}")
-    destination = REPO_ROOT / ARTIFACTS / "train_all.effective.toml"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text("\n".join(lines) + "\n")
-    return destination
-
-
-def _ensure_session(python: Path) -> None:
-    config = _effective_config()
-    status = _kaglab(
-        python,
-        "league",
-        "status",
-        "--session-id",
-        SESSION_ID,
-        "--database",
-        str(DATABASE),
-        check=False,
-        quiet=True,
+    return replace(
+        base,
+        anchor_manifests=tuple(anchors),
+        training_agents=tuple(TrainingAgentSpec.from_dict(item) for item in TRAINING_AGENTS),
     )
-    if status.returncode == 0:
-        print(f"Resuming league session: {SESSION_ID}", flush=True)
-        _kaglab(
-            python,
-            "league",
-            "trainers",
-            "--session-id",
-            SESSION_ID,
-            "--database",
-            str(DATABASE),
-            "--config",
-            str(config),
-        )
-        return
 
+
+def _ensure_session() -> None:
+    config = _effective_config()
     if not (REPO_ROOT / LEAGUE_CONFIG).is_file():
         raise FileNotFoundError(f"league config not found: {LEAGUE_CONFIG}")
-    print(f"Creating league session: {SESSION_ID}", flush=True)
-    _kaglab(
-        python,
-        "league",
-        "init",
-        "--config",
-        str(config),
-        "--session-id",
+    created, _ = ensure_session(
+        config,
+        DATABASE,
         SESSION_ID,
-        "--database",
-        str(DATABASE),
+        workspace=REPO_ROOT,
+        artifacts=ARTIFACTS,
+        runner="train_all",
+        experiment={"training_agents": TRAINING_AGENTS},
     )
+    print(f"{'Creating' if created else 'Resuming'} league session: {SESSION_ID}", flush=True)
 
 
-def _run_training_iteration(python: Path, iteration: int) -> None:
+def _after_training_iteration(iteration: int, _: dict) -> None:
     # One command. Collection and model updates ride the league's round schedule
     # through each agent's `train.py` hooks, so which models train, how much data
     # a round buys, and when a fit is attempted are all the agents' business --
@@ -276,36 +270,17 @@ def _run_training_iteration(python: Path, iteration: int) -> None:
         f"\n=== Training iteration {iteration}/{GENERATIONS}: league ===",
         flush=True,
     )
-    _kaglab(
-        python,
-        "league",
-        "run",
-        "--session-id",
-        SESSION_ID,
-        "--database",
-        str(DATABASE),
-        "--artifacts",
-        str(ARTIFACTS),
-    )
-
     if EXPORT_ACTIVE_DQN_WEIGHTS:
-        exported = _agent_cli(
-            python,
-            "agents.dqn_job_scorer.cli",
-            "model",
-            "export-active",
-            "--name",
-            DQN_EXPORT_NAME,
-            "--database",
-            str(DATABASE),
-            "--output",
-            str(DQN_WEIGHTS_OUTPUT),
-            "--confirm-release",
-            check=False,
-        )
-        if exported.returncode == 0:
+        try:
+            export_active_model(
+                REPO_ROOT / "agents/dqn_job_scorer/agent.toml",
+                DATABASE,
+                DQN_WEIGHTS_OUTPUT,
+                confirm_release=True,
+                name=DQN_EXPORT_NAME,
+            )
             print("Exported the active DQN inference weights.", flush=True)
-        else:
+        except ValueError:
             print(
                 "warning: no DQN checkpoint has passed promotion yet",
                 file=sys.stderr,
@@ -313,34 +288,14 @@ def _run_training_iteration(python: Path, iteration: int) -> None:
             )
 
     for instance in TRAINING_AGENTS:
-        module = f"agents.{instance['type']}.cli"
         if not (REPO_ROOT / "agents" / str(instance["type"]) / "cli.py").is_file():
             continue
-        _agent_cli(
-            python,
-            module,
-            "model",
-            "status",
-            "--name",
-            str(instance["name"]),
-            "--database",
-            str(DATABASE),
-        )
-
-    # Always leave the next generation OPEN so every later invocation completes
-    # exactly GENERATIONS new generations.
-    _kaglab(
-        python,
-        "league",
-        "next-generation",
-        "--session-id",
-        SESSION_ID,
-        "--database",
-        str(DATABASE),
-    )
+        manifest = REPO_ROOT / "agents" / str(instance["type"]) / "agent.toml"
+        if manifest.is_file():
+            print(model_status(manifest, DATABASE, name=str(instance["name"])))
 
 
-def _run_final_arena(python: Path) -> None:
+def _run_final_arena() -> None:
     if not RUN_FINAL_ARENA:
         return
     agent_specs = sorted((REPO_ROOT / "agents").glob("*/main.py"))
@@ -351,30 +306,29 @@ def _run_final_arena(python: Path) -> None:
         f"\n=== Final all-agent round-robin ({FINAL_ARENA_SEEDS} seeds in both seats) ===",
         flush=True,
     )
-    command = [
-        str(python),
-        "-m",
-        "sim.arena",
-        "league",
-        *(str(path.relative_to(REPO_ROOT)) for path in agent_specs),
-        "starter",
-        "--seeds",
-        str(FINAL_ARENA_SEEDS),
-    ]
-    if FINAL_ARENA_JOBS is not None:
-        command.extend(["--jobs", str(FINAL_ARENA_JOBS)])
-    _run(command)
+    specs = [str(path.relative_to(REPO_ROOT)) for path in agent_specs]
+    jobs = FINAL_ARENA_JOBS or max(1, (os.cpu_count() or 2) - 1)
+    for summary in run_round_robin(
+        [*specs, "starter"], seeds=FINAL_ARENA_SEEDS, jobs=jobs
+    ):
+        print(render(summary))
 
 
 def main() -> int:
     if len(sys.argv) != 1:
         raise SystemExit("train_all.py does not accept arguments; edit its configuration constants")
     _validate_configuration()
-    python = _prepare_environment()
-    _ensure_session(python)
-    for iteration in range(1, GENERATIONS + 1):
-        _run_training_iteration(python, iteration)
-    _run_final_arena(python)
+    _prepare_environment()
+    _ensure_session()
+    run_generations(
+        session_id=SESSION_ID,
+        database=DATABASE,
+        artifacts=ARTIFACTS,
+        generations=GENERATIONS,
+        workspace=REPO_ROOT,
+        on_generation=_after_training_iteration,
+    )
+    _run_final_arena()
     print(f"\nTraining loop complete. Session: {SESSION_ID}", flush=True)
     return 0
 

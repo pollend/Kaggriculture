@@ -1,88 +1,65 @@
-"""Enumerate the legal job set the Q-network chooses from.
-
-This is deliberately *not* ``ConfigurableAgent._jobs``. That method applies the
-heuristic's own filters -- ``target_planted_tiles`` caps how much may be planted,
-``_should_harvest`` decides when a plant is ripe enough -- which would trap a
-learned policy inside the heuristic we are trying to beat. Here the rule is
-"emit what the rules allow, attach no opinion", and the network supplies the
-opinion.
-
-Geometry and crop constants come from this agent's own ``rules`` module. The
-duplication is deliberate: an agent directory is self-contained.
-"""
+"""Enumerate legal crop, animal, logistics, and terrain jobs for the hybrid DQN."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from agents.dqn_job_scorer.rules import CROP_DATA, distance, shed_tiles
+from agents.dqn_job_scorer.hybrid import HybridPlan
+from agents.dqn_job_scorer.rules import ANIMAL_DATA, ANIMALS, CROP_DATA, CROPS, distance, shed_tiles
 
-# Job kinds, in a fixed order -- the index is the one-hot slot in `features.py`,
-# so appending is safe but reordering silently invalidates trained weights.
-JOB_KINDS = ("PASS", "WATER", "HARVEST", "PLANT", "DIG", "FERTILIZE", "DROP")
+# Append-only within schema v2. Reordering invalidates weights.
+JOB_KINDS = (
+    "PASS", "WATER", "HARVEST", "PLANT", "DIG", "FERTILIZE", "DROP",
+    "BUILD_COOP", "BUILD_PASTURE", "PICKUP_WHEAT", "FEED", "CARE",
+    "COLLECT_FERTILIZER", "PICKUP_FERTILIZER", "PICKUP_ANIMAL", "PLACE_ANIMAL",
+)
 JOB_KIND_INDEX = {kind: index for index, kind in enumerate(JOB_KINDS)}
-
-CROP_ORDER = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
-CROP_INDEX = {crop: index for index, crop in enumerate(CROP_ORDER)}
-
-# Per-unit candidate cap. Truncation is reported, never silent -- see `enumerate_jobs`.
-MAX_JOBS = 64
+ASSET_ORDER = (*CROPS, *ANIMALS, "WHEAT_ITEM", "FERTILIZER_ITEM")
+ASSET_INDEX = {asset: index for index, asset in enumerate(ASSET_ORDER)}
+MAX_JOBS = 96
 
 
 @dataclass(frozen=True, slots=True)
 class Job:
-    """One legal thing a unit could be sent to do.
-
-    `owner` binds a job to a single unit (only DROP uses it, since a carry job
-    belongs to whoever is carrying). `None` means any unit may take it.
-    """
-
     kind: str
     target: tuple[int, int]
     action: tuple[str, ...]
-    crop: str | None = None
+    asset: str | None = None
     tile: dict | None = None
     owner: int | None = None
+    urgent: bool = False
+    value: float = 0.0
+
+    @property
+    def crop(self) -> str | None:  # compatibility for commitment keys/tests
+        return self.asset if self.asset in CROPS else None
 
 
-def _plant_is_harvestable(tile: dict, day: int) -> bool:
+def _harvestable(tile: dict, day: int) -> bool:
     if int(tile.get("yield_units", 0)) <= 0:
         return False
-    crop = str(tile.get("crop", ""))
-    data = CROP_DATA.get(crop)
-    if data is None:
-        return False
-    return day - int(tile.get("planted_day", day)) >= int(data["first"])
+    if tile.get("kind") != "PLANT":
+        return True
+    data = CROP_DATA.get(str(tile.get("crop", "")))
+    return bool(data and day - int(tile.get("planted_day", day)) >= int(data["first"]))
 
 
-def enumerate_jobs(
-    farm: dict,
-    private: dict,
-    day: int,
-    positions: list[tuple[int, int]],
-    inventories: list[dict],
-) -> tuple[list[Job], int]:
-    """Return (jobs, truncated_count) for the current turn.
+def _nearest_shed(position: tuple[int, int], sheds) -> tuple[int, int]:
+    return min(sheds, key=lambda tile: (distance(position, tile), tile))
 
-    PASS is always index 0 so "do nothing" is a real, always-available choice
-    rather than a fallback the network can never express.
-    """
+
+def enumerate_jobs(farm: dict, private: dict, day: int, positions: list[tuple[int, int]], inventories: list[dict], plan: HybridPlan | None = None) -> tuple[list[Job], int]:
     tiles = farm.get("tiles") or []
-    board_size = len(tiles)
-    sheds = shed_tiles(board_size) if board_size else ((0, 0),)
+    sheds = shed_tiles(len(tiles)) if tiles else ((0, 0),)
     anchor = positions[0] if positions else sheds[0]
-
-    jobs: list[Job] = [Job("PASS", anchor, ("PASS",))]
-
+    jobs = [Job("PASS", anchor, ("PASS",))]
     seeds = private.get("seeds", {}) or {}
-    plantable = [crop for crop in CROP_ORDER if int(seeds.get(crop, 0)) > 0]
-    fertilizer_units = [
-        unit
-        for unit, inventory in enumerate(inventories)
-        if int((inventory or {}).get("FERTILIZER", 0)) > 0
-    ]
-
+    shed = private.get("shed", {}) or {}
     empty: list[tuple[int, int]] = []
+    empty_structures = {"COOP": [], "PASTURE": []}
+    animal_counts = {name: 0 for name in ANIMALS}
+    hungry: list[tuple[tuple[int, int], dict]] = []
+
     for y, row in enumerate(tiles):
         for x, tile in enumerate(row):
             target = (x, y)
@@ -90,73 +67,105 @@ def enumerate_jobs(
                 empty.append(target)
                 continue
             if not isinstance(tile, dict):
-                continue  # "LOCKED" -- passable but nothing can be done there
-
-            kind = tile.get("kind")
+                continue
+            kind = str(tile.get("kind", ""))
             if kind == "WEED":
-                jobs.append(Job("DIG", target, ("DIG",), tile=tile))
-                continue
-            if kind != "PLANT":
-                continue
+                jobs.append(Job("DIG", target, ("DIG",), tile=tile, value=25.0))
+            elif kind == "PLANT":
+                crop = str(tile.get("crop", ""))
+                fresh = int(tile.get("planted_day", -1)) == day
+                emergency = fresh or int(tile.get("consecutive_unwatered", 0)) >= 1
+                if not tile.get("watered_today"):
+                    jobs.append(Job("WATER", target, ("WATER",), crop, tile, urgent=emergency, value=10_000.0 if emergency else 50.0))
+                if _harvestable(tile, day):
+                    jobs.append(Job("HARVEST", target, ("HARVEST",), crop, tile, value=float(tile.get("yield_units", 0))))
+                if int(tile.get("fertilized_until_day", -1)) < day:
+                    for unit, inventory in enumerate(inventories):
+                        if int((inventory or {}).get("FERTILIZER", 0)) > 0:
+                            jobs.append(Job("FERTILIZE", target, ("FERTILIZE",), crop, tile, owner=unit))
+            elif kind in empty_structures and not tile.get("animal"):
+                empty_structures[kind].append(target)
+            animal = tile.get("animal")
+            if animal in ANIMAL_DATA:
+                animal = str(animal)
+                animal_counts[animal] += 1
+                emergency = int(tile.get("consecutive_unfed", 0)) >= 1
+                if not tile.get("fed_today"):
+                    hungry.append((target, tile))
+                    for unit, inventory in enumerate(inventories):
+                        if int((inventory or {}).get("WHEAT", 0)) > 0:
+                            jobs.append(Job("FEED", target, ("FEED",), animal, tile, owner=unit, urgent=emergency, value=12_000.0 if emergency else 100.0))
+                if not tile.get("cared_today"):
+                    jobs.append(Job("CARE", target, ("CARE",), animal, tile, value=80.0))
+                if _harvestable(tile, day):
+                    jobs.append(Job("HARVEST", target, ("HARVEST",), animal, tile, value=float(tile.get("yield_units", 0))))
+                if tile.get("fertilizer_available"):
+                    jobs.append(Job("COLLECT_FERTILIZER", target, ("COLLECT_FERTILIZER",), animal, tile, value=100.0))
 
-            if not tile.get("watered_today"):
-                jobs.append(Job("WATER", target, ("WATER",), crop=tile.get("crop"), tile=tile))
-            if _plant_is_harvestable(tile, day):
-                jobs.append(Job("HARVEST", target, ("HARVEST",), crop=tile.get("crop"), tile=tile))
-            if int(tile.get("fertilized_until_day", -1)) < day:
-                for unit in fertilizer_units:
-                    jobs.append(
-                        Job(
-                            "FERTILIZE",
-                            target,
-                            ("FERTILIZE",),
-                            crop=tile.get("crop"),
-                            tile=tile,
-                            owner=unit,
-                        )
-                    )
+    carried_wheat = sum(int((slot or {}).get("WHEAT", 0)) for slot in inventories)
+    if hungry and carried_wheat < len(hungry) and int(shed.get("WHEAT", 0)) > 0 and positions:
+        unit = min(range(len(positions)), key=lambda i: distance(positions[i], _nearest_shed(positions[i], sheds)))
+        emergency = any(int(tile.get("consecutive_unfed", 0)) >= 1 for _, tile in hungry)
+        amount = min(8, len(hungry) - carried_wheat, int(shed.get("WHEAT", 0)))
+        jobs.append(Job("PICKUP_WHEAT", _nearest_shed(positions[unit], sheds), ("PICKUP", "WHEAT", amount), "WHEAT_ITEM", owner=unit, urgent=emergency, value=9_000.0 if emergency else 200.0))
 
-    for crop in plantable:
-        for target in empty:
-            jobs.append(Job("PLANT", target, ("PLANT", crop), crop=crop))
+    carried_fertilizer = sum(int((slot or {}).get("FERTILIZER", 0)) for slot in inventories)
+    if carried_fertilizer == 0 and int(shed.get("FERTILIZER", 0)) > 0 and positions:
+        unit = min(range(len(positions)), key=lambda i: distance(positions[i], _nearest_shed(positions[i], sheds)))
+        jobs.append(Job("PICKUP_FERTILIZER", _nearest_shed(positions[unit], sheds), ("PICKUP", "FERTILIZER", 1), "FERTILIZER_ITEM", owner=unit))
 
-    for unit, inventory in enumerate(inventories):
-        if sum(int(count) for count in (inventory or {}).values()) <= 0:
+    desired = plan.target_animals if plan else 0
+    preferred = plan.animal if plan else "GOOSE"
+    structures = animal_counts["GOOSE"] + len(empty_structures["COOP"]), animal_counts["COW"] + animal_counts["SHEEP"] + len(empty_structures["PASTURE"])
+    total_owned = sum(animal_counts.values()) + sum(int(shed.get(name, 0)) for name in ANIMALS) + sum(int((slot or {}).get(name, 0)) for slot in inventories for name in ANIMALS)
+    structure = str(ANIMAL_DATA[preferred]["structure"])
+    structure_count = structures[0] if structure == "COOP" else structures[1]
+    if total_owned and structure_count < min(desired, total_owned):
+        kind = "BUILD_COOP" if structure == "COOP" else "BUILD_PASTURE"
+        for target in empty[: min(desired, total_owned) - structure_count]:
+            jobs.append(Job(kind, target, (kind,), preferred, value=300.0))
+
+    carried_animals = [(unit, animal) for unit, inv in enumerate(inventories) for animal in ANIMALS if int((inv or {}).get(animal, 0)) > 0]
+    for unit, animal in carried_animals:
+        for target in empty_structures[str(ANIMAL_DATA[animal]["structure"])]:
+            jobs.append(Job("PLACE_ANIMAL", target, ("PLACE", animal, 1), animal, owner=unit, value=500.0))
+    for animal in ANIMALS:
+        if int(shed.get(animal, 0)) <= 0 or not empty_structures[str(ANIMAL_DATA[animal]["structure"])] or not positions:
             continue
-        position = positions[unit] if unit < len(positions) else anchor
-        target = min(sheds, key=lambda tile: (distance(position, tile), tile))
-        jobs.append(Job("DROP", target, ("DROP",), owner=unit))
+        unit = min(range(len(positions)), key=lambda i: distance(positions[i], _nearest_shed(positions[i], sheds)))
+        jobs.append(Job("PICKUP_ANIMAL", _nearest_shed(positions[unit], sheds), ("PICKUP", animal, 1), animal, owner=unit, value=450.0))
+
+    target_crops = plan.target_crops if plan else 12
+    planted = sum(1 for row in tiles for tile in row if isinstance(tile, dict) and tile.get("kind") == "PLANT")
+    room = len(empty) if plan is None else max(0, target_crops - planted)
+    # Keep the cultivated area compact around the shed across days. Unit
+    # distance is only a tie-breaker: hands are temporary, while every crop
+    # repeatedly needs service and its harvest ultimately returns to the shed.
+    empty.sort(key=lambda target: (
+        min(distance(target, shed) for shed in sheds),
+        min((distance(position, target) for position in positions), default=0),
+        target,
+    ))
+    for crop in CROPS:
+        if int(seeds.get(crop, 0)) > 0:
+            for target in empty[:room]:
+                jobs.append(Job("PLANT", target, ("PLANT", crop), crop))
+
+    useful = {"FERTILIZER", *ANIMALS}
+    if plan is not None and plan.target_animals:
+        useful.add("WHEAT")
+    for unit, inventory in enumerate(inventories):
+        if not any(item not in useful and int(count) > 0 for item, count in (inventory or {}).items()):
+            continue
+        jobs.append(Job("DROP", _nearest_shed(positions[unit], sheds), ("DROP",), owner=unit))
 
     if len(jobs) <= MAX_JOBS:
         return jobs, 0
-
-    # Keep PASS and every unit-owned job. Dropping an owned DROP strands a carrier.
-    pinned = [job for job in jobs if job.kind == "PASS" or job.owner is not None]
-    rest = [job for job in jobs if job.kind != "PASS" and job.owner is None]
-    room = max(0, MAX_JOBS - len(pinned))
-
-    # Cut by what is cheapest to lose, not by distance alone. Only PLANT
-    # multiplies -- it is crops-in-hand x empty tiles, so it is what overflows
-    # the cap -- while maintenance is bounded by the tiles already planted.
-    # Ranking purely on distance let a nearby PLANT evict a distant plant that
-    # dies tonight without water, which is a far worse trade.
-    def priority(job: Job) -> int:
-        if job.kind == "WATER" and int((job.tile or {}).get("consecutive_unwatered", 0)) >= 1:
-            return 0  # unwatered again tonight means a weed tomorrow
-        if job.kind == "HARVEST":
-            return 1
-        if job.kind == "WATER":
-            return 2
-        if job.kind in ("DIG", "FERTILIZE"):
-            return 3
-        return 4  # PLANT
-
-    nearest = {id(job): min(distance(pos, job.target) for pos in positions) for job in rest}
-    rest.sort(key=lambda job: (priority(job), nearest[id(job)], job.target))
-    kept = pinned + rest[:room]
-
-    # Restore enumeration order so the job list stays a deterministic function
-    # of the observation rather than of the sort.
+    pinned = [job for job in jobs if job.kind == "PASS" or job.owner is not None or job.urgent]
+    rest = [job for job in jobs if job not in pinned]
+    rank = {"HARVEST": 0, "WATER": 1, "FEED": 1, "CARE": 2, "COLLECT_FERTILIZER": 3, "DIG": 4, "FERTILIZE": 4, "PLACE_ANIMAL": 4, "BUILD_COOP": 5, "BUILD_PASTURE": 5, "PLANT": 6}
+    rest.sort(key=lambda job: (rank.get(job.kind, 5), -job.value, min(distance(pos, job.target) for pos in positions), job.target))
+    kept = pinned[:MAX_JOBS] + rest[: max(0, MAX_JOBS - len(pinned))]
     order = {id(job): index for index, job in enumerate(jobs)}
     kept.sort(key=lambda job: order[id(job)])
     return kept, len(jobs) - len(kept)
