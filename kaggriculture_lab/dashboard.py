@@ -8,74 +8,23 @@ import html
 import json
 import re
 import sys
-import threading
 import time
-from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
+
+from kaggriculture_lab.codex_config import dashboard_mcp_url, sync_codex_mcp_config
+from kaggriculture_lab.database import DatabaseTarget, connect_postgres
+from kaggriculture_lab.progress_mcp import PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS, ProgressMCP
 
 PAGE_SIZE = 50
 
 
-class ConsoleRingBuffer:
-    """Thread-safe bounded text sink for the dashboard's live console."""
-
-    def __init__(self, max_chars: int = 100_000):
-        if max_chars < 1:
-            raise ValueError("max_chars must be positive")
-        self.max_chars = max_chars
-        self._chunks: deque[str] = deque()
-        self._chars = 0
-        self._sequence = 0
-        self._lock = threading.Lock()
-
-    def write(self, value: str) -> int:
-        if not value:
-            return 0
-        with self._lock:
-            self._chunks.append(value)
-            self._chars += len(value)
-            self._sequence += 1
-            while self._chars > self.max_chars:
-                excess = self._chars - self.max_chars
-                if len(self._chunks[0]) <= excess:
-                    self._chars -= len(self._chunks.popleft())
-                else:
-                    self._chunks[0] = self._chunks[0][excess:]
-                    self._chars -= excess
-        return len(value)
-
-    def snapshot(self) -> tuple[int, str]:
-        with self._lock:
-            return self._sequence, "".join(self._chunks)
-
-
-class ConsoleTee:
-    """Mirror writes to the terminal and an in-memory console."""
-
-    def __init__(self, stream: Any, buffer: ConsoleRingBuffer):
-        self.stream = stream
-        self.buffer = buffer
-
-    def write(self, value: str) -> int:
-        written = self.stream.write(value)
-        self.buffer.write(value)
-        return written
-
-    def flush(self) -> None:
-        self.stream.flush()
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.stream, name)
-
-
 class DashboardUnavailable(RuntimeError):
-    """The catalog cannot currently be opened, normally because a writer owns it."""
+    """The database cannot currently be opened."""
 
 
 class DashboardNotFound(LookupError):
@@ -98,19 +47,20 @@ def _row(connection: Any, sql: str, parameters: list[Any] | None = None) -> dict
 
 
 class DashboardRepository:
-    """Narrow read-only access to the league portion of the experiment catalog."""
+    """Narrow read-only access to the shared league database."""
 
-    def __init__(self, database: str | Path, *, read_only: bool = True):
-        self.path = Path(database)
-        self.read_only = read_only
+    def __init__(self, database: str | DatabaseTarget):
+        self.target = (
+            database
+            if isinstance(database, DatabaseTarget)
+            else DatabaseTarget(database)
+        )
 
     @contextmanager
     def connect(self) -> Iterator[Any]:
-        import duckdb
-
         try:
-            connection = duckdb.connect(str(self.path), read_only=self.read_only)
-        except duckdb.Error as error:
+            connection = connect_postgres(self.target, initialize=False)
+        except Exception as error:
             raise DashboardUnavailable("The database is temporarily unavailable.") from error
         try:
             yield connection
@@ -118,26 +68,21 @@ class DashboardRepository:
             connection.close()
 
     def validate(self) -> bool:
-        """Validate when possible; return False when a running writer holds the file."""
-        if not self.path.is_file():
-            raise FileNotFoundError(
-                f"database does not exist: {self.path} (create a league session first)"
-            )
+        """Validate that PostgreSQL's public schema contains the lab tables."""
         try:
             with self.connect() as connection:
                 tables = {
                     row[0]
                     for row in connection.execute(
                         "SELECT table_name FROM information_schema.tables "
-                        "WHERE table_schema = 'main'"
+                        "WHERE table_schema = %s",
+                        ["public"],
                     ).fetchall()
                 }
-        except DashboardUnavailable:
-            return False
         except Exception as error:
-            raise ValueError(f"not a Kaggriculture experiment database: {self.path}") from error
+            raise ValueError("not a Kaggriculture PostgreSQL database") from error
         if not {"runs", "episodes", "training_sessions"} <= tables:
-            raise ValueError(f"not a Kaggriculture experiment database: {self.path}")
+            raise ValueError("not a Kaggriculture PostgreSQL database")
         return True
 
 
@@ -257,11 +202,12 @@ def _agent_replay_name(
 CSS = """
 :root{color-scheme:dark;--bg:#0b1220;--panel:#121c2f;--line:#263650;--ink:#e8eef8;
 --muted:#9dafc8;--accent:#62d4c7;--gold:#f0c66b;--bad:#ff8181;--warn:#ffcf70}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,sans-serif}
+*{box-sizing:border-box}body{min-height:100vh;margin:0;background:var(--bg);color:var(--ink);
+font:15px/1.45 system-ui,sans-serif;display:flex;flex-direction:column}
 a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}header{border-bottom:1px solid var(--line);
 background:#0e1828;position:sticky;top:0;z-index:2}.bar{max-width:1200px;margin:auto;padding:14px 22px;display:flex;
 align-items:center;justify-content:space-between;gap:20px}.brand{font-weight:750;color:var(--ink);letter-spacing:.02em}
-main{max-width:1200px;margin:auto;padding:28px 22px 60px}h1{font-size:29px;margin:0 0 8px}h2{font-size:20px;margin:32px 0 12px}
+main{width:100%;max-width:1200px;margin:auto;padding:28px 22px 60px;flex:1}h1{font-size:29px;margin:0 0 8px}h2{font-size:20px;margin:32px 0 12px}
 h3{font-size:16px;margin:18px 0 8px}
 .muted{color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin:20px 0}
 .card,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px}.card{padding:14px}.card b{font-size:22px;display:block}
@@ -282,8 +228,8 @@ details{margin:8px 0}.pager{display:flex;justify-content:space-between;margin-to
 .player-stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 20px;margin:18px 0}.player-stats div{border-top:1px solid var(--line);padding-top:9px}
 .player-stats dt{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em}.player-stats dd{font-size:18px;font-weight:700;margin:3px 0 0}
 .replay-frame{display:block;width:100%;height:1000px;border:1px solid var(--line);border-radius:12px;background:#0a111d}
-.console{max-width:1200px;margin:auto;padding:0 22px 28px}.console pre{height:240px;max-height:none;margin:8px 0 0;color:#b9f6d2}
-@media(max-width:650px){main{padding:20px 12px}.bar{padding:12px}.grid,.players{grid-template-columns:1fr}h1{font-size:24px}.replay-frame{min-height:420px}}
+@media(max-width:650px){.bar{padding:12px}main{padding:20px 12px}.grid,.players{grid-template-columns:1fr}h1{font-size:24px}
+.replay-frame{min-height:420px}}
 """
 
 
@@ -343,23 +289,6 @@ DASHBOARD_JS = r"""
   window.addEventListener('popstate', () => connect(location.pathname + location.search));
   connect(location.pathname + location.search);
 
-  const consoleOutput = document.querySelector('#dashboard-console');
-  let consoleSequence = -1;
-  const refreshConsole = async () => {
-    if (!consoleOutput) return;
-    try {
-      const response = await fetch('/console');
-      if (!response.ok) return;
-      const snapshot = await response.json();
-      if (snapshot.sequence === consoleSequence) return;
-      const follow = consoleOutput.scrollHeight - consoleOutput.scrollTop - consoleOutput.clientHeight < 40;
-      consoleSequence = snapshot.sequence;
-      consoleOutput.textContent = snapshot.text || 'Waiting for console output…';
-      if (follow) consoleOutput.scrollTop = consoleOutput.scrollHeight;
-    } catch (_) {}
-  };
-  refreshConsole();
-  window.setInterval(refreshConsole, 1000);
 })();
 """.strip()
 
@@ -368,7 +297,7 @@ def _layout(title: str, body: str) -> str:
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(title)} · Kaggriculture</title>
 <style>{CSS}</style><script src="/dashboard.js" defer></script></head><body><header><div class="bar"><a class="brand" href="/">Kaggriculture League</a>
-</div></header><main>{body}</main><section class="console"><h2>Console</h2><pre id="dashboard-console">Waiting for console output…</pre></section></body></html>"""
+<span class="muted">Shared PostgreSQL database</span></div></header><main>{body}</main></body></html>"""
 
 
 def _main_fragment(document: str) -> str:
@@ -454,8 +383,8 @@ def _sessions_page(connection: Any, page: int) -> str:
     sessions = _rows(
         connection,
         """
-        SELECT session_id, name, status, seed, config_json, created_at
-        FROM training_sessions ORDER BY created_at DESC, session_id LIMIT ? OFFSET ?
+        SELECT session_id, league, name, status, seed, config_json, created_at
+        FROM training_sessions ORDER BY created_at DESC, session_id LIMIT %s OFFSET %s
         """,
         [PAGE_SIZE + 1, offset],
     )
@@ -465,7 +394,7 @@ def _sessions_page(connection: Any, page: int) -> str:
     rollups: dict[str, dict[str, Any]] = {}
     leaders: dict[str, dict[str, Any]] = {}
     if session_ids:
-        placeholders = ",".join("?" for _ in session_ids)
+        placeholders = ",".join("%s" for _ in session_ids)
         rollups = {
             row["session_id"]: row
             for row in _rows(
@@ -505,7 +434,9 @@ def _sessions_page(connection: Any, page: int) -> str:
                            rs.rating - 2 * rs.deviation AS conservative,
                            row_number() OVER (
                                PARTITION BY g.session_id
-                               ORDER BY g.generation_index DESC, conservative DESC, rs.revision_id
+                               ORDER BY g.generation_index DESC,
+                                        (rs.rating - 2 * rs.deviation) DESC,
+                                        rs.revision_id
                            ) AS position
                     FROM generations g JOIN rating_snapshots rs USING (generation_id)
                     LEFT JOIN agent_revisions ar USING (revision_id)
@@ -538,23 +469,23 @@ def _sessions_page(connection: Any, page: int) -> str:
         leader_html = "—" if not leader else f'{_escape(leader["display_name"])}<br><small>{_number(leader["conservative"], 1)}</small>'
         rows_html.append(
             f'<tr><td><a href="{_escape(_id_path("sessions", session_id))}"><b>{_escape(session["name"])}</b></a><br><small>{_escape(session_id)}</small></td>'
-            f'<td>{_status(session["status"])}</td><td>{int(stats.get("generations") or 0):,}</td>'
+            f'<td>{_escape(session["league"])}</td><td>{_status(session["status"])}</td><td>{int(stats.get("generations") or 0):,}</td>'
             f'<td>{progress}</td><td>{int(stats.get("episodes") or 0):,}</td>'
             f'<td>{int(stats.get("failed_episodes") or 0):,}</td><td>{leader_html}</td><td>{_escape(session["created_at"])}</td></tr>'
         )
     table = (
-        '<div class="panel"><table><thead><tr><th>Session</th><th>Status</th><th>Generations</th><th>Progress</th><th>Episodes</th><th>Failures</th><th>Latest leader</th><th>Created</th></tr></thead>'
+        '<div class="panel"><table><thead><tr><th>Session</th><th>League</th><th>Status</th><th>Generations</th><th>Progress</th><th>Episodes</th><th>Failures</th><th>Latest leader</th><th>Created</th></tr></thead>'
         f'<tbody>{"".join(rows_html)}</tbody></table>{_pager("/", page, has_next)}</div>'
         if sessions
         else '<div class="panel empty">No league sessions have been recorded yet.</div>'
     )
-    return _layout("Sessions", f'<h1>League sessions</h1><p class="muted">Every persistent training league in this catalog.</p>{table}')
+    return _layout("Sessions", f'<h1>League sessions</h1><p class="muted">Every persistent training league in the shared database.</p>{table}')
 
 
 def _session_page(connection: Any, session_id: str) -> str:
     session = _row(
         connection,
-        "SELECT session_id, name, status, seed, config_json, created_at FROM training_sessions WHERE session_id = ?",
+        "SELECT session_id, league, name, status, seed, config_json, created_at FROM training_sessions WHERE session_id = %s",
         [session_id],
     )
     if session is None:
@@ -593,7 +524,7 @@ def _session_page(connection: Any, session_id: str) -> str:
         LEFT JOIN member_counts mc USING (generation_id)
         LEFT JOIN pairing_counts pc USING (generation_id)
         LEFT JOIN round_counts rc USING (generation_id)
-        WHERE g.session_id = ?
+        WHERE g.session_id = %s
         ORDER BY g.generation_index DESC
         """,
         [session_id],
@@ -602,9 +533,11 @@ def _session_page(connection: Any, session_id: str) -> str:
         connection,
         """
         SELECT g.generation_index, max(rs.rating - 2 * rs.deviation) AS champion,
-               median(rs.rating - 2 * rs.deviation) AS median_rating
+               percentile_cont(0.5) WITHIN GROUP (
+                   ORDER BY rs.rating - 2 * rs.deviation
+               ) AS median_rating
         FROM generations g JOIN rating_snapshots rs USING (generation_id)
-        WHERE g.session_id = ? AND NOT rs.is_frozen
+        WHERE g.session_id = %s AND NOT rs.is_frozen
         GROUP BY g.generation_index ORDER BY g.generation_index
         """,
         [session_id],
@@ -617,14 +550,14 @@ def _session_page(connection: Any, session_id: str) -> str:
                count(*) FILTER (
                    WHERE ee.status = 'COMPLETE'
                      AND coalesce(
-                           CAST(json_extract(ee.result_json, '$.should_reevaluate') AS BOOLEAN),
+                           CAST(ee.result_json ->> 'should_reevaluate' AS BOOLEAN),
                            false
                          )
                ) AS reevaluation_requests
         FROM episode_evaluations ee
         JOIN pairing_episodes pe USING (match_id)
         JOIN league_pairings lp USING (pairing_id)
-        JOIN generations g USING (generation_id) WHERE g.session_id = ?
+        JOIN generations g USING (generation_id) WHERE g.session_id = %s
         """,
         [session_id],
     ) or {}
@@ -642,7 +575,7 @@ def _session_page(connection: Any, session_id: str) -> str:
             SELECT count(*) FROM (
                 SELECT mrh.generation_id, mrh.round_index
                 FROM model_round_hooks mrh JOIN generations g USING (generation_id)
-                WHERE g.session_id = ? AND mrh.scope = 'round'
+                WHERE g.session_id = %s AND mrh.scope = 'round'
                 GROUP BY mrh.generation_id, mrh.round_index
                 HAVING bool_and(mrh.status = 'COMPLETE')
             )
@@ -665,7 +598,7 @@ def _session_page(connection: Any, session_id: str) -> str:
         if trainer_only else [("Pairings", f"{completed_pairings:,} / {total_pairings:,}")]
     )
     body = f'''<p><a href="/">← Sessions</a></p><h1>{_escape(session["name"])}</h1>
-<p class="muted">{_escape(session_id)} · seed {_escape(session["seed"])} · created {_escape(session["created_at"])} · {_status(session["status"])}</p>
+<p class="muted">League {_escape(session["league"])} · {_escape(session_id)} · seed {_escape(session["seed"])} · created {_escape(session["created_at"])} · {_status(session["status"])}</p>
 {_cards([("Generations", f"{len(generations):,}"), *work_cards,
           ("Episodes", f"{episodes:,}"), ("Episode failures", f"{failures:,}"),
           ("Hook errors", f"{int(evaluation.get('errors') or 0):,} / {int(evaluation.get('evaluations') or 0):,}"),
@@ -682,13 +615,13 @@ def _outcome_panel(connection: Any, generation_id: str) -> str:
         connection,
         """
         SELECT count(*) AS scored, avg(pr.paired_margin) AS mean_margin,
-               median(pr.paired_margin) AS median_margin,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY pr.paired_margin) AS median_margin,
                stddev_samp(pr.paired_margin) AS margin_stddev,
                min(pr.paired_margin) AS min_margin, max(pr.paired_margin) AS max_margin,
                avg(pr.outcome_a) AS mean_outcome_a,
                count(*) FILTER (WHERE pr.paired_margin = 0) AS drawn
         FROM league_pairings lp JOIN pairing_results pr USING (pairing_id)
-        WHERE lp.generation_id = ? AND NOT pr.failed
+        WHERE lp.generation_id = %s AND NOT pr.failed
         """,
         [generation_id],
     ) or {}
@@ -701,7 +634,7 @@ def _outcome_panel(connection: Any, generation_id: str) -> str:
                avg(ep.win) AS win_rate, avg(ep.final_money) AS mean_money
         FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
         JOIN episodes e USING (match_id) JOIN episode_players ep USING (match_id)
-        WHERE lp.generation_id = ? AND NOT e.failed
+        WHERE lp.generation_id = %s AND NOT e.failed
         GROUP BY ep.seat ORDER BY ep.seat
         """,
         [generation_id],
@@ -736,55 +669,6 @@ def _outcome_panel(connection: Any, generation_id: str) -> str:
     )
 
 
-def _round_panel(connection: Any, generation_id: str) -> str:
-    """Per-round rollup. Pairings and episodes are aggregated apart, then joined.
-
-    Counting both in one FROM would fan each pairing out across its episodes and skew
-    the mean margin, because a failed pairing does not contribute the usual two.
-    """
-    rounds = _rows(
-        connection,
-        """
-        WITH pairing_counts AS (
-            SELECT lp.round_index, count(*) AS pairings,
-                   count(*) FILTER (WHERE lp.status = 'COMPLETE') AS completed,
-                   avg(pr.paired_margin) FILTER (WHERE NOT coalesce(pr.failed, true)) AS mean_margin
-            FROM league_pairings lp LEFT JOIN pairing_results pr USING (pairing_id)
-            WHERE lp.generation_id = ? GROUP BY lp.round_index
-        ), episode_counts AS (
-            SELECT lp.round_index, count(pe.match_id) AS episodes,
-                   count(*) FILTER (WHERE e.failed) AS failed_episodes,
-                   sum(e.wallclock) AS wallclock, avg(e.steps) AS mean_steps
-            FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
-            JOIN episodes e USING (match_id)
-            WHERE lp.generation_id = ? GROUP BY lp.round_index
-        )
-        SELECT pc.round_index, pc.pairings, pc.completed, pc.mean_margin,
-               coalesce(ec.episodes, 0) AS episodes,
-               coalesce(ec.failed_episodes, 0) AS failed_episodes,
-               ec.wallclock, ec.mean_steps
-        FROM pairing_counts pc LEFT JOIN episode_counts ec USING (round_index)
-        ORDER BY pc.round_index
-        """,
-        [generation_id, generation_id],
-    )
-    if not rounds:
-        return '<div class="panel empty">No rounds have been scheduled yet.</div>'
-    body = "".join(
-        f'<tr><td>{int(row["round_index"])}</td>'
-        f'<td>{_progress(int(row["completed"] or 0), int(row["pairings"] or 0))}</td>'
-        f'<td>{int(row["episodes"] or 0):,}</td><td>{int(row["failed_episodes"] or 0):,}</td>'
-        f'<td>{_number(row["mean_margin"], 1)}</td><td>{_number(row["mean_steps"])}</td>'
-        f'<td>{_duration(row["wallclock"])}</td></tr>'
-        for row in rounds
-    )
-    return (
-        '<div class="panel"><table><thead><tr><th>Round</th><th>Pairings</th><th>Episodes</th>'
-        '<th>Failures</th><th>Mean margin</th><th>Mean steps</th><th>Episode wall clock</th>'
-        f"</tr></thead><tbody>{body}</tbody></table></div>"
-    )
-
-
 def _agent_panel(connection: Any, generation_id: str) -> str:
     """Per-agent money and behaviour mix.
 
@@ -798,7 +682,8 @@ def _agent_panel(connection: Any, generation_id: str) -> str:
         SELECT ep.strategy_id AS revision_id,
                coalesce(af.name, ar.family_id, ep.strategy_id) AS display_name,
                count(*) AS episodes, avg(ep.final_money) AS mean_money,
-               median(ep.final_money) AS median_money, avg(ep.money_difference) AS mean_margin,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY ep.final_money) AS median_money,
+               avg(ep.money_difference) AS mean_margin,
                avg(ep.reward) AS mean_reward, avg(ep.win) AS win_rate,
                avg(ep.productive_action_percentage) AS productive,
                avg(ep.movement_percentage) AS movement, avg(ep.idle_percentage) AS idle,
@@ -811,7 +696,7 @@ def _agent_panel(connection: Any, generation_id: str) -> str:
         LEFT JOIN agent_families af USING (family_id)
         LEFT JOIN rating_snapshots rs
                ON rs.generation_id = lp.generation_id AND rs.revision_id = ep.strategy_id
-        WHERE lp.generation_id = ? AND NOT e.failed
+        WHERE lp.generation_id = %s AND NOT e.failed
         GROUP BY ep.strategy_id, display_name
         ORDER BY conservative DESC NULLS LAST, mean_margin DESC NULLS LAST, revision_id
         """,
@@ -848,12 +733,12 @@ def _runtime_panel(connection: Any, generation_id: str) -> str:
         """
         SELECT count(*) AS episodes, count(*) FILTER (WHERE e.failed) AS failed,
                sum(e.wallclock) AS total_wallclock, avg(e.wallclock) AS mean_wallclock,
-               median(e.wallclock) AS median_wallclock,
-               quantile_cont(e.wallclock, 0.95) AS p95_wallclock,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY e.wallclock) AS median_wallclock,
+               percentile_cont(0.95) WITHIN GROUP (ORDER BY e.wallclock) AS p95_wallclock,
                max(e.wallclock) AS max_wallclock,
                avg(e.steps) AS mean_steps, max(e.steps) AS max_steps
         FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
-        JOIN episodes e USING (match_id) WHERE lp.generation_id = ?
+        JOIN episodes e USING (match_id) WHERE lp.generation_id = %s
         """,
         [generation_id],
     ) or {}
@@ -865,7 +750,7 @@ def _runtime_panel(connection: Any, generation_id: str) -> str:
         """
         SELECT e.match_id, e.wallclock, e.steps, e.failed, lp.round_index
         FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
-        JOIN episodes e USING (match_id) WHERE lp.generation_id = ?
+        JOIN episodes e USING (match_id) WHERE lp.generation_id = %s
         ORDER BY e.wallclock DESC LIMIT 5
         """,
         [generation_id],
@@ -903,14 +788,14 @@ def _hook_panel(connection: Any, generation_id: str) -> str:
                count(*) FILTER (
                    WHERE ee.status = 'COMPLETE'
                      AND coalesce(
-                           CAST(json_extract(ee.result_json, '$.should_reevaluate') AS BOOLEAN),
+                           CAST(ee.result_json ->> 'should_reevaluate' AS BOOLEAN),
                            false
                          )
                ) AS reevaluation_requests
         FROM episode_evaluations ee
         JOIN pairing_episodes pe USING (match_id)
         JOIN league_pairings lp USING (pairing_id)
-        WHERE lp.generation_id = ?
+        WHERE lp.generation_id = %s
         """,
         [generation_id],
     ) or {}
@@ -931,7 +816,6 @@ def _performance_section(connection: Any, generation_id: str) -> str:
     return (
         "<h2>Performance</h2>"
         f"<h3>Match outcomes</h3>{_outcome_panel(connection, generation_id)}"
-        f"<h3>Rounds</h3>{_round_panel(connection, generation_id)}"
         f"<h3>Agent money and behaviour</h3>{_agent_panel(connection, generation_id)}"
         f"<h3>Runtime cost</h3>{_runtime_panel(connection, generation_id)}"
         f"<h3>Evaluation hooks</h3>{_hook_panel(connection, generation_id)}"
@@ -952,7 +836,7 @@ def _generation_page(
         """
         SELECT g.generation_id, g.generation_index, g.status, g.created_at, g.completed_at,
                ts.session_id, ts.name AS session_name, ts.config_json
-        FROM generations g JOIN training_sessions ts USING (session_id) WHERE g.generation_id = ?
+        FROM generations g JOIN training_sessions ts USING (session_id) WHERE g.generation_id = %s
         """,
         [generation_id],
     )
@@ -971,7 +855,7 @@ def _generation_page(
         LEFT JOIN agent_families af USING (family_id)
         LEFT JOIN generation_members gm USING (generation_id, revision_id)
         LEFT JOIN generation_stats gs USING (generation_id, revision_id)
-        WHERE rs.generation_id = ? AND NOT rs.is_frozen
+        WHERE rs.generation_id = %s AND NOT rs.is_frozen
         ORDER BY conservative DESC, gs.mean_margin DESC NULLS LAST, rs.revision_id
         """,
         [generation_id],
@@ -982,7 +866,7 @@ def _generation_page(
         SELECT count(*) AS pairings,
                count(*) FILTER (WHERE status = 'COMPLETE') AS completed,
                count(*) FILTER (WHERE status = 'FAILED') AS failed
-        FROM league_pairings WHERE generation_id = ?
+        FROM league_pairings WHERE generation_id = %s
         """,
         [generation_id],
     ) or {}
@@ -992,17 +876,17 @@ def _generation_page(
         SELECT count(DISTINCT pe.match_id) AS episodes,
                count(DISTINCT CASE WHEN e.failed THEN e.match_id END) AS failed_episodes
         FROM league_pairings lp LEFT JOIN pairing_episodes pe USING (pairing_id)
-        LEFT JOIN episodes e USING (match_id) WHERE lp.generation_id = ?
+        LEFT JOIN episodes e USING (match_id) WHERE lp.generation_id = %s
         """,
         [generation_id],
     ) or {}
-    conditions = ["lp.generation_id = ?"]
+    conditions = ["lp.generation_id = %s"]
     parameters: list[Any] = [generation_id]
     if status_filter != "all":
-        conditions.append("lp.status = ?")
+        conditions.append("lp.status = %s")
         parameters.append(status_filter)
     if kind_filter != "all":
-        conditions.append("lp.pairing_kind = ?")
+        conditions.append("lp.pairing_kind = %s")
         parameters.append(kind_filter)
     sort_columns = {
         "round": "lp.round_index",
@@ -1036,7 +920,7 @@ def _generation_page(
         LEFT JOIN agent_families afa ON afa.family_id = ara.family_id
         LEFT JOIN agent_revisions arb ON arb.revision_id = lp.revision_b
         LEFT JOIN agent_families afb ON afb.family_id = arb.family_id
-        WHERE {' AND '.join(conditions)} ORDER BY {order} LIMIT ? OFFSET ?
+        WHERE {' AND '.join(conditions)} ORDER BY {order} LIMIT %s OFFSET %s
         """,
         [*parameters, PAGE_SIZE + 1, offset],
     )
@@ -1045,7 +929,7 @@ def _generation_page(
     episodes_by_pairing: dict[str, list[dict[str, Any]]] = {}
     if pairings:
         ids = [row["pairing_id"] for row in pairings]
-        placeholders = ",".join("?" for _ in ids)
+        placeholders = ",".join("%s" for _ in ids)
         for episode in _rows(
             connection,
             f"""
@@ -1059,8 +943,8 @@ def _generation_page(
             ids,
         ):
             episodes_by_pairing.setdefault(str(episode["pairing_id"]), []).append(episode)
-    status_values = [row[0] for row in connection.execute("SELECT DISTINCT status FROM league_pairings WHERE generation_id = ? ORDER BY status", [generation_id]).fetchall()]
-    kind_values = [row[0] for row in connection.execute("SELECT DISTINCT pairing_kind FROM league_pairings WHERE generation_id = ? ORDER BY pairing_kind", [generation_id]).fetchall()]
+    status_values = [row[0] for row in connection.execute("SELECT DISTINCT status FROM league_pairings WHERE generation_id = %s ORDER BY status", [generation_id]).fetchall()]
+    kind_values = [row[0] for row in connection.execute("SELECT DISTINCT pairing_kind FROM league_pairings WHERE generation_id = %s ORDER BY pairing_kind", [generation_id]).fetchall()]
     leaderboard_rows = "".join(
         f'<tr><td>{index}</td><td><b>{_escape(row["display_name"])}</b><br><small>{_escape(row["revision_id"])}</small></td>'
         f'<td>{_escape(row["role"] or "—")}</td><td>{_number(row["conservative"], 1)}</td><td>{_number(row["rating"], 1)} ± {_number(row["deviation"], 1)}</td>'
@@ -1112,7 +996,7 @@ def _generation_page(
             """
             SELECT count(*) FROM (
                 SELECT round_index FROM model_round_hooks
-                WHERE generation_id = ? AND scope = 'round'
+                WHERE generation_id = %s AND scope = 'round'
                 GROUP BY round_index HAVING bool_and(status = 'COMPLETE')
             )
             """,
@@ -1124,11 +1008,41 @@ def _generation_page(
         ]
     else:
         work_cards = [("Pairings", f"{completed:,} / {total:,}")]
+    hook_rows = _rows(
+        connection,
+        """
+        SELECT round_index, model_id, status, batches_recorded, error_text,
+               started_at, completed_at
+        FROM model_round_hooks
+        WHERE generation_id = %s AND scope = 'round'
+        ORDER BY round_index, model_id
+        """,
+        [generation_id],
+    )
+    hook_rows_html = "".join(
+        f'<tr><td>{int(row["round_index"])}</td><td><code>{_escape(row["model_id"])}</code></td>'
+        f'<td>{_status(row["status"])}</td><td>{int(row["batches_recorded"] or 0):,}</td>'
+        f'<td>{_escape(row["error_text"] or "—")}</td>'
+        f'<td>{_escape(row["completed_at"] or row["started_at"])}</td></tr>'
+        for row in hook_rows
+    )
+    rounds_section = (
+        '<h2>Training rounds</h2><div class="panel"><table><thead><tr>'
+        '<th>Round</th><th>Model</th><th>Status</th><th>Batches</th><th>Error</th><th>Updated</th>'
+        f'</tr></thead><tbody>{hook_rows_html}</tbody></table></div>'
+        if hook_rows
+        else (
+            '<h2>Training rounds</h2><div class="panel empty">No trainer hooks have been recorded yet.</div>'
+            if trainer_only
+            else ""
+        )
+    )
     body = f'''<p><a href="{_escape(_id_path("sessions", generation["session_id"]))}">← {_escape(generation["session_name"])}</a></p>
 <h1>Generation {int(generation["generation_index"])}</h1><p class="muted">{_escape(generation_id)} · {_status(generation["status"])}</p>
 {_cards([*work_cards, ("Pairing failures", f"{int(summary.get('failed') or 0):,}"),
           ("Episodes", f"{int(episode_summary.get('episodes') or 0):,}"), ("Episode failures", f"{int(episode_summary.get('failed_episodes') or 0):,}"),
           ("Ranked agents", f"{len(leaderboard):,}")])}
+{rounds_section}
 <h2>Leaderboard</h2><div class="panel">{('<table><thead><tr><th>#</th><th>Agent</th><th>Role</th><th>Conservative</th><th>Rating</th><th>W–D–L</th><th>Score</th><th>Mean margin</th><th>Opponents</th></tr></thead><tbody>'+leaderboard_rows+'</tbody></table>') if leaderboard else '<div class="empty">Ratings appear after this generation closes.</div>'}</div>
 {_performance_section(connection, generation_id)}
 <h2>Pairings and episodes</h2><div class="panel"><form class="filters" method="get"><label>Status<select name="status">{status_options}</select></label>
@@ -1156,7 +1070,7 @@ def _episode_page(connection: Any, match_id: str) -> str:
         LEFT JOIN agent_families afa ON afa.family_id = ara.family_id
         LEFT JOIN agent_revisions arb ON arb.revision_id = lp.revision_b
         LEFT JOIN agent_families afb ON afb.family_id = arb.family_id
-        WHERE e.match_id = ?
+        WHERE e.match_id = %s
         """,
         [match_id],
     )
@@ -1169,7 +1083,7 @@ def _episode_page(connection: Any, match_id: str) -> str:
                opponent_money, money_difference, win, total_unit_actions, productive_actions,
                movement_actions, idle_actions, productive_action_percentage, movement_percentage,
                idle_percentage, plants_lost_inferred, final_shed_items, final_carried_items, metrics_json
-        FROM episode_players WHERE match_id = ? ORDER BY seat
+        FROM episode_players WHERE match_id = %s ORDER BY seat
         """,
         [match_id],
     )
@@ -1177,11 +1091,11 @@ def _episode_page(connection: Any, match_id: str) -> str:
         connection,
         """
         SELECT revision_id, seat, evaluator_path, status, result_json, error_text, created_at
-        FROM episode_evaluations WHERE match_id = ? ORDER BY seat, created_at DESC
+        FROM episode_evaluations WHERE match_id = %s ORDER BY seat, created_at DESC
         """,
         [match_id],
     )
-    has_replay = connection.execute("SELECT 1 FROM episode_payloads WHERE match_id = ?", [match_id]).fetchone() is not None
+    has_replay = connection.execute("SELECT 1 FROM episode_payloads WHERE match_id = %s", [match_id]).fetchone() is not None
     orientation = int(episode["orientation"])
     agent_a = (
         episode["agent_a_name"], episode["agent_a_strategy_id"], episode["revision_a"],
@@ -1230,7 +1144,7 @@ def _episode_page(connection: Any, match_id: str) -> str:
 
 
 def _load_replay(connection: Any, match_id: str) -> tuple[bytes, dict[str, Any]]:
-    row = connection.execute("SELECT replay_gzip FROM episode_payloads WHERE match_id = ?", [match_id]).fetchone()
+    row = connection.execute("SELECT replay_gzip FROM episode_payloads WHERE match_id = %s", [match_id]).fetchone()
     if row is None:
         raise DashboardNotFound(f"replay not found: {match_id}")
     try:
@@ -1259,7 +1173,7 @@ def _replay_page(connection: Any, match_id: str) -> str:
         LEFT JOIN agent_families afa ON afa.family_id = ara.family_id
         LEFT JOIN agent_revisions arb ON arb.revision_id = lp.revision_b
         LEFT JOIN agent_families afb ON afb.family_id = arb.family_id
-        WHERE pe.match_id = ?
+        WHERE pe.match_id = %s
         """,
         [match_id],
     )
@@ -1299,7 +1213,7 @@ def _replay_page(connection: Any, match_id: str) -> str:
 
 class DashboardHandler(BaseHTTPRequestHandler):
     repository: DashboardRepository
-    console_buffer: ConsoleRingBuffer
+    mcp_backend: ProgressMCP
     http_log_stream: Any
     server_version = "KaggricultureDashboard/0.1"
 
@@ -1318,13 +1232,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._handle(head=True)
 
     def do_POST(self) -> None:  # noqa: N802
-        self._send_text(HTTPStatus.METHOD_NOT_ALLOWED, "Method not allowed", head=False, headers={"Allow": "GET, HEAD"})
+        path = urlsplit(self.path).path.rstrip("/") or "/"
+        if path != "/mcp":
+            self._send_text(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                "Method not allowed",
+                head=False,
+                headers={"Allow": "GET, HEAD"},
+            )
+            return
+        self._handle_mcp()
 
     def _handle(self, *, head: bool) -> None:
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path.rstrip("/") or "/"
         try:
+            if path == "/mcp":
+                self._send_text(
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    "This stateless MCP endpoint accepts POST requests.",
+                    head=head,
+                    headers={"Allow": "POST"},
+                )
+                return
             if path == "/dashboard.js":
                 self._send(
                     HTTPStatus.OK,
@@ -1332,14 +1263,6 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "text/javascript; charset=utf-8",
                     head=head,
                     headers={"Cache-Control": "no-store"},
-                )
-                return
-            if path == "/console":
-                sequence, output = self.console_buffer.snapshot()
-                self._send_json(
-                    HTTPStatus.OK,
-                    {"sequence": sequence, "text": output},
-                    head=head,
                 )
                 return
             if path == "/events/dashboard":
@@ -1355,8 +1278,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/healthz":
                 with self.repository.connect() as connection:
-                    sessions = connection.execute("SELECT count(*) FROM training_sessions").fetchone()[0]
-                self._send_json(HTTPStatus.OK, {"status": "ok", "sessions": int(sessions)}, head=head)
+                    sessions = int(
+                        connection.execute("SELECT count(*) FROM training_sessions").fetchone()[0]
+                    )
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"status": "ok", "sessions": sessions},
+                    head=head,
+                )
                 return
             if path.startswith("/episodes/") and path.endswith("/replay.json"):
                 match_id = self._identifier(path, "/episodes/", "/replay.json")
@@ -1390,7 +1319,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except DashboardUnavailable as error:
             cause = error.__cause__ or error
             print(f"dashboard database unavailable: {cause}", file=sys.stderr)
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "Database unavailable", "A league process may be writing to DuckDB. Pause it and refresh this page.", head=head, headers={"Retry-After": "5"})
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "Database unavailable", "PostgreSQL is unavailable. Check the local lab stack and refresh this page.", head=head, headers={"Retry-After": "5"})
         except Exception as error:
             print(f"dashboard request failed: {error!r}", file=sys.stderr)
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "Dashboard error", "The request could not be completed. See the server log for details.", head=head)
@@ -1420,6 +1349,77 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path.startswith("/episodes/"):
                 return _episode_page(connection, self._identifier(path, "/episodes/"))
         raise DashboardNotFound("page not found")
+
+    def _handle_mcp(self) -> None:
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urlsplit(origin)
+            request_host = self.headers.get("Host", "")
+            if parsed_origin.scheme not in {"http", "https"} or parsed_origin.netloc.casefold() != request_host.casefold():
+                self._send_mcp_error(HTTPStatus.FORBIDDEN, -32000, "Invalid Origin")
+                return
+        protocol_version = self.headers.get("MCP-Protocol-Version")
+        if protocol_version and protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+            self._send_mcp_error(
+                HTTPStatus.BAD_REQUEST,
+                -32602,
+                "Unsupported MCP protocol version",
+                {"supported": list(SUPPORTED_PROTOCOL_VERSIONS), "requested": protocol_version},
+            )
+            return
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().casefold()
+        if content_type != "application/json":
+            self._send_mcp_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE, -32600, "Content-Type must be application/json")
+            return
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            self._send_mcp_error(HTTPStatus.LENGTH_REQUIRED, -32600, "Content-Length is required")
+            return
+        if length < 1:
+            self._send_mcp_error(HTTPStatus.BAD_REQUEST, -32700, "Request body is empty")
+            return
+        if length > 1_048_576:
+            self._send_mcp_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, -32600, "Request body exceeds 1 MiB")
+            return
+        try:
+            message = json.loads(self.rfile.read(length))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._send_mcp_error(HTTPStatus.BAD_REQUEST, -32700, "Parse error")
+            return
+        response = self.mcp_backend.handle(message)
+        negotiated = None
+        if response and isinstance(response.get("result"), dict):
+            negotiated = response["result"].get("protocolVersion")
+        headers = {"MCP-Protocol-Version": protocol_version or negotiated or PROTOCOL_VERSION}
+        if response is None:
+            self._send(HTTPStatus.ACCEPTED, b"", "application/json; charset=utf-8", head=False, headers=headers)
+        else:
+            self._send(
+                HTTPStatus.OK,
+                json.dumps(response, sort_keys=True).encode(),
+                "application/json; charset=utf-8",
+                head=False,
+                headers=headers,
+            )
+
+    def _send_mcp_error(
+        self,
+        status: HTTPStatus,
+        code: int,
+        message: str,
+        data: Any = None,
+    ) -> None:
+        error: dict[str, Any] = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
+        self._send(
+            status,
+            json.dumps({"jsonrpc": "2.0", "id": None, "error": error}, sort_keys=True).encode(),
+            "application/json; charset=utf-8",
+            head=False,
+            headers={"MCP-Protocol-Version": PROTOCOL_VERSION},
+        )
 
     def _stream_dashboard(self, query: dict[str, list[str]]) -> None:
         target = query.get("path", ["/"])[0]
@@ -1516,21 +1516,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def make_server(
-    database: str | Path,
+    database: str | DatabaseTarget,
     host: str = "127.0.0.1",
     port: int = 8000,
-    *,
-    read_only: bool = True,
-    console_buffer: ConsoleRingBuffer | None = None,
 ) -> ThreadingHTTPServer:
-    repository = DashboardRepository(database, read_only=read_only)
+    repository = DashboardRepository(database)
     available = repository.validate()
 
     class BoundDashboardHandler(DashboardHandler):
         pass
 
     BoundDashboardHandler.repository = repository
-    BoundDashboardHandler.console_buffer = console_buffer or ConsoleRingBuffer()
+    BoundDashboardHandler.mcp_backend = ProgressMCP(repository)
     BoundDashboardHandler.http_log_stream = sys.stderr
     server = ThreadingHTTPServer((host, port), BoundDashboardHandler)
     server.daemon_threads = True
@@ -1538,14 +1535,22 @@ def make_server(
     return server
 
 
-def serve(database: str | Path, host: str = "127.0.0.1", port: int = 8000) -> None:
+def serve(database: str | DatabaseTarget, host: str = "127.0.0.1", port: int = 8000) -> None:
     server = make_server(database, host, port)
     actual_host, actual_port = server.server_address[:2]
     if host not in {"127.0.0.1", "::1", "localhost"}:
         print("warning: dashboard has no authentication and is bound beyond loopback", file=sys.stderr)
-    if not getattr(server, "database_available_at_startup", True):
-        print("database is currently busy; the dashboard will retry on each request", file=sys.stderr)
+    mcp_url = dashboard_mcp_url(str(actual_host), int(actual_port))
+    try:
+        config_path = sync_codex_mcp_config(
+            mcp_url,
+        )
+    except (OSError, ValueError) as error:
+        print(f"warning: could not update project Codex MCP config: {error}", file=sys.stderr)
+    else:
+        print(f"Codex MCP config: {config_path}")
     print(f"Kaggriculture dashboard: http://{actual_host}:{actual_port}/")
+    print(f"Kaggriculture MCP: {mcp_url}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

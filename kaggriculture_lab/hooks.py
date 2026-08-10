@@ -39,7 +39,7 @@ class EpisodeReader:
             """
             SELECT status, failed, reward, final_money, opponent_money,
                    money_difference, win, metrics_json
-            FROM episode_players WHERE match_id = ? AND seat = ?
+            FROM episode_players WHERE match_id = %s AND seat = %s
             """,
             [self.match_id, self.seat],
         ).fetchone()
@@ -58,7 +58,7 @@ class EpisodeReader:
 
     def replay(self) -> dict[str, Any]:
         row = self._connection.execute(
-            "SELECT replay_gzip FROM episode_payloads WHERE match_id = ?", [self.match_id]
+            "SELECT replay_gzip FROM episode_payloads WHERE match_id = %s", [self.match_id]
         ).fetchone()
         if row is None:
             raise ValueError(f"replay payload not found: {self.match_id}")
@@ -97,7 +97,7 @@ class EpisodeReader:
             FROM pairing_episodes pe
             JOIN league_pairings lp USING (pairing_id)
             JOIN generations g USING (generation_id)
-            WHERE pe.match_id = ?
+            WHERE pe.match_id = %s
             """,
             [self.match_id],
         )
@@ -109,9 +109,9 @@ class EpisodeReader:
                 SELECT ep.match_id, ep.seed, ep.seat, ep.failed, ep.final_money,
                        ep.opponent_money, ep.money_difference, ep.win
                 FROM episode_players ep
-                WHERE ep.strategy_id = ? AND ep.match_id != ?
+                WHERE ep.strategy_id = %s AND ep.match_id != %s
                 ORDER BY ep.match_id DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 [revision_id, self.match_id, limit],
             )
@@ -125,12 +125,12 @@ class EpisodeReader:
                 JOIN pairing_episodes pe USING (match_id)
                 JOIN league_pairings lp USING (pairing_id)
                 JOIN generations g USING (generation_id)
-                WHERE ep.strategy_id = ? AND g.session_id = ?
+                WHERE ep.strategy_id = %s AND g.session_id = %s
                   AND (g.generation_index, lp.round_index, lp.pairing_id, pe.orientation)
-                      < (?, ?, ?, ?)
+                      < (%s, %s, %s, %s)
                 ORDER BY g.generation_index DESC, lp.round_index DESC,
                          lp.pairing_id DESC, pe.orientation DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 [
                     revision_id,

@@ -33,6 +33,7 @@ episodes_per_batch = 16
 episode_steps = 720
 population_size = 10
 gradient_steps_per_batch = 400
+training_batches_per_update = 20
 batch_size = 512
 learning_rate = 0.0001
 market_learning_rate = 0.0001

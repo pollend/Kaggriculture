@@ -27,6 +27,7 @@ from kaggriculture_lab.league import LeagueConfig, create_session
 from kaggriculture_lab.model_trainers import RoundContext, TrainingBatchWriter
 from kaggriculture_lab.model_updates import ActiveCheckpoint, ModelUpdateContext, TrainingBatch
 from kaggriculture_lab.storage import ExperimentStore
+from tests.postgres_support import postgres_database
 
 
 def test_manifest_declares_new_training_family():
@@ -47,12 +48,12 @@ def test_sp_psro_league_is_trainer_only_and_has_no_surrogate_population(tmp_path
     config = LeagueConfig.from_toml("configs/sp_psro_joint_league.toml")
     assert config.pairing_mode == "trainer_only"
     assert config.manifest == "agents/sp_psro_job_scorer/agent.toml"
-    create_session(config, tmp_path / "sp.duckdb", session_id="sp")
-    with ExperimentStore(tmp_path / "sp.duckdb") as store:
+    create_session(config, postgres_database(tmp_path, "sp"), session_id="sp")
+    with ExperimentStore(postgres_database(tmp_path, "sp")) as store:
         assert store.connection.execute("SELECT count(*) FROM generation_members").fetchone()[0] == 0
         assert (
             store.connection.execute(
-                "SELECT count(*) FROM agent_families WHERE family_id = ?",
+                "SELECT count(*) FROM agent_families WHERE family_id = %s",
                 ["configurable_crop_surrogate"],
             ).fetchone()[0]
             == 0
@@ -281,29 +282,6 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(tmp_path
         return copied, [float(len(calls))], [float(len(calls))]
 
     monkeypatch.setattr(updater, "_train_role", fake_train)
-    monkeypatch.setattr(
-        updater,
-        "evaluate_admission",
-        lambda *args, **kwargs: {
-            "pairs": 2,
-            "errors": 0,
-            "wins": 1,
-            "losses": 1,
-            "margin": 0.0,
-            "margin_ci": [-1.0, 1.0],
-        },
-    )
-    monkeypatch.setattr(
-        updater,
-        "evaluate_member",
-        lambda path, *args, **kwargs: {
-            "opponents": [],
-            "mean_win_rate": 0.6 if "candidate" in Path(path).name else 0.1,
-            "mean_margin": 100.0 if "candidate" in Path(path).name else -100.0,
-            "mean_money": 3400.0 if "candidate" in Path(path).name else 1000.0,
-            "errors": 0,
-        },
-    )
     context = ModelUpdateContext(
         "model",
         "sp_psro_job_scorer",
@@ -316,6 +294,7 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(tmp_path
             **(AgentManifest.load("agents/sp_psro_job_scorer/agent.toml").models[0].config or {}),
             "warmup_episodes": 1,
             "gradient_steps_per_batch": 3,
+            "training_batches_per_update": 1,
             "buffer_episodes": 8,
             "admission_seeds": 2,
             "nu_average_snapshots": 2,
@@ -333,42 +312,32 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(tmp_path
     assert len(saved["nu_snapshots"]) == 1
     assert result.metrics["nu_loss"] == 1.0
     assert result.metrics["beta_loss"] == 2.0
-    assert result.gate["passed"] is True
-    assert saved["release_champion"]["candidate_id"] == "beta-00000001"
+    assert result.gate["passed"] is False
+    assert saved["pending_admission"] is not None
 
-    monkeypatch.setattr(
-        updater,
-        "evaluate_admission",
-        lambda *args, **kwargs: {
-            "pairs": 2,
-            "errors": 0,
-            "wins": 2,
-            "losses": 0,
-            "margin": 2.0,
-            "margin_ci": [1.0, 3.0],
-        },
-    )
-    monkeypatch.setattr(
-        updater,
-        "evaluate_member",
-        lambda *args, **kwargs: {
-            "opponents": [],
-            "mean_win_rate": 0.5,
-            "mean_margin": 0.0,
-            "mean_money": 3000.0,
-            "errors": 0,
-        },
-    )
+    admission_request = saved["pending_admission"]["request_id"]
     batch2 = TrainingBatch(
         "model",
         2,
         "batch-2",
-        "sp_psro_rollout",
-        "source-2",
-        str(batch_path),
-        collect.digest(batch_path),
-        len(records),
-        {},
+        "model_evaluation",
+        admission_request,
+        None,
+        None,
+        4,
+        {
+            "family_id": "sp_psro_job_scorer",
+            "evaluation_kind": "admission",
+            "request_id": admission_request,
+            "result": {
+                "pairs": 2,
+                "errors": 0,
+                "wins": 2,
+                "losses": 0,
+                "margin": 2.0,
+                "margin_ci": [1.0, 3.0],
+            },
+        },
     )
     accepted_context = ModelUpdateContext(
         "model",
@@ -398,9 +367,64 @@ def test_updater_advances_both_live_learners_and_writes_resumable_state(tmp_path
     assert accepted_state["nu_snapshots"] == []
     assert accepted_state["live"]["nu"]["gradient_steps"] == 0
     assert accepted_state["live"]["beta"]["gradient_steps"] == 0
-    assert accepted_state["exploration_start_batch_seq"] == 2
-    assert accepted.gate["passed"] is True
-    assert accepted_state["release_champion"] is not None
+    assert accepted_state["exploration_start_batch_seq"] == 1
+    assert accepted.gate["passed"] is False
+    assert accepted_state["pending_validation"] is not None
+
+    validation_request = accepted_state["pending_validation"]["request_id"]
+    good_validation = {
+        "opponents": [],
+        "mean_win_rate": 0.6,
+        "mean_margin": 100.0,
+        "mean_money": 3400.0,
+        "errors": 0,
+    }
+    batch3 = TrainingBatch(
+        "model",
+        3,
+        "batch-3",
+        "model_evaluation",
+        validation_request,
+        None,
+        None,
+        8,
+        {
+            "family_id": "sp_psro_job_scorer",
+            "evaluation_kind": "validation",
+            "request_id": validation_request,
+            "result": {
+                "suite": "suite-a",
+                "members": {
+                    member["member_id"]: good_validation
+                    for member in accepted_state["population"]
+                },
+                "beta": good_validation,
+            },
+        },
+    )
+    validated_context = ModelUpdateContext(
+        "model",
+        "sp_psro_job_scorer",
+        "update-3",
+        3,
+        (batch3,),
+        (batch, batch2, batch3),
+        ActiveCheckpoint(
+            accepted.checkpoint_id,
+            accepted.trainer_artifact_path,
+            accepted.inference_artifact_path,
+            accepted.artifact_sha256,
+            accepted.metrics,
+        ),
+        context.config,
+        context.artifacts,
+        "dataset-3",
+    )
+    validated = updater.PopulationUpdater().update(validated_context, object())
+    validated_state = torch.load(validated.trainer_artifact_path, map_location="cpu", weights_only=False)
+    assert validated.gate["passed"] is True
+    assert validated_state["pending_validation"] is None
+    assert validated_state["release_champion"] is not None
 
 
 def test_inference_agent_plays_a_legal_action():
@@ -448,13 +472,13 @@ def test_manifest_rollouts_are_persisted_as_paired_episode_artifacts(tmp_path: P
         config={"episodeSteps": 2, "trace_root": str(tmp_path / "traces")},
     )
 
-    with ExperimentStore(tmp_path / "ledger.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "ledger")) as store:
         store.connection.execute(
-            "INSERT INTO training_sessions VALUES (?, ?, ?, ?, ?, current_timestamp)",
-            ["session", "session", "RUNNING", 1, "{}"],
+            "INSERT INTO training_sessions VALUES (%s, %s, %s, %s, %s, %s, current_timestamp)",
+            ["session", "test", "session", "RUNNING", 1, "{}"],
         )
         store.connection.execute(
-            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (?, ?, ?, ?)",
+            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, %s, %s)",
             ["session:g0000", "session", 0, "RUNNING"],
         )
         writer = TrainingBatchWriter(store, "model")
@@ -472,7 +496,7 @@ def test_manifest_rollouts_are_persisted_as_paired_episode_artifacts(tmp_path: P
         )
         weighted_id = writer.record_policy_mixture(context, ["member-a", "live-nu"], max_members=2, weights=[0.8, 0.2])
         assert store.connection.execute(
-            "SELECT revision_id, weight FROM policy_mixture_members WHERE mixture_id = ? ORDER BY ordinal",
+            "SELECT revision_id, weight FROM policy_mixture_members WHERE mixture_id = %s ORDER BY ordinal",
             [weighted_id],
         ).fetchall() == [("member-a", 0.8), ("live-nu", 0.2)]
         mixture_id = writer.record_policy_mixture(context, ["member-a"], max_members=10)

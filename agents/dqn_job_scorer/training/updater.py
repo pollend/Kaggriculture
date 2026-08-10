@@ -41,6 +41,34 @@ def _incumbent_path(config: dict[str, Any]) -> Path:
     return Path(str(config.get("incumbent_weights", WEIGHTS_PATH)))
 
 
+def initial_bundle(config: dict[str, Any]) -> PolicyBundle:
+    """Build the first behavior policy for a new training instance.
+
+    Fixed-curriculum runs can continue from an inference-only checkpoint while
+    starting a fresh optimizer and replay buffer. Ordinary DQN experiments keep
+    their historical random initialization unless they opt in explicitly.
+    """
+
+    initialization = str(config.get("initialization", "random"))
+    if initialization == "random":
+        return PolicyBundle.random(seed=int(config.get("seed", 0)))
+    if initialization != "incumbent":
+        raise ValueError(f"unsupported DQN initialization: {initialization}")
+    path = _incumbent_path(config)
+    if not path.is_file():
+        raise FileNotFoundError(f"DQN incumbent checkpoint does not exist: {path}")
+    bundle = PolicyBundle.load(path)
+    if bundle.market is None:
+        bundle = PolicyBundle(
+            bundle.job,
+            QNetwork.random(
+                seed=int(config.get("seed", 0)) + 1,
+                feature_dim=MARKET_FEATURE_DIM,
+            ),
+        )
+    return bundle
+
+
 def _file_digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -62,8 +90,8 @@ def league_opponents(context, reader) -> list[str]:
         SELECT DISTINCT ar.agent_spec
         FROM generation_members gm
         JOIN agent_revisions ar USING (revision_id)
-        WHERE gm.generation_id = ? AND ar.agent_spec IS NOT NULL
-          AND ar.family_id != ?
+        WHERE gm.generation_id = %s AND ar.agent_spec IS NOT NULL
+          AND ar.family_id != %s
         ORDER BY ar.agent_spec
         """,
         [context.generation_id, context.family_id],
@@ -83,8 +111,8 @@ def self_play_pool(context, reader, limit: int) -> list[str]:
     rows = reader.fetchall(
         """
         SELECT inference_artifact_path FROM model_training_checkpoints
-        WHERE model_id = ? AND promoted
-        ORDER BY created_at DESC, checkpoint_id DESC LIMIT ?
+        WHERE model_id = %s AND promoted
+        ORDER BY created_at DESC, checkpoint_id DESC LIMIT %s
         """,
         [context.model_id, limit],
     )
@@ -158,13 +186,13 @@ class DQNCollector:
                     ),
                 )
         else:
-            bundle = PolicyBundle.random(seed=int(config.get("seed", 0)))
+            bundle = initial_bundle(config)
 
         total_transitions = int(
             reader.fetchone(
                 """
-                SELECT coalesce(sum(CAST(json_extract(metadata_json, '$.transitions') AS BIGINT)), 0)
-                FROM training_batches WHERE model_id = ?
+                SELECT coalesce(sum(CAST(metadata_json ->> 'transitions' AS BIGINT)), 0)
+                FROM training_batches WHERE model_id = %s
                 """,
                 [context.model_id],
             )[0]
@@ -182,7 +210,7 @@ class DQNCollector:
             )
             batch_index = int(
                 reader.fetchone(
-                    "SELECT count(*) FROM training_batches WHERE model_id = ?",
+                    "SELECT count(*) FROM training_batches WHERE model_id = %s",
                     [context.model_id],
                 )[0]
             )
@@ -388,6 +416,10 @@ class DQNUpdater:
             if "replay_rng_state" in state:
                 buffer.rng.bit_generator.state = state["replay_rng_state"]
         else:
+            bundle = initial_bundle(config)
+            online = net_module.from_numpy(bundle.job, online)
+            if bundle.market is not None:
+                market_online = net_module.from_numpy(bundle.market, market_online)
             target.load_state_dict(online.state_dict())
             market_target.load_state_dict(market_online.state_dict())
 
@@ -504,7 +536,15 @@ class DQNUpdater:
         )
         evaluations: list[ModelEvaluation] = []
         promote = False
-        incumbent_path = Path(context.active_checkpoint.inference_artifact_path) if context.active_checkpoint is not None else None
+        incumbent_path = (
+            Path(context.active_checkpoint.inference_artifact_path)
+            if context.active_checkpoint is not None
+            else (
+                _incumbent_path(config)
+                if str(config.get("initialization", "random")) == "incumbent"
+                else None
+            )
+        )
         gate: dict[str, Any] = {
             "kind": "significant_incumbent_improvement_and_benchmark_non_regression",
             "seed_start": seed_start,
@@ -525,7 +565,19 @@ class DQNUpdater:
             benchmark_ok = not challenger_benchmark["errors"] and not incumbent_benchmark["errors"] and float(challenger_benchmark["margin_ci"][1]) >= float(incumbent_benchmark["margin_ci"][0])
             promote = head_to_head_ok and benchmark_ok
             gate.update({"head_to_head": head_to_head, "incumbent_benchmark": incumbent_benchmark, "head_to_head_significantly_better": head_to_head_ok, "benchmark_non_regression": benchmark_ok, "passed": promote})
-            evaluations.append(ModelEvaluation("incumbent_head_to_head", head_to_head, head_to_head_ok, context.active_checkpoint.checkpoint_id))
+            opponent_checkpoint_id = (
+                context.active_checkpoint.checkpoint_id
+                if context.active_checkpoint is not None
+                else None
+            )
+            evaluations.append(
+                ModelEvaluation(
+                    "incumbent_head_to_head",
+                    head_to_head,
+                    head_to_head_ok,
+                    opponent_checkpoint_id,
+                )
+            )
             evaluations.append(ModelEvaluation("fixed_benchmark", challenger_benchmark, promote))
         metrics = {
             "episodes_in_buffer": len(buffer.episodes),

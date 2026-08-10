@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from kaggriculture_lab.database import DatabaseTarget, database_target
 from kaggriculture_lab.identity import training_artifact_root
 from kaggriculture_lab.read_only import fetchall_select
 from kaggriculture_lab.storage import ExperimentStore
@@ -163,14 +164,14 @@ def record_training_batch(
         SELECT model_id, batch_seq, batch_id, source_kind, source_id,
                artifact_path, artifact_sha256, sample_count, metadata_json
         FROM training_batches
-        WHERE model_id = ? AND source_kind = ? AND source_id = ?
+        WHERE model_id = %s AND source_kind = %s AND source_id = %s
         """,
         [model_id, source_kind, source_id],
     ).fetchone()
     if known:
         return _batch_from_row(known)
     if store.connection.execute(
-        "SELECT 1 FROM training_models WHERE model_id = ?", [model_id]
+        "SELECT 1 FROM training_models WHERE model_id = %s", [model_id]
     ).fetchone() is None:
         raise ValueError(f"unknown training model: {model_id}")
     path_text = str(artifact_path) if artifact_path is not None else None
@@ -180,9 +181,27 @@ def record_training_batch(
     )
     store.connection.execute("BEGIN")
     try:
+        # One row lock gives each model an independent, gap-free batch sequence
+        # while allowing other models and sessions to write concurrently.
+        store.connection.execute(
+            "SELECT 1 FROM training_models WHERE model_id = %s FOR UPDATE",
+            [model_id],
+        )
+        known = store.connection.execute(
+            """
+            SELECT model_id, batch_seq, batch_id, source_kind, source_id,
+                   artifact_path, artifact_sha256, sample_count, metadata_json
+            FROM training_batches
+            WHERE model_id = %s AND source_kind = %s AND source_id = %s
+            """,
+            [model_id, source_kind, source_id],
+        ).fetchone()
+        if known:
+            store.connection.execute("COMMIT")
+            return _batch_from_row(known)
         sequence = int(
             store.connection.execute(
-                "SELECT coalesce(max(batch_seq), 0) + 1 FROM training_batches WHERE model_id = ?",
+                "SELECT coalesce(max(batch_seq), 0) + 1 FROM training_batches WHERE model_id = %s",
                 [model_id],
             ).fetchone()[0]
         )
@@ -191,7 +210,7 @@ def record_training_batch(
             INSERT INTO training_batches (
                 model_id, batch_seq, batch_id, source_kind, source_id,
                 artifact_path, artifact_sha256, sample_count, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             [
                 model_id,
@@ -229,7 +248,7 @@ def _active_checkpoint(store: ExperimentStore, checkpoint_id: str | None) -> Act
         """
         SELECT checkpoint_id, trainer_artifact_path, inference_artifact_path,
                artifact_sha256, metrics_json
-        FROM model_training_checkpoints WHERE checkpoint_id = ?
+        FROM model_training_checkpoints WHERE checkpoint_id = %s
         """,
         [checkpoint_id],
     ).fetchone()
@@ -245,11 +264,24 @@ def update_model_in_store(
     artifacts: str | Path = "artifacts",
     force: bool = False,
 ) -> UpdateReport:
+    with store.connection.advisory_lock("model", model_id):
+        return _update_model_in_store_unlocked(
+            store, model_id, artifacts=artifacts, force=force
+        )
+
+
+def _update_model_in_store_unlocked(
+    store: ExperimentStore,
+    model_id: str,
+    *,
+    artifacts: str | Path = "artifacts",
+    force: bool = False,
+) -> UpdateReport:
     row = store.connection.execute(
         """
         SELECT family_id, trainer_path, min_new_batches, config_json,
                active_checkpoint_id, last_attempted_batch_seq
-        FROM training_models WHERE model_id = ?
+        FROM training_models WHERE model_id = %s
         """,
         [model_id],
     ).fetchone()
@@ -260,14 +292,23 @@ def update_model_in_store(
         """
         SELECT model_id, batch_seq, batch_id, source_kind, source_id,
                artifact_path, artifact_sha256, sample_count, metadata_json
-        FROM training_batches WHERE model_id = ? ORDER BY batch_seq
+        FROM training_batches WHERE model_id = %s ORDER BY batch_seq
         """,
         [model_id],
     ).fetchall()
     batches = tuple(_batch_from_row(item) for item in batch_rows)
     new_batches = tuple(item for item in batches if item.sequence > int(watermark))
     cutoff = new_batches[-1].sequence if new_batches else int(watermark)
-    if not new_batches or (len(new_batches) < int(minimum) and not force):
+    # Evaluation results are control events, not gradient-training samples.
+    # They must be applied promptly so a trainer can advance a pending
+    # admission/release state machine without fabricating enough data batches
+    # to satisfy its ordinary training threshold.
+    has_evaluation_result = any(
+        item.source_kind == "model_evaluation" for item in new_batches
+    )
+    if not new_batches or (
+        len(new_batches) < int(minimum) and not force and not has_evaluation_result
+    ):
         return UpdateReport(
             model_id,
             "deferred",
@@ -287,23 +328,11 @@ def update_model_in_store(
     update_id = _stable_id("update", model_id, active_id or "", cutoff, dataset_digest)
     existing = store.connection.execute(
         """
-        SELECT status, candidate_checkpoint_id, error_text,
-               started_at < now() - INTERVAL '6 hours' AS stale
-        FROM model_updates WHERE update_id = ?
+        SELECT status, candidate_checkpoint_id, error_text
+        FROM model_updates WHERE update_id = %s
         """,
         [update_id],
     ).fetchone()
-    if existing and existing[0] == "RUNNING" and not existing[3]:
-        return UpdateReport(
-            model_id,
-            "busy",
-            len(new_batches),
-            int(minimum),
-            cutoff,
-            update_id,
-            existing[1],
-            active_id,
-        )
     if existing and existing[0] not in {"ERROR", "RUNNING"}:
         return UpdateReport(
             model_id,
@@ -317,11 +346,14 @@ def update_model_in_store(
             existing[2],
         )
     if existing:
+        # The model advisory lock is already held. A RUNNING row here cannot
+        # have a live owner, so it is an interrupted attempt and is resumable
+        # immediately rather than after a wall-clock timeout.
         store.connection.execute(
             """
             UPDATE model_updates SET status = 'RUNNING', error_text = NULL,
                 started_at = current_timestamp, completed_at = NULL
-            WHERE update_id = ?
+            WHERE update_id = %s
             """,
             [update_id],
         )
@@ -331,7 +363,7 @@ def update_model_in_store(
             INSERT INTO model_updates (
                 update_id, model_id, parent_checkpoint_id, cutoff_batch_seq,
                 new_batch_count, dataset_sha256, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING')
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'RUNNING')
             """,
             [update_id, model_id, active_id, cutoff, len(new_batches), dataset_digest],
         )
@@ -358,9 +390,21 @@ def update_model_in_store(
         try:
             store.connection.execute(
                 """
-                INSERT OR REPLACE INTO model_training_checkpoints VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, current_timestamp
+                INSERT INTO model_training_checkpoints VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, current_timestamp
                 )
+                ON CONFLICT (checkpoint_id) DO UPDATE SET
+                    model_id = excluded.model_id,
+                    update_id = excluded.update_id,
+                    parent_checkpoint_id = excluded.parent_checkpoint_id,
+                    trainer_artifact_path = excluded.trainer_artifact_path,
+                    inference_artifact_path = excluded.inference_artifact_path,
+                    artifact_sha256 = excluded.artifact_sha256,
+                    dataset_sha256 = excluded.dataset_sha256,
+                    metrics_json = excluded.metrics_json,
+                    gate_json = excluded.gate_json,
+                    promoted = excluded.promoted,
+                    created_at = excluded.created_at
                 """,
                 [
                     result.checkpoint_id,
@@ -382,9 +426,17 @@ def update_model_in_store(
                 )
                 store.connection.execute(
                     """
-                    INSERT OR REPLACE INTO model_evaluations VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, current_timestamp
+                    INSERT INTO model_evaluations VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, current_timestamp
                     )
+                    ON CONFLICT (evaluation_id) DO UPDATE SET
+                        update_id = excluded.update_id,
+                        model_id = excluded.model_id,
+                        evaluation_kind = excluded.evaluation_kind,
+                        opponent_checkpoint_id = excluded.opponent_checkpoint_id,
+                        metrics_json = excluded.metrics_json,
+                        passed = excluded.passed,
+                        created_at = excluded.created_at
                     """,
                     [
                         evaluation_id,
@@ -398,9 +450,9 @@ def update_model_in_store(
                 )
             store.connection.execute(
                 """
-                UPDATE model_updates SET status = ?, candidate_checkpoint_id = ?,
-                    metrics_json = ?, gate_json = ?, completed_at = current_timestamp
-                WHERE update_id = ?
+                UPDATE model_updates SET status = %s, candidate_checkpoint_id = %s,
+                    metrics_json = %s, gate_json = %s, completed_at = current_timestamp
+                WHERE update_id = %s
                 """,
                 [
                     status,
@@ -412,9 +464,9 @@ def update_model_in_store(
             )
             store.connection.execute(
                 """
-                UPDATE training_models SET last_attempted_batch_seq = ?,
-                    active_checkpoint_id = CASE WHEN ? THEN ? ELSE active_checkpoint_id END,
-                    updated_at = current_timestamp WHERE model_id = ?
+                UPDATE training_models SET last_attempted_batch_seq = %s,
+                    active_checkpoint_id = CASE WHEN %s THEN %s ELSE active_checkpoint_id END,
+                    updated_at = current_timestamp WHERE model_id = %s
                 """,
                 [cutoff, result.promote, result.checkpoint_id, model_id],
             )
@@ -435,8 +487,8 @@ def update_model_in_store(
     except Exception as error:
         store.connection.execute(
             """
-            UPDATE model_updates SET status = 'ERROR', error_text = ?,
-                completed_at = current_timestamp WHERE update_id = ?
+            UPDATE model_updates SET status = 'ERROR', error_text = %s,
+                completed_at = current_timestamp WHERE update_id = %s
             """,
             ["".join(traceback.format_exception(error)), update_id],
         )
@@ -454,23 +506,23 @@ def update_model_in_store(
 
 def update_model(
     model_id: str,
-    database: str | Path = "artifacts/experiments.duckdb",
+    database: DatabaseTarget | None = None,
     *,
     artifacts: str | Path = "artifacts",
     force: bool = False,
 ) -> UpdateReport:
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or database_target()) as store:
         return update_model_in_store(store, model_id, artifacts=artifacts, force=force)
 
 
 def update_models(
-    database: str | Path = "artifacts/experiments.duckdb",
+    database: DatabaseTarget | None = None,
     *,
     model_id: str | None = None,
     artifacts: str | Path = "artifacts",
     force: bool = False,
 ) -> list[UpdateReport]:
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or database_target()) as store:
         ids = [model_id] if model_id else [
             str(row[0])
             for row in store.connection.execute(

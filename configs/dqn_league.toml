@@ -1,4 +1,5 @@
 [league]
+league = "dqn_self_play"
 name = "dqn-self-play-training"
 
 # The job-scorer trainers collect their own full episodes. A minimal breedable

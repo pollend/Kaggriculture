@@ -84,7 +84,7 @@ run_match(("a.py", "b.py"), seed=0)                             # metrics == {}
 ```
 
 The league opts in because it persists those metrics for agents' evaluation hooks to read
-back out of DuckDB. `tests/test_layering.py` enforces the direction: `sim` may not import
+back out of PostgreSQL. `tests/test_layering.py` enforces the direction: `sim` may not import
 `kaggriculture_lab` or any agent.
 
 ## Why it is built this way

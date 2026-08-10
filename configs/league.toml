@@ -1,4 +1,5 @@
 [league]
+league = "experiments"
 name = "configurable-crop-training"
 manifest = "agents/configurable_crop_surrogate/agent.toml"
 anchor_manifests = [

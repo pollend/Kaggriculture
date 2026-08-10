@@ -1,4 +1,5 @@
 [league]
+league = "sp_psro_v4"
 name = "sp-psro-job-market-v4-training"
 manifest = "agents/sp_psro_job_scorer/agent.toml"
 training_manifests = ["agents/sp_psro_job_scorer/agent.toml"]

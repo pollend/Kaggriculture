@@ -9,6 +9,7 @@ import sys
 from dataclasses import replace
 from pathlib import Path
 
+from kaggriculture_lab.database import database_target
 from kaggriculture_lab.identity import TrainingAgentSpec
 from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.runner import ensure_session, run_generations, run_round_robin
@@ -29,7 +30,6 @@ FINAL_ARENA_JOBS = 24
 SYNC_ENVIRONMENT = True
 
 SESSION_ID = "receding-horizon-planner-training"
-DATABASE = Path("artifacts/planner_experiments.duckdb")
 ARTIFACTS = Path("artifacts")
 LEAGUE_CONFIG = Path("configs/planner_league.toml")
 TRAINING_AGENTS = [
@@ -42,6 +42,10 @@ TRAINING_AGENTS = [
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _database():
+    return database_target()
 
 
 def _run(command: list[str], *, check: bool = True, quiet: bool = False):
@@ -82,7 +86,7 @@ def _ensure_session() -> None:
     config = _effective_config()
     created, _ = ensure_session(
         config,
-        DATABASE,
+        _database(),
         SESSION_ID,
         workspace=REPO_ROOT,
         artifacts=ARTIFACTS,
@@ -110,7 +114,7 @@ def main() -> int:
     _ensure_session()
     run_generations(
         session_id=SESSION_ID,
-        database=DATABASE,
+        database=_database(),
         artifacts=ARTIFACTS,
         generations=GENERATIONS,
         workspace=REPO_ROOT,

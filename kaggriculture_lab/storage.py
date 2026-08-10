@@ -1,4 +1,7 @@
-"""DuckDB experiment catalog and portable exports."""
+"""Experiment storage and portable exports.
+
+PostgreSQL is the sole backend.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from kaggriculture_lab.database import DatabaseTarget, connect_postgres
 from kaggriculture_lab.identity import (
     DEFAULT_AGENT_NAME,
     AgentManifest,
@@ -21,13 +25,16 @@ from sim.runner import MatchResult
 
 
 class ExperimentStore:
-    def __init__(self, path: str | Path):
-        import duckdb
-
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = duckdb.connect(str(self.path))
-        self._initialize()
+    def __init__(
+        self,
+        database: str | DatabaseTarget,
+    ):
+        self.target = (
+            database
+            if isinstance(database, DatabaseTarget)
+            else DatabaseTarget(database)
+        )
+        self.connection = connect_postgres(self.target)
 
     def close(self) -> None:
         self.connection.close()
@@ -38,15 +45,10 @@ class ExperimentStore:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _initialize(self) -> None:
-        """Create every missing catalog object from the canonical schema."""
-        schema_path = Path(__file__).with_name("schema.sql")
-        self.connection.execute(schema_path.read_text())
-
     def register_family(
         self, manifest: AgentManifest, manifest_path: str | Path
     ) -> None:
-        """Register a family and its backward-compatible default model instance."""
+        """Register a family and its default model instance."""
 
         self.register_training_agent(
             manifest,
@@ -70,9 +72,17 @@ class ExperimentStore:
             )
         self.connection.execute(
             """
-            INSERT OR REPLACE INTO agent_families VALUES (
-                ?, ?, ?, ?, ?, ?, ?, current_timestamp
+            INSERT INTO agent_families VALUES (
+                %s, %s, %s, %s, %s, %s, %s, current_timestamp
             )
+            ON CONFLICT (family_id) DO UPDATE SET
+                name = excluded.name,
+                manifest_path = excluded.manifest_path,
+                entry_point = excluded.entry_point,
+                training_adapter = excluded.training_adapter,
+                episode_evaluator = excluded.episode_evaluator,
+                parameter_schema_version = excluded.parameter_schema_version,
+                created_at = excluded.created_at
             """,
             [
                 manifest.family_id,
@@ -101,7 +111,7 @@ class ExperimentStore:
                 INSERT INTO training_models (
                     model_id, family_id, agent_type, agent_name, declared_model_id,
                     trainer_path, min_new_batches, config_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (model_id) DO UPDATE SET
                     family_id = excluded.family_id,
                     agent_type = excluded.agent_type,
@@ -146,11 +156,12 @@ class ExperimentStore:
         if rows:
             self.connection.executemany(
                 """
-                INSERT OR IGNORE INTO agent_revisions (
+                INSERT INTO agent_revisions (
                     revision_id, family_id, strategy_id, entry_point, agent_spec,
                     code_fingerprint, parameter_schema_version, params_json,
                     checkpoint_id, checkpoint_digest, source, episode_evaluator
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
                 """,
                 rows,
             )
@@ -160,7 +171,10 @@ class ExperimentStore:
         digest = hashlib.sha256(raw).hexdigest()
         payload = gzip.compress(raw, compresslevel=6)
         self.connection.execute(
-            "INSERT OR REPLACE INTO episode_payloads VALUES (?, ?, ?)",
+            """INSERT INTO episode_payloads VALUES (%s, %s, %s)
+            ON CONFLICT (match_id) DO UPDATE SET
+                replay_gzip = excluded.replay_gzip,
+                payload_sha256 = excluded.payload_sha256""",
             [match_id, payload, digest],
         )
         return digest
@@ -175,12 +189,20 @@ class ExperimentStore:
         git_commit: str | None,
     ) -> None:
         self.connection.execute(
-            "INSERT OR REPLACE INTO runs VALUES (?, ?, current_timestamp, 'RUNNING', ?, ?, ?, ?)",
+            """INSERT INTO runs VALUES (%s, %s, current_timestamp, 'RUNNING', %s, %s, %s, %s)
+            ON CONFLICT (run_id) DO UPDATE SET
+                name = excluded.name,
+                created_at = excluded.created_at,
+                status = excluded.status,
+                seed = excluded.seed,
+                config_json = excluded.config_json,
+                versions_json = excluded.versions_json,
+                git_commit = excluded.git_commit""",
             [run_id, name, seed, json.dumps(config), json.dumps(versions), git_commit],
         )
 
     def finish_run(self, run_id: str, status: str = "COMPLETE") -> None:
-        self.connection.execute("UPDATE runs SET status = ? WHERE run_id = ?", [status, run_id])
+        self.connection.execute("UPDATE runs SET status = %s WHERE run_id = %s", [status, run_id])
 
     def add_strategies(
         self, strategies: Iterable[Any], source: str, run_id: str | None = None
@@ -193,12 +215,12 @@ class ExperimentStore:
         ]
         if rows:
             self.connection.executemany(
-                "INSERT OR IGNORE INTO strategies VALUES (?, ?, ?, ?)", rows
+                "INSERT INTO strategies VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", rows
             )
 
     def completed_match_ids(self, run_id: str) -> set[str]:
         rows = self.connection.execute(
-            "SELECT match_id FROM episodes WHERE run_id = ?", [run_id]
+            "SELECT match_id FROM episodes WHERE run_id = %s", [run_id]
         ).fetchall()
         return {row[0] for row in rows}
 
@@ -215,7 +237,7 @@ class ExperimentStore:
         self.connection.execute("BEGIN")
         try:
             self.connection.execute(
-                "INSERT OR IGNORE INTO episodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO episodes VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 [
                     match_id,
                     run_id,
@@ -243,9 +265,10 @@ class ExperimentStore:
                 metrics = seat.metrics
                 self.connection.execute(
                     """
-                    INSERT OR IGNORE INTO episode_players VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    INSERT INTO episode_players VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
+                    ON CONFLICT DO NOTHING
                     """,
                     [
                         match_id,
@@ -285,10 +308,10 @@ class ExperimentStore:
             """
             SELECT strategy_id, avg(money_difference) AS score
             FROM episode_players
-            WHERE run_id = ? AND stage = ? AND strategy_id NOT LIKE 'builtin:%' AND NOT failed
+            WHERE run_id = %s AND stage = %s AND strategy_id NOT LIKE 'builtin:%' AND NOT failed
             GROUP BY strategy_id
             ORDER BY score DESC, strategy_id
-            LIMIT ?
+            LIMIT %s
             """,
             [run_id, stage, limit],
         ).fetchall()
@@ -306,7 +329,7 @@ class ExperimentStore:
             ids = list(strategy_ids)
             if not ids:
                 return {}
-            placeholders = ",".join("?" for _ in ids)
+            placeholders = ",".join("%s" for _ in ids)
             rows = self.connection.execute(
                 f"SELECT strategy_id, params_json FROM strategies WHERE strategy_id IN ({placeholders})",
                 ids,
@@ -314,10 +337,10 @@ class ExperimentStore:
         return {row[0]: json.loads(row[1]) for row in rows}
 
     def save_ratings(self, run_id: str, ratings: dict[str, tuple[float, int]]) -> None:
-        self.connection.execute("DELETE FROM ratings WHERE run_id = ?", [run_id])
+        self.connection.execute("DELETE FROM ratings WHERE run_id = %s", [run_id])
         rows = [[run_id, key, value[0], value[1]] for key, value in ratings.items()]
         if rows:
-            self.connection.executemany("INSERT INTO ratings VALUES (?, ?, ?, ?)", rows)
+            self.connection.executemany("INSERT INTO ratings VALUES (%s, %s, %s, %s)", rows)
 
     def save_model(
         self,
@@ -328,14 +351,20 @@ class ExperimentStore:
         report: dict[str, Any],
     ) -> None:
         self.connection.execute(
-            "INSERT OR REPLACE INTO models VALUES (?, ?, ?, ?, ?, current_timestamp)",
+            """INSERT INTO models VALUES (%s, %s, %s, %s, %s, current_timestamp)
+            ON CONFLICT (model_id) DO UPDATE SET
+                run_id = excluded.run_id,
+                kind = excluded.kind,
+                artifact_path = excluded.artifact_path,
+                report_json = excluded.report_json,
+                created_at = excluded.created_at""",
             [model_id, run_id, kind, artifact_path, json.dumps(report, sort_keys=True)],
         )
 
     def save_proposals(self, run_id: str, rows: list[dict[str, Any]]) -> None:
-        self.connection.execute("DELETE FROM proposals WHERE run_id = ?", [run_id])
+        self.connection.execute("DELETE FROM proposals WHERE run_id = %s", [run_id])
         self.connection.executemany(
-            "INSERT INTO proposals VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO proposals VALUES (%s, %s, %s, %s, %s, %s, %s)",
             [
                 [
                     run_id,
@@ -356,14 +385,23 @@ class ExperimentStore:
         tables = ("runs", "strategies", "episodes", "episode_players", "ratings", "models", "proposals")
         written: list[Path] = []
         for table in tables:
-            run_filter = "run_id = ?" if table != "strategies" else "created_run_id = ?"
+            run_filter = "run_id = %s" if table != "strategies" else "created_run_id = %s"
             extension = "csv" if csv else "parquet"
             path = destination / f"{table}.{extension}"
-            escaped = str(path).replace("'", "''")
-            options = "(HEADER, DELIMITER ',')" if csv else "(FORMAT PARQUET, COMPRESSION ZSTD)"
-            self.connection.execute(
-                f"COPY (SELECT * FROM {table} WHERE {run_filter}) TO '{escaped}' {options}",
-                [run_id],
+            import pyarrow as pa
+            import pyarrow.csv as pa_csv
+            import pyarrow.parquet as pa_parquet
+
+            cursor = self.connection.execute(
+                f"SELECT * FROM {table} WHERE {run_filter}", [run_id]
             )
+            names = [column.name for column in cursor.description]
+            arrow_table = pa.Table.from_pylist(
+                [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+            )
+            if csv:
+                pa_csv.write_csv(arrow_table, path)
+            else:
+                pa_parquet.write_table(arrow_table, path, compression="zstd")
             written.append(path)
         return written

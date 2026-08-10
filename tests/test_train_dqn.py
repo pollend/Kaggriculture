@@ -23,7 +23,7 @@ def test_effective_dqn_config_builds_joint_self_play_roster(tmp_path: Path, monk
 
 
 def test_dqn_runner_uses_an_isolated_store_and_global_device():
-    assert train_dqn.DATABASE == Path("artifacts/dqn_self_play_experiments.duckdb")
+    assert train_dqn.LeagueConfig.from_toml(train_dqn.LEAGUE_CONFIG).league == "dqn_self_play"
     assert train_dqn.ARTIFACTS == Path("artifacts/dqn_self_play")
     assert train_dqn.FROZEN_DQN.endswith("?network_seed=0")
     assert train_dqn._device() == "auto"

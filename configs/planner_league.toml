@@ -1,4 +1,5 @@
 [league]
+league = "planner"
 name = "receding-horizon-planner-training"
 manifest = "agents/receding_horizon_planner/agent.toml"
 anchor_manifests = [

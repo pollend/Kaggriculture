@@ -29,6 +29,7 @@ INFRA_ALLOWED_SUFFIXES = (
     "experiment.py",
     "cli.py",
     "evaluation.py",
+    "progression.py",
 )
 INFRA_ALLOWED_DIRS = ("training",)
 

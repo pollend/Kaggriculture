@@ -90,7 +90,7 @@ class ConfigurableCropAdapter:
             FROM training_models tm
             JOIN model_training_checkpoints mtc
               ON mtc.checkpoint_id = tm.active_checkpoint_id
-            WHERE tm.model_id = ?
+            WHERE tm.model_id = %s
             """,
             [model_id],
         )
@@ -164,7 +164,7 @@ class CropSurrogateUpdater:
         ]
         if len(generation_ids) < 2:
             raise ValueError("crop surrogate requires at least two closed generations")
-        placeholders = ",".join("?" for _ in generation_ids)
+        placeholders = ",".join("%s" for _ in generation_ids)
         rows = reader.fetchall(
             f"""
             SELECT ar.params_json, rs.rating - 2 * rs.deviation AS target,

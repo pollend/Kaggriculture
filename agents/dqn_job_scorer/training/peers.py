@@ -24,7 +24,7 @@ def active_checkpoint_opponents(
     types = tuple(dict.fromkeys(str(item) for item in agent_types))
     if not types:
         return []
-    placeholders = ",".join("?" for _ in types)
+    placeholders = ",".join("%s" for _ in types)
     rows = reader.fetchall(
         f"""
         SELECT af.entry_point, cp.inference_artifact_path
@@ -32,7 +32,7 @@ def active_checkpoint_opponents(
         JOIN agent_families af USING (family_id)
         JOIN model_training_checkpoints cp
           ON cp.checkpoint_id = tm.active_checkpoint_id
-        WHERE tm.agent_type IN ({placeholders}) AND tm.model_id != ?
+        WHERE tm.agent_type IN ({placeholders}) AND tm.model_id != %s
         ORDER BY tm.agent_type, tm.agent_name, tm.model_id
         """,
         [*types, context.model_id],
@@ -57,7 +57,7 @@ def historical_checkpoint_opponents(
     types = tuple(dict.fromkeys(str(item) for item in agent_types))
     if not types or limit < 1:
         return []
-    placeholders = ",".join("?" for _ in types)
+    placeholders = ",".join("%s" for _ in types)
     rows = reader.fetchall(
         f"""
         SELECT af.entry_point, cp.inference_artifact_path

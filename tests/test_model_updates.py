@@ -13,7 +13,7 @@ from kaggriculture_lab.model_updates import (
     update_model_in_store,
 )
 from kaggriculture_lab.storage import ExperimentStore
-from scripts.rebuild_experiments_db import rebuild
+from tests.postgres_support import postgres_database
 
 
 class FakeTrainer:
@@ -39,7 +39,7 @@ trainer = FakeTrainer()
 
 
 def test_model_training_reader_rejects_multi_statement_bypass(tmp_path: Path):
-    with ExperimentStore(tmp_path / "reader.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "reader")) as store:
         reader = ModelTrainingReader(store)
         assert reader.fetchone("WITH value AS (SELECT 1 AS n) SELECT n FROM value") == (1,)
         for sql in (
@@ -59,14 +59,14 @@ def _register(store: ExperimentStore, model_id: str, promote: bool = True) -> No
         """
         INSERT INTO training_models (
             model_id, family_id, trainer_path, min_new_batches, config_json
-        ) VALUES (?, 'test', 'test_model_updates:trainer', 2, ?)
+        ) VALUES (%s, 'test', 'tests.test_model_updates:trainer', 2, %s)
         """,
         [model_id, '{"promote": true}' if promote else '{"promote": false}'],
     )
 
 
 def test_thresholds_idempotency_and_promotion(tmp_path: Path):
-    with ExperimentStore(tmp_path / "models.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "models")) as store:
         _register(store, "test.model")
         first = record_training_batch(
             store,
@@ -93,13 +93,28 @@ def test_thresholds_idempotency_and_promotion(tmp_path: Path):
             sample_count=5,
         )
         report = update_model_in_store(store, "test.model", artifacts=tmp_path)
-        assert report.status == "promoted"
+        assert report.status == "promoted", report.error
         assert report.active_checkpoint_id == "checkpoint-2"
         assert update_model_in_store(store, "test.model", artifacts=tmp_path, force=True).status == "deferred"
 
 
+def test_recorded_model_evaluation_bypasses_training_batch_threshold(tmp_path: Path):
+    with ExperimentStore(postgres_database(tmp_path, "evaluation")) as store:
+        _register(store, "test.model")
+        record_training_batch(
+            store,
+            "test.model",
+            source_kind="model_evaluation",
+            source_id="candidate-validation",
+            sample_count=8,
+        )
+        report = update_model_in_store(store, "test.model", artifacts=tmp_path)
+        assert report.status == "promoted", report.error
+        assert report.new_batches == 1
+
+
 def test_rejection_advances_only_its_models_watermark(tmp_path: Path):
-    with ExperimentStore(tmp_path / "models.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "models")) as store:
         _register(store, "test.rejected", promote=False)
         _register(store, "test.independent")
         for model_id in ("test.rejected", "test.independent"):
@@ -112,27 +127,10 @@ def test_rejection_advances_only_its_models_watermark(tmp_path: Path):
                     sample_count=1,
                 )
         rejected = update_model_in_store(store, "test.rejected", artifacts=tmp_path)
-        assert rejected.status == "rejected"
+        assert rejected.status == "rejected", rejected.error
         assert rejected.active_checkpoint_id is None
         assert update_model_in_store(store, "test.rejected", artifacts=tmp_path).status == "deferred"
         assert update_model_in_store(store, "test.independent", artifacts=tmp_path).status == "promoted"
-
-
-def test_rebuild_uses_schema_and_backs_up_existing_database(tmp_path: Path):
-    database = tmp_path / "experiments.duckdb"
-    with ExperimentStore(database) as store:
-        store.begin_run("old", "old", 1, {}, {}, None)
-    rebuilt, backup = rebuild(database, force=True)
-    assert rebuilt == database
-    assert backup is not None and backup.exists()
-    with ExperimentStore(database) as store:
-        tables = {
-            row[0]
-            for row in store.connection.execute(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'main'"
-            ).fetchall()
-        }
-        assert {"training_models", "model_round_hooks"} <= tables
 
 
 def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):
@@ -140,7 +138,7 @@ def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):
     manifest = AgentManifest.load(manifest_path)
     strategies = generate_population(12, seed=91)
     revisions = [build_revision(manifest, strategy) for strategy in strategies]
-    with ExperimentStore(tmp_path / "crop.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "crop")) as store:
         store.register_family(manifest, manifest_path)
         store.connection.execute(
             """
@@ -153,12 +151,12 @@ def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):
         for generation_index in range(2):
             generation_id = f"crop:g{generation_index:04d}"
             store.connection.execute(
-                "INSERT INTO generations VALUES (?, 'crop', ?, 'COMPLETE', NULL, now(), now())",
+                "INSERT INTO generations VALUES (%s, 'crop', %s, 'COMPLETE', NULL, now(), now())",
                 [generation_id, generation_index],
             )
             selected = revisions[generation_index * 6 : (generation_index + 1) * 6]
             store.connection.executemany(
-                "INSERT INTO rating_snapshots VALUES (?, ?, ?, 80, 0.06, 4, false)",
+                "INSERT INTO rating_snapshots VALUES (%s, %s, %s, 80, 0.06, 4, false)",
                 [
                     [generation_id, revision.revision_id, 1400 + index * 25]
                     for index, revision in enumerate(selected)
@@ -180,7 +178,7 @@ def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):
         assert report.status == "promoted"
         assert report.active_checkpoint_id is not None
         artifact = store.connection.execute(
-            "SELECT inference_artifact_path FROM model_training_checkpoints WHERE checkpoint_id = ?",
+            "SELECT inference_artifact_path FROM model_training_checkpoints WHERE checkpoint_id = %s",
             [report.active_checkpoint_id],
         ).fetchone()[0]
         assert Path(artifact).exists()

@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from kaggriculture_lab.dashboard import serve as serve_dashboard
+from kaggriculture_lab.database import database_target
 from kaggriculture_lab.identity import AgentManifest
 from kaggriculture_lab.league import (
     LeagueConfig,
@@ -25,16 +26,19 @@ from kaggriculture_lab.league import (
 )
 from kaggriculture_lab.storage import ExperimentStore
 
-DEFAULT_DATABASE = "artifacts/experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts"
 SAFE_NAME = re.compile(r"[a-z][a-z0-9_]*")
+
+
+def _target(args: argparse.Namespace, *, role: str = "writer"):
+    return database_target(url=args.database_url, role=role)
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
     destination = (
         Path(args.output) if args.output else Path(args.artifacts) / ("csv" if args.csv else "parquet") / args.run_id
     )
-    with ExperimentStore(args.database) as store:
+    with ExperimentStore(_target(args)) as store:
         paths = store.export(args.run_id, destination, csv=args.csv)
     print("\n".join(str(path) for path in paths))
     return 0
@@ -67,7 +71,7 @@ def _cmd_new_attempt(args: argparse.Namespace) -> int:
         "def evaluate_episode(\n"
         '    context: "EpisodeHookContext", reader: "EpisodeReader"\n'
         ") -> dict[str, Any]:\n"
-        '    """Derive training features after this episode is stored in DuckDB."""\n'
+        '    """Derive training features after this episode is stored in PostgreSQL."""\n'
         "    summary = reader.summary()\n"
         '    return {"schema_version": 1, "money_difference": summary["money_difference"]}\n'
     )
@@ -127,7 +131,7 @@ def _cmd_bundle(args: argparse.Namespace) -> int:
 
 def _cmd_league_init(args: argparse.Namespace) -> int:
     config = LeagueConfig.from_toml(args.config)
-    session_id = create_session(config, args.database, session_id=args.session_id)
+    session_id = create_session(config, _target(args), session_id=args.session_id)
     print(session_id)
     return 0
 
@@ -135,32 +139,33 @@ def _cmd_league_init(args: argparse.Namespace) -> int:
 def _cmd_league_run(args: argparse.Namespace) -> int:
     # Registration lives here rather than inside `run_generation` so the library
     # function never discovers the working tree's agents on its own.
-    with ExperimentStore(args.database) as store:
+    target = _target(args)
+    with ExperimentStore(target) as store:
         _register_training_models(store)
-    result = run_generation(args.session_id, args.database, args.artifacts, update_models=True)
+    result = run_generation(args.session_id, target, args.artifacts, update_models=True)
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 
 
 def _cmd_league_status(args: argparse.Namespace) -> int:
-    print(json.dumps(session_status(args.session_id, args.database), indent=2, sort_keys=True))
+    print(json.dumps(session_status(args.session_id, _target(args)), indent=2, sort_keys=True))
     return 0
 
 
 def _cmd_league_leaderboard(args: argparse.Namespace) -> int:
-    print(json.dumps(leaderboard(args.session_id, args.database, args.limit), indent=2, sort_keys=True))
+    print(json.dumps(leaderboard(args.session_id, _target(args), args.limit), indent=2, sort_keys=True))
     return 0
 
 
 def _cmd_league_next(args: argparse.Namespace) -> int:
-    print(create_next_generation(args.session_id, args.database))
+    print(create_next_generation(args.session_id, _target(args)))
     return 0
 
 
 def _cmd_league_evaluate(args: argparse.Namespace) -> int:
     result = reevaluate_hooks(
         args.session_id,
-        args.database,
+        _target(args),
         generation_id=args.generation_id,
         force=args.force,
     )
@@ -173,21 +178,21 @@ def _cmd_league_trainers(args: argparse.Namespace) -> int:
 
     if args.config:
         config = LeagueConfig.from_toml(args.config)
-        identifiers = set_training_agents(args.session_id, args.database, config)
+        identifiers = set_training_agents(args.session_id, _target(args), config)
         payload = {
             "training_agents": [asdict(item) for item in config.training_agents],
             "model_ids": list(identifiers),
         }
     else:
         manifests = list(args.manifest)
-        families = set_training_manifests(args.session_id, args.database, manifests)
+        families = set_training_manifests(args.session_id, _target(args), manifests)
         payload = {"training_manifests": manifests, "families": list(families)}
     print(json.dumps(payload, indent=2))
     return 0
 
 
 def _cmd_web(args: argparse.Namespace) -> int:
-    serve_dashboard(args.database, args.host, args.port)
+    serve_dashboard(_target(args, role="reader"), args.host, args.port)
     return 0
 
 
@@ -198,8 +203,12 @@ def _register_training_models(store: ExperimentStore) -> None:
             store.register_family(manifest, path)
 
 
+def _add_database(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database-url", help="PostgreSQL URL; defaults to the project env file")
+
+
 def _add_paths(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(parser)
     parser.add_argument("--artifacts", default=DEFAULT_ARTIFACTS)
 
 
@@ -225,7 +234,7 @@ def build_parser() -> argparse.ArgumentParser:
     bundle.set_defaults(func=_cmd_bundle)
 
     web = commands.add_parser("web", help="review persistent league sessions in a local dashboard")
-    web.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(web)
     web.add_argument("--host", default="127.0.0.1")
     web.add_argument("--port", type=int, default=8000)
     web.set_defaults(func=_cmd_web)
@@ -236,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     league_init = league_commands.add_parser("init", help="create generation zero")
     league_init.add_argument("--config", required=True)
     league_init.add_argument("--session-id")
-    league_init.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(league_init)
     league_init.set_defaults(func=_cmd_league_init)
 
     for name, help_text in (
@@ -255,32 +264,32 @@ def build_parser() -> argparse.ArgumentParser:
     league_trainers.add_argument("--session-id", required=True)
     league_trainers.add_argument("--config", help="read training_manifests from this league config")
     league_trainers.add_argument("--manifest", action="append", default=[], help="path to an agent.toml; repeatable")
-    league_trainers.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(league_trainers)
     league_trainers.set_defaults(func=_cmd_league_trainers)
 
     league_status = league_commands.add_parser("status", help="show persisted generation progress")
     league_status.add_argument("--session-id", required=True)
-    league_status.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(league_status)
     league_status.set_defaults(func=_cmd_league_status)
 
     league_board = league_commands.add_parser("leaderboard", help="show Glicko-2 standings")
     league_board.add_argument("--session-id", required=True)
     league_board.add_argument("--limit", type=int, default=20)
-    league_board.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(league_board)
     league_board.set_defaults(func=_cmd_league_leaderboard)
 
     league_next = league_commands.add_parser("next-generation", help="breed the next immutable population")
     league_next.add_argument("--session-id", required=True)
-    league_next.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(league_next)
     league_next.set_defaults(func=_cmd_league_next)
 
     league_evaluate = league_commands.add_parser(
-        "evaluate", help="run main.py episode hooks against stored DuckDB replays"
+        "evaluate", help="run main.py episode hooks against stored PostgreSQL replays"
     )
     league_evaluate.add_argument("--session-id", required=True)
     league_evaluate.add_argument("--generation-id")
     league_evaluate.add_argument("--force", action="store_true")
-    league_evaluate.add_argument("--database", default=DEFAULT_DATABASE)
+    _add_database(league_evaluate)
     league_evaluate.set_defaults(func=_cmd_league_evaluate)
 
     return parser

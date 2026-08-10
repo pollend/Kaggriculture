@@ -1,5 +1,13 @@
 # SP-PSRO Job Scorer
 
+> **Temporarily paused.** `python train_sp_psro.py` currently launches the
+> fixed-opponent DQN curriculum in `train_fixed_dqn.py`, using a separate
+> database and artifacts directory. It trains one learner against `starter`,
+> the configurable crop surrogate, and the receding-horizon planner with no
+> population mixture, Exp3 update, admission round, or self-play. The original
+> resumable population workflow remains available as
+> `python train_sp_psro_population.py`.
+
 This strategy keeps the DQN Job Scorer's inference policy and replaces its
 training curriculum with a learned self-play population policy inspired by
 Self-Play PSRO (arXiv:2207.06541). Each population member is one joint artifact:
@@ -25,10 +33,15 @@ approximation of the new policy's time average are admitted together only when
 their uniform pair has a positive paired-margin 95% lower bound against the old
 population. Rejected learners keep training. Accepted learners are frozen, both
 live learners are reset, and only accepted members participate in the bounded
-recent-policy pool.
+recent-policy pool. Admission is submitted as a seat-swapped league evaluation
+round after the candidate checkpoint is committed; every orientation and replay
+is durable, so an interrupted evaluation resumes only its missing games.
 
 The population is training-only. Each accepted member is evaluated on held-out
 seat-swapped games against the fixed validation suite. The live best response is
 evaluated by the same external release gate even before population admission, so
 an externally strong beta may become the inference artifact while it continues
 training. Population admission and submission release are deliberately separate.
+External validation is likewise a recorded league evaluation round. Its compact
+result batch advances the pending checkpoint immediately without counting as a
+gradient-training batch.

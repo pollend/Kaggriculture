@@ -12,7 +12,6 @@ from pathlib import Path
 from kaggriculture_lab.model_admin import add_model_commands
 
 MANIFEST = Path(__file__).with_name("agent.toml")
-DEFAULT_DATABASE = "artifacts/planner_experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts/planner"
 
 
@@ -22,7 +21,6 @@ def main(argv: list[str] | None = None) -> int:
     add_model_commands(
         commands,
         manifest_path=MANIFEST,
-        default_database=DEFAULT_DATABASE,
         default_artifacts=DEFAULT_ARTIFACTS,
     )
     args = parser.parse_args(argv)

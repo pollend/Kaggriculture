@@ -66,19 +66,17 @@ python -m sim.arena match \
 
 ## 2. League rounds — evolving a population
 
-A league is a persistent DuckDB session: generations of immutable agent revisions playing
+A league is a persistent PostgreSQL session: generations of immutable agent revisions playing
 paired matches, rated with Glicko-2, bred into the next generation.
 
 ```bash
-DB=artifacts/experiments.duckdb
-
 # Generation zero. Population is sampled by the agent family's own training adapter.
 .venv/bin/python -m kaggriculture_lab.cli league init \
-  --config configs/league_smoke.toml --session-id demo --database $DB
+  --config configs/league_smoke.toml --session-id demo
 
 # Play every pairing in the current generation. Resumable: rerun to continue.
 .venv/bin/python -m kaggriculture_lab.cli league run \
-  --session-id demo --database $DB --artifacts artifacts
+  --session-id demo --artifacts artifacts
 ```
 
 `league run` is also the normal model update call. After every closed round it invokes
@@ -94,9 +92,9 @@ hooks run after rating snapshots have been committed.
 Then inspect and breed:
 
 ```bash
-.venv/bin/python -m kaggriculture_lab.cli league status      --session-id demo --database $DB
-.venv/bin/python -m kaggriculture_lab.cli league leaderboard --session-id demo --database $DB --limit 10
-.venv/bin/python -m kaggriculture_lab.cli league next-generation --session-id demo --database $DB
+.venv/bin/python -m kaggriculture_lab.cli league status      --session-id demo
+.venv/bin/python -m kaggriculture_lab.cli league leaderboard --session-id demo --limit 10
+.venv/bin/python -m kaggriculture_lab.cli league next-generation --session-id demo
 ```
 
 `next-generation` builds a 20/50/20/10 elite / evolution / surrogate / random mix. The
@@ -109,7 +107,7 @@ episodes — finishes in under a minute) before `league.toml`.
 ### Episode hooks
 
 Each agent's `agent.toml` may name an `episode_evaluator`, run after every episode it plays,
-with read-only DuckDB access to *all* of its prior games:
+with read-only PostgreSQL access to *all* of its prior games:
 
 ```python
 def evaluate_episode(context, reader):
@@ -125,7 +123,7 @@ noisy to see that, since a good checkpoint still loses plenty of individual game
 Re-run hooks over stored replays without replaying anything:
 
 ```bash
-.venv/bin/python -m kaggriculture_lab.cli league evaluate --session-id demo --database $DB --force
+.venv/bin/python -m kaggriculture_lab.cli league evaluate --session-id demo --force
 ```
 
 ### Model learning across sessions
@@ -138,7 +136,7 @@ single object such as `trainer = "agents.dqn_job_scorer.train:trainer"` with two
 - `on_batch(context, reader)` receives all batches through a stable cutoff, the active
   checkpoint, and model config; it returns a gated candidate checkpoint.
 
-DuckDB stores the hook ledger, batches, batch watermark, update attempts, evaluations,
+PostgreSQL stores the hook ledger, batches, batch watermark, update attempts, evaluations,
 and active checkpoint pointer by `model_id`. Therefore restarting the process, resuming
 the same league, or creating another session against the same database preserves what
 the model learned. Using another database starts an isolated history. Completed hooks
@@ -155,10 +153,10 @@ can be changed safely on an existing session:
 
 ```bash
 .venv/bin/python -m kaggriculture_lab.cli league trainers \
-  --session-id demo --database $DB --config configs/league.toml
+  --session-id demo --config configs/league.toml
 
-.venv/bin/python -m agents.configurable_crop_surrogate.cli model status --database $DB
-.venv/bin/python -m agents.dqn_job_scorer.cli model status --name dqn05 --database $DB
+.venv/bin/python -m agents.configurable_crop_surrogate.cli model status
+.venv/bin/python -m agents.dqn_job_scorer.cli model status --name dqn05
 ```
 
 ## 3. Training rounds — the DQN
@@ -170,7 +168,7 @@ collection and eligible update automatically:
 
 ```bash
 .venv/bin/python -m kaggriculture_lab.cli league run \
-  --session-id demo --database $DB --artifacts artifacts
+  --session-id demo --artifacts artifacts
 ```
 
 For an isolated research run that does not use the league database, the standalone loop
@@ -237,7 +235,7 @@ without breaking the others.
 
 ```
 sim/                 game-agnostic match runner and paired statistics
-kaggriculture_lab/   league, DuckDB storage, hooks, episode analysis
+kaggriculture_lab/   league, PostgreSQL storage, hooks, episode analysis
 agents/<name>/       one self-contained agent each
   train.py           the lab-facing on_round/on_batch trainer object
   training/          model implementation and replay code (never bundled)

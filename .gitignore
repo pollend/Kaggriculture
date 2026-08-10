@@ -11,3 +11,4 @@ agents/receding_horizon_planner/submission/
 agents/receding_horizon_planner/receding_horizon_planner_submission.tgz
 *.duckdb
 *.joblib
+.kaggriculture/

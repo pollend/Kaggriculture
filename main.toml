@@ -17,7 +17,6 @@ export_active_dqn_weights = false
 device = "auto"
 
 [paths]
-database = "artifacts/experiments.duckdb"
 artifacts = "artifacts"
 league_config = "configs/league.toml"
 dqn_weights_output = "agents/dqn_job_scorer/weights.npz"

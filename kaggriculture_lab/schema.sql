@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS episodes (
     seat0_spec VARCHAR NOT NULL,
     seat1_spec VARCHAR NOT NULL,
     steps INTEGER NOT NULL,
-    wallclock DOUBLE NOT NULL,
+    wallclock DOUBLE PRECISION NOT NULL,
     failed BOOLEAN NOT NULL,
     replay_path VARCHAR
 );
@@ -41,18 +41,18 @@ CREATE TABLE IF NOT EXISTS episode_players (
     opponent_id VARCHAR NOT NULL,
     status VARCHAR NOT NULL,
     failed BOOLEAN NOT NULL,
-    reward DOUBLE,
-    final_money DOUBLE,
-    opponent_money DOUBLE,
-    money_difference DOUBLE,
-    win DOUBLE,
+    reward DOUBLE PRECISION,
+    final_money DOUBLE PRECISION,
+    opponent_money DOUBLE PRECISION,
+    money_difference DOUBLE PRECISION,
+    win DOUBLE PRECISION,
     total_unit_actions BIGINT,
     productive_actions BIGINT,
     movement_actions BIGINT,
     idle_actions BIGINT,
-    productive_action_percentage DOUBLE,
-    movement_percentage DOUBLE,
-    idle_percentage DOUBLE,
+    productive_action_percentage DOUBLE PRECISION,
+    movement_percentage DOUBLE PRECISION,
+    idle_percentage DOUBLE PRECISION,
     plants_lost_inferred BIGINT,
     final_shed_items BIGINT,
     final_carried_items BIGINT,
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS episode_players (
 CREATE TABLE IF NOT EXISTS ratings (
     run_id VARCHAR NOT NULL,
     strategy_id VARCHAR NOT NULL,
-    rating DOUBLE NOT NULL,
+    rating DOUBLE PRECISION NOT NULL,
     games INTEGER NOT NULL,
     PRIMARY KEY (run_id, strategy_id)
 );
@@ -82,9 +82,9 @@ CREATE TABLE IF NOT EXISTS proposals (
     strategy_id VARCHAR NOT NULL,
     rank INTEGER NOT NULL,
     acquisition VARCHAR NOT NULL,
-    predicted_quality DOUBLE,
-    predicted_matchup DOUBLE,
-    uncertainty DOUBLE,
+    predicted_quality DOUBLE PRECISION,
+    predicted_matchup DOUBLE PRECISION,
+    uncertainty DOUBLE PRECISION,
     PRIMARY KEY (run_id, strategy_id)
 );
 
@@ -117,6 +117,7 @@ CREATE TABLE IF NOT EXISTS agent_revisions (
 
 CREATE TABLE IF NOT EXISTS training_sessions (
     session_id VARCHAR PRIMARY KEY,
+    league VARCHAR NOT NULL,
     name VARCHAR NOT NULL,
     status VARCHAR NOT NULL,
     seed BIGINT NOT NULL,
@@ -139,9 +140,9 @@ CREATE TABLE IF NOT EXISTS generation_members (
     generation_id VARCHAR NOT NULL,
     revision_id VARCHAR NOT NULL,
     role VARCHAR NOT NULL,
-    initial_rating DOUBLE NOT NULL,
-    initial_deviation DOUBLE NOT NULL,
-    initial_volatility DOUBLE NOT NULL,
+    initial_rating DOUBLE PRECISION NOT NULL,
+    initial_deviation DOUBLE PRECISION NOT NULL,
+    initial_volatility DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (generation_id, revision_id)
 );
 
@@ -165,14 +166,14 @@ CREATE TABLE IF NOT EXISTS pairing_episodes (
 
 CREATE TABLE IF NOT EXISTS episode_payloads (
     match_id VARCHAR PRIMARY KEY,
-    replay_gzip BLOB NOT NULL,
+    replay_gzip BYTEA NOT NULL,
     payload_sha256 VARCHAR NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pairing_results (
     pairing_id VARCHAR PRIMARY KEY,
-    paired_margin DOUBLE,
-    outcome_a DOUBLE,
+    paired_margin DOUBLE PRECISION,
+    outcome_a DOUBLE PRECISION,
     failed BOOLEAN NOT NULL,
     episodes_completed INTEGER NOT NULL,
     metrics_json JSON NOT NULL
@@ -199,10 +200,10 @@ CREATE TABLE IF NOT EXISTS generation_stats (
     wins INTEGER NOT NULL,
     draws INTEGER NOT NULL,
     losses INTEGER NOT NULL,
-    mean_margin DOUBLE,
-    median_margin DOUBLE,
-    margin_ci_low DOUBLE,
-    margin_ci_high DOUBLE,
+    mean_margin DOUBLE PRECISION,
+    median_margin DOUBLE PRECISION,
+    margin_ci_low DOUBLE PRECISION,
+    margin_ci_high DOUBLE PRECISION,
     opponent_diversity INTEGER NOT NULL,
     PRIMARY KEY (generation_id, revision_id)
 );
@@ -210,9 +211,9 @@ CREATE TABLE IF NOT EXISTS generation_stats (
 CREATE TABLE IF NOT EXISTS rating_snapshots (
     generation_id VARCHAR NOT NULL,
     revision_id VARCHAR NOT NULL,
-    rating DOUBLE NOT NULL,
-    deviation DOUBLE NOT NULL,
-    volatility DOUBLE NOT NULL,
+    rating DOUBLE PRECISION NOT NULL,
+    deviation DOUBLE PRECISION NOT NULL,
+    volatility DOUBLE PRECISION NOT NULL,
     games INTEGER NOT NULL,
     is_frozen BOOLEAN NOT NULL,
     PRIMARY KEY (generation_id, revision_id)
@@ -243,7 +244,7 @@ CREATE TABLE IF NOT EXISTS lineage (
 );
 
 -- Incremental model training. Large datasets and checkpoints remain immutable
--- filesystem artifacts; this catalog owns identity, lineage, and decisions.
+-- filesystem artifacts; this database owns identity, lineage, and decisions.
 CREATE TABLE IF NOT EXISTS training_models (
     model_id VARCHAR PRIMARY KEY,
     family_id VARCHAR NOT NULL,
@@ -322,7 +323,7 @@ CREATE TABLE IF NOT EXISTS model_evaluations (
 -- roll out episodes for minutes, so "already done" cannot be re-derived from
 -- pairing status -- resuming a half-finished generation would re-fire every
 -- earlier round. `round_index` uses -1 for generation scope rather than NULL:
--- DuckDB's UNIQUE does not dedupe NULL-bearing keys, so a nullable column would
+-- A non-null sentinel keeps generation-scope hook identity unambiguous.
 -- silently admit two generation rows.
 CREATE TABLE IF NOT EXISTS model_round_hooks (
     hook_id VARCHAR PRIMARY KEY,
@@ -359,7 +360,7 @@ CREATE TABLE IF NOT EXISTS policy_mixture_members (
     mixture_id VARCHAR NOT NULL,
     revision_id VARCHAR NOT NULL,
     ordinal INTEGER NOT NULL,
-    weight DOUBLE NOT NULL,
+    weight DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (mixture_id, revision_id)
 );
 

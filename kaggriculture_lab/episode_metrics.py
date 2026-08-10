@@ -6,7 +6,7 @@ mix, crops planted, plants lost, market orders, money -- lives here and is
 injected into `run_match` by the callers that want it.
 
 Used by the league to persist per-episode metrics, which agents' own evaluation
-hooks then read back out of DuckDB.
+hooks then read back out of PostgreSQL.
 """
 
 from __future__ import annotations

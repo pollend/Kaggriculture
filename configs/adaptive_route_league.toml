@@ -1,4 +1,5 @@
 [league]
+league = "adaptive_route"
 name = "adaptive-route-planner-training"
 manifest = "agents/adaptive_route_planner/agent.toml"
 anchor_manifests = [
@@ -17,4 +18,3 @@ seed = 70117
 jobs = 0
 tau = 0.5
 candidate_pool = 10000
-

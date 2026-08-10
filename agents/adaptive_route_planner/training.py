@@ -90,7 +90,7 @@ class AdaptiveRouteTrainingAdapter:
             FROM training_models tm
             JOIN model_training_checkpoints mtc
               ON mtc.checkpoint_id = tm.active_checkpoint_id
-            WHERE tm.model_id = ?
+            WHERE tm.model_id = %s
             """,
             [model_id],
         )
@@ -132,7 +132,7 @@ class AdaptiveRouteSurrogateTrainer:
         generation_ids = [batch.source_id for batch in context.all_batches if batch.source_kind == "league_generation"]
         if len(generation_ids) < 2:
             raise ValueError("adaptive route surrogate requires two closed generations")
-        placeholders = ",".join("?" for _ in generation_ids)
+        placeholders = ",".join("%s" for _ in generation_ids)
         rows = reader.fetchall(
             f"""
             SELECT ar.params_json, rs.rating - 2 * rs.deviation AS target,
@@ -140,7 +140,7 @@ class AdaptiveRouteSurrogateTrainer:
             FROM rating_snapshots rs
             JOIN generations g USING (generation_id)
             JOIN agent_revisions ar USING (revision_id)
-            WHERE g.generation_id IN ({placeholders}) AND ar.family_id = ?
+            WHERE g.generation_id IN ({placeholders}) AND ar.family_id = %s
               AND ar.params_json IS NOT NULL AND NOT rs.is_frozen
             ORDER BY g.generation_index, ar.revision_id
             """,

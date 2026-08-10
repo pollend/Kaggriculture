@@ -1,0 +1,18 @@
+[league]
+league = "mixed_farm_v3"
+name = "configurable-mixed-farm-v3-training"
+manifest = "agents/configurable_mixed_farm_surrogate/agent.toml"
+anchor_manifests = [
+  "agents/configurable_crop_surrogate/agent.toml",
+  "agents/receding_horizon_planner/agent.toml",
+  "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/agent.toml",
+]
+training_manifests = ["agents/configurable_mixed_farm_surrogate/agent.toml"]
+population_size = 20
+rounds_per_generation = 24
+hall_of_fame_rounds = 12
+episode_steps = 720
+seed = 2718
+jobs = 0
+tau = 0.5
+candidate_pool = 10000

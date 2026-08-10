@@ -22,6 +22,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from agents.configurable_crop_surrogate.strategy import Strategy, generate_population
+from kaggriculture_lab.database import DatabaseTarget
 from kaggriculture_lab.episode_metrics import episode_metrics
 from kaggriculture_lab.storage import ExperimentStore
 from sim.runner import MatchResult, run_match
@@ -97,7 +98,7 @@ def _match_id(
 
 def _versions() -> dict[str, str]:
     result = {"python": os.sys.version.split()[0]}
-    for package in ("kaggle-environments", "duckdb", "pandas", "scikit-learn"):
+    for package in ("kaggle-environments", "psycopg", "pandas", "scikit-learn"):
         try:
             result[package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
@@ -330,7 +331,7 @@ class ExperimentRunner:
 
 def run_experiment(
     config: ExperimentConfig,
-    database: str | Path = "artifacts/experiments.duckdb",
+    database: str | DatabaseTarget,
     artifacts: str | Path = "artifacts",
     run_id: str | None = None,
 ) -> str:

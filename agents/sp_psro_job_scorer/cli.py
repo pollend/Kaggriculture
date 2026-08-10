@@ -9,10 +9,10 @@ from pathlib import Path
 
 import torch
 
+from kaggriculture_lab.database import database_target
 from kaggriculture_lab.model_admin import add_model_commands
 
 MANIFEST = Path(__file__).with_name("agent.toml")
-DEFAULT_DATABASE = "artifacts/sp_psro_v4_experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts/sp_psro_v4"
 
 
@@ -24,14 +24,14 @@ def _default_model_id() -> str:
 def _population_status(args: argparse.Namespace) -> int:
     from kaggriculture_lab.storage import ExperimentStore
 
-    with ExperimentStore(args.database) as store:
+    with ExperimentStore(database_target(url=args.database_url)) as store:
         row = store.connection.execute(
             """
             SELECT mtc.trainer_artifact_path
             FROM training_models tm
             LEFT JOIN model_training_checkpoints mtc
               ON mtc.checkpoint_id = tm.active_checkpoint_id
-            WHERE tm.model_id = ?
+            WHERE tm.model_id = %s
             """,
             [args.model_id],
         ).fetchone()
@@ -58,12 +58,11 @@ def main(argv: list[str] | None = None) -> int:
     add_model_commands(
         commands,
         manifest_path=MANIFEST,
-        default_database=DEFAULT_DATABASE,
         default_artifacts=DEFAULT_ARTIFACTS,
         allow_export=True,
     )
     population = commands.add_parser("population-status")
-    population.add_argument("--database", default=DEFAULT_DATABASE)
+    population.add_argument("--database-url")
     population.add_argument("--model-id", default=_default_model_id())
     population.set_defaults(func=_population_status)
     args = parser.parse_args(argv)

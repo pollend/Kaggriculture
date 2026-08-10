@@ -83,7 +83,7 @@ class PlannerTrainingAdapter:
             FROM training_models tm
             JOIN model_training_checkpoints mtc
               ON mtc.checkpoint_id = tm.active_checkpoint_id
-            WHERE tm.model_id = ?
+            WHERE tm.model_id = %s
             """,
             [model_id],
         )
@@ -130,7 +130,7 @@ class PlannerSurrogateTrainer:
         generation_ids = [batch.source_id for batch in context.all_batches if batch.source_kind == "league_generation"]
         if len(generation_ids) < 2:
             raise ValueError("planner surrogate requires at least two closed generations")
-        placeholders = ",".join("?" for _ in generation_ids)
+        placeholders = ",".join("%s" for _ in generation_ids)
         rows = reader.fetchall(
             f"""
             SELECT ar.params_json, rs.rating - 2 * rs.deviation AS target,
@@ -139,7 +139,7 @@ class PlannerSurrogateTrainer:
             JOIN generations g ON g.generation_id = rs.generation_id
             JOIN agent_revisions ar ON ar.revision_id = rs.revision_id
             WHERE g.generation_id IN ({placeholders})
-              AND ar.family_id = ?
+              AND ar.family_id = %s
               AND ar.params_json IS NOT NULL AND NOT rs.is_frozen
             ORDER BY g.generation_index, ar.revision_id
             """,

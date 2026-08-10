@@ -8,7 +8,6 @@ from pathlib import Path
 from kaggriculture_lab.model_admin import add_model_commands
 
 MANIFEST = Path(__file__).with_name("agent.toml")
-DEFAULT_DATABASE = "artifacts/adaptive_route_experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts/adaptive_route_planner"
 
 
@@ -18,7 +17,6 @@ def main(argv: list[str] | None = None) -> int:
     add_model_commands(
         commands,
         manifest_path=MANIFEST,
-        default_database=DEFAULT_DATABASE,
         default_artifacts=DEFAULT_ARTIFACTS,
     )
     args = parser.parse_args(argv)
@@ -27,4 +25,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

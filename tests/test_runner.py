@@ -1,10 +1,14 @@
+import hashlib
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from kaggriculture_lab import runner
-from kaggriculture_lab.dashboard import DashboardRepository
+from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.storage import ExperimentStore
+from tests.postgres_support import postgres_database
 
 
 def test_run_generations_reports_round_start_and_session_completion(
@@ -38,10 +42,9 @@ def test_run_generations_reports_round_start_and_session_completion(
 
     runner.run_generations(
         session_id="training-session",
-        database=Path("database.duckdb"),
+        database="postgresql://writer:test@127.0.0.1/test",
         artifacts=Path("artifacts"),
         generations=1,
-        dashboard=False,
     )
 
     output = capsys.readouterr().out
@@ -50,22 +53,7 @@ def test_run_generations_reports_round_start_and_session_completion(
     assert "training session run completed (1 generation)" in output
 
 
-def test_run_generations_starts_and_stops_embedded_dashboard(monkeypatch, capsys):
-    calls = []
-
-    class FakeServer:
-        server_address = ("127.0.0.1", 8123)
-
-        def serve_forever(self):
-            calls.append("serve")
-
-        def shutdown(self):
-            calls.append("shutdown")
-
-        def server_close(self):
-            calls.append("close")
-
-    monkeypatch.setattr(runner, "make_server", lambda *args, **kwargs: FakeServer())
+def test_run_generations_does_not_own_dashboard_or_mcp(monkeypatch, capsys):
     monkeypatch.setattr(runner, "session_status", lambda *args: {"status": "OPEN"})
     monkeypatch.setattr(
         runner,
@@ -75,13 +63,14 @@ def test_run_generations_starts_and_stops_embedded_dashboard(monkeypatch, capsys
 
     runner.run_generations(
         session_id="session",
-        database=Path("database.duckdb"),
+        database="postgresql://writer:test@127.0.0.1/test",
         artifacts=Path("artifacts"),
         generations=1,
     )
 
-    assert calls == ["serve", "shutdown", "close"]
-    assert "dashboard: http://127.0.0.1:8123/" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "dashboard:" not in output
+    assert "MCP:" not in output
 
 
 def test_continuous_generations_are_blocking_and_sequential(monkeypatch, capsys):
@@ -104,26 +93,65 @@ def test_continuous_generations_are_blocking_and_sequential(monkeypatch, capsys)
     with pytest.raises(KeyboardInterrupt):
         runner.run_generations(
             session_id="continuous",
-            database=Path("database.duckdb"),
+            database="postgresql://writer:test@127.0.0.1/test",
             artifacts=Path("artifacts"),
             generations=5,
             continuous=True,
-            dashboard=False,
         )
 
     assert calls == ["create", "run", "create", "run", "create", "run"]
     assert "generation 1 started" in capsys.readouterr().out
 
 
-def test_embedded_dashboard_can_read_while_training_store_is_open(tmp_path):
-    database = tmp_path / "live.duckdb"
+def test_ensure_session_upgrades_only_the_legacy_missing_league_manifest(tmp_path: Path):
+    database = postgres_database(tmp_path, "legacy-run-manifest")
+    config = LeagueConfig(
+        league="mixed_farm_v3",
+        name="legacy-manifest-test",
+        population_size=2,
+        rounds_per_generation=1,
+        hall_of_fame_rounds=0,
+        episode_steps=1,
+    )
+    runner.ensure_session(
+        config,
+        database,
+        "legacy-manifest-session",
+        artifacts=tmp_path,
+    )
     with ExperimentStore(database) as store:
+        row = store.connection.execute(
+            "SELECT manifest_json FROM session_manifests WHERE session_id = %s",
+            ["legacy-manifest-session"],
+        ).fetchone()
+        payload = json.loads(row[0])
+        del payload["league"]["league"]
+        legacy_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        legacy_digest = hashlib.sha256(legacy_json.encode()).hexdigest()
         store.connection.execute(
-            "INSERT INTO training_sessions VALUES (?, ?, ?, ?, ?, current_timestamp)",
-            ["live", "live", "RUNNING", 1, "{}"],
+            "UPDATE session_manifests SET manifest_json = %s, manifest_sha256 = %s "
+            "WHERE session_id = %s",
+            [legacy_json, legacy_digest, "legacy-manifest-session"],
         )
-        repository = DashboardRepository(database, read_only=False)
-        with repository.connect() as connection:
-            assert connection.execute(
-                "SELECT status FROM training_sessions WHERE session_id = 'live'"
-            ).fetchone()[0] == "RUNNING"
+
+    created, _ = runner.ensure_session(
+        config,
+        database,
+        "legacy-manifest-session",
+        artifacts=tmp_path,
+    )
+
+    assert created is False
+    with ExperimentStore(database) as store:
+        upgraded = store.connection.execute(
+            "SELECT manifest_json FROM session_manifests WHERE session_id = %s",
+            ["legacy-manifest-session"],
+        ).fetchone()[0]
+    assert json.loads(upgraded)["league"]["league"] == "mixed_farm_v3"
+    with pytest.raises(ValueError, match="manifest mismatch"):
+        runner.ensure_session(
+            replace(config, seed=config.seed + 1),
+            database,
+            "legacy-manifest-session",
+            artifacts=tmp_path,
+        )

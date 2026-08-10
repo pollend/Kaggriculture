@@ -11,6 +11,7 @@ import tomllib
 from dataclasses import replace
 from pathlib import Path
 
+from kaggriculture_lab.database import database_target
 from kaggriculture_lab.identity import TrainingAgentSpec
 from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.model_admin import model_status
@@ -26,7 +27,6 @@ FINAL_ARENA_JOBS = 8
 SYNC_ENVIRONMENT = True
 
 SESSION_ID = "dqn-self-play-training"
-DATABASE = Path("artifacts/dqn_self_play_experiments.duckdb")
 ARTIFACTS = Path("artifacts/dqn_self_play")
 LEAGUE_CONFIG = Path("configs/dqn_league.toml")
 FROZEN_DQN = (
@@ -43,6 +43,10 @@ DQN_SELF_PLAY_CONFIG = {
     "self_play_pool": 5,
     "self_play_ratio": 0.3,
 }
+
+
+def _database():
+    return database_target()
 TRAINING_AGENTS = [
     {
         "type": "dqn_job_scorer",
@@ -85,7 +89,7 @@ def _ensure_session() -> None:
     config = _effective_config()
     created, _ = ensure_session(
         config,
-        DATABASE,
+        _database(),
         SESSION_ID,
         workspace=REPO_ROOT,
         artifacts=ARTIFACTS,
@@ -103,7 +107,7 @@ def _model_status() -> None:
         print(
             model_status(
                 REPO_ROOT / "agents/dqn_job_scorer/agent.toml",
-                DATABASE,
+                _database(),
                 name=name,
             )
         )
@@ -147,7 +151,7 @@ def main() -> int:
 
     run_generations(
         session_id=SESSION_ID,
-        database=DATABASE,
+        database=_database(),
         artifacts=ARTIFACTS,
         generations=GENERATIONS,
         workspace=REPO_ROOT,

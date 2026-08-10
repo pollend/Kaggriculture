@@ -15,6 +15,7 @@ import tomllib
 from dataclasses import replace
 from pathlib import Path
 
+from kaggriculture_lab.database import database_target
 from kaggriculture_lab.identity import TrainingAgentSpec
 from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.model_admin import export_active_model, model_status
@@ -31,7 +32,6 @@ FINAL_ARENA_SEEDS = 20
 FINAL_ARENA_JOBS = 24  # set to None to use the arena's automatic default
 
 SESSION_ID = "all-agents-training"
-DATABASE = Path("artifacts/experiments.duckdb")
 ARTIFACTS = Path("artifacts")
 LEAGUE_CONFIG = Path("configs/league.toml")
 INCLUDE_ALL_AGENT_ANCHORS = True
@@ -64,6 +64,11 @@ TRAINING_AGENTS = [
     {
         "type": "receding_horizon_planner",
         "name": "default",
+        "train": False,
+    },
+    {
+        "type": "configurable_mixed_farm_surrogate",
+        "name": "v3",
         "train": False,
     },
     {
@@ -128,6 +133,10 @@ TRAINING_AGENTS = [
     },
 ]
 
+
+def _database():
+    return database_target()
+
 SYNC_ENVIRONMENT = True
 # Shipping is an explicit release action. A long-running trainer must never
 # replace the reviewed submission checkpoint merely because a gate passed.
@@ -147,7 +156,7 @@ MAIN_CONFIG = REPO_ROOT / "main.toml"
 def _load_main_config(path: Path = MAIN_CONFIG) -> None:
     """Apply machine-level root settings to this constants-driven runner."""
 
-    global ARTIFACTS, DATABASE, DQN_WEIGHTS_OUTPUT, EXPORT_ACTIVE_DQN_WEIGHTS
+    global ARTIFACTS, DQN_WEIGHTS_OUTPUT, EXPORT_ACTIVE_DQN_WEIGHTS
     global FINAL_ARENA_JOBS, FINAL_ARENA_SEEDS, GENERATIONS, INCLUDE_ALL_AGENT_ANCHORS
     global LEAGUE_CONFIG, RUN_FINAL_ARENA, SESSION_ID, SYNC_ENVIRONMENT, TRAINING_DEVICE
 
@@ -168,7 +177,6 @@ def _load_main_config(path: Path = MAIN_CONFIG) -> None:
     EXPORT_ACTIVE_DQN_WEIGHTS = training.get(
         "export_active_dqn_weights", EXPORT_ACTIVE_DQN_WEIGHTS
     )
-    DATABASE = Path(paths.get("database", DATABASE))
     ARTIFACTS = Path(paths.get("artifacts", ARTIFACTS))
     LEAGUE_CONFIG = Path(paths.get("league_config", LEAGUE_CONFIG))
     DQN_WEIGHTS_OUTPUT = Path(paths.get("dqn_weights_output", DQN_WEIGHTS_OUTPUT))
@@ -251,7 +259,7 @@ def _ensure_session() -> None:
         raise FileNotFoundError(f"league config not found: {LEAGUE_CONFIG}")
     created, _ = ensure_session(
         config,
-        DATABASE,
+        _database(),
         SESSION_ID,
         workspace=REPO_ROOT,
         artifacts=ARTIFACTS,
@@ -274,7 +282,7 @@ def _after_training_iteration(iteration: int, _: dict) -> None:
         try:
             export_active_model(
                 REPO_ROOT / "agents/dqn_job_scorer/agent.toml",
-                DATABASE,
+                _database(),
                 DQN_WEIGHTS_OUTPUT,
                 confirm_release=True,
                 name=DQN_EXPORT_NAME,
@@ -292,7 +300,7 @@ def _after_training_iteration(iteration: int, _: dict) -> None:
             continue
         manifest = REPO_ROOT / "agents" / str(instance["type"]) / "agent.toml"
         if manifest.is_file():
-            print(model_status(manifest, DATABASE, name=str(instance["name"])))
+            print(model_status(manifest, _database(), name=str(instance["name"])))
 
 
 def _run_final_arena() -> None:
@@ -322,7 +330,7 @@ def main() -> int:
     _ensure_session()
     run_generations(
         session_id=SESSION_ID,
-        database=DATABASE,
+        database=_database(),
         artifacts=ARTIFACTS,
         generations=GENERATIONS,
         workspace=REPO_ROOT,

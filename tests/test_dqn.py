@@ -8,6 +8,8 @@ that stops being deterministic at epsilon=0.
 
 from __future__ import annotations
 
+from tests.postgres_support import postgres_database
+
 import copy
 import hashlib
 import json
@@ -125,6 +127,8 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_p
     manifest = AgentManifest.load(manifest_path)
     artifact = save_episode_batch([episode], tmp_path / "rollout.npz")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    incumbent = tmp_path / "incumbent.npz"
+    PolicyBundle.random(seed=19).save(incumbent)
     config = {
         **(manifest.models[0].config or {}),
         "gradient_steps_per_batch": 1,
@@ -133,6 +137,8 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_p
         "warmup_episodes": 1,
         "jobs": 1,
         "eval_seeds": 1,
+        "initialization": "incumbent",
+        "incumbent_weights": str(incumbent),
     }
     unresolved_evaluation = {
         "opponent": "test",
@@ -153,10 +159,10 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_p
         },
     )
 
-    with ExperimentStore(tmp_path / "dqn.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "dqn")) as store:
         store.register_family(manifest, manifest_path)
         store.connection.execute(
-            "UPDATE training_models SET config_json = ? WHERE model_id = ?",
+            "UPDATE training_models SET config_json = %s WHERE model_id = %s",
             [json.dumps(config), MODEL_ID],
         )
         # Derived, not hardcoded: the threshold tracks the league's round count.
@@ -176,12 +182,21 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_p
         checkpoint = store.connection.execute(
             """
             SELECT trainer_artifact_path, inference_artifact_path
-            FROM model_training_checkpoints WHERE checkpoint_id = ?
+            FROM model_training_checkpoints WHERE checkpoint_id = %s
             """,
             [report.checkpoint_id],
         ).fetchone()
         assert Path(checkpoint[0]).exists()
         assert Path(checkpoint[1]).exists()
+        evaluation = store.connection.execute(
+            """
+            SELECT opponent_checkpoint_id
+            FROM model_evaluations
+            WHERE update_id = %s AND evaluation_kind = 'incumbent_head_to_head'
+            """,
+            [report.update_id],
+        ).fetchone()
+        assert evaluation == (None,)
 
 
 def test_feature_dimensions_are_pinned():
@@ -760,7 +775,7 @@ def test_episode_reader_rejects_mutating_and_multi_statement_sql(tmp_path):
     """A reporting hook must not be able to write to the league it reports on."""
     from kaggriculture_lab.hooks import EpisodeReader
 
-    with ExperimentStore(tmp_path / "readonly.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "readonly")) as store:
         reader = EpisodeReader(connection=store.connection, match_id="m", seat=0)
         for statement in (
             "DELETE FROM episode_players",
@@ -805,7 +820,7 @@ def test_truncation_keeps_maintenance_over_planting():
     assert all(job.kind == "PLANT" for job in jobs if job.kind not in {"PASS", "WATER"})
 
 
-def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
+def test_evaluator_runs_against_the_real_postgres_schema(tmp_path):
     """The fake-reader tests pin the logic; this pins the SQL.
 
     `EpisodeReader.history` joins `episode_players` by `strategy_id`, and a
@@ -841,7 +856,7 @@ def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
             replay={"steps": [[{"observation": {"step": 0}}]]},
         )
 
-    with ExperimentStore(tmp_path / "league.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "league")) as store:
         # 30 prior games: the older half strong, the recent half collapsed.
         for index in range(30):
             mine = 21_000.0 if index < 15 else 8_000.0
@@ -1106,7 +1121,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
         model_id = MODEL_ID
         family_id = "dqn_job_scorer"
 
-    with ExperimentStore(tmp_path / "pool.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "pool")) as store:
         store.register_family(manifest, manifest_path)
         for index, (path, promoted) in enumerate(((present, True), (missing, True), (present, False))):
             store.connection.execute(
@@ -1114,7 +1129,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
                 INSERT INTO model_updates (
                     update_id, model_id, cutoff_batch_seq, new_batch_count,
                     dataset_sha256, status
-                ) VALUES (?, 'dqn_job_scorer.adaptive_hybrid_q_v2', ?, 1, 'd', 'PROMOTED')
+                ) VALUES (%s, 'dqn_job_scorer.adaptive_hybrid_q_v2', %s, 1, 'd', 'PROMOTED')
                 """,
                 [f"update{index}", index + 1],
             )
@@ -1124,7 +1139,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
                     checkpoint_id, model_id, update_id, trainer_artifact_path,
                     inference_artifact_path, artifact_sha256, dataset_sha256,
                     metrics_json, gate_json, promoted
-                ) VALUES (?, 'dqn_job_scorer.adaptive_hybrid_q_v2', ?, ?, ?, 'a', 'd', '{}', '{}', ?)
+                ) VALUES (%s, 'dqn_job_scorer.adaptive_hybrid_q_v2', %s, %s, %s, 'a', 'd', '{}', '{}', %s)
                 """,
                 [f"checkpoint{index}", f"update{index}", str(path), str(path), promoted],
             )
@@ -1153,7 +1168,7 @@ def test_joint_peer_pool_finds_active_instances_and_non_active_history(tmp_path)
     class Context:
         model_id = MODEL_ID
 
-    with ExperimentStore(tmp_path / "joint-pool.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "joint-pool")) as store:
         store.register_training_agent(
             dqn_manifest,
             dqn_manifest_path,
@@ -1178,7 +1193,7 @@ def test_joint_peer_pool_finds_active_instances_and_non_active_history(tmp_path)
                 INSERT INTO model_updates (
                     update_id, model_id, cutoff_batch_seq, new_batch_count,
                     dataset_sha256, status
-                ) VALUES (?, ?, 1, 1, ?, 'PROMOTED')
+                ) VALUES (%s, %s, 1, 1, %s, 'PROMOTED')
                 """,
                 [update_id, model_id, checkpoint_id],
             )
@@ -1188,13 +1203,13 @@ def test_joint_peer_pool_finds_active_instances_and_non_active_history(tmp_path)
                     checkpoint_id, model_id, update_id, trainer_artifact_path,
                     inference_artifact_path, artifact_sha256, dataset_sha256,
                     metrics_json, gate_json, promoted
-                ) VALUES (?, ?, ?, ?, ?, 'a', ?, '{}', '{}', true)
+                ) VALUES (%s, %s, %s, %s, %s, 'a', %s, '{}', '{}', true)
                 """,
                 [checkpoint_id, model_id, update_id, str(path), str(path), checkpoint_id],
             )
             if active:
                 store.connection.execute(
-                    "UPDATE training_models SET active_checkpoint_id = ? WHERE model_id = ?",
+                    "UPDATE training_models SET active_checkpoint_id = %s WHERE model_id = %s",
                     [checkpoint_id, model_id],
                 )
 

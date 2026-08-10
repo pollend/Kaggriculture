@@ -66,19 +66,18 @@ The normal persistent workflow is driven by a league session whose
 which collects one 16-episode rollout batch. After twenty new schema-v4 batches, `on_batch`
 trains and gates a checkpoint. Batches, replay artifacts, watermarks, and the active
 checkpoint remain available when the process or session resumes against the same
-DuckDB catalog.
+shared PostgreSQL database.
 
 ```bash
 python -m kaggriculture_lab.cli league run \
   --session-id all-agents-training \
-  --database artifacts/experiments.duckdb --artifacts artifacts
+  --artifacts artifacts
 
 python -m agents.dqn_job_scorer.cli model status \
-  --name default \
-  --database artifacts/experiments.duckdb
+  --name default
 ```
 
-The constants-driven runner can keep several named DQN instances in the same catalog.
+The constants-driven runner can keep several named DQN instances in the same database.
 Each name has independent rollout batches, checkpoints, random seed, and active pointer
 under `artifacts/dqn_job_scorer/<name>/`. Set that roster entry's `train` flag to `False`
 to freeze it without deleting or exporting anything.
@@ -96,8 +95,8 @@ For an isolated resumable job-scorer self-play league, use:
 python train_dqn.py
 ```
 
-It writes to `artifacts/dqn_self_play_experiments.duckdb` and
-`artifacts/dqn_self_play/`, separate from the all-agent and planner stores. Three
+It labels its sessions `dqn_self_play` and writes artifacts under
+`artifacts/dqn_self_play/`. Three
 independently seeded DQNs train against a deterministic schema-current DQN and
 each other's active and historical checkpoints. The two-member, one-turn crop
 population is only a lightweight 20-round hook clock; every full 720-turn
@@ -119,7 +118,7 @@ Two things to know before changing it:
   collapse. `--ship` is required to touch the live weights at all; without it, promotion only
   writes `runs/<name>/best.npz`.
 
-For league training, promotion changes the catalog's active-checkpoint pointer and does
+For league training, promotion changes the database's active-checkpoint pointer and does
 not overwrite `weights.npz`. Copy a reviewed active checkpoint into the submission only
 with `python -m agents.dqn_job_scorer.cli model export-active --output
 agents/dqn_job_scorer/weights.npz --confirm-release`.

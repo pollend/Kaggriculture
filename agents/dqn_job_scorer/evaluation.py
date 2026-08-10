@@ -1,7 +1,7 @@
 """Post-episode hook: decide whether the Q-network is due for re-evaluation.
 
 The league fires this after every episode this agent plays. It has read-only
-DuckDB access, so unlike the agent itself it can look at the games this revision
+PostgreSQL access, so unlike the agent itself it can look at the games this revision
 has already played and judge the checkpoint on accumulated evidence rather than
 on the single episode that triggered it.
 

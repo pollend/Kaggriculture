@@ -1,4 +1,5 @@
 [league]
+league = "experiments"
 name = "configurable-crop-smoke"
 manifest = "agents/configurable_crop_surrogate/agent.toml"
 population_size = 6

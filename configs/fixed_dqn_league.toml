@@ -1,0 +1,14 @@
+[league]
+league = "fixed_dqn"
+name = "fixed-opponent-job-market-v1-training"
+manifest = "agents/dqn_job_scorer/agent.toml"
+training_manifests = ["agents/dqn_job_scorer/agent.toml"]
+pairing_mode = "trainer_only"
+population_size = 0
+rounds_per_generation = 100
+hall_of_fame_rounds = 0
+episode_steps = 720
+seed = 31415
+jobs = 0
+tau = 0.5
+candidate_pool = 2

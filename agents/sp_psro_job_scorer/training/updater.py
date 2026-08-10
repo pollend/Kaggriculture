@@ -29,7 +29,7 @@ from kaggriculture_lab.model_updates import (
 )
 
 SELF_SPEC = "agents/sp_psro_job_scorer/main.py"
-STATE_VERSION = 5
+STATE_VERSION = 6
 Z95 = 1.959963985
 
 
@@ -74,6 +74,9 @@ def initial_state(seed: int) -> dict[str, Any]:
         "exploration_start_batch_seq": 0,
         "validation_suite": None,
         "release_champion": None,
+        "pending_admission": None,
+        "pending_validation": None,
+        "last_training_batch_seq": 0,
     }
 
 
@@ -81,6 +84,15 @@ def load_state(path: str | Path | None, seed: int) -> dict[str, Any]:
     if path is None:
         return initial_state(seed)
     state = torch.load(path, map_location="cpu", weights_only=False)
+    if state.get("version") == 5:
+        # Version 5 performed evaluation synchronously inside on_batch.  Its
+        # completed checkpoints migrate cleanly into the recorded two-phase
+        # evaluator; an in-flight v5 update has no checkpoint to migrate.
+        state["version"] = STATE_VERSION
+        state.setdefault("pending_admission", None)
+        state.setdefault("pending_validation", None)
+        state.setdefault("last_training_batch_seq", 0)
+        state["_needs_training_watermark"] = True
     if state["version"] != STATE_VERSION:
         raise ValueError(f"unsupported SP-PSRO trainer state {state.get('version')}")
     return state
@@ -437,7 +449,7 @@ def _load_training_data(
     nu_buffer = make_buffer(seed + 1)
     beta_buffer = make_buffer(seed + 2)
     new_records = []
-    new_batch_ids = {batch.batch_id for batch in context.new_batches}
+    training_watermark = int(state.get("last_training_batch_seq", 0))
     for batch in context.all_batches:
         if batch.source_kind != "sp_psro_rollout" or not batch.artifact_path:
             continue
@@ -446,7 +458,7 @@ def _load_training_data(
         records = load_batch(batch.artifact_path)
         nu_buffer.add([record.new_policy for record in records])
         beta_buffer.add([record.best_response for record in records])
-        if batch.batch_id in new_batch_ids:
+        if batch.sequence > training_watermark:
             new_records.extend(records)
     for role, buffer in (("nu", nu_buffer), ("beta", beta_buffer)):
         rng_state = state["live"][role].get("replay_rng_state")
@@ -458,13 +470,13 @@ def _load_training_data(
     return nu_buffer, beta_buffer, new_records
 
 
-def _admit_candidates(
+def _prepare_admission(
     context: ModelUpdateContext,
     state: dict[str, Any],
     config: dict[str, Any],
     seed: int,
     members_dir: Path,
-) -> tuple[Path, Path, dict[str, Any], bool]:
+) -> tuple[Path, Path]:
     if not state["population"]:
         initial_path = members_dir / "member-000000-initial.npz"
         PolicyBundle(QNetwork(state.pop("initial_job_network")), None).save(initial_path)
@@ -486,42 +498,151 @@ def _admit_candidates(
     nu_path = members_dir / (f"candidate-{iteration:06d}-nu-average-{context.cutoff_batch_seq}.npz")
     _network_from_state(state["live"]["beta"]).save(beta_path)
     _save_nu_average(state, nu_path)
-    admission = evaluate_admission(
-        [beta_path, nu_path],
-        [Path(member["path"]) for member in state["population"]],
-        int(config["admission_seeds"]),
-        seed + 2_000_000 + context.cutoff_batch_seq * 10_000,
-    )
-    admitted = admission["errors"] == 0 and admission["pairs"] > 1 and float(admission["margin_ci"][0]) > 0.0
-    if admitted:
-        new_members = []
-        for role, candidate_path in (("beta", beta_path), ("nu-average", nu_path)):
-            member_id = f"member-{iteration + 1:06d}-{role}"
-            final_path = members_dir / f"{member_id}.npz"
-            PopulationArtifact.load(candidate_path).save(final_path)
-            new_members.append(
+    request_id = f"admission-{context.update_id}"
+    state["pending_admission"] = {
+        "request_id": request_id,
+        "iteration": iteration,
+        "cutoff_batch_seq": context.cutoff_batch_seq,
+        "beta_path": str(beta_path),
+        "nu_path": str(nu_path),
+        "population": [
+            {"member_id": str(member["member_id"]), "path": str(member["path"])}
+            for member in state["population"]
+        ],
+        "seeds": int(config["admission_seeds"]),
+        "seed_start": seed + 2_000_000 + context.cutoff_batch_seq * 10_000,
+    }
+    return beta_path, nu_path
+
+
+def _apply_recorded_evaluations(
+    context: ModelUpdateContext,
+    state: dict[str, Any],
+    config: dict[str, Any],
+    seed: int,
+    members_dir: Path,
+) -> list[ModelEvaluation]:
+    """Advance pending evaluation requests from league-recorded control batches."""
+
+    evaluations: list[ModelEvaluation] = []
+    for batch in context.new_batches:
+        if batch.source_kind != "model_evaluation":
+            continue
+        metadata = batch.metadata
+        if metadata.get("family_id") != "sp_psro_job_scorer":
+            continue
+        kind = str(metadata.get("evaluation_kind", ""))
+        request_id = str(metadata.get("request_id", ""))
+        result = dict(metadata.get("result") or {})
+        if kind == "admission":
+            pending = state.get("pending_admission")
+            if pending is None or request_id != pending.get("request_id"):
+                continue
+            admitted = (
+                int(result.get("errors", 0)) == 0
+                and int(result.get("pairs", 0)) > 1
+                and float((result.get("margin_ci") or [0.0, 0.0])[0]) > 0.0
+            )
+            state["last_admission"] = {**result, "admitted": admitted}
+            iteration = int(pending["iteration"])
+            if admitted:
+                new_members = []
+                for role, key in (("beta", "beta_path"), ("nu-average", "nu_path")):
+                    candidate_path = Path(pending[key])
+                    member_id = f"member-{iteration + 1:06d}-{role}"
+                    final_path = members_dir / f"{member_id}.npz"
+                    PopulationArtifact.load(candidate_path).save(final_path)
+                    new_members.append(
+                        {
+                            "member_id": member_id,
+                            "role": role,
+                            "path": str(final_path),
+                            "sha256": digest(final_path),
+                            "validation": None,
+                        }
+                    )
+                state["population"].extend(new_members)
+                state["population"] = state["population"][-int(config["population_size"]) :]
+                state["iteration"] = iteration + 1
+                state["live"] = fresh_live(seed + 10_000 + (iteration + 1) * 100)
+                state["exploration_start_batch_seq"] = int(pending["cutoff_batch_seq"])
+                state["restricted"] = {"arm_ids": [], "log_weights": []}
+                state["nu_snapshots"] = []
+                state["nu_snapshots_seen"] = 0
+                state["nu_snapshot_rng_state"] = None
+            Path(pending["nu_path"]).unlink(missing_ok=True)
+            state["pending_validation"] = {
+                "request_id": f"validation-{request_id}",
+                "candidate_id": f"beta-{int(pending['cutoff_batch_seq']):08d}",
+                "beta_path": str(pending["beta_path"]),
+                "cutoff_batch_seq": int(pending["cutoff_batch_seq"]),
+                "seeds": int(config["validation_seeds"]),
+            }
+            state["pending_admission"] = None
+            evaluations.append(ModelEvaluation("population_pair_admission", result, admitted))
+            continue
+
+        if kind != "validation":
+            continue
+        pending = state.get("pending_validation")
+        if pending is None or request_id != pending.get("request_id"):
+            continue
+        suite = str(result.get("suite", ""))
+        if state.get("validation_suite") != suite:
+            for member in state["population"]:
+                member["validation"] = None
+            state["validation_suite"] = suite
+            state["release_champion"] = None
+        member_results = dict(result.get("members") or {})
+        for member in state["population"]:
+            if str(member["member_id"]) in member_results:
+                member["validation"] = member_results[str(member["member_id"])]
+        eligible = [
+            member
+            for member in state["population"]
+            if member.get("validation") is not None and not member["validation"].get("errors")
+        ]
+        if eligible:
+            state["population_champion_id"] = max(eligible, key=_candidate_rank)["member_id"]
+        beta_validation = dict(result.get("beta") or {})
+        release_candidates = [
+            {
+                "candidate_id": str(member["member_id"]),
+                "path": str(member["path"]),
+                "validation": member["validation"],
+            }
+            for member in state["population"]
+            if member.get("validation") is not None
+            and passes_release_gate(member["validation"], config)
+        ]
+        beta_path = Path(pending["beta_path"])
+        if passes_release_gate(beta_validation, config):
+            release_candidates.append(
                 {
-                    "member_id": member_id,
-                    "role": role,
-                    "path": str(final_path),
-                    "sha256": digest(final_path),
-                    "validation": None,
+                    "candidate_id": str(pending["candidate_id"]),
+                    "path": str(beta_path),
+                    "validation": beta_validation,
                 }
             )
-        state["population"].extend(new_members)
-        state["population"] = state["population"][-int(config["population_size"]) :]
-        state["iteration"] = iteration + 1
-        state["live"] = fresh_live(seed + 10_000 + (iteration + 1) * 100)
-        # Exploration belongs to the newly created learners, not to the
-        # lifetime training session.  The collector uses this cutoff to count
-        # only decisions gathered since this reset.
-        state["exploration_start_batch_seq"] = context.cutoff_batch_seq
-        state["restricted"] = {"arm_ids": [], "log_weights": []}
-        state["nu_snapshots"] = []
-        state["nu_snapshots_seen"] = 0
-        state["nu_snapshot_rng_state"] = None
-    state["last_admission"] = {**admission, "admitted": admitted}
-    return beta_path, nu_path, admission, admitted
+        if state.get("release_champion") is not None:
+            release_candidates.append(state["release_champion"])
+        if release_candidates:
+            selected = max(release_candidates, key=_candidate_rank)
+            if Path(selected["path"]) == beta_path:
+                released_path = members_dir / f"release-{selected['candidate_id']}.npz"
+                PopulationArtifact.load(beta_path).save(released_path)
+                selected = {**selected, "path": str(released_path)}
+            state["release_champion"] = selected
+        beta_path.unlink(missing_ok=True)
+        state["pending_validation"] = None
+        evaluations.append(
+            ModelEvaluation(
+                "submission_beta_validation",
+                beta_validation,
+                passes_release_gate(beta_validation, config),
+            )
+        )
+    return evaluations
 
 
 class PopulationUpdater:
@@ -532,97 +653,86 @@ class PopulationUpdater:
             context.active_checkpoint.trainer_artifact_path if context.active_checkpoint is not None else None,
             seed,
         )
-        nu_buffer, beta_buffer, new_records = _load_training_data(context, state, config, seed)
-
-        device = resolve_device(str(config.get("device", "auto")))
-        steps = int(config["gradient_steps_per_batch"]) * len(context.new_batches)
-        print(
-            f"[sp-psro training] update started: {len(context.new_batches)} new batches, "
-            f"{steps} gradient steps per role on {device}",
-            flush=True,
-        )
+        if state.pop("_needs_training_watermark", False) and context.active_checkpoint is not None:
+            row = reader.fetchone(
+                """
+                SELECT mu.cutoff_batch_seq
+                FROM model_training_checkpoints mtc
+                JOIN model_updates mu USING (update_id)
+                WHERE mtc.checkpoint_id = %s
+                """,
+                [context.active_checkpoint.checkpoint_id],
+            )
+            if row is not None:
+                state["last_training_batch_seq"] = int(row[0])
         started = time.perf_counter()
-        print("[sp-psro training] training nu policy", flush=True)
-        state["live"]["nu"], nu_losses, nu_market_losses = _train_role(
-            state["live"]["nu"], nu_buffer, config, steps, device
-        )
-        print("[sp-psro training] nu policy complete; training beta policy", flush=True)
-        state["live"]["beta"], beta_losses, beta_market_losses = _train_role(
-            state["live"]["beta"], beta_buffer, config, steps, device
-        )
-        print("[sp-psro training] beta policy complete; evaluating candidates", flush=True)
-        state["live"]["nu"]["replay_rng_state"] = nu_buffer.rng.bit_generator.state
-        state["live"]["beta"]["replay_rng_state"] = beta_buffer.rng.bit_generator.state
-        _update_restricted_distribution(state, new_records, config)
-        updated_arm_ids, updated_probabilities = mixture_probabilities(state, config)
-
         artifact_root = context.artifacts
         members_dir = artifact_root / "population_members"
         checkpoints_dir = artifact_root / "checkpoints"
         members_dir.mkdir(parents=True, exist_ok=True)
         checkpoints_dir.mkdir(parents=True, exist_ok=True)
 
-        beta_candidate_path, nu_candidate_path, admission, admitted = _admit_candidates(
-            context, state, config, seed, members_dir
-        )
-        print(
-            f"[sp-psro training] admission evaluation complete: admitted={admitted}; running validation",
-            flush=True,
-        )
-        opponents = validation_opponent_specs(context, reader, config)
-        suite = hashlib.sha256("\0".join(opponents).encode()).hexdigest()
-        if state.get("validation_suite") != suite:
-            for member in state["population"]:
-                member["validation"] = None
-            state["validation_suite"] = suite
-            state["release_champion"] = None
-        validation_seeds = int(config["validation_seeds"])
-        jobs = int(config["jobs"])
-        for member in state["population"]:
-            if member.get("validation") is None:
-                member["validation"] = evaluate_member(
-                    Path(member["path"]), opponents, validation_seeds, seed + 4_000_000, jobs
-                )
-        population_eligible = [member for member in state["population"] if not member["validation"].get("errors")]
-        if population_eligible:
-            state["population_champion_id"] = max(population_eligible, key=_candidate_rank)["member_id"]
-        beta_validation = evaluate_member(
-            beta_candidate_path,
-            opponents,
-            validation_seeds,
-            seed + 5_000_000 + context.cutoff_batch_seq * 10_000,
-            jobs,
-        )
-        print(
-            f"[sp-psro training] validation complete after {time.perf_counter() - started:.1f}s",
-            flush=True,
-        )
-        release_candidates = [
-            {
-                "candidate_id": str(member["member_id"]),
-                "path": str(member["path"]),
-                "validation": member["validation"],
-            }
-            for member in state["population"]
-            if passes_release_gate(member["validation"], config)
+        evaluations = _apply_recorded_evaluations(context, state, config, seed, members_dir)
+        untrained_batches = [
+            batch
+            for batch in context.all_batches
+            if batch.source_kind == "sp_psro_rollout"
+            and batch.sequence > int(state.get("last_training_batch_seq", 0))
         ]
-        if passes_release_gate(beta_validation, config):
-            release_candidates.append(
-                {
-                    "candidate_id": f"beta-{context.cutoff_batch_seq:08d}",
-                    "path": str(beta_candidate_path),
-                    "validation": beta_validation,
-                }
+        required = int(config.get("training_batches_per_update", 20))
+        should_train = (
+            len(untrained_batches) >= required
+            and state.get("pending_admission") is None
+            and state.get("pending_validation") is None
+        )
+        nu_losses: list[float] = []
+        beta_losses: list[float] = []
+        nu_market_losses: list[float] = []
+        beta_market_losses: list[float] = []
+        nu_market_transitions = 0
+        beta_market_transitions = 0
+        steps = 0
+        updated_arm_ids, updated_probabilities = mixture_probabilities(state, config)
+
+        if should_train:
+            nu_buffer, beta_buffer, new_records = _load_training_data(
+                context, state, config, seed
             )
-        if state.get("release_champion") is not None:
-            release_candidates.append(state["release_champion"])
-        if release_candidates:
-            selected = max(release_candidates, key=_candidate_rank)
-            if Path(selected["path"]) == beta_candidate_path:
-                released_path = members_dir / f"release-{selected['candidate_id']}.npz"
-                PopulationArtifact.load(beta_candidate_path).save(released_path)
-                selected = {**selected, "path": str(released_path)}
-            state["release_champion"] = selected
+            device = resolve_device(str(config.get("device", "auto")))
+            steps = int(config["gradient_steps_per_batch"]) * len(untrained_batches)
+            print(
+                f"[sp-psro training] update started: {len(untrained_batches)} rollout batches, "
+                f"{steps} gradient steps per role on {device}",
+                flush=True,
+            )
+            print("[sp-psro training] training nu policy", flush=True)
+            state["live"]["nu"], nu_losses, nu_market_losses = _train_role(
+                state["live"]["nu"], nu_buffer, config, steps, device
+            )
+            print("[sp-psro training] nu policy complete; training beta policy", flush=True)
+            state["live"]["beta"], beta_losses, beta_market_losses = _train_role(
+                state["live"]["beta"], beta_buffer, config, steps, device
+            )
+            state["live"]["nu"]["replay_rng_state"] = nu_buffer.rng.bit_generator.state
+            state["live"]["beta"]["replay_rng_state"] = beta_buffer.rng.bit_generator.state
+            _update_restricted_distribution(state, new_records, config)
+            updated_arm_ids, updated_probabilities = mixture_probabilities(state, config)
+            state["last_training_batch_seq"] = max(
+                batch.sequence for batch in untrained_batches
+            )
+            nu_market_transitions = nu_buffer.market_transitions
+            beta_market_transitions = beta_buffer.market_transitions
+            _prepare_admission(context, state, config, seed, members_dir)
+            print(
+                "[sp-psro training] candidate checkpoint complete; "
+                "admission evaluation queued for the next league round",
+                flush=True,
+            )
+        elif evaluations:
+            print(
+                f"[sp-psro training] applied {len(evaluations)} recorded evaluation result(s)",
+                flush=True,
+            )
 
         retained_ids = {member["member_id"] for member in state["population"]}
         if state["population_champion_id"] not in retained_ids:
@@ -644,12 +754,18 @@ class PopulationUpdater:
         )
         PopulationArtifact.load(inference_source).save(inference_path)
         combined_digest = hashlib.sha256(trainer_path.read_bytes() + inference_path.read_bytes()).hexdigest()
-        beta_candidate_path.unlink(missing_ok=True)
-        nu_candidate_path.unlink(missing_ok=True)
+        beta_validation = next(
+            (item.metrics for item in evaluations if item.kind == "submission_beta_validation"),
+            None,
+        )
         metrics = {
             "population_size": len(state["population"]),
             "iteration": state["iteration"],
-            "admitted": admitted,
+            "admitted": (
+                None
+                if state.get("last_admission") is None
+                else bool(state["last_admission"].get("admitted"))
+            ),
             "champion_id": state["population_champion_id"],
             "inference_champion_id": (release_champion["candidate_id"] if release_champion is not None else None),
             "beta_validation": beta_validation,
@@ -657,10 +773,12 @@ class PopulationUpdater:
             "nu_loss": float(np.mean(nu_losses)) if nu_losses else None,
             "beta_market_loss": (float(np.mean(beta_market_losses)) if beta_market_losses else None),
             "nu_market_loss": (float(np.mean(nu_market_losses)) if nu_market_losses else None),
-            "beta_market_transitions": beta_buffer.market_transitions,
-            "nu_market_transitions": nu_buffer.market_transitions,
+            "beta_market_transitions": beta_market_transitions,
+            "nu_market_transitions": nu_market_transitions,
             "restricted_distribution": dict(zip(updated_arm_ids, updated_probabilities)),
             "gradient_steps_this_update": steps,
+            "pending_admission": state.get("pending_admission") is not None,
+            "pending_validation": state.get("pending_validation") is not None,
             "train_seconds": time.perf_counter() - started,
         }
         gate = {
@@ -674,14 +792,6 @@ class PopulationUpdater:
                 "margin": float(config["release_min_margin"]),
             },
         }
-        evaluations = (
-            ModelEvaluation("population_pair_admission", admission, admitted),
-            ModelEvaluation(
-                "submission_beta_validation",
-                beta_validation,
-                passes_release_gate(beta_validation, config),
-            ),
-        )
         # The active inference artifact is always the already validated champion;
         # activating every successful checkpoint is what lets rejected live
         # learners retain optimizer state and continue training.
@@ -693,5 +803,5 @@ class PopulationUpdater:
             metrics,
             gate,
             True,
-            evaluations,
+            tuple(evaluations),
         )
