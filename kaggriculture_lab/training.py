@@ -13,6 +13,7 @@ able to break the others.
 from __future__ import annotations
 
 import importlib
+import inspect
 import random
 from typing import Any, Protocol, TypeVar
 
@@ -44,6 +45,7 @@ def propose(
     rng: random.Random,
     reader: Any,
     model_id: str | None = None,
+    candidate_pool: int = 2_000,
 ) -> list[Any]:
     """Ask the adapter for `count` model-guided candidates, best first.
 
@@ -62,8 +64,42 @@ def propose(
             rng=rng,
             reader=reader,
             model_id=model_id,
+            candidate_pool=candidate_pool,
         )
     )
+
+
+def initialize_population(
+    adapter: Any,
+    count: int,
+    rng: random.Random,
+    reader: Any,
+    seed_session_ids: tuple[str, ...] | list[str] | str | None = None,
+) -> list[tuple[Any, str]]:
+    """Build a family's initial population, optionally using prior history."""
+
+    hook = getattr(adapter, "initialize_population", None)
+    if isinstance(seed_session_ids, str):
+        seeds = (seed_session_ids,)
+    else:
+        seeds = tuple(seed_session_ids or ())
+    if hook is None or not seeds:
+        return [(adapter.sample(rng), "random") for _ in range(count)]
+    parameter = "seed_session_ids" if "seed_session_ids" in inspect.signature(hook).parameters else "seed_session_id"
+    seed_value: Any = seeds if parameter == "seed_session_ids" else seeds[0]
+    initialized = list(
+        hook(
+            count=count,
+            rng=rng,
+            reader=reader,
+            **{parameter: seed_value},
+        )
+    )
+    if len(initialized) != count:
+        raise ValueError(
+            f"training adapter initialized {len(initialized)} strategies; expected {count}"
+        )
+    return initialized
 
 
 def load_training_adapter(manifest: AgentManifest) -> TrainingAdapter | None:

@@ -45,21 +45,14 @@ class DatabaseTarget:
         return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
 
-def database_target(
-    *,
-    url: str | None = None,
-    role: str = "writer",
-) -> DatabaseTarget:
+def database_target(*, url: str | None = None) -> DatabaseTarget:
     """Resolve a project-local PostgreSQL target without logging credentials."""
 
-    values = _env_file_values()
     if url is None:
-        env_key = (
-            "KAGGRICULTURE_READER_DATABASE_URL"
-            if role == "reader"
-            else "KAGGRICULTURE_DATABASE_URL"
+        values = _env_file_values()
+        url = os.environ.get("KAGGRICULTURE_DATABASE_URL") or values.get(
+            "KAGGRICULTURE_DATABASE_URL"
         )
-        url = os.environ.get(env_key) or values.get(env_key)
     if not url:
         raise RuntimeError(
             "PostgreSQL is not configured; run ./lab-stack.sh up or set "

@@ -6,7 +6,7 @@ import json
 import pandas as pd
 import pytest
 
-from agents.configurable_mixed_farm_surrogate.progression import opening_daily, opening_records
+from agents.mixed_farm_v5.progression import opening_daily, opening_records
 from kaggriculture_lab.database import connect_postgres, database_target
 
 
@@ -55,7 +55,7 @@ def test_opening_records_decompresses_replay_and_aggregates_days():
     )
     connection.execute("CREATE TABLE episode_payloads (match_id VARCHAR, replay_gzip BYTEA)")
     connection.execute(
-        "INSERT INTO agent_revisions VALUES ('mixed', 'configurable_mixed_farm_surrogate'), "
+        "INSERT INTO agent_revisions VALUES ('mixed', 'mixed_farm_v5'), "
         "('moon', 'competitor_prvsiyan_moon_counts_melons')"
     )
     connection.execute("INSERT INTO episode_players VALUES ('m1', 0, 'mixed', 'moon', false)")

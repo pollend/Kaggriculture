@@ -12,7 +12,7 @@ from agents.dqn_job_scorer.cli import main as dqn_cli
 from agents.receding_horizon_planner.cli import main as planner_cli
 from kaggriculture_lab.cli import build_parser
 from kaggriculture_lab.storage import ExperimentStore
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 @pytest.mark.parametrize(
@@ -99,9 +99,9 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
             """
             INSERT INTO model_updates (
                 update_id, model_id, cutoff_batch_seq, new_batch_count,
-                dataset_sha256, status, candidate_checkpoint_id
+                dataset_sha256, status
             ) VALUES ('update', 'dqn_job_scorer.adaptive_hybrid_q_v2', 1, 1,
-                      'dataset', 'PROMOTED', 'checkpoint')
+                      'dataset', 'PROMOTED')
             """
         )
         store.connection.execute(
@@ -120,6 +120,9 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
             UPDATE training_models SET active_checkpoint_id = 'checkpoint'
             WHERE model_id = 'dqn_job_scorer.adaptive_hybrid_q_v2'
             """
+        )
+        store.connection.execute(
+            "UPDATE model_updates SET candidate_checkpoint_id = 'checkpoint'"
         )
 
     output = tmp_path / "released.npz"
@@ -153,9 +156,9 @@ def test_export_rejects_active_checkpoint_that_failed_release_gate(tmp_path: Pat
             """
             INSERT INTO model_updates (
                 update_id, model_id, cutoff_batch_seq, new_batch_count,
-                dataset_sha256, status, candidate_checkpoint_id
+                dataset_sha256, status
             ) VALUES ('update', 'dqn_job_scorer.adaptive_hybrid_q_v2', 1, 1,
-                      'dataset', 'PROMOTED', 'checkpoint')
+                      'dataset', 'PROMOTED')
             """
         )
         store.connection.execute(
@@ -171,6 +174,9 @@ def test_export_rejects_active_checkpoint_that_failed_release_gate(tmp_path: Pat
         )
         store.connection.execute(
             "UPDATE training_models SET active_checkpoint_id = 'checkpoint'"
+        )
+        store.connection.execute(
+            "UPDATE model_updates SET candidate_checkpoint_id = 'checkpoint'"
         )
     with pytest.raises(ValueError, match="release gate"):
         export_active_model(

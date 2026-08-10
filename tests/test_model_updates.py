@@ -13,7 +13,7 @@ from kaggriculture_lab.model_updates import (
     update_model_in_store,
 )
 from kaggriculture_lab.storage import ExperimentStore
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 class FakeTrainer:
@@ -38,23 +38,14 @@ class FakeTrainer:
 trainer = FakeTrainer()
 
 
-def test_model_training_reader_rejects_multi_statement_bypass(tmp_path: Path):
+def test_model_training_reader_runs_queries(tmp_path: Path):
     with ExperimentStore(postgres_database(tmp_path, "reader")) as store:
         reader = ModelTrainingReader(store)
         assert reader.fetchone("WITH value AS (SELECT 1 AS n) SELECT n FROM value") == (1,)
-        for sql in (
-            "DELETE FROM training_models",
-            "SELECT 1; DELETE FROM training_models",
-        ):
-            try:
-                reader.fetchall(sql)
-            except ValueError as error:
-                assert "only permits SELECT/WITH" in str(error)
-            else:
-                raise AssertionError(f"mutating SQL was accepted: {sql}")
 
 
 def _register(store: ExperimentStore, model_id: str, promote: bool = True) -> None:
+    seed_reference_rows(store.connection, family_id="test")
     store.connection.execute(
         """
         INSERT INTO training_models (
@@ -147,6 +138,8 @@ def test_crop_surrogate_trains_after_two_generation_batches(tmp_path: Path):
             WHERE model_id = 'configurable_crop_surrogate.surrogate'
             """
         )
+        seed_reference_rows(store.connection, run_id="crop", session_id="crop")
+        store.add_strategies(strategies, "test", "crop")
         store.add_agent_revisions(revisions)
         for generation_index in range(2):
             generation_id = f"crop:g{generation_index:04d}"

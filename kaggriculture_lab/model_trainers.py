@@ -94,12 +94,11 @@ class EvaluationPolicy:
 
 
 class TrainingBatchWriter:
-    """The single write a round hook is granted.
+    """The batch-recording surface handed to a round hook.
 
-    `model_id` is bound at construction, so a trainer cannot record data against
-    another model. Everything else a hook needs is a read, and reads go through
-    `ModelTrainingReader` -- the same SELECT-only boundary the batch hook and
-    every episode evaluator already live under.
+    `model_id` is bound at construction, so a trainer records batches against
+    its own model without having to name it on every call. Everything else a
+    hook needs is a read, and reads go through `ModelTrainingReader`.
     """
 
     def __init__(self, store: ExperimentStore, model_id: str):

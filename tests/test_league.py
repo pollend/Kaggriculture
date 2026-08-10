@@ -1,4 +1,5 @@
 import json
+import random
 from pathlib import Path
 
 import pytest
@@ -25,9 +26,9 @@ from kaggriculture_lab.league import (
 from kaggriculture_lab.model_trainers import load_trainer
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
 from kaggriculture_lab.storage import ExperimentStore
-from kaggriculture_lab.training import allocate_generation
+from kaggriculture_lab.training import allocate_generation, initialize_population, propose
 from sim.runner import MatchResult, SeatResult
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 def test_glicko2_matches_published_example():
@@ -52,6 +53,29 @@ def test_generation_allocation_is_exact():
         "random": 2,
     }
     assert sum(allocate_generation(7).values()) == 7
+
+
+def test_training_hooks_receive_candidate_pool_and_seed_session():
+    class Adapter:
+        def sample(self, rng):
+            return rng.randrange(1000)
+
+        def propose(self, **kwargs):
+            assert kwargs["candidate_pool"] == 321
+            return ["proposed"]
+
+        def initialize_population(self, **kwargs):
+            assert kwargs["seed_session_id"] == "previous"
+            return [(index, "seed") for index in range(kwargs["count"])]
+
+    adapter = Adapter()
+    rng = random.Random(7)
+    assert propose(adapter, 1, [], rng, object(), candidate_pool=321) == ["proposed"]
+    assert initialize_population(adapter, 3, rng, object(), "previous") == [
+        (0, "seed"),
+        (1, "seed"),
+        (2, "seed"),
+    ]
 
 
 def test_revision_identity_tracks_behavior_code(tmp_path: Path):
@@ -84,6 +108,9 @@ def test_replay_is_compressed_in_postgres_and_read_through_narrow_reader(tmp_pat
         replay={"steps": [[{"observation": {"step": 0}}]]},
     )
     with ExperimentStore(postgres_database(tmp_path, "episodes")) as store:
+        seed_reference_rows(
+            store.connection, run_id="run", family_id="family", revision_ids=("a", "b")
+        )
         store.add_match("match", "run", "league:test", ("a", "b"), ("a", "b"), result)
         store.add_replay_payload("match", result.replay)
         reader = EpisodeReader(store.connection, "match", 0)
@@ -167,6 +194,50 @@ def test_scheduler_gives_every_member_each_round_and_avoids_self_play(tmp_path: 
             if right in appearances:
                 appearances[right] += 1
         assert set(appearances.values()) == {4}
+
+
+def test_scheduler_gives_every_member_every_fixed_anchor(tmp_path: Path):
+    database = postgres_database(tmp_path, "anchor-coverage")
+    config = LeagueConfig(
+        population_size=4,
+        rounds_per_generation=4,
+        anchor_rounds=2,
+        hall_of_fame_rounds=0,
+        anchor_manifests=(
+            "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/agent.toml",
+            "agents/competitor_lucifer19_kaggriculture_night_harvest/agent.toml",
+        ),
+        episode_steps=24,
+    )
+    session_id = create_session(config, database, session_id="anchor-coverage")
+    with ExperimentStore(database) as store:
+        assert schedule_generation(store, session_id) == 12
+        generation_id = "anchor-coverage:g0000"
+        anchors = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT revision_id FROM generation_members "
+                "WHERE generation_id = %s AND role = 'anchor'",
+                [generation_id],
+            ).fetchall()
+        }
+        members = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT revision_id FROM generation_members "
+                "WHERE generation_id = %s AND role != 'anchor'",
+                [generation_id],
+            ).fetchall()
+        }
+        rows = store.connection.execute(
+            "SELECT revision_a, revision_b, pairing_kind FROM league_pairings "
+            "WHERE generation_id = %s",
+            [generation_id],
+        ).fetchall()
+        fixed = [(left, right) for left, right, kind in rows if kind == "anchor"]
+        assert len(fixed) == len(members) * len(anchors)
+        for member in members:
+            assert {right for left, right in fixed if left == member} == anchors
 
 
 def test_running_generation_resumes_without_being_scheduled_again(

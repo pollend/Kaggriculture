@@ -1,16 +1,26 @@
 [league]
-league = "mixed_farm_v3"
-name = "configurable-mixed-farm-v3-training"
-manifest = "agents/configurable_mixed_farm_surrogate/agent.toml"
+league = "mixed_farm_v5"
+name = "configurable-mixed-farm-v5-training"
+manifest = "agents/mixed_farm_v5/agent.toml"
 anchor_manifests = [
-  "agents/configurable_crop_surrogate/agent.toml",
-  "agents/receding_horizon_planner/agent.toml",
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/agent.toml",
+  "agents/competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine/agent.toml",
+  "agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/agent.toml",
+  "agents/competitor_degnonguidi_kaggriculture_agent_builder/agent.toml",
+  "agents/competitor_ektarr_diversified_scheduler_baseline_kaggriculture/agent.toml",
+  "agents/competitor_jek1wantaufik_building_a_kaggriculture_ai_agent/agent.toml",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/agent.toml",
+  "agents/competitor_lucifer19_kaggriculture_night_harvest/agent.toml",
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/agent.toml",
   "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/agent.toml",
+  "agents/competitor_romantamrazov_kaggriculture_hamburger/agent.toml",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/agent.toml",
 ]
-training_manifests = ["agents/configurable_mixed_farm_surrogate/agent.toml"]
+training_manifests = ["agents/mixed_farm_v5/agent.toml"]
 population_size = 20
-rounds_per_generation = 24
-hall_of_fame_rounds = 12
+rounds_per_generation = 28
+anchor_rounds = 12
+hall_of_fame_rounds = 4
 episode_steps = 720
 seed = 2718
 jobs = 0

@@ -64,7 +64,6 @@ case "$command_name" in
   up)
     uv run python -m kaggriculture_lab.postgres_admin write-env
     start_postgres
-    uv run python -m kaggriculture_lab.postgres_admin migrate-catalogs
     uv run python -m kaggriculture_lab.postgres_admin bootstrap
     exec uv run kaglab web
     ;;

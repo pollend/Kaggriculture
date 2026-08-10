@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Run the isolated, resumable multi-DQN self-play workflow."""
+"""Run the resumable DQN self-play workflow.
+
+One learner, one session. The learner improves by playing frozen snapshots of
+its own promoted checkpoints; the fixed benchmarks exist only so promotion has
+an external yardstick. Training curriculum and release gate are deliberately
+separate knobs -- conflating them is how a policy losing every benchmark game by
+~30,000 still scored `benchmark_non_regression: true` against an equally weak
+incumbent.
+"""
 
 from __future__ import annotations
 
@@ -16,48 +24,66 @@ from kaggriculture_lab.identity import TrainingAgentSpec
 from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.model_admin import model_status
 from kaggriculture_lab.runner import ensure_session, run_generations
-from sim.arena import play_series
-from sim.metrics import render, summarize
 
 # Edit these experiment constants. The runner intentionally accepts no flags.
-GENERATIONS = 5  # 3 collectors * 5 * 20 * 16 = 4,800 rollout games
-RUN_FINAL_ARENA = False  # enable after explicitly exporting a reviewed active checkpoint
-FINAL_ARENA_SEEDS = 100
-FINAL_ARENA_JOBS = 8
+GENERATIONS = 5
 SYNC_ENVIRONMENT = True
 
-SESSION_ID = "dqn-self-play-training"
+SESSION_ID = "dqn-self-play-v1"
 ARTIFACTS = Path("artifacts/dqn_self_play")
 LEAGUE_CONFIG = Path("configs/dqn_league.toml")
-FROZEN_DQN = (
-    "agents.dqn_job_scorer.main:agent"
-    "?network_seed=0"
+MODEL_NAME = "default"
+
+# Measurement, not curriculum. These never enter the rollout mix.
+BENCHMARKS = (
+    "starter",
+    "agents/configurable_crop_surrogate/main.py",
 )
-DQN_SELF_PLAY_CONFIG = {
-    "opponents": [FROZEN_DQN],
-    "benchmark": FROZEN_DQN,
+
+SELF_PLAY_CONFIG = {
+    "initialization": "random",
+    # Cold-start floor only. `self_play_pool` is empty until the first
+    # checkpoint is promoted, and `compose_opponents` falls back to this base
+    # while it is.
+    "opponents": ["starter"],
+    "benchmarks": list(BENCHMARKS),
+    # `benchmark` remains for older readers; promotion evaluates `benchmarks`.
+    "benchmark": BENCHMARKS[1],
     "league_opponents": False,
-    "active_peer_types": ["dqn_job_scorer"],
-    "history_peer_types": ["dqn_job_scorer"],
+    # No live peers and no cross-instance history: an empty `history_peer_types`
+    # routes opponent selection to `self_play_pool`, i.e. this model's own
+    # promoted checkpoints.
+    "active_peer_types": [],
+    "history_peer_types": [],
     "self_play_after": 0,
     "self_play_pool": 5,
-    "self_play_ratio": 0.3,
+    # Against a single-item base this resolves to three self-play slots per
+    # base slot, so three of every four rollouts face a frozen snapshot.
+    "self_play_ratio": 0.75,
+    "episode_steps": 720,
+    # Durable observation rounds, so progression is visible in `episodes`
+    # rather than only in gate JSON.
+    "progress_observation_seeds": 2,
+    "progress_opponents": list(BENCHMARKS),
+    "progress_seed_base": 1_500_000_000,
 }
+
+TRAINING_AGENTS = [
+    {
+        "type": "dqn_job_scorer",
+        "name": MODEL_NAME,
+        "train": True,
+        "primary": True,
+        "model_config": SELF_PLAY_CONFIG,
+    }
+]
+
+REPO_ROOT = Path(__file__).resolve().parent
+MAIN_CONFIG = REPO_ROOT / "main.toml"
 
 
 def _database():
     return database_target()
-TRAINING_AGENTS = [
-    {
-        "type": "dqn_job_scorer",
-        "name": name,
-        "train": True,
-        "model_config": DQN_SELF_PLAY_CONFIG,
-    }
-    for name in ("default", "peer_a", "peer_b")
-]
-REPO_ROOT = Path(__file__).resolve().parent
-MAIN_CONFIG = REPO_ROOT / "main.toml"
 
 
 def _device() -> str:
@@ -103,43 +129,20 @@ def _ensure_session() -> None:
 
 
 def _model_status() -> None:
-    for name in ("default", "peer_a", "peer_b"):
-        print(
-            model_status(
-                REPO_ROOT / "agents/dqn_job_scorer/agent.toml",
-                _database(),
-                name=name,
-            )
+    print(
+        model_status(
+            REPO_ROOT / "agents/dqn_job_scorer/agent.toml",
+            _database(),
+            name=MODEL_NAME,
         )
-
-
-def _final_arena() -> None:
-    if not RUN_FINAL_ARENA:
-        return
-    opponents = [FROZEN_DQN]
-    agent = "agents/dqn_job_scorer/main.py"
-    for opponent in opponents:
-        results = play_series(
-            agent,
-            opponent,
-            range(FINAL_ARENA_SEEDS),
-            {},
-            FINAL_ARENA_JOBS,
-        )
-        print(render(summarize(agent, opponent, results)))
+    )
 
 
 def main() -> int:
     if len(sys.argv) != 1:
         raise SystemExit("train_dqn.py accepts no arguments; edit its constants")
-    positive = {
-        "GENERATIONS": GENERATIONS,
-        "FINAL_ARENA_SEEDS": FINAL_ARENA_SEEDS,
-        "FINAL_ARENA_JOBS": FINAL_ARENA_JOBS,
-    }
-    invalid = [name for name, value in positive.items() if not isinstance(value, int) or isinstance(value, bool) or value < 1]
-    if invalid:
-        raise ValueError(f"invalid DQN training constants: {invalid}")
+    if not isinstance(GENERATIONS, int) or isinstance(GENERATIONS, bool) or GENERATIONS < 1:
+        raise ValueError(f"invalid DQN training constant: GENERATIONS={GENERATIONS!r}")
 
     os.environ["KAGGRICULTURE_TORCH_DEVICE"] = _device()
     _prepare_environment()
@@ -157,7 +160,6 @@ def main() -> int:
         workspace=REPO_ROOT,
         on_generation=report,
     )
-    _final_arena()
     print(f"DQN self-play training complete. Session: {SESSION_ID}")
     return 0
 

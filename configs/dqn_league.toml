@@ -1,22 +1,20 @@
 [league]
 league = "dqn_self_play"
-name = "dqn-self-play-training"
+name = "dqn-self-play-v1"
 
-# The job-scorer trainers collect their own full episodes. A minimal breedable
-# crop population supplies the league's resumable 20-round hook clock only.
-manifest = "agents/configurable_crop_surrogate/agent.toml"
+# The job-scorer trainer collects its own full-length episodes, so the league
+# runs trainer-only: no breedable population, no anchor pairings, no hall of
+# fame. `rounds_per_generation` is the trainer's batch clock.
+manifest = "agents/dqn_job_scorer/agent.toml"
 anchor_manifests = []
-training_manifests = [
-  "agents/dqn_job_scorer/agent.toml",
-]
+training_manifests = ["agents/dqn_job_scorer/agent.toml"]
 
-# Clock matches the DQN's min_new_batches=20. These league episodes are one
-# turn long; all DQN rollout episodes are independently collected at full length.
-population_size = 2
-rounds_per_generation = 20
+pairing_mode = "trainer_only"
+population_size = 0
+rounds_per_generation = 100
 hall_of_fame_rounds = 0
-episode_steps = 1
+episode_steps = 720
 seed = 2718
-jobs = 1
+jobs = 0
 tau = 0.5
 candidate_pool = 2

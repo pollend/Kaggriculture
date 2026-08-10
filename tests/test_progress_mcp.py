@@ -10,7 +10,7 @@ import pytest
 from kaggriculture_lab.dashboard import DashboardRepository, make_server
 from kaggriculture_lab.progress_mcp import PROTOCOL_VERSION, ProgressMCP
 from kaggriculture_lab.storage import ExperimentStore
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 def _seed_progress(database: Path) -> None:
@@ -30,6 +30,14 @@ def _seed_progress(database: Path) -> None:
             ) VALUES
                 ('g0', 'session', 0, 'COMPLETE', now(), now()),
                 ('g1', 'session', 1, 'RUNNING', now(), NULL)
+            """
+        )
+        seed_reference_rows(connection, run_id="session", family_id="family")
+        connection.execute(
+            """
+            INSERT INTO strategies VALUES
+                ('strategy-0', '{}', 'test', NULL),
+                ('strategy-1', '{}', 'test', NULL)
             """
         )
         connection.execute(
@@ -98,8 +106,8 @@ def _seed_progress(database: Path) -> None:
             """
             INSERT INTO training_models (
                 model_id, family_id, trainer_path, min_new_batches, config_json,
-                active_checkpoint_id, last_attempted_batch_seq
-            ) VALUES ('model', 'family', 'agent.train:trainer', 2, '{"trees": 10}', 'checkpoint', 1)
+                last_attempted_batch_seq
+            ) VALUES ('model', 'family', 'agent.train:trainer', 2, '{"trees": 10}', 1)
             """
         )
         connection.execute(
@@ -116,9 +124,8 @@ def _seed_progress(database: Path) -> None:
             """
             INSERT INTO model_updates (
                 update_id, model_id, cutoff_batch_seq, new_batch_count,
-                dataset_sha256, status, candidate_checkpoint_id, metrics_json,
-                gate_json, completed_at
-            ) VALUES ('update', 'model', 1, 1, 'data', 'COMPLETE', 'checkpoint',
+                dataset_sha256, status, metrics_json, gate_json, completed_at
+            ) VALUES ('update', 'model', 1, 1, 'data', 'COMPLETE',
                       '{"mae": 1.5}', '{"passed": true}', now())
             """
         )
@@ -129,6 +136,14 @@ def _seed_progress(database: Path) -> None:
                 'artifact', 'data', '{"mae": 1.5}', '{"passed": true}', true, now()
             )
             """
+        )
+        # The checkpoint cites its update, so both citations back to it have to
+        # wait until the checkpoint row exists.
+        connection.execute(
+            "UPDATE training_models SET active_checkpoint_id = 'checkpoint' WHERE model_id = 'model'"
+        )
+        connection.execute(
+            "UPDATE model_updates SET candidate_checkpoint_id = 'checkpoint' WHERE update_id = 'update'"
         )
         connection.execute(
             """
@@ -224,13 +239,27 @@ def test_query_database_accepts_parameterized_selects_and_caps_rows(progress_dat
         "max_rows": 1,
     }
 
-    for sql in (
-        "DELETE FROM generations",
-        "SELECT 1; DELETE FROM generations",
-    ):
-        denied = _tool_call(backend, "query_database", {"sql": sql})
-        assert denied["isError"] is True
-        assert "only permits SELECT/WITH" in denied["structuredContent"]["message"]
+
+def test_query_database_writes_are_permitted(progress_database: Path):
+    backend = ProgressMCP(DashboardRepository(progress_database))
+    updated = _tool_call(
+        backend,
+        "query_database",
+        {
+            "sql": "UPDATE generations SET status = %s WHERE generation_id = %s",
+            "parameters": ["ARCHIVED", "g0"],
+        },
+    )
+    assert updated["isError"] is False
+    assert updated["structuredContent"]["affected_rows"] == 1
+    assert updated["structuredContent"]["rows"] == []
+
+    after = _tool_call(
+        backend,
+        "query_database",
+        {"sql": "SELECT status FROM generations WHERE generation_id = %s", "parameters": ["g0"]},
+    )
+    assert after["structuredContent"]["rows"] == [["ARCHIVED"]]
 
 
 @pytest.fixture

@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kaggriculture_lab.read_only import fetchall_select
-
 
 @dataclass(frozen=True, slots=True)
 class EpisodeHookContext:
@@ -27,7 +25,7 @@ class EpisodeHookContext:
 
 
 class EpisodeReader:
-    """Narrow read-only view over one persisted episode."""
+    """Narrow view over one persisted episode."""
 
     def __init__(self, connection: Any, match_id: str, seat: int):
         self._connection = connection
@@ -67,16 +65,13 @@ class EpisodeReader:
     def fetchall(
         self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()
     ) -> list[tuple[Any, ...]]:
-        """Read-only query across the whole store.
+        """Run one query across the whole store.
 
         An evaluator often needs more than the episode it was fired for -- "is
         this revision trending down over its last N games" cannot be answered
-        from a single match. Guarded to SELECT/WITH so a hook cannot mutate the
-        league it is reporting on, the same rule `ModelTrainingReader` applies.
+        from a single match.
         """
-        return fetchall_select(
-            self._connection, sql, parameters, reader_name="episode reader"
-        )
+        return self._connection.execute(sql, list(parameters)).fetchall()
 
     def fetchone(
         self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()

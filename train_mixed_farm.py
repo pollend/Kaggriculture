@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the isolated configurable mixed-farm surrogate league."""
+"""Run the isolated mixed-farm v5 league."""
 
 from __future__ import annotations
 
@@ -16,24 +16,22 @@ from kaggriculture_lab.runner import ensure_session, run_generations
 
 GENERATIONS = 48
 POPULATION_SIZE = 20
-ROUNDS_PER_GENERATION = 24
-HALL_OF_FAME_ROUNDS = 12
+ROUNDS_PER_GENERATION = 28
+ANCHOR_ROUNDS = 12
+HALL_OF_FAME_ROUNDS = 4
 EPISODE_STEPS = 720
 TRAINING_JOBS = 0
 TRAINING_SEED = 2718
 CANDIDATE_POOL = 10_000
-RUN_ACCEPTANCE_ARENA = True
-ACCEPTANCE_SEEDS = 20
-ACCEPTANCE_JOBS = 24
 SYNC_ENVIRONMENT = True
 
-SESSION_ID = "configurable-mixed-farm-v3-training"
+SESSION_ID = "configurable-mixed-farm-v5-training"
 ARTIFACTS = Path("artifacts")
 LEAGUE_CONFIG = Path("configs/mixed_farm_league.toml")
 TRAINING_AGENTS = [
     {
-        "type": "configurable_mixed_farm_surrogate",
-        "name": "v3",
+        "type": "mixed_farm_v5",
+        "name": "v5",
         "primary": True,
         "train": True,
     }
@@ -72,6 +70,7 @@ def _effective_config() -> LeagueConfig:
         name=SESSION_ID,
         population_size=POPULATION_SIZE,
         rounds_per_generation=ROUNDS_PER_GENERATION,
+        anchor_rounds=ANCHOR_ROUNDS,
         hall_of_fame_rounds=HALL_OF_FAME_ROUNDS,
         episode_steps=EPISODE_STEPS,
         jobs=TRAINING_JOBS,
@@ -99,21 +98,6 @@ def _ensure_session() -> None:
     )
 
 
-def _run_acceptance() -> None:
-    _run(
-        [
-            sys.executable,
-            "-m",
-            "agents.configurable_mixed_farm_surrogate.analysis",
-            "--seeds",
-            str(ACCEPTANCE_SEEDS),
-            "--jobs",
-            str(ACCEPTANCE_JOBS),
-            "--broad",
-        ]
-    )
-
-
 def main() -> int:
     if len(sys.argv) != 1:
         raise SystemExit("train_mixed_farm.py accepts no arguments; edit its constants")
@@ -123,8 +107,6 @@ def main() -> int:
         "ROUNDS_PER_GENERATION": ROUNDS_PER_GENERATION,
         "EPISODE_STEPS": EPISODE_STEPS,
         "CANDIDATE_POOL": CANDIDATE_POOL,
-        "ACCEPTANCE_SEEDS": ACCEPTANCE_SEEDS,
-        "ACCEPTANCE_JOBS": ACCEPTANCE_JOBS,
     }
     invalid = [name for name, value in positive.items() if value < 1]
     if invalid or TRAINING_JOBS < 0:
@@ -144,8 +126,6 @@ def main() -> int:
         ),
     )
 
-    if RUN_ACCEPTANCE_ARENA:
-        _run_acceptance()
     print(f"Mixed-farm training complete. Session: {SESSION_ID}")
     return 0
 

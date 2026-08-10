@@ -121,7 +121,9 @@ def self_play_pool(context, reader, limit: int) -> list[str]:
     ]
 
 
-def compose_opponents(base: list[str], pool: list[str], ratio: float) -> list[str]:
+def compose_opponents(
+    base: list[str], pool: list[str], ratio: float, *, pool_offset: int = 0
+) -> list[str]:
     """Mix self-play into `base` so it lands on `ratio` of the episodes.
 
     `collect_batch` walks the returned list round-robin, so its composition *is*
@@ -142,7 +144,10 @@ def compose_opponents(base: list[str], pool: list[str], ratio: float) -> list[st
     repeats = max(1, math.ceil((1 - ratio) / (ratio * len(base))))
     widened = base * repeats
     slots = max(1, round(len(widened) * ratio / (1 - ratio)))
-    return [*widened, *(pool[index % len(pool)] for index in range(slots))]
+    return [
+        *widened,
+        *(pool[(pool_offset + index) % len(pool)] for index in range(slots)),
+    ]
 
 
 def rotate_opponents(opponents: list[str], offset: int) -> list[str]:
@@ -260,7 +265,12 @@ class DQNCollector:
                     )
                 )
             opponents = rotate_opponents(
-                compose_opponents(base, pool, float(config.get("self_play_ratio", 0.3))),
+                compose_opponents(
+                    base,
+                    pool,
+                    float(config.get("self_play_ratio", 0.3)),
+                    pool_offset=batch_index,
+                ),
                 batch_index * len(seeds),
             )
             records = collect_batch(
@@ -344,6 +354,59 @@ def _arena_evaluate(
         "significant": summary.significant,
         "errors": summary.errors,
     }
+
+
+def configured_benchmarks(config: dict[str, Any]) -> list[str]:
+    """Return the fixed release suite, accepting the legacy singular key."""
+
+    configured = config.get("benchmarks")
+    if configured:
+        return list(dict.fromkeys(str(item) for item in configured))
+    return [
+        str(
+            config.get(
+                "benchmark", "agents/configurable_crop_surrogate/main.py"
+            )
+        )
+    ]
+
+
+def _benchmark_kind(index: int, total: int) -> str:
+    return "fixed_benchmark" if total == 1 else f"fixed_benchmark:{index}"
+
+
+def _reject_degenerate_head_to_head(result: dict[str, Any]) -> None:
+    """Fail loudly when challenger and incumbent evaluate as the same policy.
+
+    Paired seeds cancel exactly only when both seats run one policy, so a
+    zero-width interval over many pairs is a harness fault -- a dropped
+    `?weights=`, a missing checkpoint -- not evidence about the candidate.
+    Scored as an ordinary result it reads as "no significant improvement" and
+    the session rejects every update forever while looking healthy.
+    """
+
+    if result["errors"] or int(result["pairs"]) <= 1:
+        return
+    low, high = (float(bound) for bound in result["margin_ci"])
+    if low == 0.0 and high == 0.0:
+        raise RuntimeError(
+            "head-to-head margin is identically zero over "
+            f"{result['pairs']} paired seeds against {result['opponent']}: "
+            "challenger and incumbent are playing as the same policy"
+        )
+
+
+def benchmark_non_regression(
+    challenger: dict[str, Any], incumbent: dict[str, Any]
+) -> bool:
+    """Apply the release gate to one fixed benchmark result pair."""
+
+    return (
+        not challenger["errors"]
+        and not incumbent["errors"]
+        and float(challenger["margin_ci"][1])
+        >= float(incumbent["margin_ci"][0])
+    )
 
 
 class DQNUpdater:
@@ -530,10 +593,11 @@ class DQNUpdater:
         seed_stride = int(config.get("promotion_seed_stride", 10_000))
         seed_start = seed_base + context.cutoff_batch_seq * seed_stride
         jobs = int(config.get("jobs", 1))
-        benchmark = str(config.get("benchmark", "agents/configurable_crop_surrogate/main.py"))
-        challenger_benchmark = _arena_evaluate(
-            inference_path, benchmark, eval_seeds, jobs, seed_start
-        )
+        benchmarks = configured_benchmarks(config)
+        challenger_benchmarks = [
+            _arena_evaluate(inference_path, benchmark, eval_seeds, jobs, seed_start)
+            for benchmark in benchmarks
+        ]
         evaluations: list[ModelEvaluation] = []
         promote = False
         incumbent_path = (
@@ -546,25 +610,67 @@ class DQNUpdater:
             )
         )
         gate: dict[str, Any] = {
-            "kind": "significant_incumbent_improvement_and_benchmark_non_regression",
+            "kind": "significant_incumbent_improvement_and_benchmarks_non_regression",
             "seed_start": seed_start,
-            "challenger_benchmark": challenger_benchmark,
+            "challenger_benchmarks": challenger_benchmarks,
         }
         if incumbent_path is None:
-            promote = not challenger_benchmark["errors"]
+            benchmark_results = [not result["errors"] for result in challenger_benchmarks]
+            promote = all(benchmark_results)
             gate.update({"initial_checkpoint": True, "passed": promote})
-            evaluations.append(ModelEvaluation("fixed_benchmark", challenger_benchmark, promote))
+            evaluations.extend(
+                ModelEvaluation(
+                    _benchmark_kind(index, len(benchmarks)),
+                    result,
+                    passed,
+                )
+                for index, (result, passed) in enumerate(
+                    zip(challenger_benchmarks, benchmark_results)
+                )
+            )
             head_to_head = None
         else:
             incumbent_spec = f"{SELF_SPEC}?weights={incumbent_path}"
-            head_to_head = _arena_evaluate(inference_path, incumbent_spec, promotion_seeds, jobs, seed_start)
-            incumbent_benchmark = _arena_evaluate(incumbent_path, benchmark, eval_seeds, jobs, seed_start)
-        # Promotion is a release decision, not an absence-of-proof-of-harm
-        # decision. The paired lower bound must clear zero.
-            head_to_head_ok = not head_to_head["errors"] and float(head_to_head["margin_ci"][0]) > 0.0
-            benchmark_ok = not challenger_benchmark["errors"] and not incumbent_benchmark["errors"] and float(challenger_benchmark["margin_ci"][1]) >= float(incumbent_benchmark["margin_ci"][0])
-            promote = head_to_head_ok and benchmark_ok
-            gate.update({"head_to_head": head_to_head, "incumbent_benchmark": incumbent_benchmark, "head_to_head_significantly_better": head_to_head_ok, "benchmark_non_regression": benchmark_ok, "passed": promote})
+            head_to_head = _arena_evaluate(
+                inference_path,
+                incumbent_spec,
+                promotion_seeds,
+                jobs,
+                seed_start,
+            )
+            _reject_degenerate_head_to_head(head_to_head)
+            incumbent_benchmarks = [
+                _arena_evaluate(
+                    incumbent_path, benchmark, eval_seeds, jobs, seed_start
+                )
+                for benchmark in benchmarks
+            ]
+            # Promotion is a release decision, not an absence-of-proof-of-harm
+            # decision. The paired lower bound must clear zero, and every fixed
+            # benchmark must remain statistically compatible with its incumbent.
+            head_to_head_ok = (
+                not head_to_head["errors"]
+                and float(head_to_head["margin_ci"][0]) > 0.0
+            )
+            benchmark_results = [
+                benchmark_non_regression(challenger, incumbent)
+                for challenger, incumbent in zip(
+                    challenger_benchmarks, incumbent_benchmarks
+                )
+            ]
+            benchmarks_ok = all(benchmark_results)
+            promote = head_to_head_ok and benchmarks_ok
+            gate.update(
+                {
+                    "head_to_head": head_to_head,
+                    "incumbent_benchmarks": incumbent_benchmarks,
+                    "head_to_head_significantly_better": head_to_head_ok,
+                    "benchmark_non_regression": dict(
+                        zip(benchmarks, benchmark_results)
+                    ),
+                    "passed": promote,
+                }
+            )
             opponent_checkpoint_id = (
                 context.active_checkpoint.checkpoint_id
                 if context.active_checkpoint is not None
@@ -578,7 +684,16 @@ class DQNUpdater:
                     opponent_checkpoint_id,
                 )
             )
-            evaluations.append(ModelEvaluation("fixed_benchmark", challenger_benchmark, promote))
+            evaluations.extend(
+                ModelEvaluation(
+                    _benchmark_kind(index, len(benchmarks)),
+                    challenger,
+                    passed,
+                )
+                for index, (challenger, passed) in enumerate(
+                    zip(challenger_benchmarks, benchmark_results)
+                )
+            )
         metrics = {
             "episodes_in_buffer": len(buffer.episodes),
             "skipped_legacy_batches": skipped_legacy_batches,

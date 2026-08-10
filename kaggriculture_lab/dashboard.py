@@ -1,4 +1,4 @@
-"""Small, read-only web dashboard for persistent Kaggriculture leagues."""
+"""Small web dashboard for persistent Kaggriculture leagues."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ def _row(connection: Any, sql: str, parameters: list[Any] | None = None) -> dict
 
 
 class DashboardRepository:
-    """Narrow read-only access to the shared league database."""
+    """Narrow access to the shared league database."""
 
     def __init__(self, database: str | DatabaseTarget):
         self.target = (

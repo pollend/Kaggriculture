@@ -30,8 +30,8 @@ DEFAULT_ARTIFACTS = "artifacts"
 SAFE_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
 
-def _target(args: argparse.Namespace, *, role: str = "writer"):
-    return database_target(url=args.database_url, role=role)
+def _target(args: argparse.Namespace):
+    return database_target(url=args.database_url)
 
 
 def _cmd_export(args: argparse.Namespace) -> int:
@@ -192,7 +192,7 @@ def _cmd_league_trainers(args: argparse.Namespace) -> int:
 
 
 def _cmd_web(args: argparse.Namespace) -> int:
-    serve_dashboard(_target(args, role="reader"), args.host, args.port)
+    serve_dashboard(_target(args), args.host, args.port)
     return 0
 
 

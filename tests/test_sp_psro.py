@@ -27,7 +27,7 @@ from kaggriculture_lab.league import LeagueConfig, create_session
 from kaggriculture_lab.model_trainers import RoundContext, TrainingBatchWriter
 from kaggriculture_lab.model_updates import ActiveCheckpoint, ModelUpdateContext, TrainingBatch
 from kaggriculture_lab.storage import ExperimentStore
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 def test_manifest_declares_new_training_family():
@@ -480,6 +480,19 @@ def test_manifest_rollouts_are_persisted_as_paired_episode_artifacts(tmp_path: P
         store.connection.execute(
             "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, %s, %s)",
             ["session:g0000", "session", 0, "RUNNING"],
+        )
+        seed_reference_rows(
+            store.connection,
+            run_id="session",
+            family_id="sp_psro_match_policy_v3",
+            revision_ids=("member-a", "live-nu"),
+        )
+        store.connection.execute(
+            """
+            INSERT INTO training_models (
+                model_id, family_id, trainer_path, min_new_batches, config_json
+            ) VALUES ('model', 'sp_psro_match_policy_v3', 'trainer:train', 1, '{}')
+            """
         )
         writer = TrainingBatchWriter(store, "model")
         context = RoundContext(

@@ -73,8 +73,6 @@ try {
             uv run python -m kaggriculture_lab.postgres_admin write-env
             if ($LASTEXITCODE -ne 0) { throw "Could not write the PostgreSQL environment file." }
             Start-LabPostgres
-            uv run python -m kaggriculture_lab.postgres_admin migrate-catalogs
-            if ($LASTEXITCODE -ne 0) { throw "Could not migrate PostgreSQL catalogs." }
             uv run python -m kaggriculture_lab.postgres_admin bootstrap
             if ($LASTEXITCODE -ne 0) { throw "Could not bootstrap PostgreSQL." }
             uv run kaglab web

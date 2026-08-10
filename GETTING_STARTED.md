@@ -101,13 +101,17 @@ Then inspect and breed:
 surrogate share comes from the family's own `propose()`; a family without one falls back to
 mutation, so a new agent works before it has any model.
 
+For leagues with fixed external benchmarks, `anchor_rounds` is separate from
+`hall_of_fame_rounds`. The former gives deterministic coverage of immutable opponents; the
+latter remains reserved for strong historical policies from earlier generations.
+
 Configs live in `configs/`. Start with `league_smoke.toml` (6 agents, 4 rounds, 120-step
 episodes — finishes in under a minute) before `league.toml`.
 
 ### Episode hooks
 
 Each agent's `agent.toml` may name an `episode_evaluator`, run after every episode it plays,
-with read-only PostgreSQL access to *all* of its prior games:
+with PostgreSQL access to *all* of its prior games:
 
 ```python
 def evaluate_episode(context, reader):
@@ -160,6 +164,20 @@ can be changed safely on an existing session:
 ```
 
 ## 3. Training rounds — the DQN
+
+`python train_dqn.py` is the persistent single-learner research run. It starts from random
+weights and collects each 16-episode batch as 4 games against `starter` and 12 games
+against a rotating pool of the five most recent promoted checkpoints, so the learner
+improves by playing frozen snapshots of itself. It stops after five 100-round generations.
+The fixed benchmarks never enter that mix — they exist so the promotion gate has an
+absolute reference rather than only a relative one. Each generation records small
+`dqn_progress` evaluation rounds at its start and end—two seat-swapped seeds per
+benchmark—so the dashboard exposes replayable observation episodes without adding them to
+the training buffer.
+
+The first update has no incumbent to beat, so it promotes on the benchmarks merely running.
+That promotion seeds the self-play pool; every later update gates head-to-head against the
+checkpoint before it.
 
 The primary persistent path is the league hook. In `configs/league.toml`, each closed
 league round buys one 16-episode DQN rollout batch. The current twenty-batch threshold

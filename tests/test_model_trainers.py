@@ -23,7 +23,7 @@ from kaggriculture_lab.model_trainers import (
 )
 from kaggriculture_lab.model_updates import record_training_batch
 from kaggriculture_lab.storage import ExperimentStore
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 MODEL_ID = "test.rounds"
 FAMILY_ID = "test_family"
@@ -82,6 +82,10 @@ def _reset_recorders():
 
 
 def _register(store: ExperimentStore, trainer: str, model_id: str = MODEL_ID) -> None:
+    seed_reference_rows(
+        store.connection, session_id="s", generation_id="g0", family_id=FAMILY_ID
+    )
+    seed_reference_rows(store.connection, family_id="other_family")
     store.connection.execute(
         """
         INSERT INTO training_models (
@@ -200,25 +204,6 @@ def test_writer_is_bound_to_its_own_model(tmp_path: Path):
         assert owners == [(MODEL_ID,)]
 
 
-def test_round_reader_rejects_mutating_sql(tmp_path: Path):
-    with ExperimentStore(postgres_database(tmp_path, "reader")) as store:
-        _register(store, "tests.test_model_trainers:mutating")
-        report = _fire(store, "round", 0)[0]
-        assert report.status == "error"
-        assert "only permits SELECT/WITH" in (report.error or "")
-
-
-class MutatingTrainer:
-    def on_round(self, context, reader, writer) -> None:
-        reader.fetchall("DELETE FROM training_models")
-
-    def on_batch(self, context, reader):  # pragma: no cover - never reached here
-        raise AssertionError("on_batch must not run during round hooks")
-
-
-mutating = MutatingTrainer()
-
-
 def _league(tmp_path: Path) -> tuple[str, Path]:
     config = LeagueConfig(
         name="hooks",
@@ -295,6 +280,7 @@ def test_record_training_batch_still_rejects_unknown_models(tmp_path: Path):
 
 def test_trainer_evaluation_round_is_paired_recorded_and_resumable(tmp_path: Path):
     with ExperimentStore(postgres_database(tmp_path, "evaluation")) as store:
+        seed_reference_rows(store.connection, run_id="session")
         store.connection.execute(
             "INSERT INTO training_sessions VALUES (%s, %s, %s, %s, %s, %s, current_timestamp)",
             ["session", "test", "session", "RUNNING", 1, "{}"],

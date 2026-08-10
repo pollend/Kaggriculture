@@ -1,7 +1,7 @@
-"""Read-only MCP tools for evaluating persistent league progress.
+"""MCP tools for evaluating persistent league progress.
 
 The dashboard owns the HTTP transport. This module owns protocol dispatch and
-the bounded PostgreSQL queries, which keeps model-facing data independent from the
+the PostgreSQL queries, which keeps model-facing data independent from the
 HTML presentation layer.
 """
 
@@ -11,8 +11,6 @@ import json
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
-
-from kaggriculture_lab.read_only import fetchmany_select
 
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, "2025-06-18", "2025-03-26")
@@ -84,6 +82,13 @@ READ_ONLY_ANNOTATIONS = {
     "readOnlyHint": True,
     "destructiveHint": False,
     "idempotentHint": True,
+    "openWorldHint": False,
+}
+
+MUTATING_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "idempotentHint": False,
     "openWorldHint": False,
 }
 
@@ -177,10 +182,12 @@ TOOLS: tuple[dict[str, Any], ...] = (
     },
     {
         "name": "query_database",
-        "title": "Query the progress database",
+        "title": "Query or modify the progress database",
         "description": (
-            "Run one parameterized SELECT/WITH query against the shared PostgreSQL database. "
-            "Mutation and multi-statement SQL are rejected; results are row-capped. "
+            "Run parameterized SQL against the shared PostgreSQL database. Reads, writes, "
+            "and DDL are all permitted and commit immediately, so mutate deliberately. "
+            "Result sets are row-capped by max_rows; statements without a result set "
+            "report the number of affected rows instead. "
             "Use information_schema.tables and information_schema.columns to discover the schema."
         ),
         "inputSchema": {
@@ -198,7 +205,7 @@ TOOLS: tuple[dict[str, Any], ...] = (
             "required": ["sql"],
             "additionalProperties": False,
         },
-        "annotations": READ_ONLY_ANNOTATIONS,
+        "annotations": MUTATING_ANNOTATIONS,
     },
 )
 
@@ -252,7 +259,8 @@ class ProgressMCP:
                     },
                     "instructions": (
                         "Use list_training_sessions first, then inspect a session, generation, "
-                        "or model. All tools are bounded and read-only."
+                        "or model. The inspection tools are bounded and read-only; "
+                        "query_database runs arbitrary SQL, including writes and DDL."
                     ),
                 }
             elif method == "ping":
@@ -795,17 +803,25 @@ class ProgressMCP:
             raise ValueError("parameters may contain only JSON scalar values")
         max_rows = _bounded_int(arguments, "max_rows", 200, 1000)
         with self.repository.connect() as connection:
-            columns, rows, truncated = fetchmany_select(
-                connection,
-                sql,
-                parameters,
-                limit=max_rows,
-                reader_name="dashboard MCP query_database",
-            )
+            cursor = connection.execute(sql, list(parameters))
+            if cursor.description is None:
+                # INSERT/UPDATE/DELETE/DDL: nothing to page through, so report the
+                # write instead. Connections are autocommit, so it has already landed.
+                return {
+                    "columns": [],
+                    "rows": [],
+                    "row_count": 0,
+                    "affected_rows": cursor.rowcount,
+                    "truncated": False,
+                    "max_rows": max_rows,
+                }
+            columns = [str(item[0]) for item in cursor.description]
+            fetched = cursor.fetchmany(max_rows + 1)
+        rows = fetched[:max_rows]
         return {
             "columns": columns,
             "rows": [_plain(row) for row in rows],
             "row_count": len(rows),
-            "truncated": truncated,
+            "truncated": len(fetched) > max_rows,
             "max_rows": max_rows,
         }

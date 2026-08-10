@@ -211,21 +211,28 @@ class JobScorerAgent:
         return {"farmer": unit_actions[0], "hands": unit_actions[1:], "market": orders}
 
 
-def _load_network() -> QNetwork:
+# Bound at import, while `sim.registry.resolve` still has KAGG_AGENT_CONFIG
+# exported for *this* spec. Reading it any later is too late: resolve() restores
+# the variable in a finally block, and `sim.runner.run_match` resolves both seats
+# before either one plays. Reading it lazily made every `?weights=` silently fall
+# back to the packaged weights, so challenger and incumbent played as one policy
+# and every paired promotion margin came out exactly 0.0.
+_IMPORT_CONFIG = os.environ.get("KAGG_AGENT_CONFIG")
+
+
+def _load_network(raw: str | None = _IMPORT_CONFIG) -> QNetwork:
     """Trained weights if present, otherwise a zero net.
 
     A `weights` key in KAGG_AGENT_CONFIG overrides the default path -- that is
     how self-play resolves a frozen snapshot as an opponent spec, e.g.
     ``agents/dqn_job_scorer/main.py?weights=runs/dqn/snapshots/round0100.npz``.
-    The environment variable is read the same way
-    `agents.configurable_crop_surrogate.agent.strategy_from_environment` reads it, so the agent
-    stays dependency-free.
+    The config arrives as the raw JSON captured at import; it is a parameter so
+    callers can supply one without reaching through the process environment.
 
     A zero net plays legally and deterministically (every Q is 0, so selection
     falls to the index tiebreak), which keeps the agent importable and testable
     before the first training run finishes.
     """
-    raw = os.environ.get("KAGG_AGENT_CONFIG")
     if raw:
         config = json.loads(raw)
         override = config.get("weights")
@@ -241,8 +248,7 @@ def _load_network() -> QNetwork:
     return QNetwork.random(seed=0)
 
 
-def _load_bundle() -> PolicyBundle:
-    raw = os.environ.get("KAGG_AGENT_CONFIG")
+def _load_bundle(raw: str | None = _IMPORT_CONFIG) -> PolicyBundle:
     if raw:
         config = json.loads(raw)
         override = config.get("weights")

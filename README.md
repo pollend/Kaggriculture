@@ -39,12 +39,14 @@ uv sync --locked --python 3.12
 # Edit root main.toml to change machine-wide scale, paths, and compute settings.
 python train_all.py
 
-# Run three adaptive-hybrid DQNs in an isolated self-play store.
-python train_dqn.py
+# Train mixed-farm v5 against every imported Kaggle snapshot. Generation zero
+# is drawn entirely from the bounded prior; v3/v4 champions are not inherited.
+python train_mixed_farm.py
 
-# Run the stable single-learner fixed-opponent curriculum. During the current
-# PSRO pause, train_sp_psro.py is a compatibility alias for this command.
-python train_fixed_dqn.py
+# Train one adaptive-hybrid DQN by self-play. Three of every four rollouts face
+# a frozen snapshot of its own promoted checkpoints; the fixed benchmarks are
+# only the external yardstick the promotion gate measures against.
+python train_dqn.py
 
 # Compare named profiles directly.
 .venv/bin/python -m sim.arena league \
@@ -133,8 +135,7 @@ Start the complete local service in one terminal:
 ```
 
 That command writes the local PostgreSQL environment file, starts the single
-`kaggriculture-postgres` container, migrates any legacy catalog schemas into `public`,
-bootstraps the schema, then runs the shared dashboard in the
+`kaggriculture-postgres` container, bootstraps the schema, then runs the shared dashboard in the
 foreground. Docker Compose is not required. The persistent data lives in one named Docker
 volume. Run `train_*.py` or `kaglab league run` from another terminal. Useful lifecycle
 commands are:
@@ -171,7 +172,7 @@ by default and has no authentication.
 
 ### Agent access through MCP
 
-The dashboard also exposes a stateless, read-only MCP Streamable HTTP endpoint at
+The dashboard also exposes a stateless MCP Streamable HTTP endpoint at
 `http://127.0.0.1:8000/mcp`. Configure one MCP client with that URL while `kaglab web`
 is running. The endpoint supports protocol revisions
 2025-11-25, 2025-06-18, and 2025-03-26 and returns JSON responses rather than opening
@@ -189,11 +190,13 @@ The model-facing tools are:
 - `get_session_progress` — inspect generation history, rating deltas, leaders, evaluations, and models
 - `get_generation_progress` — inspect work completion, outcomes, agents, hooks, and runtime
 - `get_model_progress` — inspect batch watermarks, updates, gates, checkpoints, and evaluations
-- `query_database` — run one parameterized `SELECT`/`WITH` query against the shared database
+- `query_database` — run parameterized SQL against the shared database, reads and writes alike
 
 `query_database` accepts `sql`, an optional `parameters` array, and `max_rows` (default
-200, maximum 1000). Mutations and multiple statements are rejected and the HTTP
-service uses the PostgreSQL reader role. Schema discovery is available through
+200, maximum 1000). It connects as the `kag_writer` role, so mutations and DDL are
+permitted and commit immediately — this is a playground, not a guarded production
+surface. Statements without a result set report `affected_rows` instead of rows.
+Schema discovery is available through
 `information_schema.tables` and `information_schema.columns`. For example:
 
 ```json
@@ -223,9 +226,26 @@ rating snapshots, lineage, surrogate checkpoints, and post-episode evaluations r
 queryable alongside them. `league resume` safely continues missing episodes.
 
 `configs/league.toml` registers the 12 `competitor_` snapshots as fixed benchmark
-anchors. They receive paired games through the hall-of-fame rounds but are never bred,
-mutated, trained, or bundled with our agent. `configs/league_smoke.toml` intentionally
-omits them to keep plumbing tests small.
+anchors. A config may reserve `anchor_rounds` so every live policy receives deterministic
+seat-swapped coverage of those fixed opponents before separate historical hall-of-fame
+rounds. Anchors are never bred, mutated, trained, or bundled with our agent.
+`configs/league_smoke.toml` intentionally omits them to keep plumbing tests small.
+
+`configs/mixed_farm_league.toml` uses all twelve anchor rounds, twelve population rounds,
+and four historical rounds. Its v5 Random Forest keeps the v4 target weights: 40% conservative
+rating, 25% equal-opponent macro margin, 20% bottom-quartile opponent margin, and 15% final
+money. It can tune bounded economic preferences, but the deterministic controller owns
+feasibility: a normal 10-hand ceiling, an absolute 16-hand ceiling, exact Fibonacci costs,
+cash-reserve and daily-spend checks, useful-work requirements, and a doubled ROI hurdle for
+hands 11–16. The forest is trusted only after 60 rows and held-out error gates for performance,
+productive hand actions, and idle hand actions; otherwise evolution supplies the candidates.
+
+The v4 generation in `configurable-mixed-farm-v4-training` remains preserved and incomplete, but
+nothing runs it any more: v4 was not competitive, so its frozen baseline controller and the
+automated acceptance arena were both removed. The single mixed-farm agent is now
+`agents/mixed_farm_v5/` (family `mixed_farm_v5`), training in the
+`configurable-mixed-farm-v5-training` session from a fresh population rather than inherited
+v3/v4 champions. Compare a champion by hand with `sim.arena` against the 12 anchors.
 
 An agent may export an optional `evaluate_episode(context, reader)` hook from its
 `main.py`. The parent league process invokes it only after the episode and replay have
@@ -271,7 +291,7 @@ not create separate model namespaces.
 `training_manifests` in the league config controls which families receive trainer hooks.
 Being present as an `anchor_manifest` does not train that family. Completed round hooks
 are ledgered and skipped when an interrupted league resumes, so expensive collection is
-not repeated. The current crop and planner surrogates each wait for two
+not repeated. The current crop, mixed-farm, and planner surrogates each wait for two
 closed-generation batches; the DQN waits for twenty 16-episode rollout batches.
 
 ```bash

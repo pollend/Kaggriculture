@@ -1,12 +1,17 @@
 # SP-PSRO Job Scorer
 
-> **Temporarily paused.** `python train_sp_psro.py` currently launches the
-> fixed-opponent DQN curriculum in `train_fixed_dqn.py`, using a separate
-> database and artifacts directory. It trains one learner against `starter`,
-> the configurable crop surrogate, and the receding-horizon planner with no
-> population mixture, Exp3 update, admission round, or self-play. The original
-> resumable population workflow remains available as
-> `python train_sp_psro_population.py`.
+> **No entrypoint.** The population workflow has no runnable launcher: DQN
+> training is consolidated into `python train_dqn.py`, a single learner playing
+> frozen snapshots of itself, with no population mixture, Exp3 update, or
+> admission round. The mixture never earned its complexity in practice.
+>
+> The code below stays as the source for three pieces worth folding into the
+> base DQN later: the absolute release gate (`passes_release_gate`,
+> `training/updater.py`), the iterate-averaged candidate (`_record_nu_snapshot`
+> / `_save_nu_average`), and durable, resumable gate evaluation recorded as
+> league rounds (`_prepare_admission` / `_apply_recorded_evaluations`).
+> Restoring the population itself needs a new entrypoint written against
+> `configs/sp_psro_joint_league.toml`.
 
 This strategy keeps the DQN Job Scorer's inference policy and replaces its
 training curriculum with a learned self-play population policy inspired by

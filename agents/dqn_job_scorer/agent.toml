@@ -41,8 +41,8 @@ episodes_per_batch = 16
 # adds the current generation's evolved revisions, whose parameters the
 # checked-in main.py files do not carry. Self-play mixes in past promoted
 # checkpoints once enough batches exist, held to `self_play_ratio` of each
-# batch -- evaluation is always against the benchmark, so a higher share trains
-# on a distribution the objective never measures.
+# batch -- evaluation is always against the configured benchmark or benchmark
+# suite, so a higher share trains on a distribution the objective never measures.
 league_opponents = true
 self_play_after = 20
 self_play_pool = 5

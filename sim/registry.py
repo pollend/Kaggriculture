@@ -93,15 +93,29 @@ def split_spec(spec: str) -> tuple[str, dict[str, Any]]:
     return target, config
 
 
-def _load_path(path: Path) -> Any:
-    """Import a .py file and return its `agent` attribute, else its last callable."""
-    module_name = f"_kagg_agent_{path.stem}_{abs(hash(str(path.resolve())))}"
+def _import_file(path: Path, config: dict[str, Any] | None = None) -> Any:
+    """Execute a .py file under a name that includes its config.
+
+    The config is part of the module's identity, not just its input. A
+    submission-shaped module reads KAGG_AGENT_CONFIG at import and keeps the
+    result in module state, so two specs that differ only in query string are
+    two different agents. Keying on the path alone let them share one entry.
+    """
+    identity = (str(path.resolve()), json.dumps(config or {}, sort_keys=True))
+    module_name = f"_kagg_agent_{path.stem}_{abs(hash(identity))}"
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ValueError(f"cannot import agent file: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    return module
+
+
+def _load_path(path: Path, config: dict[str, Any] | None = None) -> Any:
+    """Import a .py file and return its `agent` attribute, else its last callable."""
+    module = _import_file(path, config)
+    module_name = module.__name__
 
     # The real submission contract is a module-level `agent(obs)`; fall back to
     # the last defined callable to match how kaggle-environments loads sources.
@@ -111,6 +125,21 @@ def _load_path(path: Path) -> Any:
     if not callables:
         raise ValueError(f"no callable agent found in {path}")
     return callables[-1]
+
+
+def _load_module_attr(module_name: str, attr: str, config: dict[str, Any]) -> Any:
+    """Resolve ``package.module:attr``, re-executing the file when configured.
+
+    `import_module` is memoized in `sys.modules`, so a module that binds its
+    config at import would keep the first spec's config for the life of the
+    process. When a config is present, load the file under a config-specific
+    name instead; without one the ordinary cached import is correct and cheap.
+    """
+    module = importlib.import_module(module_name)
+    origin = getattr(module, "__file__", None)
+    if config and origin:
+        module = _import_file(Path(origin), config)
+    return getattr(module, attr)
 
 
 def _is_factory(obj: Any) -> bool:
@@ -145,12 +174,12 @@ def resolve(spec: str, env_name: str = DEFAULT_ENV) -> Callable[[dict], dict]:
     try:
         if ":" in target:
             module_name, _, attr = target.partition(":")
-            obj = getattr(importlib.import_module(module_name), attr)
+            obj = _load_module_attr(module_name, attr, config)
         else:
             path = Path(target)
             if not path.exists():
                 raise ValueError(f"unknown agent spec: {spec!r} (no such file)")
-            obj = _load_path(path)
+            obj = _load_path(path, config)
 
         return obj(config) if _is_factory(obj) else obj
     finally:

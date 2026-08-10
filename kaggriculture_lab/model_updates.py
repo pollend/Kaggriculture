@@ -12,7 +12,6 @@ from typing import Any, Protocol
 
 from kaggriculture_lab.database import DatabaseTarget, database_target
 from kaggriculture_lab.identity import training_artifact_root
-from kaggriculture_lab.read_only import fetchall_select
 from kaggriculture_lab.storage import ExperimentStore
 
 
@@ -108,15 +107,13 @@ class UpdateReport:
 
 
 class ModelTrainingReader:
-    """Read-only-by-convention view supplied to family-specific updaters."""
+    """Query view over the league store supplied to family-specific updaters."""
 
     def __init__(self, store: ExperimentStore):
         self._connection = store.connection
 
     def fetchall(self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-        return fetchall_select(
-            self._connection, sql, parameters, reader_name="model training reader"
-        )
+        return self._connection.execute(sql, list(parameters)).fetchall()
 
     def fetchone(self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()) -> tuple[Any, ...] | None:
         rows = self.fetchall(sql, parameters)

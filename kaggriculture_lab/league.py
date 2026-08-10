@@ -38,7 +38,12 @@ from kaggriculture_lab.model_trainers import (
 from kaggriculture_lab.model_updates import ModelTrainingReader, update_model_in_store
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
 from kaggriculture_lab.storage import ExperimentStore
-from kaggriculture_lab.training import allocate_generation, load_training_adapter, propose
+from kaggriculture_lab.training import (
+    allocate_generation,
+    initialize_population,
+    load_training_adapter,
+    propose,
+)
 from sim.runner import MatchResult, run_match
 
 
@@ -58,12 +63,15 @@ class LeagueConfig:
     training_agents: tuple[TrainingAgentSpec, ...] = ()
     population_size: int = 20
     rounds_per_generation: int = 20
+    anchor_rounds: int = 0
     hall_of_fame_rounds: int = 4
     episode_steps: int = 720
     seed: int = 42
     jobs: int = 1
     tau: float = 0.5
     candidate_pool: int = 2_000
+    seed_session_id: str | None = None
+    seed_session_ids: tuple[str, ...] = ()
     pairing_mode: str = "league"
 
     @classmethod
@@ -79,6 +87,7 @@ class LeagueConfig:
             TrainingAgentSpec.from_dict(item)
             for item in values.get("training_agents", ())
         )
+        values["seed_session_ids"] = tuple(values.get("seed_session_ids", ()))
         return cls(**values)
 
     def validate(self) -> None:
@@ -92,6 +101,14 @@ class LeagueConfig:
             raise ValueError("rounds_per_generation must be positive")
         if not 0 <= self.hall_of_fame_rounds <= self.rounds_per_generation:
             raise ValueError("hall_of_fame_rounds must be between 0 and rounds_per_generation")
+        if not 0 <= self.anchor_rounds <= self.rounds_per_generation:
+            raise ValueError("anchor_rounds must be between 0 and rounds_per_generation")
+        if self.anchor_rounds + self.hall_of_fame_rounds > self.rounds_per_generation:
+            raise ValueError(
+                "anchor_rounds plus hall_of_fame_rounds cannot exceed rounds_per_generation"
+            )
+        if self.anchor_rounds and not self.anchor_manifests:
+            raise ValueError("anchor_rounds requires at least one anchor manifest")
         if self.episode_steps < 1:
             raise ValueError("episode_steps must be positive")
         if self.jobs < 0:
@@ -203,21 +220,6 @@ def create_session(
     if adapter is None and config.pairing_mode == "league":
         raise ValueError(f"agent family has no training_adapter: {manifest.family_id}")
     population_rng = random.Random(config.seed)
-    strategies = (
-        [adapter.sample(population_rng) for _ in range(config.population_size)]
-        if adapter is not None and config.pairing_mode == "league"
-        else []
-    )
-    revisions = [
-        build_revision(
-            manifest,
-            strategy,
-            workspace=workspace,
-            episode_steps=config.episode_steps,
-            source="random",
-        )
-        for strategy in strategies
-    ]
     anchors = (
         [
             builtin_revision("starter"),
@@ -240,12 +242,37 @@ def create_session(
             "SELECT 1 FROM training_sessions WHERE session_id = %s", [session_id]
         ).fetchone():
             raise ValueError(f"training session already exists: {session_id}")
+        initialized = (
+            initialize_population(
+                adapter,
+                config.population_size,
+                population_rng,
+                ModelTrainingReader(store),
+                config.seed_session_ids or ((config.seed_session_id,) if config.seed_session_id else ()),
+            )
+            if adapter is not None and config.pairing_mode == "league"
+            else []
+        )
+        strategies = [strategy for strategy, _ in initialized]
+        revisions = [
+            build_revision(
+                manifest,
+                strategy,
+                workspace=workspace,
+                episode_steps=config.episode_steps,
+                source=source,
+            )
+            for strategy, source in initialized
+        ]
         store.register_family(manifest, manifest_path)
         for anchor_manifest, anchor_path in zip(anchor_manifests, anchor_manifest_paths):
             store.register_family(anchor_manifest, anchor_path)
         _register_training_agents(store, config, workspace=workspace)
-        store.add_agent_revisions([*revisions, *anchors, *competitor_anchors])
+        # Parents before children: strategies own the revisions that cite them,
+        # and the run owns the strategies' `created_run_id`.
+        store.begin_run(session_id, config.name, config.seed, asdict(config), {}, None)
         store.add_strategies(strategies, "league-random", session_id)
+        store.add_agent_revisions([*revisions, *anchors, *competitor_anchors])
         config_json = json.dumps(asdict(config), sort_keys=True)
         store.connection.execute(
             """
@@ -255,7 +282,6 @@ def create_session(
             """,
             [session_id, config.league, config.name, config.seed, config_json],
         )
-        store.begin_run(session_id, config.name, config.seed, asdict(config), {}, None)
         store.connection.execute(
             "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, 0, 'OPEN')",
             [generation_id, session_id],
@@ -286,6 +312,7 @@ def _load_session(store: ExperimentStore, session_id: str) -> LeagueConfig:
     values["training_agents"] = tuple(
         TrainingAgentSpec.from_dict(item) for item in values.get("training_agents", ())
     )
+    values["seed_session_ids"] = tuple(values.get("seed_session_ids", ()))
     return LeagueConfig(**values)
 
 
@@ -411,6 +438,47 @@ def _hall_of_fame(
     return [*anchors, *historical] or ["builtin:starter"]
 
 
+def _anchor_ids(store: ExperimentStore, session_id: str) -> list[str]:
+    return [
+        str(row[0])
+        for row in store.connection.execute(
+            """
+            SELECT DISTINCT gm.revision_id
+            FROM generation_members gm
+            JOIN generations g USING (generation_id)
+            WHERE g.session_id = %s AND gm.role = 'anchor'
+            ORDER BY gm.revision_id
+            """,
+            [session_id],
+        ).fetchall()
+    ]
+
+
+def _historical_hall_of_fame(
+    store: ExperimentStore, session_id: str, generation_index: int, limit: int
+) -> list[str]:
+    if generation_index == 0:
+        return ["builtin:starter", "builtin:seeded_random", "builtin:pass"]
+    rows = store.connection.execute(
+        """
+        SELECT rs.revision_id, max(rs.rating - 2 * rs.deviation) AS conservative,
+               max(gs.mean_margin) AS margin
+        FROM rating_snapshots rs
+        JOIN generations g ON g.generation_id = rs.generation_id
+        LEFT JOIN generation_stats gs
+          ON gs.generation_id = rs.generation_id AND gs.revision_id = rs.revision_id
+        JOIN agent_revisions ar ON ar.revision_id = rs.revision_id
+        WHERE g.session_id = %s AND g.generation_index < %s
+          AND NOT rs.is_frozen AND ar.family_id != 'builtin'
+        GROUP BY rs.revision_id
+        ORDER BY conservative DESC, margin DESC NULLS LAST, rs.revision_id
+        LIMIT %s
+        """,
+        [session_id, generation_index, limit],
+    ).fetchall()
+    return [str(row[0]) for row in rows] or ["builtin:starter"]
+
+
 def schedule_generation(store: ExperimentStore, session_id: str) -> int:
     """Create deterministic random pairings, including both seat orientations."""
 
@@ -433,7 +501,11 @@ def schedule_generation(store: ExperimentStore, session_id: str) -> int:
     members = _member_ids(store, generation_id)
     rng = random.Random(config.seed + generation_index * 1_000_003)
     rows: list[list[Any]] = []
-    intra_rounds = config.rounds_per_generation - config.hall_of_fame_rounds
+    intra_rounds = (
+        config.rounds_per_generation
+        - config.anchor_rounds
+        - config.hall_of_fame_rounds
+    )
     rotation: list[str | None] = members[:]
     rng.shuffle(rotation)
     if len(rotation) % 2:
@@ -458,9 +530,39 @@ def schedule_generation(store: ExperimentStore, session_id: str) -> int:
             rows.append([pairing_id, generation_id, round_index, "population", seed, left, right, "PENDING"])
         rotation = [rotation[0], rotation[-1], *rotation[1:-1]]
 
-    hall = _hall_of_fame(store, session_id, generation_index, max(3, math.ceil(len(members) * 0.2)))
+    if config.anchor_rounds:
+        anchors = _anchor_ids(store, session_id)
+        if not anchors:
+            raise ValueError("session config requests anchor rounds but has no anchors")
+        for offset in range(config.anchor_rounds):
+            round_index = intra_rounds + offset
+            for index, member in enumerate(members):
+                opponent = anchors[(index + offset) % len(anchors)]
+                seed = rng.randrange(0, 2**31)
+                pairing_id = _stable_id(
+                    "pair", generation_id, round_index, member, opponent, seed
+                )
+                rows.append(
+                    [
+                        pairing_id,
+                        generation_id,
+                        round_index,
+                        "anchor",
+                        seed,
+                        member,
+                        opponent,
+                        "PENDING",
+                    ]
+                )
+        hall = _historical_hall_of_fame(
+            store, session_id, generation_index, max(3, math.ceil(len(members) * 0.2))
+        )
+    else:
+        hall = _hall_of_fame(
+            store, session_id, generation_index, max(3, math.ceil(len(members) * 0.2))
+        )
     for offset in range(config.hall_of_fame_rounds):
-        round_index = intra_rounds + offset
+        round_index = intra_rounds + config.anchor_rounds + offset
         shuffled = members[:]
         rng.shuffle(shuffled)
         for index, member in enumerate(shuffled):
@@ -1310,6 +1412,7 @@ def create_next_generation(
             model_id=_primary_training_model_id(
                 config, manifest.family_id, workspace=workspace
             ),
+            candidate_pool=config.candidate_pool,
         )
         surrogate_iter = iter(proposed)
         while sum(item[1] == "surrogate" for item in selected) < allocation["surrogate"]:
@@ -1324,10 +1427,10 @@ def create_next_generation(
         next_index = current_index + 1
         generation_id = f"{session_id}:g{next_index:04d}"
         new_revisions = [item[0] for item in selected if item[1] != "elite"]
-        store.add_agent_revisions(new_revisions)
         store.add_strategies(
             [adapter.decode(item) for item in new_revisions], "league-next-generation", session_id
         )
+        store.add_agent_revisions(new_revisions)
         store.connection.execute(
             "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, %s, 'OPEN')",
             [generation_id, session_id, next_index],

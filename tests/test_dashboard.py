@@ -24,7 +24,7 @@ from kaggriculture_lab.dashboard import (
 from kaggriculture_lab.database import DatabaseTarget
 from kaggriculture_lab.storage import ExperimentStore
 from sim.runner import MatchResult, SeatResult
-from tests.postgres_support import postgres_database
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 def _seed_dashboard(database: DatabaseTarget) -> dict:
@@ -60,7 +60,12 @@ def _seed_dashboard(database: DatabaseTarget) -> dict:
         connection.execute(
             "INSERT INTO agent_families (family_id, name, manifest_path, entry_point, parameter_schema_version) VALUES ('family', 'Farm Stars', 'agent.toml', 'agent:agent', 1)"
         )
+        seed_reference_rows(connection, run_id="session/one")
         for revision, strategy in (("revision-a", "alpha"), ("revision-b", "beta")):
+            connection.execute(
+                "INSERT INTO strategies VALUES (%s, '{}', 'test', 'session/one')",
+                [strategy],
+            )
             connection.execute(
                 """
                 INSERT INTO agent_revisions (
@@ -237,6 +242,13 @@ def test_trainer_only_dashboard_reports_round_progress_not_pairing_fraction(tmp_
         connection.execute(
             "UPDATE training_sessions SET config_json = %s WHERE session_id = 'session/one'",
             [json.dumps({"pairing_mode": "trainer_only", "rounds_per_generation": 100})],
+        )
+        connection.execute(
+            """
+            INSERT INTO training_models (
+                model_id, family_id, trainer_path, min_new_batches, config_json
+            ) VALUES ('model', 'family', 'trainer:train', 1, '{}')
+            """
         )
         connection.execute(
             """
@@ -444,6 +456,7 @@ def test_replay_loader_rejects_missing_and_corrupt_payloads(tmp_path: Path):
     with ExperimentStore(database) as store:
         with pytest.raises(DashboardNotFound, match="missing"):
             _load_replay(store.connection, "missing")
+        seed_reference_rows(store.connection, run_id="run", match_ids=("broken",))
         store.connection.execute(
             "INSERT INTO episode_payloads VALUES ('broken', %s, 'not-a-digest')",
             [b"not gzip"],

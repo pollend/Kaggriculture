@@ -1,0 +1,31 @@
+family_id = "mixed_farm_v5"
+name = "Mixed-Farm Surrogate v5"
+entry_point = "agents.mixed_farm_v5.agent_v5:make_agent"
+parameter_schema_version = 4
+training_adapter = "agents.mixed_farm_v5.training:adapter"
+episode_evaluator = "agents.mixed_farm_v5.main:evaluate_episode"
+
+code_paths = [
+  "agents/__init__.py",
+  "agents/mixed_farm_v5/__init__.py",
+  "agents/mixed_farm_v5/main.py",
+  "agents/mixed_farm_v5/agent_v5.py",
+  "agents/mixed_farm_v5/strategy.py",
+  "agents/mixed_farm_v5/strategy_v5.py",
+  "agents/mixed_farm_v5/rules.py",
+  "agents/mixed_farm_v5/portfolio.py",
+  "agents/mixed_farm_v5/portfolio_v5.py",
+  "agents/mixed_farm_v5/scheduler.py",
+  "agents/mixed_farm_v5/market_v5.py",
+  "agents/mixed_farm_v5/labor_v5.py",
+]
+
+[[models]]
+model_id = "mixed_farm_v5.surrogate"
+trainer = "agents.mixed_farm_v5.train:trainer"
+min_new_batches = 2
+
+[models.config]
+n_estimators = 300
+min_samples_leaf = 2
+moon_min_rows = 20

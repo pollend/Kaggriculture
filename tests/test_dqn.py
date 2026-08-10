@@ -8,8 +8,6 @@ that stops being deterministic at epsilon=0.
 
 from __future__ import annotations
 
-from tests.postgres_support import postgres_database
-
 import copy
 import hashlib
 import json
@@ -43,6 +41,7 @@ from kaggriculture_lab.identity import AgentManifest, TrainingAgentSpec
 from kaggriculture_lab.model_updates import record_training_batch, update_model_in_store
 from kaggriculture_lab.storage import ExperimentStore
 from sim.runner import run_match
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 GAMMA = 0.997
 MODEL_ID = "dqn_job_scorer.adaptive_hybrid_q_v2"
@@ -101,11 +100,10 @@ def test_joint_policy_bundle_round_trips_and_legacy_falls_back(tmp_path):
     assert legacy.market is None
 
 
-def test_explicit_network_seed_is_a_frozen_schema_current_policy(monkeypatch):
+def test_explicit_network_seed_is_a_frozen_schema_current_policy():
     from agents.dqn_job_scorer import main as main_module
 
-    monkeypatch.setenv("KAGG_AGENT_CONFIG", json.dumps({"network_seed": 17}))
-    observed = main_module._load_network()
+    observed = main_module._load_network(json.dumps({"network_seed": 17}))
     expected = QNetwork.random(seed=17)
     for (observed_w, observed_b), (expected_w, expected_b) in zip(observed.layers, expected.layers):
         np.testing.assert_array_equal(observed_w, expected_w)
@@ -139,6 +137,7 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_p
         "eval_seeds": 1,
         "initialization": "incumbent",
         "incumbent_weights": str(incumbent),
+        "benchmarks": ["starter", "crop.py", "planner.py"],
     }
     unresolved_evaluation = {
         "opponent": "test",
@@ -197,6 +196,19 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_p
             [report.update_id],
         ).fetchone()
         assert evaluation == (None,)
+        benchmark_evaluations = store.connection.execute(
+            """
+            SELECT evaluation_kind, passed FROM model_evaluations
+            WHERE update_id = %s AND evaluation_kind LIKE 'fixed_benchmark:%%'
+            ORDER BY evaluation_kind
+            """,
+            [report.update_id],
+        ).fetchall()
+        assert benchmark_evaluations == [
+            ("fixed_benchmark:0", True),
+            ("fixed_benchmark:1", True),
+            ("fixed_benchmark:2", True),
+        ]
 
 
 def test_feature_dimensions_are_pinned():
@@ -601,10 +613,42 @@ def test_epsilon_zero_play_is_deterministic(tmp_path):
     assert [s.reward for s in first.seats] == [s.reward for s in second.seats]
 
 
+def _played_actions(match) -> list:
+    return [state[0]["action"] for state in match.replay["steps"]]
+
+
+@pytest.mark.parametrize(
+    "target", ["agents/dqn_job_scorer/main.py", "agents.dqn_job_scorer.main:agent"]
+)
+def test_weights_query_selects_the_policy(tmp_path, target):
+    """`?weights=` must reach the agent, or every promotion gate is a no-op.
+
+    `sim.registry.resolve` only exports KAGG_AGENT_CONFIG for the duration of
+    the resolve, and `sim.runner.run_match` resolves both seats before either
+    one plays. An agent that reads the variable when its first observation
+    arrives sees nothing and silently falls back to the packaged weights, so
+    challenger and incumbent play as the same policy and every paired margin
+    collapses to exactly zero. The `module:attr` form additionally survives in
+    `sys.modules`, so a stale policy would outlive the process's first resolve.
+    """
+    left, right = tmp_path / "left.npz", tmp_path / "right.npz"
+    QNetwork.random(seed=5).save(left)
+    QNetwork.random(seed=97).save(right)
+
+    first = run_match((f"{target}?weights={left}", "starter"), seed=4, keep_replay=True)
+    second = run_match((f"{target}?weights={right}", "starter"), seed=4, keep_replay=True)
+    assert not first.failed and not second.failed
+    assert _played_actions(first) != _played_actions(second)
+
+
 def test_agent_emits_only_legal_actions(tmp_path):
     weights = tmp_path / "w.npz"
     QNetwork.random(seed=9).save(weights)
-    match = run_match((f"agents/dqn_job_scorer/main.py?weights={weights}", "starter"), seed=2)
+    match = run_match(
+        (f"agents/dqn_job_scorer/main.py?weights={weights}", "starter"),
+        seed=2,
+        keep_replay=True,
+    )
     assert not match.failed
 
     for state in match.replay["steps"]:
@@ -771,22 +815,6 @@ def test_evaluator_ignores_failed_episodes():
     assert result["should_reevaluate"] is False
 
 
-def test_episode_reader_rejects_mutating_and_multi_statement_sql(tmp_path):
-    """A reporting hook must not be able to write to the league it reports on."""
-    from kaggriculture_lab.hooks import EpisodeReader
-
-    with ExperimentStore(postgres_database(tmp_path, "readonly")) as store:
-        reader = EpisodeReader(connection=store.connection, match_id="m", seat=0)
-        for statement in (
-            "DELETE FROM episode_players",
-            "UPDATE runs SET status = 'x'",
-            "DROP TABLE runs",
-            "SELECT 1; DELETE FROM episode_players",
-        ):
-            with pytest.raises(ValueError, match="only permits SELECT/WITH"):
-                reader.fetchall(statement)
-
-
 def test_truncation_keeps_maintenance_over_planting():
     """Only PLANT multiplies, so it must be what overflows the cap.
 
@@ -857,6 +885,9 @@ def test_evaluator_runs_against_the_real_postgres_schema(tmp_path):
         )
 
     with ExperimentStore(postgres_database(tmp_path, "league")) as store:
+        seed_reference_rows(
+            store.connection, run_id="run", family_id="family", revision_ids=("rev1", "rev2")
+        )
         # 30 prior games: the older half strong, the recent half collapsed.
         for index in range(30):
             mine = 21_000.0 if index < 15 else 8_000.0
@@ -1086,6 +1117,68 @@ def test_league_path_self_play_disabled_and_empty_pool():
     assert compose_opponents(base, [], 0.3) == base
     # A ratio above 0.9 is clamped rather than allowed to starve the benchmark.
     assert 0 < sum(1 for i in compose_opponents(base, pool, 1.0) if "weights=" in i)
+
+
+def test_mixed_curriculum_uses_exact_quarter_self_play_and_rotates_history():
+    from agents.dqn_job_scorer.training.updater import compose_opponents
+
+    base = ["starter", "crop.py", "planner.py"]
+    pool = [f"agents/dqn_job_scorer/main.py?weights=c{n}.npz" for n in range(5)]
+    selected = []
+    for batch_index in range(5):
+        opponents = compose_opponents(
+            base, pool, 0.25, pool_offset=batch_index
+        )
+        played = [opponents[index % len(opponents)] for index in range(16)]
+        self_play = [item for item in played if "weights=" in item]
+        assert len(self_play) == 4
+        assert all(played.count(item) == 4 for item in base)
+        assert len(set(self_play)) == 1
+        selected.append(self_play[0])
+
+    assert selected == pool
+
+
+def test_every_fixed_benchmark_must_pass_non_regression():
+    from agents.dqn_job_scorer.training.updater import benchmark_non_regression
+
+    incumbent = {"errors": 0, "margin_ci": [-10.0, 10.0]}
+    passing = {"errors": 0, "margin_ci": [-20.0, 5.0]}
+    regressed = {"errors": 0, "margin_ci": [-30.0, -11.0]}
+    failed = {"errors": 1, "margin_ci": [0.0, 20.0]}
+
+    results = [
+        benchmark_non_regression(item, incumbent)
+        for item in (passing, regressed, failed)
+    ]
+    assert results == [True, False, False]
+    assert not all(results)
+
+
+def test_identical_policy_head_to_head_is_an_error_not_a_rejection():
+    """A zero-width paired interval means one policy on both seats.
+
+    Scoring it as "no significant improvement" is how a broken `?weights=`
+    hid for 140 batches: every update rejected, the session looked healthy.
+    """
+    from agents.dqn_job_scorer.training.updater import (
+        _reject_degenerate_head_to_head,
+    )
+
+    degenerate = {
+        "errors": {},
+        "pairs": 100,
+        "margin_ci": [0.0, 0.0],
+        "opponent": "agents/dqn_job_scorer/main.py?weights=incumbent.npz",
+    }
+    with pytest.raises(RuntimeError, match="same policy"):
+        _reject_degenerate_head_to_head(degenerate)
+
+    # A real tie has spread, a single pair cannot show any, and a failed
+    # evaluation is already reported through `errors`.
+    _reject_degenerate_head_to_head({**degenerate, "margin_ci": [-12.0, 9.0]})
+    _reject_degenerate_head_to_head({**degenerate, "pairs": 1})
+    _reject_degenerate_head_to_head({**degenerate, "errors": {"seat0": "boom"}})
 
 
 def test_rotation_covers_every_opponent_across_batches():

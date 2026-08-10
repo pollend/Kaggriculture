@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from agents.dqn_job_scorer.training.progress import DQNProgressEvaluator
 from agents.dqn_job_scorer.training.updater import DQNCollector, DQNUpdater
 
 if TYPE_CHECKING:
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 class DQNTrainer:
     def __init__(self) -> None:
         self._collector = DQNCollector()
+        self._progress = DQNProgressEvaluator()
         self._updater = DQNUpdater()
 
     def on_round(
@@ -34,10 +36,11 @@ class DQNTrainer:
         reader: ModelTrainingReader,
         writer: TrainingBatchWriter,
     ) -> None:
-        # Generation close adds nothing an off-policy learner can use that the
-        # rounds leading up to it did not already provide.
-        if context.scope != "round":
+        if context.scope == "generation":
+            self._progress.observe(context, writer, phase="end")
             return
+        if context.round_index == 0:
+            self._progress.observe(context, writer, phase="start")
         self._collector.collect(context, reader, writer)
 
     def on_batch(

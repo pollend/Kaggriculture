@@ -26,9 +26,8 @@ class Trainer:
 ```
 
 The league owns matchups, rounds, and every promotion decision; the agent owns
-what training means. `reader` accepts SELECT/WITH only, and the round hook is
-offered at most once per round per model, so it is safe to resume an interrupted
-run without repeating expensive work. Which sessions drive which trainers is
+what training means. The round hook is offered at most once per round per model,
+so it is safe to resume an interrupted run without repeating expensive work. Which sessions drive which trainers is
 declared by `training_manifests` in the league config, not in code.
 
 The constants-driven runners may refine those manifests into named training

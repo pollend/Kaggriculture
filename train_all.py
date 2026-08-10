@@ -67,7 +67,7 @@ TRAINING_AGENTS = [
         "train": False,
     },
     {
-        "type": "configurable_mixed_farm_surrogate",
+        "type": "mixed_farm_v5",
         "name": "v3",
         "train": False,
     },

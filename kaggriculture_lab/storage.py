@@ -135,7 +135,40 @@ class ExperimentStore:
             )
         return tuple(identifiers)
 
+    def ensure_agent_families(self, revisions: Iterable[AgentRevision]) -> None:
+        """Guarantee a parent row for every family a revision cites.
+
+        Built-in anchors (`identity.builtin_revision`) and ad-hoc evaluation
+        opponents name families -- `builtin`, `evaluation_opponent` -- that no
+        manifest ever registers, and `agent_revisions.family_id` references
+        `agent_families`. Placeholders are written with `DO NOTHING`, so a real
+        `register_family` still overwrites them whenever one arrives."""
+
+        first: dict[str, AgentRevision] = {}
+        for item in revisions:
+            first.setdefault(item.family_id, item)
+        if not first:
+            return
+        self.connection.executemany(
+            """
+            INSERT INTO agent_families
+            VALUES (%s, %s, '', %s, NULL, %s, %s, current_timestamp)
+            ON CONFLICT (family_id) DO NOTHING
+            """,
+            [
+                [
+                    family_id,
+                    family_id,
+                    item.entry_point,
+                    item.episode_evaluator,
+                    item.parameter_schema_version,
+                ]
+                for family_id, item in first.items()
+            ],
+        )
+
     def add_agent_revisions(self, revisions: Iterable[AgentRevision]) -> None:
+        items = list(revisions)
         rows = [
             [
                 item.revision_id,
@@ -151,9 +184,10 @@ class ExperimentStore:
                 item.source,
                 item.episode_evaluator,
             ]
-            for item in revisions
+            for item in items
         ]
         if rows:
+            self.ensure_agent_families(items)
             self.connection.executemany(
                 """
                 INSERT INTO agent_revisions (
