@@ -19,6 +19,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from kaggriculture_lab.constants import default_database
 from kaggriculture_lab.database import DatabaseTarget
 from kaggriculture_lab.episode_metrics import episode_metrics
 from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader, load_evaluator
@@ -153,10 +154,8 @@ def _league_worker(task: LeagueEpisodeTask):
         (seats[0].agent_spec, seats[1].agent_spec),
         task.seed,
         {"episodeSteps": task.episode_steps},
-        keep_replay=True,
-        # The league persists per-episode metrics for agents' evaluation hooks
-        # and the replay itself for evaluators to read back, so it opts into
-        # both retention and the kaggriculture analyzer explicitly.
+        # The league persists per-episode metrics for agents' evaluation hooks,
+        # so it opts into the kaggriculture analyzer explicitly.
         analyzer=episode_metrics,
     )
     return task, result
@@ -201,7 +200,7 @@ def _get_revision(store: ExperimentStore, revision_id: str) -> AgentRevision:
 
 def create_session(
     config: LeagueConfig,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     *,
     workspace: str | Path = ".",
     session_id: str | None = None,
@@ -237,7 +236,7 @@ def create_session(
         for item in anchor_manifests
     ]
     generation_id = f"{session_id}:g0000"
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         if store.connection.execute(
             "SELECT 1 FROM training_sessions WHERE session_id = %s", [session_id]
         ).fetchone():
@@ -727,6 +726,12 @@ def _store_orientation_result(
     task: LeagueEpisodeTask,
     result: MatchResult,
 ) -> None:
+    """Persist one played orientation, replay included.
+
+    Every episode keeps its payload -- scheduled matches and trainer rollouts
+    alike. The evaluation hooks fire for both and read the replay back, so an
+    episode stored without one is a row that can never answer anything.
+    """
     if result.replay is None:
         raise ValueError("league match result is missing its required replay payload")
     pairing_id = task.pairing_id
@@ -997,7 +1002,7 @@ def _run_round(
 
 def run_generation(
     session_id: str,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     artifacts: str | Path = "artifacts",
     *,
     update_models: bool = False,
@@ -1015,7 +1020,7 @@ def run_generation(
     training dependencies in; the CLI turns it on.
     """
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         # A duplicate invocation of the same session waits here, while other
         # globally unique sessions continue independently.
         store.connection.execute(
@@ -1167,14 +1172,14 @@ def _update_session_models(
 
 def reevaluate_hooks(
     session_id: str,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     *,
     generation_id: str | None = None,
     force: bool = False,
 ) -> dict[str, int]:
     """Run each revision's current evaluator against already-persisted episodes."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         if generation_id is None:
             generation_id, _, _ = _current_generation(store, session_id)
         rows = store.connection.execute(
@@ -1319,13 +1324,13 @@ def _close_generation(
 
 def create_next_generation(
     session_id: str,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     *,
     workspace: str | Path = ".",
 ) -> str:
     """Build a 20/50/20/10 elite/evolution/surrogate/random population."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         config = _load_session(store, session_id)
         current_id, current_index, status = _current_generation(store, session_id)
         if status != "COMPLETE":
@@ -1500,13 +1505,17 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
     }
 
 
-def session_status(session_id: str, database: str | DatabaseTarget) -> dict[str, Any]:
-    with ExperimentStore(database) as store:
+def session_status(
+    session_id: str, database: str | DatabaseTarget | None = None
+) -> dict[str, Any]:
+    with ExperimentStore(database or default_database()) as store:
         return generation_status(store, session_id)
 
 
-def leaderboard(session_id: str, database: str | DatabaseTarget, limit: int = 20) -> list[dict[str, Any]]:
-    with ExperimentStore(database) as store:
+def leaderboard(
+    session_id: str, database: str | DatabaseTarget | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    with ExperimentStore(database or default_database()) as store:
         generation_id, _, _ = _current_generation(store, session_id)
         rows = store.connection.execute(
             """

@@ -15,4 +15,10 @@ Run the fixed competitors in the direct round-robin arena with:
 ```
 
 The persistent league loads the same snapshots as non-trainable anchors from
-`configs/league.toml`. Competitor files are deliberately absent from `kaglab bundle`.
+`configs/league.toml`. `competitor_*` files are deliberately absent from `kaglab bundle`.
+
+One exception, deliberate and licensed: `dqn_market_scorer` ships a byte-for-byte copy
+of the pilkwang snapshot as its own `donor.py`, because it freezes that field policy and
+learns only the market layer on top. The copy carries the upstream Apache-2.0 licence
+(`LICENSE-pilkwang`) and a `NOTICE` recording provenance and the derivative changes, and
+a test pins its sha256 to the snapshot. No `competitor_*` path is ever bundled.

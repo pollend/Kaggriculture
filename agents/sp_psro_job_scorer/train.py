@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     )
 
 
+MATCH_MANIFEST = "agents/sp_psro_job_scorer/match_agent.toml"
+
+
 class PopulationCollector:
     def collect(self, context, reader, writer) -> list[str]:
         config = context.config
@@ -129,16 +132,29 @@ class PopulationCollector:
             for episode_index, record in enumerate(records):
                 if record.match is None:
                     continue
+                specs = [seat.spec for seat in record.match.seats]
                 artifact_ids.extend(
                     writer.record_policy_episode(
                         context=context,
-                        manifest_path="agents/sp_psro_job_scorer/match_agent.toml",
+                        pairing_kind="sp_psro_training",
                         pairing_index=(batch_index + local_index) * (episodes // 2) + episode_index // 2,
-                        beta_seat=record.beta_seat,
-                        population_revision_id=str(record.behavior_member_id),
-                        beta_revision_id=beta_revision_id,
-                        mixture_id=mixture_id,
+                        left=EvaluationPolicy(
+                            str(record.behavior_member_id),
+                            specs[1 - record.beta_seat],
+                            MATCH_MANIFEST,
+                            "population",
+                        ),
+                        right=EvaluationPolicy(
+                            beta_revision_id,
+                            specs[record.beta_seat],
+                            MATCH_MANIFEST,
+                            "best_response",
+                        ),
+                        # Seat order as played: the population holds seat 0
+                        # whenever beta took seat 1.
+                        orientation=1 - record.beta_seat,
                         result=record.match,
+                        mixture_id=mixture_id,
                     )
                 )
             source_id = f"population-rollout-{batch_index + local_index:08d}"

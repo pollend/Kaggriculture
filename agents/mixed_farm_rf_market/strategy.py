@@ -8,6 +8,13 @@ import random
 from dataclasses import asdict, dataclass, fields
 from typing import Any
 
+# `startingMoney` defaults to 3000. The buy budget is `money - cash_reserve`, so a
+# reserve near the opening bank leaves no working capital and money settles at the
+# reserve forever. The validator still accepts up to 10_000 so stored revisions keep
+# loading; only the prior is capped.
+STARTING_MONEY = 3000
+MAX_SAMPLED_CASH_RESERVE = STARTING_MONEY // 2
+
 
 @dataclass(frozen=True, slots=True)
 class Strategy:
@@ -211,7 +218,7 @@ def sample_strategy(rng: random.Random) -> Strategy:
     return Strategy(
         max_hands=round(rng.triangular(minimum_hands, 24, max(minimum_hands, 10))),
         hire_until_hour=round(rng.triangular(0, 23, 5)),
-        cash_reserve=round(rng.triangular(0, 5_000, 400)),
+        cash_reserve=min(MAX_SAMPLED_CASH_RESERVE, round(rng.triangular(0, 5_000, 400))),
         target_crop_tiles=round(rng.triangular(0, 100, 48)),
         target_goose=round(rng.triangular(0, 30, 4)),
         target_cow=round(rng.triangular(0, 30, 8)),

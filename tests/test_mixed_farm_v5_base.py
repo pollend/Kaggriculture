@@ -236,6 +236,28 @@ def test_portfolio_caps_combined_assets_to_strategy_capacity():
     assert sum(plan.target_crops.values()) + sum(plan.target_animals.values()) <= 25
 
 
+def test_capacity_clamp_fits_a_herd_a_large_crop_target_cannot_veto():
+    """`target_crop_tiles` is a want, not a floor the herd must clear.
+
+    Treating it as one zeroed a whole herd whenever the crop target alone exceeded
+    the board, even though the crop side is clamped to the leftover tiles anyway.
+    """
+
+    obs = observation()
+    strategy = Strategy(
+        max_quadrants=1,
+        target_crop_tiles=32,
+        crop_target_floor=16,
+        target_goose=13,
+        target_cow=17,
+        target_sheep=17,
+    )
+    plan = build_plan(obs, obs["farms"][0], strategy)
+
+    assert sum(plan.target_animals.values()) > 0
+    assert sum(plan.target_crops.values()) + sum(plan.target_animals.values()) <= 25
+
+
 def test_owned_animal_exposes_structure_and_daily_logistics():
     obs = observation(step=48)
     obs["private"]["shed"]["COW"] = 1
@@ -330,6 +352,27 @@ def test_sell_batch_size_limits_cash_cycle_quantity():
     )
 
     assert ["SELL", "MELON", 7] in orders
+
+
+def test_broke_at_the_reserve_still_liquidates_stock():
+    """Money settles at exactly `cash_reserve`, never below it.
+
+    The buy budget is `money - cash_reserve`, so once it reaches zero nothing is
+    spent and the balance stops moving. A strict `money < cash_reserve` distress
+    check therefore never fires, and a high `sell_price_ratio` sat on a full shed
+    for the rest of the season.
+    """
+
+    obs = observation(step=432)
+    obs["farms"][0]["money"] = 2523.0
+    obs["private"]["shed"]["CARROT"] = 26
+    strategy = StrategyV5(cash_reserve=2523, sell_price_ratio=1.25, shed_pressure_fraction=0.9)
+    plan = build_plan_v5(obs, obs["farms"][0], strategy)
+    orders = market_orders(
+        obs, obs["farms"][0], obs["private"], plan, idle_labor(2523.0), strategy
+    )
+
+    assert ["SELL", "CARROT", 26] in orders
 
 
 def test_hires_are_funded_before_discretionary_assets():

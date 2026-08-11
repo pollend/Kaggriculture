@@ -51,7 +51,6 @@ python -m sim.arena sweep  main.py --vs starter --param harvest_age=2,3,4,5 --se
 ```
 
 Flags: `--jobs`, `--steps` (shorten `episodeSteps` for coarse sweeps),
-`--replay-dir` (dump replay JSON for non-wins and errors only),
 `--config KEY=VALUE` (any env configuration key, repeatable).
 
 ## Agent specs

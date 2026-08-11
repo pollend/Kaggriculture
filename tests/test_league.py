@@ -18,6 +18,7 @@ from kaggriculture_lab.league import (
     LeagueConfig,
     _primary_training_model_id,
     _run_hook,
+    _store_orientation_result,
     _training_model_ids,
     create_session,
     run_generation,
@@ -130,6 +131,47 @@ def test_replay_is_compressed_in_postgres_and_read_through_narrow_reader(tmp_pat
         assert status == "ERROR"
 
 
+def test_every_episode_keeps_its_replay_including_trainer_rollouts(tmp_path: Path):
+    """Rollouts are stored exactly like scheduled matches, payload included.
+
+    Rollouts were briefly recorded without a payload to save disk. The
+    evaluation hook fires for them regardless, so every replay-reading
+    evaluator raised on those episodes and the league recorded 76
+    `episode_evaluations` ERROR rows instead of diagnostics. There is no longer
+    a way to store an episode without its replay, and a `MatchResult` that
+    arrives without one is a fault rather than a policy.
+    """
+
+    import inspect
+
+    from kaggriculture_lab.model_trainers import TrainingBatchWriter
+
+    assert "store_replay" not in inspect.signature(_store_orientation_result).parameters
+    assert (
+        "store_replay"
+        not in inspect.signature(TrainingBatchWriter.record_policy_episode).parameters
+    )
+
+    result = MatchResult(
+        seed=7,
+        seats=[
+            SeatResult("a", 0, 20, "DONE", False, None, None, 1, 0, 0, 0, 20, {"productive_actions": 1}),
+            SeatResult("b", 1, 10, "DONE", False, None, None, 1, 0, 0, 0, 10, {"productive_actions": 0}),
+        ],
+        steps=1,
+        wallclock=0.1,
+        replay=None,
+    )
+    with ExperimentStore(postgres_database(tmp_path, "no_replay")) as store:
+        seed_reference_rows(
+            store.connection, run_id="run", family_id="family", revision_ids=("a", "b")
+        )
+        store.add_match("match", "run", "league:test", ("a", "b"), ("a", "b"), result)
+        reader = EpisodeReader(store.connection, "match", 0)
+        with pytest.raises(ValueError, match="replay payload not found"):
+            reader.replay()
+
+
 def test_league_worker_retains_the_required_replay(monkeypatch):
     from types import SimpleNamespace
 
@@ -144,11 +186,10 @@ def test_league_worker_retains_the_required_replay(monkeypatch):
     )
     expected = object()
 
-    def fake_run_match(specs, seed, config, *, keep_replay, analyzer):
+    def fake_run_match(specs, seed, config, *, analyzer):
         assert specs == ("left", "right")
         assert seed == 7
         assert config == {"episodeSteps": 24}
-        assert keep_replay is True
         assert analyzer is league.episode_metrics
         return expected
 

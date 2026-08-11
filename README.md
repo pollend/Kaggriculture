@@ -48,6 +48,12 @@ python train_mixed_farm.py
 # only the external yardstick the promotion gate measures against.
 python train_dqn.py
 
+# Train one market Q-network on top of a frozen field policy. The field play is
+# an unmodified copy of the pilkwang snapshot, and the promotion benchmark is
+# that same snapshot, so the paired margin measures the learned market layer and
+# nothing else.
+python train_market_scorer.py
+
 # Compare named profiles directly.
 .venv/bin/python -m sim.arena league \
   agents/configurable_crop_surrogate/main.py \

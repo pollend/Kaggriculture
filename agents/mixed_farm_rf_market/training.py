@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import gzip
 import hashlib
-import json
 import math
 import statistics
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -36,9 +34,18 @@ from agents.mixed_farm_rf_market.strategy import Strategy
 from kaggriculture_lab.model_updates import ModelEvaluation, ModelUpdateResult
 
 FAMILY_ID = "mixed_farm_rf_market"
-BASE_FAMILY_ID = "configurable_mixed_farm_surrogate"
 MODEL_ID = f"{FAMILY_ID}.market_policy"
 SELF_SPEC = "agents.mixed_farm_rf_market.agent:make_agent"
+
+# The field policy this experiment holds fixed while it learns the market. It is a
+# committed default rather than another family's champion: the surrogate families
+# come and go, and reaching into their sessions made this trainer unrunnable the
+# moment one was retired. `agent.py` falls back to `heuristic_market` whenever it
+# has no weights, so the bare spec below plays exactly this strategy with the
+# hand-written market the forests are meant to replace -- which makes it both the
+# warm-start data source and the honest promotion baseline.
+FROZEN_STRATEGY = Strategy()
+HEURISTIC_SPEC = SELF_SPEC
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,71 +323,53 @@ def _file_digest(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def _json_object(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return value
-    return json.loads(str(value))
-
-
-def _champion(reader, session_id: str) -> tuple[str, Strategy, str]:
-    row = reader.fetchone(
-        """
-        SELECT ar.revision_id, ar.params_json, ar.agent_spec
-        FROM generations g
-        JOIN generation_members gm USING (generation_id)
-        JOIN agent_revisions ar USING (revision_id)
-        JOIN rating_snapshots rs USING (generation_id, revision_id)
-        WHERE g.session_id = %s AND g.status = 'COMPLETE'
-          AND ar.family_id = %s AND NOT rs.is_frozen AND ar.params_json IS NOT NULL
-        ORDER BY g.generation_index DESC, rs.rating - 2 * rs.deviation DESC, ar.revision_id
-        LIMIT 1
-        """,
-        [session_id, BASE_FAMILY_ID],
-    )
-    if row is None:
-        raise ValueError(f"no completed mixed-farm champion in session {session_id!r}")
-    return str(row[0]), Strategy.from_dict(_json_object(row[1])), str(row[2])
-
-
-def bootstrap_dataset(reader, sessions: list[str], limit: int) -> tuple[DecisionDataset, Strategy, str]:
-    if not sessions:
-        raise ValueError("bootstrap_sessions cannot be empty")
-    _, champion_strategy, champion_spec = _champion(reader, sessions[-1])
-    placeholders = ",".join("%s" for _ in sessions)
-    rows = reader.fetchall(
-        f"""
-        SELECT ep.match_id, ep.seat, ar.params_json, payload.replay_gzip
-        FROM episode_players ep
-        JOIN agent_revisions ar ON ar.revision_id = ep.strategy_id
-        JOIN pairing_episodes pe USING (match_id)
-        JOIN league_pairings lp USING (pairing_id)
-        JOIN generations g USING (generation_id)
-        JOIN episode_payloads payload USING (match_id)
-        WHERE g.session_id IN ({placeholders}) AND ar.family_id = %s
-          AND ar.params_json IS NOT NULL AND NOT ep.failed
-        ORDER BY g.generation_index DESC, ep.match_id, ep.seat
-        LIMIT %s
-        """,
-        [*sessions, BASE_FAMILY_ID, limit],
-    )
-    datasets = []
-    for match_id, seat, params, replay_gzip in rows:
-        replay = json.loads(gzip.decompress(bytes(replay_gzip)))
-        datasets.append(
-            extract_replay_dataset(
-                replay,
-                int(seat),
-                Strategy.from_dict(_json_object(params)),
-                f"bootstrap:{match_id}:{seat}",
-            )
-        )
-    if not datasets:
-        raise ValueError("bootstrap sessions contain no successful mixed-farm replays")
-    return concatenate(datasets), champion_strategy, champion_spec
-
-
 def _spec(path: str | Path, *, epsilon: float = 0.0, seed: int = 0) -> str:
     return f"{SELF_SPEC}?weights={quote(str(path))}&epsilon={epsilon}&policy_seed={seed}"
+
+
+def _collect_dataset(
+    policy_for_seed: Callable[[int], str],
+    strategy: Strategy,
+    opponents: list[str],
+    seeds: list[int],
+    jobs: int,
+    group_prefix: str,
+) -> DecisionDataset:
+    from sim.arena import play_series
+
+    if not opponents:
+        raise ValueError("at least one opponent is required to collect decisions")
+    datasets: list[DecisionDataset] = []
+    for index, seed in enumerate(seeds):
+        opponent = opponents[index % len(opponents)]
+        pair = play_series(policy_for_seed(seed), opponent, [seed], {}, jobs=jobs)[seed]
+        forward, reverse = pair
+        if not forward.failed and forward.replay is not None:
+            datasets.append(
+                extract_replay_dataset(forward.replay, 0, strategy, f"{group_prefix}:{seed}:0")
+            )
+        if not reverse.failed and reverse.replay is not None:
+            datasets.append(
+                extract_replay_dataset(reverse.replay, 1, strategy, f"{group_prefix}:{seed}:1")
+            )
+    return concatenate(datasets)
+
+
+def bootstrap_dataset(opponents: list[str], seeds: list[int], jobs: int) -> DecisionDataset:
+    """Warm start by watching the frozen heuristic play.
+
+    The agent falls back to `heuristic_market` whenever it has no weights, so the
+    bare spec is exactly the policy the forests are meant to improve on. Collecting
+    from it keeps the experiment self-contained -- no other family's session has to
+    exist, or still exist, before this one can run.
+    """
+
+    dataset = _collect_dataset(
+        lambda _: HEURISTIC_SPEC, FROZEN_STRATEGY, opponents, seeds, jobs, "bootstrap"
+    )
+    if not dataset.purchase_x.size and not dataset.sale_x.size:
+        raise ValueError("heuristic bootstrap produced no successful replays")
+    return dataset
 
 
 def rollout_dataset(
@@ -390,20 +379,15 @@ def rollout_dataset(
     epsilon: float,
     jobs: int,
 ) -> DecisionDataset:
-    from sim.arena import play_series
-
     bundle = MarketPolicyBundle.load(bundle_path)
-    datasets: list[DecisionDataset] = []
-    for index, seed in enumerate(seeds):
-        opponent = opponents[index % len(opponents)]
-        policy = _spec(bundle_path, epsilon=epsilon, seed=seed)
-        pair = play_series(policy, opponent, [seed], {}, jobs=jobs, keep_replay=True)[seed]
-        forward, reverse = pair
-        if not forward.failed and forward.replay is not None:
-            datasets.append(extract_replay_dataset(forward.replay, 0, bundle.strategy, f"rollout:{seed}:0"))
-        if not reverse.failed and reverse.replay is not None:
-            datasets.append(extract_replay_dataset(reverse.replay, 1, bundle.strategy, f"rollout:{seed}:1"))
-    return concatenate(datasets)
+    return _collect_dataset(
+        lambda seed: _spec(bundle_path, epsilon=epsilon, seed=seed),
+        bundle.strategy,
+        opponents,
+        seeds,
+        jobs,
+        "rollout",
+    )
 
 
 def fit_forests(dataset: DecisionDataset, config: dict[str, Any]):
@@ -579,13 +563,14 @@ class RFMarketTrainer:
         directory = Path(context.artifacts) / "training_batches"
         source_id = f"market-{batch_index:08d}"
         path = directory / f"{source_id}.npz"
-        sessions = [str(value) for value in config.get(
-            "bootstrap_sessions",
-            ["configurable-mixed-farm-v3-training", "configurable-mixed-farm-v4-training"],
-        )]
+        opponents = [str(value) for value in config.get("opponents", ["starter"])]
         if batch_index == 0:
-            dataset, _, _ = bootstrap_dataset(
-                reader, sessions, int(config.get("bootstrap_episodes", 500))
+            count = int(config.get("bootstrap_episodes", 40))
+            seed_base = int(config.get("seed", 42))
+            dataset = bootstrap_dataset(
+                opponents,
+                list(range(seed_base, seed_base + count)),
+                max(1, int(config.get("jobs", 1))),
             )
             parts = split_by_episode(
                 dataset, int(config.get("bootstrap_batches", 5))
@@ -636,7 +621,6 @@ class RFMarketTrainer:
             seed = int(config.get("seed", 42)) + batch_index * 1009
             count = int(config.get("episodes_per_batch", 8))
             seeds = list(range(seed, seed + count))
-            opponents = [str(value) for value in config.get("opponents", ["starter"])]
             dataset = rollout_dataset(
                 checkpoint_path, opponents, seeds, epsilon, max(1, int(config.get("jobs", 1)))
             )
@@ -665,11 +649,7 @@ class RFMarketTrainer:
         datasets = [DecisionDataset.load(batch.artifact_path) for batch in batches[-max_batches:]]
         dataset = concatenate(datasets)
         purchase, sale, fit_metrics = fit_forests(dataset, context.config)
-        sessions = [str(value) for value in context.config.get(
-            "bootstrap_sessions",
-            ["configurable-mixed-farm-v3-training", "configurable-mixed-farm-v4-training"],
-        )]
-        champion_id, strategy, baseline_spec = _champion(reader, sessions[-1])
+        strategy, baseline_spec = FROZEN_STRATEGY, HEURISTIC_SPEC
         checkpoint_id = hashlib.sha256(
             f"{context.model_id}\0{context.update_id}\0{context.dataset_sha256}".encode()
         ).hexdigest()[:24]
@@ -689,7 +669,7 @@ class RFMarketTrainer:
             "episodes": dataset.episodes,
             "purchase_rows": len(dataset.purchase_y),
             "sale_rows": len(dataset.sale_y),
-            "champion_revision_id": champion_id,
+            "frozen_strategy_id": strategy.strategy_id,
             "dataset_sha256": context.dataset_sha256,
             "gate": gate,
         }

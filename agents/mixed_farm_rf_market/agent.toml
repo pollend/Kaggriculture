@@ -33,7 +33,9 @@ min_samples_leaf = 5
 max_features = 0.7
 bootstrap = true
 seed = 4242
-bootstrap_episodes = 500
+# Paired heuristic rollouts collected for the warm start, not rows mined from
+# another family's session. Each one plays a full season in both seat orders.
+bootstrap_episodes = 40
 bootstrap_batches = 5
 max_training_batches = 200
 max_purchase_rows = 50000
@@ -45,10 +47,6 @@ epsilon_decay_batches = 100
 promotion_seeds = 10
 promotion_seed_base = 1000000
 jobs = 8
-bootstrap_sessions = [
-  "configurable-mixed-farm-v3-training",
-  "configurable-mixed-farm-v4-training",
-]
 opponents = [
   "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
   "agents/competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine/main.py",

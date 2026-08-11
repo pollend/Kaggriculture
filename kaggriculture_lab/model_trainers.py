@@ -93,6 +93,73 @@ class EvaluationPolicy:
     role: str = "evaluation"
 
 
+def _register_policies(
+    store: ExperimentStore,
+    policies: Sequence[EvaluationPolicy],
+    *,
+    source: str,
+    register_families: bool = False,
+) -> None:
+    """Turn policy descriptions into the `agent_revisions` rows a pairing cites.
+
+    A trainer names its seats three different ways -- a builtin registry name, a
+    manifest-backed agent, or a bare spec with no manifest behind it (a
+    competitor `main.py`) -- and all three have to resolve to a revision before
+    the pairing referencing them can be written.
+
+    `register_families` additionally promotes a manifest to a real
+    `agent_families` row; without it `add_agent_revisions` only leaves the
+    placeholder `ensure_agent_families` writes. It registers the family alone --
+    an opponent's manifest may declare models that are mid-training under a
+    configuration this caller knows nothing about.
+    """
+
+    from kaggriculture_lab.identity import builtin_revision
+
+    revisions: list[AgentRevision] = []
+    manifests: dict[str, tuple[AgentManifest, str]] = {}
+    for policy in {policy.revision_id: policy for policy in policies}.values():
+        if policy.manifest_path is None and policy.revision_id.startswith("builtin:"):
+            revisions.append(
+                builtin_revision(policy.revision_id.removeprefix("builtin:"), policy.agent_spec)
+            )
+            continue
+        if policy.manifest_path is not None:
+            cached = manifests.get(policy.manifest_path)
+            if cached is None:
+                manifest = AgentManifest.load(policy.manifest_path)
+                cached = (manifest, code_fingerprint(manifest))
+                manifests[policy.manifest_path] = cached
+                if register_families:
+                    store.register_agent_family(manifest, policy.manifest_path)
+            manifest, fingerprint = cached
+            family_id = manifest.family_id
+            entry_point = manifest.entry_point
+            schema_version = manifest.parameter_schema_version
+            evaluator = manifest.episode_evaluator
+        else:
+            family_id = "evaluation_opponent"
+            entry_point = policy.agent_spec.partition("?")[0]
+            fingerprint = hashlib.sha256(policy.agent_spec.encode()).hexdigest()
+            schema_version = 1
+            evaluator = None
+        revisions.append(
+            AgentRevision(
+                revision_id=policy.revision_id,
+                family_id=family_id,
+                strategy_id=None,
+                entry_point=entry_point,
+                agent_spec=policy.agent_spec,
+                code_fingerprint=fingerprint,
+                parameter_schema_version=schema_version,
+                params_json=json.dumps({"role": policy.role}, sort_keys=True),
+                source=source,
+                episode_evaluator=evaluator,
+            )
+        )
+    store.add_agent_revisions(revisions)
+
+
 class TrainingBatchWriter:
     """The batch-recording surface handed to a round hook.
 
@@ -141,65 +208,61 @@ class TrainingBatchWriter:
         self,
         *,
         context: RoundContext,
-        manifest_path: str | Path,
+        pairing_kind: str,
         pairing_index: int,
-        beta_seat: int,
-        population_revision_id: str,
-        beta_revision_id: str,
-        mixture_id: str,
+        left: EvaluationPolicy,
+        right: EvaluationPolicy,
+        orientation: int,
         result: Any,
+        mixture_id: str | None = None,
     ) -> tuple[str, ...]:
         """Commit one already-run manifest episode to the league ledger.
 
-        The trainer supplies policy identity and the match result; the lab owns
-        stable pairing/match IDs, revision registration, and artifact linkage.
-        Calling this again during resume is idempotent.
+        The trainer supplies the two policy identities and the match result; the
+        lab owns stable pairing/match IDs, revision registration, and artifact
+        linkage. `left` and `right` are the pairing's `revision_a`/`revision_b`,
+        and `orientation` says which seat order was actually played -- 0 for
+        (left, right), 1 for (right, left). Calling this again during resume is
+        idempotent.
+
+        Every episode keeps its replay, trainer rollouts included. Dropping the
+        payload for rollouts saved disk and cost the ability to answer anything
+        about them after the fact -- including the evaluation hooks, which fire
+        for these episodes and read the replay back.
         """
         from kaggriculture_lab.league import (
             LeagueEpisodeTask,
             _finish_pairing,
+            _get_revision,
             _store_orientation_result,
         )
         from kaggriculture_lab.league import (
             _stable_id as league_id,
         )
 
-        manifest = AgentManifest.load(manifest_path)
-        self._store.register_family(manifest, manifest_path)
-        fingerprint = code_fingerprint(manifest)
-        population_seat = 1 - beta_seat
-        orientation = 1 - beta_seat
-        specs = [seat.spec for seat in result.seats]
-
-        def revision(revision_id: str, spec: str, role: str) -> AgentRevision:
-            return AgentRevision(
-                revision_id=revision_id,
-                family_id=manifest.family_id,
-                strategy_id=None,
-                entry_point=manifest.entry_point,
-                agent_spec=spec,
-                code_fingerprint=fingerprint,
-                parameter_schema_version=manifest.parameter_schema_version,
-                params_json=json.dumps({"role": role}, sort_keys=True),
-                source="policy_matchup",
-            )
-
-        population = revision(population_revision_id, specs[population_seat], "population")
-        beta = revision(beta_revision_id, specs[beta_seat], "best_response")
-        self._store.add_agent_revisions((population, beta))
+        if orientation not in (0, 1):
+            raise ValueError("policy episode orientation must be 0 or 1")
+        if not pairing_kind:
+            raise ValueError("policy episode pairing_kind cannot be empty")
+        _register_policies(
+            self._store,
+            (left, right),
+            source="policy_matchup",
+            register_families=True,
+        )
         pairing_id = league_id(
             "policy-pair",
             context.generation_id,
             context.round_index,
             pairing_index,
-            population_revision_id,
-            beta_revision_id,
+            left.revision_id,
+            right.revision_id,
             result.seed,
         )
         self._store.connection.execute(
             """
             INSERT INTO league_pairings VALUES (
-                %s, %s, %s, 'sp_psro_training', %s, %s, %s, 'PENDING'
+                %s, %s, %s, %s, %s, %s, %s, 'PENDING'
             )
             ON CONFLICT DO NOTHING
             """,
@@ -207,40 +270,46 @@ class TrainingBatchWriter:
                 pairing_id,
                 context.generation_id,
                 context.round_index,
+                pairing_kind,
                 result.seed,
-                population_revision_id,
-                beta_revision_id,
+                left.revision_id,
+                right.revision_id,
             ],
         )
         task = LeagueEpisodeTask(
             pairing_id,
             orientation,
             result.seed,
-            population,
-            beta,
+            _get_revision(self._store, left.revision_id),
+            _get_revision(self._store, right.revision_id),
             result.steps,
         )
         _store_orientation_result(
-            self._store, context.session_id, context.generation_id, task, result
+            self._store,
+            context.session_id,
+            context.generation_id,
+            task,
+            result,
         )
-        self._store.connection.execute(
-            """
-            INSERT INTO pairing_policy_assignments VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
-            """,
-            [
-                pairing_id,
-                mixture_id,
-                f"{mixture_id}:composite",
-                population_revision_id,
-                beta_revision_id,
-            ],
-        )
+        if mixture_id is not None:
+            self._store.connection.execute(
+                """
+                INSERT INTO pairing_policy_assignments VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                    pairing_id,
+                    mixture_id,
+                    f"{mixture_id}:composite",
+                    left.revision_id,
+                    right.revision_id,
+                ],
+            )
         completed = self._store.connection.execute(
             "SELECT count(*) FROM pairing_episodes WHERE pairing_id = %s", [pairing_id]
         ).fetchone()[0]
         if int(completed) == 2:
-            _finish_pairing(self._store, pairing_id, population_revision_id)
+            _finish_pairing(self._store, pairing_id, left.revision_id)
         return tuple(
             str(row[0])
             for row in self._store.connection.execute(
@@ -271,7 +340,6 @@ class TrainingBatchWriter:
         orientations are reused after interruption instead of being replayed.
         """
 
-        from kaggriculture_lab.identity import builtin_revision
         from kaggriculture_lab.league import (
             LeagueEpisodeTask,
             _finish_pairing,
@@ -290,51 +358,11 @@ class TrainingBatchWriter:
         if episode_steps < 1:
             raise ValueError("evaluation episode_steps must be positive")
 
-        policies = {
-            policy.revision_id: policy
-            for left, right, _ in matchups
-            for policy in (left, right)
-        }
-        revisions: list[AgentRevision] = []
-        manifests: dict[str, tuple[AgentManifest, str]] = {}
-        for policy in policies.values():
-            if policy.manifest_path is None and policy.revision_id.startswith("builtin:"):
-                revisions.append(
-                    builtin_revision(policy.revision_id.removeprefix("builtin:"), policy.agent_spec)
-                )
-                continue
-            if policy.manifest_path is not None:
-                cached = manifests.get(policy.manifest_path)
-                if cached is None:
-                    manifest = AgentManifest.load(policy.manifest_path)
-                    cached = (manifest, code_fingerprint(manifest))
-                    manifests[policy.manifest_path] = cached
-                manifest, fingerprint = cached
-                family_id = manifest.family_id
-                entry_point = manifest.entry_point
-                schema_version = manifest.parameter_schema_version
-                evaluator = manifest.episode_evaluator
-            else:
-                family_id = "evaluation_opponent"
-                entry_point = policy.agent_spec.partition("?")[0]
-                fingerprint = hashlib.sha256(policy.agent_spec.encode()).hexdigest()
-                schema_version = 1
-                evaluator = None
-            revisions.append(
-                AgentRevision(
-                    revision_id=policy.revision_id,
-                    family_id=family_id,
-                    strategy_id=None,
-                    entry_point=entry_point,
-                    agent_spec=policy.agent_spec,
-                    code_fingerprint=fingerprint,
-                    parameter_schema_version=schema_version,
-                    params_json=json.dumps({"role": policy.role}, sort_keys=True),
-                    source="model_evaluation",
-                    episode_evaluator=evaluator,
-                )
-            )
-        self._store.add_agent_revisions(revisions)
+        _register_policies(
+            self._store,
+            [policy for left, right, _ in matchups for policy in (left, right)],
+            source="model_evaluation",
+        )
 
         pairing_ids: list[str] = []
         tasks: list[Any] = []

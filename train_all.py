@@ -15,7 +15,12 @@ import tomllib
 from dataclasses import replace
 from pathlib import Path
 
-from kaggriculture_lab.database import database_target
+from kaggriculture_lab.constants import (
+    ARTIFACTS_ROOT,
+    DEFAULT_GENERATIONS,
+    REPO_ROOT,
+    default_database,
+)
 from kaggriculture_lab.identity import TrainingAgentSpec
 from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.model_admin import export_active_model, model_status
@@ -26,13 +31,13 @@ from sim.metrics import render
 # Experiment defaults. Root main.toml overrides machine/workflow values.
 # ---------------------------------------------------------------------------
 
-GENERATIONS = 48
+GENERATIONS = DEFAULT_GENERATIONS
 RUN_FINAL_ARENA = True
 FINAL_ARENA_SEEDS = 20
 FINAL_ARENA_JOBS = 24  # set to None to use the arena's automatic default
 
 SESSION_ID = "all-agents-training"
-ARTIFACTS = Path("artifacts")
+ARTIFACTS = ARTIFACTS_ROOT
 LEAGUE_CONFIG = Path("configs/league.toml")
 INCLUDE_ALL_AGENT_ANCHORS = True
 
@@ -57,6 +62,14 @@ TRAINING_AGENTS = [
     },
     {"type": "dqn_job_scorer", "name": "default", "train": True},
     {
+        # Off in the shared roster: its benchmark is the pilkwang donor, so it
+        # only means anything in its own trainer-only league
+        # (`configs/dqn_market_league.toml`). Here it is an anchor.
+        "type": "dqn_market_scorer",
+        "name": "default",
+        "train": False,
+    },
+    {
         "type": "sp_psro_job_scorer",
         "name": "default",
         "train": False,
@@ -69,6 +82,13 @@ TRAINING_AGENTS = [
     {
         "type": "mixed_farm_v5",
         "name": "v3",
+        "train": False,
+    },
+    {
+        # Locked here for the same reason as the planner: its forests train in
+        # their own trainer-only league (`train_rf_market.py`).
+        "type": "mixed_farm_rf_market",
+        "name": "default",
         "train": False,
     },
     {
@@ -134,9 +154,6 @@ TRAINING_AGENTS = [
 ]
 
 
-def _database():
-    return database_target()
-
 SYNC_ENVIRONMENT = True
 # Shipping is an explicit release action. A long-running trainer must never
 # replace the reviewed submission checkpoint merely because a gate passed.
@@ -149,7 +166,6 @@ DQN_EXPORT_NAME = "default"
 # Workflow implementation.
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parent
 MAIN_CONFIG = REPO_ROOT / "main.toml"
 
 
@@ -259,7 +275,6 @@ def _ensure_session() -> None:
         raise FileNotFoundError(f"league config not found: {LEAGUE_CONFIG}")
     created, _ = ensure_session(
         config,
-        _database(),
         SESSION_ID,
         workspace=REPO_ROOT,
         artifacts=ARTIFACTS,
@@ -282,7 +297,7 @@ def _after_training_iteration(iteration: int, _: dict) -> None:
         try:
             export_active_model(
                 REPO_ROOT / "agents/dqn_job_scorer/agent.toml",
-                _database(),
+                default_database(),
                 DQN_WEIGHTS_OUTPUT,
                 confirm_release=True,
                 name=DQN_EXPORT_NAME,
@@ -300,7 +315,7 @@ def _after_training_iteration(iteration: int, _: dict) -> None:
             continue
         manifest = REPO_ROOT / "agents" / str(instance["type"]) / "agent.toml"
         if manifest.is_file():
-            print(model_status(manifest, _database(), name=str(instance["name"])))
+            print(model_status(manifest, name=str(instance["name"])))
 
 
 def _run_final_arena() -> None:
@@ -330,7 +345,6 @@ def main() -> int:
     _ensure_session()
     run_generations(
         session_id=SESSION_ID,
-        database=_database(),
         artifacts=ARTIFACTS,
         generations=GENERATIONS,
         workspace=REPO_ROOT,

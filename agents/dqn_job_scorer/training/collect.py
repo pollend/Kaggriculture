@@ -16,17 +16,19 @@ from __future__ import annotations
 
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
 
 import numpy as np
 
 from agents.dqn_job_scorer import features as F
-from agents.dqn_job_scorer.main import JobScorerAgent
 from agents.dqn_job_scorer.market_policy import MARKET_ACTION_DIM, MARKET_STATE_DIM, MarketDecision
-from agents.dqn_job_scorer.policy import QNetwork
 from agents.dqn_job_scorer.rules import ANIMAL_DATA, CROP_DATA, CROPS, PRODUCT_BASE, PRODUCTS, get
+
+if TYPE_CHECKING:
+    from sim.runner import MatchResult
 
 MONEY_SCALE = 1000.0
 TERMINAL_MARGIN_SCALE = 20_000.0
@@ -360,104 +362,172 @@ class Recorder:
         )
 
 
+#: Spec target of the training-only wrapper in `match_agent.py`. Rollouts play
+#: through it so an exploring learner is an ordinary agent spec.
+LEARNER_ENTRY_POINT = "agents.dqn_job_scorer.match_agent:make_agent"
+
+#: Revision role recorded for the learner seat of a rollout pairing.
+LEARNER_ROLE = "learner"
+
+
+@dataclass(frozen=True)
+class DQNRollout:
+    """One recorded rollout episode plus the match the league will store."""
+
+    record: EpisodeRecord
+    opponent_spec: str
+    learner_seat: int
+    seed: int
+    match: MatchResult
+    trace_path: str
+    # Which seed pair this episode belongs to. Carried rather than recomputed
+    # from list position, because a dropped episode would shift every index
+    # after it and split a pairing in two.
+    pair_index: int = 0
+
+
+def learner_spec(
+    weights_path: str | Path,
+    trace_path: str | Path,
+    epsilon: float,
+    market_epsilon: float,
+    gamma: float,
+    exploration_seed: int,
+    policy_revision_id: str,
+) -> str:
+    """The exploring learner as a resolvable agent spec.
+
+    Weights cross the process boundary as a path rather than as arrays: the
+    rollout workers are spawned interpreters, and a spec is the only thing
+    `sim.registry` accepts.
+    """
+    query = urlencode(
+        {
+            "role": LEARNER_ROLE,
+            "policy_revision_id": policy_revision_id,
+            "weights": str(Path(weights_path).resolve()),
+            "trace_path": str(Path(trace_path).resolve()),
+            "epsilon": epsilon,
+            "market_epsilon": market_epsilon,
+            "gamma": gamma,
+            "exploration_seed": exploration_seed,
+        }
+    )
+    return f"{LEARNER_ENTRY_POINT}?{query}"
+
+
 def collect_episode(
-    weights: list[tuple[np.ndarray, np.ndarray]],
+    weights_path: str | Path,
     opponent_spec: str,
     seed: int,
     epsilon: float,
     gamma: float,
     learner_seat: int = 0,
     config: dict[str, Any] | None = None,
-    market_weights: list[tuple[np.ndarray, np.ndarray]] | None = None,
     market_epsilon: float | None = None,
-) -> EpisodeRecord | None:
+    trace_root: str | Path | None = None,
+    policy_revision_id: str = "dqn-learner",
+) -> DQNRollout | None:
     """Play one episode with an epsilon-greedy learner and record it.
 
-    Returns None if the learner errored, so a broken policy is dropped rather
-    than silently trained on -- the same rule `sim/runner.py` applies to matches.
+    Goes through `sim.runner.run_match` rather than driving the environment
+    directly, so a rollout yields a full `MatchResult` -- per-seat statuses,
+    timings, the replay -- and can be committed to the league exactly like a
+    scheduled match instead of vanishing into an `.npz`.
+
+    Returns None if the *learner* errored, so a broken policy is dropped rather
+    than silently trained on. An episode the opponent crashed out of is kept and
+    recorded as failed, which is what the pre-league collector did.
     """
-    from kaggle_environments import make
+    from kaggriculture_lab.episode_metrics import episode_metrics
+    from sim.runner import OK_STATUSES, run_match
 
-    from sim import registry
-    from sim.runner import OK_STATUSES
-
-    recorder = Recorder()
-    network = QNetwork(weights)
-    market_network = QNetwork(market_weights) if market_weights is not None else None
-    learner = JobScorerAgent(
-        network,
-        market_network=market_network,
-        epsilon=epsilon,
-        market_epsilon=market_epsilon,
-        rng=np.random.default_rng(seed * 7919 + learner_seat),
-        recorder=recorder,
-    )
-    opponent = registry.resolve(opponent_spec)
-
-    seats = [opponent, opponent]
-    seats[learner_seat] = learner
-
-    env = make("kaggriculture", configuration={**(config or {}), "seed": seed}, debug=False)
-    env.run(seats)
-
-    for state in env.steps:
-        if state[learner_seat].status not in OK_STATUSES:
-            return None
-
-    final = env.steps[-1]
-    obs = final[learner_seat].observation
-    farms = get(obs, "farms", []) or []
-    farm = farms[learner_seat]
-
-    return recorder.finish(
-        final_money=float(farm.get("money", 0.0)),
-        opponent_money=max(
-            float(other.get("money", 0.0)) for index, other in enumerate(farms) if index != learner_seat
+    root = Path(trace_root) if trace_root is not None else Path()
+    trace_path = root / f"rollout-{seed}-{learner_seat}.npz"
+    specs = [
+        learner_spec(
+            weights_path,
+            trace_path,
+            epsilon,
+            epsilon if market_epsilon is None else market_epsilon,
+            gamma,
+            seed * 7919 + learner_seat,
+            policy_revision_id,
         ),
-        gamma=gamma,
+        opponent_spec,
+    ]
+    if learner_seat == 1:
+        specs.reverse()
+    result = run_match(
+        (specs[0], specs[1]),
+        seed,
+        config=config,
+        analyzer=episode_metrics,
+    )
+    if result.seats[learner_seat].status not in OK_STATUSES:
+        return None
+    return DQNRollout(
+        load_episode_batch(trace_path)[0],
+        opponent_spec,
+        learner_seat,
+        seed,
+        result,
+        str(trace_path),
     )
 
 
-def _job(args: tuple) -> EpisodeRecord | None:
+def _job(args: tuple) -> DQNRollout | None:
     return collect_episode(*args)
 
 
 def collect_batch(
-    weights: list[tuple[np.ndarray, np.ndarray]],
+    weights_path: str | Path,
     opponents: list[str],
     seeds: list[int],
     epsilon: float,
     gamma: float,
     jobs: int = 1,
     config: dict[str, Any] | None = None,
-    market_weights: list[tuple[np.ndarray, np.ndarray]] | None = None,
     market_epsilon: float | None = None,
-) -> list[EpisodeRecord]:
+    trace_root: str | Path | None = None,
+    policy_revision_id: str = "dqn-learner",
+) -> list[DQNRollout]:
     """Collect one episode per seed, alternating which seat the learner takes.
 
-    Both seats are used because the environment is symmetric and a policy that
-    only ever plays seat 0 has seen half the states it will meet in the arena.
+    Seeds arrive in consecutive pairs and each pair draws one opponent, so every
+    seed is played in both seat orientations against the same opponent. Both
+    seats are used because the environment is symmetric and a policy that only
+    ever plays seat 0 has seen half the states it will meet in the arena; the
+    completed pair is also what `pairing_results` needs before it can cancel
+    seat advantage.
     """
+    if len(seeds) % 2:
+        raise ValueError("rollout seeds must be paired for seat rotation")
     tasks = [
         (
-            weights,
-            opponents[index % len(opponents)],
+            weights_path,
+            opponents[(index // 2) % len(opponents)],
             seed,
             epsilon,
             gamma,
             index % 2,
             config,
-            market_weights,
             market_epsilon,
+            trace_root,
+            policy_revision_id,
         )
         for index, seed in enumerate(seeds)
     ]
     if jobs == 1:
-        records = [_job(task) for task in tasks]
+        rollouts = [_job(task) for task in tasks]
     else:
         # Torch is initialized before collection in both trainers. Forking that
         # process can deadlock or terminate workers after the replay grows; a
         # fresh interpreter is slower to start but stable and cross-platform.
         with ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn")) as pool:
-            records = list(pool.map(_job, tasks, chunksize=1))
-    return [record for record in records if record is not None]
+            rollouts = list(pool.map(_job, tasks, chunksize=1))
+    return [
+        replace(rollout, pair_index=index // 2)
+        for index, rollout in enumerate(rollouts)
+        if rollout is not None
+    ]

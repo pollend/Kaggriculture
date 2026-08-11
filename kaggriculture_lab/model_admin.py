@@ -7,6 +7,7 @@ import json
 import shutil
 from pathlib import Path
 
+from kaggriculture_lab.constants import default_database
 from kaggriculture_lab.database import DatabaseTarget, database_target
 from kaggriculture_lab.identity import (
     DEFAULT_AGENT_NAME,
@@ -55,13 +56,13 @@ def _single_model_id(
 
 def model_status(
     manifest_path: str | Path,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     *,
     name: str = DEFAULT_AGENT_NAME,
 ) -> list[dict[str, object]]:
     """Return batch progress and the active checkpoint for one agent's models."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         manifest = _register_manifest(store, manifest_path, name)
         identifiers = [effective_model_id(model.model_id, name) for model in manifest.models]
         placeholders = ",".join("%s" for _ in identifiers)
@@ -93,7 +94,7 @@ def model_status(
 
 def update_agent_model(
     manifest_path: str | Path,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     *,
     artifacts: str | Path,
     force: bool = False,
@@ -101,7 +102,7 @@ def update_agent_model(
 ) -> UpdateReport:
     """Try the sole model declared by an agent manifest."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         manifest = _register_manifest(store, manifest_path, name)
         return update_model_in_store(
             store,

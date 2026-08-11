@@ -8,6 +8,7 @@ from agents.mixed_farm_rf_market.agent import make_agent
 from agents.mixed_farm_rf_market.market import learned_market_orders
 from agents.mixed_farm_rf_market.policy import (
     MarketPolicyBundle,
+    PurchasePlan,
     choose_purchase,
     choose_reserves,
     enumerate_purchase_candidates,
@@ -17,7 +18,12 @@ from agents.mixed_farm_rf_market.policy import (
 from agents.mixed_farm_rf_market.portfolio import build_plan
 from agents.mixed_farm_rf_market.rules import ANIMALS, CROPS, PRODUCTS
 from agents.mixed_farm_rf_market.strategy import Strategy
-from agents.mixed_farm_rf_market.training import DecisionDataset, fit_forests, split_by_episode
+from agents.mixed_farm_rf_market.training import (
+    DecisionDataset,
+    extract_replay_dataset,
+    fit_forests,
+    split_by_episode,
+)
 from kaggriculture_lab.identity import AgentManifest
 from sim.runner import run_match
 
@@ -235,3 +241,64 @@ def test_agent_fallback_and_short_episode_are_valid():
         config={"episodeSteps": 48},
     )
     assert not result.failed
+
+
+def _replay_step(obs: dict, action: dict) -> list[dict]:
+    return [
+        {"observation": obs, "action": action},
+        {"observation": obs, "action": {}},
+    ]
+
+
+def test_replay_extraction_reads_the_pre_action_state():
+    # A replay step records the state *after* its own action, so a sale that empties a
+    # shed slot only survives if the row is built from the previous step's shed.
+    before = observation(step=120)
+    before["private"]["shed"]["MELON"] = 20
+    emptied = observation(step=121)
+    final = observation(step=122)
+
+    replay = {
+        "steps": [
+            _replay_step(before, {"market": []}),
+            _replay_step(emptied, {"market": [["SELL", "MELON", 20]]}),
+            _replay_step(final, {"market": []}),
+        ]
+    }
+    dataset = extract_replay_dataset(replay, 0, Strategy(), "group")
+
+    # Trailing sale features are [available/100, reserve/100, reserve/available, ratio].
+    assert dataset.sale_x.shape[0] == 1
+    assert dataset.sale_x[0, -4] == np.float32(0.2)
+    assert dataset.sale_x[0, -3] == np.float32(0.0)
+
+
+def test_executor_will_not_buy_animals_it_cannot_place():
+    strategy = Strategy()
+    purchase = PurchasePlan(
+        target_crops=tuple(0 for _ in CROPS),
+        target_animals=tuple(5 for _ in ANIMALS),
+        target_land=1,
+        wheat_reserve=0,
+        scale=1.0,
+    )
+
+    open_obs = observation(money=100_000)
+    open_farm = open_obs["farms"][0]
+    open_plan = build_plan(open_obs, open_farm, strategy)
+    reserves = {item: 0 for item in PRODUCTS}
+    open_orders = learned_market_orders(
+        open_obs, open_farm, open_obs["private"], open_plan, purchase, reserves, strategy
+    )
+    assert any(order[0] == "BUY_ANIMAL" for order in open_orders)
+
+    full_obs = observation(money=100_000)
+    full_farm = full_obs["farms"][0]
+    for y in range(5):
+        for x in range(5):
+            full_farm["tiles"][y][x] = {"kind": "PLANT", "crop": "WHEAT", "yield_units": 1}
+    full_plan = build_plan(full_obs, full_farm, strategy)
+    full_orders = learned_market_orders(
+        full_obs, full_farm, full_obs["private"], full_plan, purchase, reserves, strategy
+    )
+    assert not any(order[0] == "BUY_ANIMAL" for order in full_orders)

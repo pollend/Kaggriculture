@@ -338,6 +338,55 @@ def test_trainer_evaluation_round_is_paired_recorded_and_resumable(tmp_path: Pat
         assert store.connection.execute("SELECT count(*) FROM episode_payloads").fetchone()[0] == 2
 
 
+def test_meeting_a_manifest_does_not_rewrite_its_models_configuration(tmp_path: Path):
+    """Recording an opponent must not reset the model a runner is training.
+
+    A rollout pairing registers whatever manifest its opponent came from, and a
+    self-play opponent's manifest is the learner's own. `register_family` would
+    rewrite that model's `config_json` back to the manifest defaults, silently
+    discarding the runner's overlay mid-generation.
+    """
+    from kaggriculture_lab.model_trainers import _register_policies
+
+    manifest_path = "agents/dqn_job_scorer/agent.toml"
+    manifest = AgentManifest.load(manifest_path)
+    with ExperimentStore(postgres_database(tmp_path, "family-only")) as store:
+        store.register_training_agent(
+            manifest,
+            manifest_path,
+            TrainingAgentSpec(
+                "dqn_job_scorer", "default", model_config={"jobs": 3, "opponents": ["frozen"]}
+            ),
+        )
+        _register_policies(
+            store,
+            [
+                EvaluationPolicy(
+                    "opponent-a",
+                    "agents/dqn_job_scorer/main.py?weights=snapshot.npz",
+                    manifest_path,
+                    "rollout_opponent",
+                )
+            ],
+            source="policy_matchup",
+            register_families=True,
+        )
+        config = json.loads(
+            store.connection.execute(
+                "SELECT config_json FROM training_models WHERE model_id = %s",
+                ["dqn_job_scorer.adaptive_hybrid_q_v2"],
+            ).fetchone()[0]
+        )
+        family = store.connection.execute(
+            "SELECT manifest_path FROM agent_families WHERE family_id = %s",
+            ["dqn_job_scorer"],
+        ).fetchone()
+
+    assert config["jobs"] == 3
+    assert config["opponents"] == ["frozen"]
+    assert family == (manifest_path,)
+
+
 def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
     manifest = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
     with ExperimentStore(postgres_database(tmp_path, "named")) as store:

@@ -1,6 +1,5 @@
-from pathlib import Path
-
 import train_mixed_farm
+from kaggriculture_lab.constants import ARTIFACTS_ROOT
 
 
 def test_effective_mixed_farm_config_uses_named_training_instance():
@@ -27,4 +26,4 @@ def test_effective_mixed_farm_config_uses_named_training_instance():
 
 def test_mixed_farm_runner_uses_shared_artifact_root():
     assert train_mixed_farm.LeagueConfig.from_toml(train_mixed_farm.LEAGUE_CONFIG).league == "mixed_farm_v5"
-    assert train_mixed_farm.ARTIFACTS == Path("artifacts")
+    assert train_mixed_farm.ARTIFACTS == ARTIFACTS_ROOT

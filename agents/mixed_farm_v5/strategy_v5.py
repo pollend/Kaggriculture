@@ -10,6 +10,11 @@ from typing import Any
 
 from agents.mixed_farm_v5.strategy import Strategy as LegacyStrategy
 
+# `startingMoney` defaults to 3000; half of it is the most a sampled reserve may
+# withhold and still leave a season's worth of working capital.
+STARTING_MONEY = 3000
+MAX_SAMPLED_CASH_RESERVE = STARTING_MONEY // 2
+
 
 @dataclass(frozen=True, slots=True)
 class Strategy:
@@ -178,5 +183,9 @@ def sample_strategy(rng: random.Random) -> Strategy:
             values[name] = donor.to_dict()[name]
     values["max_hands"] = min(16, int(values["max_hands"]))
     values["hire_until_hour"] = min(12, int(values["hire_until_hour"]))
-    values["cash_reserve"] = max(300, min(5000, int(values["cash_reserve"])))
+    # A reserve near the opening bank leaves no working capital: the buy budget is
+    # `money - cash_reserve`, so money settles at the reserve and the strategy can
+    # never fund another seed. The validator still accepts up to 5000 so stored
+    # revisions keep loading; only the prior is capped.
+    values["cash_reserve"] = max(300, min(MAX_SAMPLED_CASH_RESERVE, int(values["cash_reserve"])))
     return Strategy.from_dict(values)

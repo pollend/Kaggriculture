@@ -35,6 +35,10 @@ min_new_batches = 20
 # `rounds_per_generation` of them, so this and `min_new_batches` together set
 # how often the learner sees fresh data.
 batches_per_round = 1
+# Must be even: seeds are played in consecutive pairs so each one is seen from
+# both seats. Every rollout episode is also recorded as an ordinary league
+# episode under `pairing_kind = 'dqn_rollout'` (see `match_agent.toml`), so a
+# completed pair is what settles `pairing_results.paired_margin`.
 episodes_per_batch = 16
 
 # Opponent variation. `opponents` below is the fixed floor; league_opponents
@@ -47,7 +51,28 @@ league_opponents = true
 self_play_after = 20
 self_play_pool = 5
 self_play_ratio = 0.3
-gradient_steps_per_batch = 400
+# 400 x 20 new batches was 8,000 steps per update over an 800-episode buffer
+# whose behaviour policy had not moved in five hours -- roughly two passes of
+# off-policy bootstrapping per update, and dqn-self-play-v1's losses climbed
+# monotonically (job 0.069 -> 0.12, market 0.39 -> 0.71) while every challenger
+# came out 20k behind its incumbent. The learner now carries state across
+# rejected updates, so a smaller step per update compounds instead of being
+# discarded, and a divergent run is no longer re-manufactured from scratch.
+# Note this is now also the target-sync period: 100 x 20 = 2,000 = `target_sync`,
+# so the target network refreshes exactly once per update rather than four times.
+gradient_steps_per_batch = 100
+# Release rule. `point_estimate` -- promote on a positive paired mean rather
+# than a resolved lower bound -- was tried here as a way out of that lockup and
+# does nothing: the challenger it was meant to rescue was 18.5k behind with a
+# tight interval and zero wins in 100 pairs, which is not a coin flip either
+# rule reads differently. What actually froze the data was sourcing the rollout
+# behaviour policy from the *released* checkpoint; that now follows the lineage
+# instead (see `lineage_checkpoint`), so the gate can go back to being strict.
+promotion_rule = "significant"
+# Escape hatch for the other half of following the lineage: carrying a diverged
+# trajectory forward compounds it. After this many consecutive rejections the
+# learner snaps back to the released checkpoint and tries again from there.
+resume_reset_after_rejections = 5
 batch_size = 512
 learning_rate = 0.0001
 market_learning_rate = 0.0001

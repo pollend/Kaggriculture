@@ -56,20 +56,18 @@ class ExperimentStore:
             TrainingAgentSpec(type=manifest.family_id, name=DEFAULT_AGENT_NAME),
         )
 
-    def register_training_agent(
-        self,
-        manifest: AgentManifest,
-        manifest_path: str | Path,
-        instance: TrainingAgentSpec,
-    ) -> tuple[str, ...]:
-        """Register one independently trained instance of a manifest's models."""
+    def register_agent_family(
+        self, manifest: AgentManifest, manifest_path: str | Path
+    ) -> None:
+        """Register the family row alone, declaring no model instance.
 
-        instance.validate()
-        if instance.type != manifest.family_id:
-            raise ValueError(
-                f"training agent type {instance.type!r} does not match manifest "
-                f"family_id {manifest.family_id!r}"
-            )
+        Distinct from `register_family` because that one also (re)writes the
+        manifest's models for the default instance, resetting their
+        `config_json` to the manifest defaults. A caller that has merely *met* a
+        manifest -- an opponent it played, say -- must not overwrite the
+        configuration a runner set for a model that may be mid-training.
+        """
+
         self.connection.execute(
             """
             INSERT INTO agent_families VALUES (
@@ -94,6 +92,22 @@ class ExperimentStore:
                 manifest.parameter_schema_version,
             ],
         )
+
+    def register_training_agent(
+        self,
+        manifest: AgentManifest,
+        manifest_path: str | Path,
+        instance: TrainingAgentSpec,
+    ) -> tuple[str, ...]:
+        """Register one independently trained instance of a manifest's models."""
+
+        instance.validate()
+        if instance.type != manifest.family_id:
+            raise ValueError(
+                f"training agent type {instance.type!r} does not match manifest "
+                f"family_id {manifest.family_id!r}"
+            )
+        self.register_agent_family(manifest, manifest_path)
         identifiers: list[str] = []
         for model in manifest.models:
             identifier = effective_model_id(model.model_id, instance.name)

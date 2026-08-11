@@ -50,7 +50,7 @@ def learned_market_orders(
     for data in ANIMAL_DATA.values():
         prices[str(data["product"])] = float(raw_prices.get(str(data["product"]), data["base"]))
     prices["FERTILIZER"] = float(raw_prices.get("FERTILIZER", 100))
-    crops, animals, _ = count_assets(farm)
+    crops, animals, structures = count_assets(farm)
     owned_animals = dict(animals)
     for animal in ANIMALS:
         owned_animals[animal] += int(shed.get(animal, 0)) + _carried(private, animal)
@@ -138,17 +138,26 @@ def learned_market_orders(
         hands += 1
         hires_today += 1
 
+    # Animals need a tile of their own, and they compete for the same empty tiles the
+    # seed loop just spent. Learned targets are sized against the *planned* quadrant
+    # count, so without a live bound the forest can buy a herd that has nowhere to
+    # stand and the cash is gone for good.
+    placed_animals = sum(animals.values())
+    pending_animals = max(0, sum(owned_animals.values()) - placed_animals)
+    vacant_structures = max(0, sum(structures.values()) - placed_animals)
+    animal_room = max(0, vacant_structures + (capacity - committed) - pending_animals)
     for animal in sorted(ANIMALS, key=lambda name: (-base_plan.animal_scores[name], name)):
-        if len(orders) >= MAX_ORDERS:
+        if len(orders) >= MAX_ORDERS or animal_room <= 0:
             break
         if remaining_days < float(ANIMAL_DATA[animal]["first"]) + 1.0:
             continue
         deficit = max(0, target_animals[animal] - owned_animals[animal])
         cost = int(ANIMAL_DATA[animal]["cost"])
-        quantity = min(deficit, int(spendable // cost))
+        quantity = min(deficit, animal_room, int(spendable // cost))
         if quantity:
             orders.append(["BUY_ANIMAL", animal, quantity])
             spendable -= quantity * cost
             owned_animals[animal] += quantity
+            animal_room -= quantity
 
     return orders[:MAX_ORDERS]

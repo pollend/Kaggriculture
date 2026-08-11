@@ -12,7 +12,6 @@ from kaggriculture_lab.database import DatabaseTarget, connect_postgres
 DEFAULT_ADMIN_URL = "postgresql://kag_admin:kag_admin_local@127.0.0.1:54329/kaggriculture"
 DEFAULT_WRITER_URL = "postgresql://kag_writer:kag_writer_local@127.0.0.1:54329/kaggriculture"
 
-
 def _url(name: str, fallback: str) -> str:
     return os.environ.get(name, fallback)
 

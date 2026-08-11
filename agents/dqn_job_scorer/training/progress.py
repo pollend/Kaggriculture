@@ -16,18 +16,27 @@ def _policy_identity(prefix: str, spec: str) -> str:
     return f"{prefix}:{hashlib.sha256(spec.encode()).hexdigest()[:20]}"
 
 
-def _opponent_policy(spec: str) -> EvaluationPolicy:
+def _opponent_policy(
+    spec: str,
+    *,
+    role: str = "progress_fixed_opponent",
+    prefix: str = "dqn-progress-opponent",
+) -> EvaluationPolicy:
+    """Identity for whatever the learner was put up against.
+
+    An opponent arrives as a bare spec and can be any of the three things the
+    league knows how to name: a builtin, a manifest-backed agent, or a plain
+    `main.py` with no manifest beside it.
+    """
     if spec in {"starter", "pass", "random"}:
-        return EvaluationPolicy(
-            f"builtin:{spec}", spec, role="progress_fixed_opponent"
-        )
+        return EvaluationPolicy(f"builtin:{spec}", spec, role=role)
     plain = Path(spec.partition("?")[0])
     manifest = plain.parent / "agent.toml"
     return EvaluationPolicy(
-        _policy_identity("dqn-progress-opponent", spec),
+        _policy_identity(prefix, spec),
         spec,
         str(manifest) if plain.name == "main.py" and manifest.is_file() else None,
-        "progress_fixed_opponent",
+        role,
     )
 
 

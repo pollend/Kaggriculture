@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from kaggriculture_lab import runner
+from kaggriculture_lab.database import DatabaseTarget
 from kaggriculture_lab.league import LeagueConfig
 from kaggriculture_lab.storage import ExperimentStore
 from tests.postgres_support import postgres_database
@@ -73,6 +74,28 @@ def test_run_generations_does_not_own_dashboard_or_mcp(monkeypatch, capsys):
     assert "MCP:" not in output
 
 
+def test_run_generations_falls_back_to_the_project_database(monkeypatch):
+    target = DatabaseTarget("postgresql://writer:fallback@127.0.0.1/fallback")
+    seen: list[object] = []
+
+    monkeypatch.setattr(runner, "default_database", lambda: target)
+    monkeypatch.setattr(runner, "session_status", lambda *args: {"status": "OPEN"})
+    monkeypatch.setattr(
+        runner,
+        "run_generation",
+        lambda session_id, database, artifacts, **kwargs: seen.append(database)
+        or {"status": "COMPLETE"},
+    )
+
+    runner.run_generations(
+        session_id="session",
+        artifacts=Path("artifacts"),
+        generations=1,
+    )
+
+    assert seen == [target]
+
+
 def test_continuous_generations_are_blocking_and_sequential(monkeypatch, capsys):
     calls = []
 
@@ -115,8 +138,8 @@ def test_ensure_session_upgrades_only_the_legacy_missing_league_manifest(tmp_pat
     )
     runner.ensure_session(
         config,
-        database,
         "legacy-manifest-session",
+        database=database,
         artifacts=tmp_path,
     )
     with ExperimentStore(database) as store:
@@ -136,8 +159,8 @@ def test_ensure_session_upgrades_only_the_legacy_missing_league_manifest(tmp_pat
 
     created, _ = runner.ensure_session(
         config,
-        database,
         "legacy-manifest-session",
+        database=database,
         artifacts=tmp_path,
     )
 
@@ -151,7 +174,7 @@ def test_ensure_session_upgrades_only_the_legacy_missing_league_manifest(tmp_pat
     with pytest.raises(ValueError, match="manifest mismatch"):
         runner.ensure_session(
             replace(config, seed=config.seed + 1),
-            database,
             "legacy-manifest-session",
+            database=database,
             artifacts=tmp_path,
         )

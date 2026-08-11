@@ -1,0 +1,25 @@
+family_id = "dqn_job_scorer_match_policy"
+name = "DQN Job Scorer Match Policy"
+entry_point = "agents.dqn_job_scorer.match_agent:make_agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_job_scorer.main:evaluate_episode"
+
+# Training-only: rollout episodes are recorded as league pairings under this
+# identity so they are queryable like any match. It imports `training/`, so it
+# is never bundled for submission -- `agent.toml` remains the submission
+# manifest.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_job_scorer/__init__.py",
+  "agents/dqn_job_scorer/match_agent.py",
+  "agents/dqn_job_scorer/main.py",
+  "agents/dqn_job_scorer/features.py",
+  "agents/dqn_job_scorer/hybrid.py",
+  "agents/dqn_job_scorer/market_policy.py",
+  "agents/dqn_job_scorer/jobs.py",
+  "agents/dqn_job_scorer/market.py",
+  "agents/dqn_job_scorer/policy.py",
+  "agents/dqn_job_scorer/rules.py",
+  "agents/dqn_job_scorer/training/__init__.py",
+  "agents/dqn_job_scorer/training/collect.py",
+]

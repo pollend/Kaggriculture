@@ -10,6 +10,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from kaggriculture_lab.constants import default_database
 from kaggriculture_lab.database import DatabaseTarget
 from kaggriculture_lab.league import (
     LeagueConfig,
@@ -27,9 +28,9 @@ from sim.metrics import Summary, summarize
 
 def ensure_session(
     config: LeagueConfig,
-    database: str | DatabaseTarget,
     session_id: str,
     *,
+    database: str | DatabaseTarget | None = None,
     workspace: str | Path = ".",
     artifacts: str | Path | None = None,
     runner: str = "league",
@@ -40,8 +41,12 @@ def ensure_session(
     Returns ``(created, status)``. A session row without a generation is an
     interrupted initialization, not an unknown session, and is reported
     explicitly so a runner never compounds the partial state.
+
+    ``database`` defaults to the project-local target, so a runner that uses the
+    one lab database never has to name it.
     """
 
+    target = database if database is not None else default_database()
     config.validate()
     manifest = {
         "schema_version": 1,
@@ -53,7 +58,7 @@ def ensure_session(
     manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
     manifest_digest = hashlib.sha256(manifest_json.encode()).hexdigest()
     manifest_path = Path(artifacts or "artifacts") / f"{session_id}.run.json"
-    with ExperimentStore(database) as store:
+    with ExperimentStore(target) as store:
         session = store.connection.execute(
             "SELECT league FROM training_sessions WHERE session_id = %s", [session_id]
         ).fetchone()
@@ -93,7 +98,7 @@ def ensure_session(
                 f"run manifest mismatch for {session_id!r}; resume with the original "
                 "experiment settings or choose a new session ID"
             )
-        with ExperimentStore(database) as store:
+        with ExperimentStore(target) as store:
             store.connection.execute(
                 """
                 UPDATE session_manifests
@@ -103,17 +108,17 @@ def ensure_session(
                 [upgraded_digest, upgraded_json, session_id, stored_manifest[0]],
             )
     if session is None:
-        create_session(config, database, workspace=workspace, session_id=session_id)
+        create_session(config, target, workspace=workspace, session_id=session_id)
         created = True
     else:
         created = False
         if config.training_agents:
-            set_training_agents(session_id, database, config, workspace=workspace)
+            set_training_agents(session_id, target, config, workspace=workspace)
         else:
-            set_training_manifests(session_id, database, config.training_manifests)
+            set_training_manifests(session_id, target, config.training_manifests)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-    with ExperimentStore(database) as store:
+    with ExperimentStore(target) as store:
         store.connection.execute(
             """
             INSERT INTO session_manifests (
@@ -123,13 +128,13 @@ def ensure_session(
             """,
             [session_id, str(manifest_path), manifest_digest, manifest_json],
         )
-    return created, session_status(session_id, database)
+    return created, session_status(session_id, target)
 
 
 def run_generations(
     *,
     session_id: str,
-    database: str | DatabaseTarget,
+    database: str | DatabaseTarget | None = None,
     artifacts: str | Path,
     generations: int,
     continuous: bool = False,
@@ -142,16 +147,20 @@ def run_generations(
     runner only orchestrates training and never binds an HTTP or MCP endpoint.
     Continuous mode never queues generations: the next generation is created
     only after ``run_generation`` has closed the current one.
+
+    ``database`` defaults to the project-local target, so a runner that uses the
+    one lab database never has to name it.
     """
 
     if generations < 1:
         raise ValueError("generations must be positive")
+    target = database if database is not None else default_database()
     reports: list[dict[str, Any]] = []
     indices = itertools.count(1) if continuous else range(1, generations + 1)
     for index in indices:
-        current = session_status(session_id, database)
+        current = session_status(session_id, target)
         if current["status"] == "COMPLETE":
-            create_next_generation(session_id, database, workspace=workspace)
+            create_next_generation(session_id, target, workspace=workspace)
         progress_label = f"{index}" if continuous else f"{index}/{generations}"
         print(f"[{session_id}] generation {progress_label} started", flush=True)
 
@@ -165,7 +174,7 @@ def run_generations(
 
         report = run_generation(
             session_id,
-            database,
+            target,
             artifacts,
             update_models=True,
             on_progress=progress,

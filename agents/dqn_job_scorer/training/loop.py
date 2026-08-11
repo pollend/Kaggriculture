@@ -208,23 +208,37 @@ def train(config: Config, output: Path) -> list[dict]:
     best_round: int | None = None
     best_margin = float("-inf")
 
+    behavior_path = output / "behavior.npz"
+    trace_root = output / "episode_traces"
+
     for round_index in range(config.rounds):
-        weights = net_module.to_numpy(online).layers
+        # Collection resolves the behaviour policy from a spec, so the current
+        # weights have to exist as a file before the workers start.
+        PolicyBundle(
+            net_module.to_numpy(online), net_module.to_numpy(market_online)
+        ).save(behavior_path)
         epsilon = epsilon_for(seen, config)
         opponents = opponents_for(round_index, config, snapshots)
-        seeds = [int(value) for value in rng.integers(0, 2**31 - 1, size=config.episodes_per_round)]
+        seeds = [
+            int(value)
+            for value in rng.integers(0, 2**31 - 1, size=config.episodes_per_round // 2)
+            for _ in range(2)
+        ]
 
         started = time.perf_counter()
-        records = collect_batch(
-            weights,
-            opponents,
-            seeds,
-            epsilon,
-            config.gamma,
-            config.jobs,
-            market_weights=net_module.to_numpy(market_online).layers,
-            market_epsilon=epsilon,
-        )
+        records = [
+            rollout.record
+            for rollout in collect_batch(
+                behavior_path,
+                opponents,
+                seeds,
+                epsilon,
+                config.gamma,
+                config.jobs,
+                market_epsilon=epsilon,
+                trace_root=trace_root / f"round-{round_index:04d}",
+            )
+        ]
         collect_time = time.perf_counter() - started
         if not records:
             print(f"round {round_index}: every episode errored -- stopping")

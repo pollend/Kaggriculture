@@ -11,13 +11,11 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import json
 import multiprocessing
 import os
 import sys
 from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
-from pathlib import Path
 from typing import Any
 
 from sim import registry
@@ -25,10 +23,10 @@ from sim.metrics import Summary, render, summarize
 from sim.runner import MatchResult, run_match
 
 
-def _job(args: tuple[tuple[str, str], int, dict[str, Any], bool]) -> MatchResult:
+def _job(args: tuple[tuple[str, str], int, dict[str, Any]]) -> MatchResult:
     """Worker entry point. Specs stay strings so nothing unpicklable crosses over."""
-    specs, seed, config, keep_replay = args
-    return run_match(specs, seed, config, keep_replay)
+    specs, seed, config = args
+    return run_match(specs, seed, config)
 
 
 def play_series(
@@ -37,14 +35,13 @@ def play_series(
     seeds: Iterable[int],
     config: dict[str, Any],
     jobs: int,
-    keep_replay: bool = False,
 ) -> dict[int, tuple[MatchResult, MatchResult]]:
     """Play every seed in both orientations. Returns {seed: (a_first, b_first)}."""
     seeds = list(seeds)
     tasks = []
     for seed in seeds:
-        tasks.append(((a, b), seed, config, keep_replay))
-        tasks.append(((b, a), seed, config, keep_replay))
+        tasks.append(((a, b), seed, config))
+        tasks.append(((b, a), seed, config))
 
     if jobs == 1:
         outcomes = [_job(task) for task in tasks]
@@ -55,28 +52,6 @@ def play_series(
             outcomes = list(pool.map(_job, tasks, chunksize=1))
 
     return {seed: (outcomes[2 * i], outcomes[2 * i + 1]) for i, seed in enumerate(seeds)}
-
-
-def _save_replays(
-    results: dict[int, tuple[MatchResult, MatchResult]], a: str, directory: Path
-) -> int:
-    """Dump replays for seeds where A did not win -- the ones worth debugging."""
-    directory.mkdir(parents=True, exist_ok=True)
-    saved = 0
-    for seed, (forward, reverse) in results.items():
-        if forward.failed or reverse.failed:
-            interesting = True
-        else:
-            interesting = forward.margin is not None and (forward.margin + -(reverse.margin)) / 2 <= 0
-        if not interesting:
-            continue
-        for match, label in ((forward, "fwd"), (reverse, "rev")):
-            if match.replay is None:
-                continue
-            path = directory / f"seed{seed}_{label}.json"
-            path.write_text(json.dumps(match.replay))
-            saved += 1
-    return saved
 
 
 def _warn_nondeterministic(specs: Iterable[str]) -> None:
@@ -91,14 +66,8 @@ def _warn_nondeterministic(specs: Iterable[str]) -> None:
 
 
 def _run_head_to_head(a: str, b: str, args: argparse.Namespace, config: dict) -> Summary:
-    results = play_series(
-        a, b, range(args.seeds), config, args.jobs, keep_replay=bool(args.replay_dir)
-    )
-    summary = summarize(a, b, results, act_timeout=config.get("actTimeout", 1.0))
-    if args.replay_dir:
-        saved = _save_replays(results, a, Path(args.replay_dir))
-        print(f"  replays      : {saved} file(s) -> {args.replay_dir}")
-    return summary
+    results = play_series(a, b, range(args.seeds), config, args.jobs)
+    return summarize(a, b, results, act_timeout=config.get("actTimeout", 1.0))
 
 
 def cmd_match(args: argparse.Namespace) -> int:
@@ -185,7 +154,6 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--seeds", type=int, default=50, help="number of seeds; each is played in both seats")
     parser.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--steps", type=int, default=None, help="override episodeSteps for fast coarse sweeps")
-    parser.add_argument("--replay-dir", default=None, help="dump replay JSON for non-wins and errors")
     parser.add_argument("--config", action="append", metavar="KEY=VALUE", help="env configuration override")
 
 

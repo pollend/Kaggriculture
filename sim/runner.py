@@ -109,7 +109,6 @@ def run_match(
     specs: tuple[str, str],
     seed: int,
     config: dict[str, Any] | None = None,
-    keep_replay: bool = False,
     env_name: str = ENV_NAME,
     analyzer: Callable[[list, int], dict[str, Any]] | None = None,
 ) -> MatchResult:
@@ -168,7 +167,7 @@ def run_match(
         seats=seats,
         steps=len(env.steps),
         wallclock=wallclock,
-        replay=env.toJSON() if keep_replay else None,
+        replay=env.toJSON(),
         training_artifacts=training_artifacts,
     )
 

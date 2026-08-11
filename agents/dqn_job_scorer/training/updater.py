@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import numpy as np
 import torch
@@ -16,6 +18,7 @@ from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
 from agents.dqn_job_scorer.policy import WEIGHTS_PATH, PolicyBundle, QNetwork
 from agents.dqn_job_scorer.training import network as net_module
 from agents.dqn_job_scorer.training.collect import (
+    LEARNER_ENTRY_POINT,
     EpisodeFormatError,
     collect_batch,
     load_episode_batch,
@@ -26,7 +29,9 @@ from agents.dqn_job_scorer.training.peers import (
     active_checkpoint_opponents,
     historical_checkpoint_opponents,
 )
+from agents.dqn_job_scorer.training.progress import _opponent_policy, _policy_identity
 from agents.dqn_job_scorer.training.replay import ReplayBuffer
+from kaggriculture_lab.model_trainers import EvaluationPolicy
 from kaggriculture_lab.model_updates import (
     ModelEvaluation,
     ModelTrainingReader,
@@ -35,6 +40,8 @@ from kaggriculture_lab.model_updates import (
 )
 
 SELF_SPEC = "agents/dqn_job_scorer/main.py"
+LEARNER_MANIFEST = "agents/dqn_job_scorer/match_agent.toml"
+_PROMOTION_RULES = {"significant", "point_estimate"}
 
 
 def _incumbent_path(config: dict[str, Any]) -> Path:
@@ -121,6 +128,113 @@ def self_play_pool(context, reader, limit: int) -> list[str]:
     ]
 
 
+@dataclass(frozen=True, slots=True)
+class LineageCheckpoint:
+    """Where the run actually is, as opposed to what it has released."""
+
+    checkpoint_id: str
+    trainer_artifact_path: Path
+    inference_artifact_path: Path
+    #: True when this is `context.active_checkpoint` -- either because nothing
+    #: newer exists, or because the reset below sent the run back to it.
+    released: bool
+    #: Rejections since the last promotion, at the moment of the call.
+    rejection_streak: int = 0
+    #: Set when the streak tripped `resume_reset_after_rejections`.
+    reset: bool = False
+
+
+def _rejections_since_restart(reader, model_id: str) -> int:
+    """Rejections since the run last got a clean start.
+
+    A clean start is a promotion or a previous reset. Counting only from the
+    last promotion would make the reset fire on every update once it fired once
+    -- the streak never drops below the limit until something promotes, so the
+    run would go back to re-deriving the same candidate from the release, which
+    is the waste the lineage exists to avoid. Resetting buys another `limit`
+    updates, not a permanent policy.
+    """
+
+    row = reader.fetchone(
+        """
+        SELECT count(*) FROM model_updates
+        WHERE model_id = %s AND status = 'REJECTED' AND started_at > coalesce(
+            (SELECT max(started_at) FROM model_updates
+             WHERE model_id = %s AND (
+                 status = 'PROMOTED'
+                 OR coalesce((gate_json ->> 'lineage_reset')::boolean, false)
+             )),
+            '-infinity'::timestamp
+        )
+        """,
+        [model_id, model_id],
+    )
+    return 0 if row is None else int(row[0])
+
+
+def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
+    """The newest checkpoint on the model's lineage, promoted or not.
+
+    Release is gated; the learner is not. `context.active_checkpoint` is the
+    *released* policy, and both resuming gradient descent from it and rolling out
+    from it are wrong in the same way: the first discards every step a rejected
+    update took, and the second freezes the behaviour distribution for as long as
+    the gate says no. dqn-self-play-v1 did both -- it reloaded the released
+    weights thirteen times running while every rollout batch from 60 to 340 came
+    out of one checkpoint frozen at 07:59, and the learner drifted to a policy
+    that lost 100 of 100 to its own incumbent and 92 of 100 to `starter`.
+
+    Two escapes. Training and collection both follow the lineage, so the data
+    tracks the learner without shipping an ungated policy; and once the run has
+    been rejected `resume_reset_after_rejections` times in a row, the lineage
+    snaps back to the release, because carrying a diverged trajectory forward
+    forever is how it stays diverged.
+
+    Falls back to the released checkpoint when the newer artifact is missing --
+    trainer `.pt` files are large and a pruned artifact root must not silently
+    restart the run from random weights.
+    """
+
+    def released() -> LineageCheckpoint | None:
+        active = context.active_checkpoint
+        if active is None:
+            return None
+        return LineageCheckpoint(
+            active.checkpoint_id,
+            Path(active.trainer_artifact_path),
+            Path(active.inference_artifact_path),
+            released=True,
+        )
+
+    row = reader.fetchone(
+        """
+        SELECT checkpoint_id, trainer_artifact_path, inference_artifact_path
+        FROM model_training_checkpoints WHERE model_id = %s
+        ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1
+        """,
+        [context.model_id],
+    )
+    if row is None or not Path(str(row[1])).is_file():
+        return released()
+    active = context.active_checkpoint
+    if active is not None and str(row[0]) == active.checkpoint_id:
+        return released()
+
+    limit = int(getattr(context, "config", {}).get("resume_reset_after_rejections", 0))
+    streak = _rejections_since_restart(reader, context.model_id) if limit > 0 else 0
+    if limit > 0 and streak >= limit:
+        fallback = released()
+        if fallback is not None:
+            return replace(fallback, rejection_streak=streak, reset=True)
+    return LineageCheckpoint(
+        str(row[0]),
+        Path(str(row[1])),
+        Path(str(row[2])),
+        released=False,
+        rejection_streak=streak,
+    )
+
+
 def compose_opponents(
     base: list[str], pool: list[str], ratio: float, *, pool_offset: int = 0
 ) -> list[str]:
@@ -165,13 +279,54 @@ def rotate_opponents(opponents: list[str], offset: int) -> list[str]:
     return [*opponents[start:], *opponents[:start]]
 
 
+def _learner_policy(
+    weights_path: Path,
+    epsilon: float,
+    market_epsilon: float,
+    gamma: float,
+) -> EvaluationPolicy:
+    """Identity of the exploring behaviour policy for one batch.
+
+    The spec actually played also carries a per-episode trace path and
+    exploration seed; folding those into the identity would mint one revision
+    per rollout episode. What defines the policy is its weights and how much it
+    explores, so the identity spec carries only those -- and stays resolvable.
+
+    The exploration rates are bucketed to two decimals. They decay continuously,
+    so carrying full precision means a distinct revision every batch and no
+    revision with more than `episodes_per_batch` games to its name; the whole
+    decay from 1.0 to the floor is ~85 buckets, and once at the floor it is one.
+    The identity is therefore a rounding of the policy played, not the policy
+    played -- close enough to name it, and the exact rates stay on the batch.
+    """
+    spec = f"{LEARNER_ENTRY_POINT}?" + urlencode(
+        {
+            "weights": str(weights_path.resolve()),
+            "epsilon": round(epsilon, 2),
+            "market_epsilon": round(market_epsilon, 2),
+            "gamma": gamma,
+        }
+    )
+    return EvaluationPolicy(
+        _policy_identity("dqn-rollout-policy", spec),
+        spec,
+        LEARNER_MANIFEST,
+        "rollout_learner",
+    )
+
+
 class DQNCollector:
     """Roll out exploration episodes for one closed league round.
 
     Off-policy, so the league's population is irrelevant -- only its clock is.
     The round hook supplies the resolved config and active checkpoint, reads go
-    through the SELECT-only reader, and the one write goes through the writer,
-    which is already bound to this model.
+    through the SELECT-only reader, and writes go through the writer, which is
+    already bound to this model.
+
+    Every episode is recorded twice over: as transitions in the batch `.npz` the
+    updater trains from, and as an ordinary league pairing under
+    `pairing_kind = 'dqn_rollout'`, so what the learner actually played is
+    answerable in SQL rather than only inferable from an artifact.
     """
 
     def collect(self, context, reader, writer) -> list[str]:
@@ -179,7 +334,14 @@ class DQNCollector:
         count = int(config.get("batches_per_round", 1))
         if count < 1:
             raise ValueError("batches_per_round must be positive")
-        checkpoint = context.active_checkpoint
+        episodes = int(config.get("episodes_per_batch", 16))
+        if episodes < 2 or episodes % 2:
+            raise ValueError("episodes_per_batch must be a positive even number")
+        # The lineage checkpoint, not the released one. Gating release is a
+        # decision about what to ship; applying it to the behaviour policy as
+        # well means a run that stops promoting also stops seeing new states,
+        # which is the loop dqn-self-play-v1 could not get out of.
+        checkpoint = lineage_checkpoint(context, reader)
         if checkpoint is not None:
             bundle = PolicyBundle.load(checkpoint.inference_artifact_path)
             if bundle.market is None:
@@ -202,6 +364,28 @@ class DQNCollector:
                 [context.model_id],
             )[0]
         )
+        # Rollouts run in spawned workers and the pairing needs a stable policy
+        # identity, so the behaviour policy goes to a file both the workers and
+        # the league refer to. Keyed by the checkpoint it came from, not by
+        # generation and round: `_learner_policy` hashes this path into the
+        # revision id, and with `batches_per_round = 1` a per-round path minted a
+        # throwaway revision every batch -- 312 of them over 4,992 episodes, none
+        # with enough games behind it to carry a rating.
+        behavior_path = (
+            Path(context.artifacts)
+            / "rollout_policies"
+            / f"{checkpoint.checkpoint_id if checkpoint is not None else 'initial'}.npz"
+        )
+        behavior_path.parent.mkdir(parents=True, exist_ok=True)
+        if not behavior_path.is_file():
+            bundle.save(behavior_path)
+        trace_root = (
+            Path(context.artifacts)
+            / "episode_traces"
+            / context.generation_id
+            / f"round-{context.round_index:04d}"
+        )
+
         seed = int(config.get("seed", 0))
         rng = np.random.default_rng(seed + total_transitions)
         written: list[str] = []
@@ -219,13 +403,13 @@ class DQNCollector:
                     [context.model_id],
                 )[0]
             )
+            # One seed per pair, played twice: the learner takes seat 0 in one
+            # orientation and seat 1 in the other, which is what lets the
+            # pairing settle a seat-balanced margin.
             seeds = [
                 int(value)
-                for value in rng.integers(
-                    0,
-                    2**31 - 1,
-                    size=int(config.get("episodes_per_batch", 16)),
-                )
+                for value in rng.integers(0, 2**31 - 1, size=episodes // 2)
+                for _ in range(2)
             ]
             configured_opponents = config.get("opponents")
             base = (
@@ -271,23 +455,52 @@ class DQNCollector:
                     float(config.get("self_play_ratio", 0.3)),
                     pool_offset=batch_index,
                 ),
-                batch_index * len(seeds),
+                # Slots consumed, not episodes played: seat rotation makes
+                # `collect_batch` draw one opponent per seed *pair*, so a batch
+                # of 16 advances the list by 8. Offsetting by 16 would step over
+                # half of it every batch.
+                batch_index * (episodes // 2),
             )
-            records = collect_batch(
-                bundle.job.layers,
+            gamma = float(config.get("gamma", 0.997))
+            market_epsilon = float(config.get("market_epsilon_start", 1.0)) + fraction * (
+                float(config.get("market_epsilon_end", config.get("epsilon_end", 0.15)))
+                - float(config.get("market_epsilon_start", 1.0))
+            )
+            learner = _learner_policy(behavior_path, epsilon, market_epsilon, gamma)
+            rollouts = collect_batch(
+                behavior_path,
                 opponents,
                 seeds,
                 epsilon,
-                float(config.get("gamma", 0.997)),
+                gamma,
                 int(config.get("jobs", 1)),
-                market_weights=bundle.market.layers if bundle.market is not None else None,
-                market_epsilon=float(config.get("market_epsilon_start", 1.0)) + fraction * (
-                    float(config.get("market_epsilon_end", config.get("epsilon_end", 0.15)))
-                    - float(config.get("market_epsilon_start", 1.0))
-                ),
+                config={"episodeSteps": int(config.get("episode_steps", 720))},
+                market_epsilon=market_epsilon,
+                trace_root=trace_root,
+                policy_revision_id=learner.revision_id,
             )
-            if not records:
+            if not rollouts:
                 raise RuntimeError("every DQN rollout episode failed")
+            records = [rollout.record for rollout in rollouts]
+            artifact_ids: list[str] = []
+            for rollout in rollouts:
+                artifact_ids.extend(
+                    writer.record_policy_episode(
+                        context=context,
+                        pairing_kind="dqn_rollout",
+                        pairing_index=batch_index * (episodes // 2) + rollout.pair_index,
+                        left=learner,
+                        right=_opponent_policy(
+                            rollout.opponent_spec,
+                            role="rollout_opponent",
+                            prefix="dqn-rollout-opponent",
+                        ),
+                        # Seat order as played: orientation 0 is (learner,
+                        # opponent), which is exactly the learner holding seat 0.
+                        orientation=rollout.learner_seat,
+                        result=rollout.match,
+                    )
+                )
             source_id = f"rollout-{batch_index:08d}"
             path = (
                 Path(context.artifacts)
@@ -297,7 +510,8 @@ class DQNCollector:
             save_episode_batch(records, path)
             transitions = sum(int(record.unit_mask.sum()) for record in records)
             market_transitions = sum(0 if record.market_step is None else len(record.market_step) for record in records)
-            writer.record(
+            played = [rollout.opponent_spec for rollout in rollouts]
+            batch = writer.record(
                 source_kind="dqn_rollout",
                 source_id=source_id,
                 sample_count=len(records),
@@ -308,25 +522,24 @@ class DQNCollector:
                     "transitions": transitions,
                     "market_transitions": market_transitions,
                     "epsilon": epsilon,
+                    "market_epsilon": market_epsilon,
                     "seeds": seeds,
                     "behavior_checkpoint_id": (
                         checkpoint.checkpoint_id if checkpoint is not None else None
                     ),
+                    "behavior_policy_revision_id": learner.revision_id,
                     "session_id": context.session_id,
                     "generation_id": context.generation_id,
                     "round_index": context.round_index,
                     # Which opponents actually played, so a collapse like dqn04's
                     # can be traced to the mix rather than guessed at.
-                    "opponents": [
-                        opponents[index % len(opponents)] for index in range(len(seeds))
-                    ],
+                    "opponents": played,
                     "self_play_episodes": sum(
-                        1
-                        for index in range(len(seeds))
-                        if "?weights=" in opponents[index % len(opponents)]
+                        1 for spec in played if "?weights=" in spec
                     ),
                 },
             )
+            writer.link_artifacts(batch.batch_id, artifact_ids)
             total_transitions += transitions
             written.append(source_id)
         return written
@@ -455,9 +668,11 @@ class DQNUpdater:
         )
         gradient_steps = 0
         market_gradient_steps = 0
-        if context.active_checkpoint is not None:
+        resumed = lineage_checkpoint(context, reader)
+        resumed_from = resumed.checkpoint_id if resumed is not None else None
+        if resumed is not None:
             state = torch.load(
-                context.active_checkpoint.trainer_artifact_path,
+                resumed.trainer_artifact_path,
                 map_location="cpu",
                 weights_only=False,
             )
@@ -609,10 +824,19 @@ class DQNUpdater:
                 else None
             )
         )
+        promotion_rule = str(config.get("promotion_rule", "significant"))
+        if promotion_rule not in _PROMOTION_RULES:
+            raise ValueError(
+                f"promotion_rule must be one of {sorted(_PROMOTION_RULES)}: {promotion_rule}"
+            )
         gate: dict[str, Any] = {
-            "kind": "significant_incumbent_improvement_and_benchmarks_non_regression",
+            "kind": f"{promotion_rule}_incumbent_improvement_and_benchmarks_non_regression",
+            "promotion_rule": promotion_rule,
             "seed_start": seed_start,
             "challenger_benchmarks": challenger_benchmarks,
+            "resumed_from_checkpoint_id": resumed_from,
+            "rejection_streak": resumed.rejection_streak if resumed is not None else 0,
+            "lineage_reset": resumed is not None and resumed.reset,
         }
         if incumbent_path is None:
             benchmark_results = [not result["errors"] for result in challenger_benchmarks]
@@ -645,12 +869,19 @@ class DQNUpdater:
                 )
                 for benchmark in benchmarks
             ]
-            # Promotion is a release decision, not an absence-of-proof-of-harm
-            # decision. The paired lower bound must clear zero, and every fixed
-            # benchmark must remain statistically compatible with its incumbent.
-            head_to_head_ok = (
-                not head_to_head["errors"]
-                and float(head_to_head["margin_ci"][0]) > 0.0
+            # Two rules, because "release" and "carry the run forward" are not
+            # the same decision. `significant` is the release rule: the paired
+            # lower bound must clear zero, which is what stops a +64-on-24-seeds
+            # coin flip from becoming the incumbent. `point_estimate` only asks
+            # the paired mean to be positive, which promotes noise about half the
+            # time it is offered -- acceptable when the point of promoting is to
+            # keep the rollout distribution and the self-play pool moving rather
+            # than to ship. Either way every fixed benchmark must stay
+            # statistically compatible with its incumbent.
+            head_to_head_ok = not head_to_head["errors"] and (
+                float(head_to_head["margin"]) > 0.0
+                if promotion_rule == "point_estimate"
+                else float(head_to_head["margin_ci"][0]) > 0.0
             )
             benchmark_results = [
                 benchmark_non_regression(challenger, incumbent)
@@ -695,6 +926,10 @@ class DQNUpdater:
                 )
             )
         metrics = {
+            "resumed_from_checkpoint_id": resumed_from,
+            "resumed_from_released": resumed is not None and resumed.released,
+            "rejection_streak": resumed.rejection_streak if resumed is not None else 0,
+            "lineage_reset": resumed is not None and resumed.reset,
             "episodes_in_buffer": len(buffer.episodes),
             "skipped_legacy_batches": skipped_legacy_batches,
             "transitions_in_buffer": buffer.transitions,

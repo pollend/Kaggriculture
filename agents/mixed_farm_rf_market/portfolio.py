@@ -144,13 +144,15 @@ def build_plan(
     )
     animal_total = requested_animal_total
     while animal_total > 0:
-        supported = max(
-            strategy.target_crop_tiles,
-            strategy.crop_target_floor + math.ceil(
-                animal_total * strategy.crop_tiles_per_animal
-            ),
+        # Fit the herd against the crop tiles it actually *requires*, not against
+        # `target_crop_tiles`, which is an aspiration the clamp below already
+        # trims. Treating the want as a floor lets a crop target larger than the
+        # board veto the entire herd: 32 crop tiles on a one-quadrant farm zeroed
+        # a 47-animal request outright instead of fitting the four that do fit.
+        required = strategy.crop_target_floor + math.ceil(
+            animal_total * strategy.crop_tiles_per_animal
         )
-        if animal_total + supported <= farm_capacity:
+        if animal_total + required <= farm_capacity:
             break
         animal_total -= 1
     if animal_total < requested_animal_total:

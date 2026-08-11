@@ -1,0 +1,21 @@
+[league]
+league = "dqn_market_scorer"
+name = "dqn-market-scorer-v1"
+
+# The market trainer collects its own full-length episodes, so the league runs
+# trainer-only: no breedable population, no anchor pairings, no hall of fame.
+# `rounds_per_generation` is the trainer's batch clock, matched to
+# `min_new_batches` in `agent.toml` so one update fires per generation.
+manifest = "agents/dqn_market_scorer/agent.toml"
+anchor_manifests = []
+training_manifests = ["agents/dqn_market_scorer/agent.toml"]
+
+pairing_mode = "trainer_only"
+population_size = 0
+rounds_per_generation = 20
+hall_of_fame_rounds = 0
+episode_steps = 720
+seed = 2718
+jobs = 0
+tau = 0.5
+candidate_pool = 2

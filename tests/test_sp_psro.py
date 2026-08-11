@@ -24,7 +24,11 @@ from agents.sp_psro_job_scorer.training.updater import (
 )
 from kaggriculture_lab.identity import AgentManifest
 from kaggriculture_lab.league import LeagueConfig, create_session
-from kaggriculture_lab.model_trainers import RoundContext, TrainingBatchWriter
+from kaggriculture_lab.model_trainers import (
+    EvaluationPolicy,
+    RoundContext,
+    TrainingBatchWriter,
+)
 from kaggriculture_lab.model_updates import ActiveCheckpoint, ModelUpdateContext, TrainingBatch
 from kaggriculture_lab.storage import ExperimentStore
 from tests.postgres_support import postgres_database, seed_reference_rows
@@ -514,15 +518,26 @@ def test_manifest_rollouts_are_persisted_as_paired_episode_artifacts(tmp_path: P
         ).fetchall() == [("member-a", 0.8), ("live-nu", 0.2)]
         mixture_id = writer.record_policy_mixture(context, ["member-a"], max_members=10)
         for rollout in rollouts:
+            specs = [seat.spec for seat in rollout.match.seats]
             writer.record_policy_episode(
                 context=context,
-                manifest_path="agents/sp_psro_job_scorer/match_agent.toml",
+                pairing_kind="sp_psro_training",
                 pairing_index=0,
-                beta_seat=rollout.beta_seat,
-                population_revision_id="member-a",
-                beta_revision_id="beta-a",
-                mixture_id=mixture_id,
+                left=EvaluationPolicy(
+                    "member-a",
+                    specs[1 - rollout.beta_seat],
+                    "agents/sp_psro_job_scorer/match_agent.toml",
+                    "population",
+                ),
+                right=EvaluationPolicy(
+                    "beta-a",
+                    specs[rollout.beta_seat],
+                    "agents/sp_psro_job_scorer/match_agent.toml",
+                    "best_response",
+                ),
+                orientation=1 - rollout.beta_seat,
                 result=rollout.match,
+                mixture_id=mixture_id,
             )
         assert (
             store.connection.execute(

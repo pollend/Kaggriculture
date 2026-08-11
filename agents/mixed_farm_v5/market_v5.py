@@ -28,7 +28,11 @@ def market_orders(obs: Any, farm: dict, private: dict, plan: Plan, labor: LaborP
             100.0,
         )
         favorable_price = float(prices.get(item, base)) / max(1.0, base) >= strategy.sell_price_ratio
-        if amount and (liquidation or favorable_price or float(farm.get("money", 0)) < strategy.cash_reserve or sum(map(int, shed.values())) >= 100 * strategy.shed_pressure_fraction):
+        # `<=`, not `<`: money settles at exactly the reserve once the budget
+        # (money - cash_reserve) hits zero and buying stops, so a strict compare
+        # never fires and a high sell_price_ratio can sit on a full shed for the
+        # rest of the season.
+        if amount and (liquidation or favorable_price or float(farm.get("money", 0)) <= strategy.cash_reserve or sum(map(int, shed.values())) >= 100 * strategy.shed_pressure_fraction):
             orders.append(["SELL", item, amount])
     if final_day:
         return orders[:MAX_ORDERS]

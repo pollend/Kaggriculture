@@ -55,10 +55,19 @@ class EpisodeReader:
         }
 
     def replay(self) -> dict[str, Any]:
+        """The full replay for this episode.
+
+        Every episode keeps one, trainer rollouts included, so an absent payload
+        is a real fault rather than a storage policy and is raised as such. It
+        was briefly otherwise: rollouts were recorded without a payload to save
+        disk, the hook fired for them anyway, and every replay-reading evaluator
+        turned those episodes into `episode_evaluations` ERROR rows.
+        """
+
         row = self._connection.execute(
             "SELECT replay_gzip FROM episode_payloads WHERE match_id = %s", [self.match_id]
         ).fetchone()
-        if row is None:
+        if row is None or row[0] is None:
             raise ValueError(f"replay payload not found: {self.match_id}")
         return json.loads(gzip.decompress(bytes(row[0])))
 

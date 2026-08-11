@@ -179,6 +179,15 @@ The first update has no incumbent to beat, so it promotes on the benchmarks mere
 That promotion seeds the self-play pool; every later update gates head-to-head against the
 checkpoint before it.
 
+`python train_market_scorer.py` is the same shape with one network instead of two. Its field
+policy is frozen — a byte-for-byte copy of the pilkwang competitor snapshot — so the only
+thing it learns is the market layer on top: how much of the donor's stated demand to fund,
+and how much of each product to hold back from the sale. Two decisions a day, 60 an episode.
+Its promotion benchmark is that same snapshot, which makes the paired margin an ablation of
+the market layer alone rather than a verdict on the field play it inherited. It starts from a
+zero network, which is not a random policy here: every argmax falls to the donor default, so
+round one rolls out unmodified pilkwang.
+
 The primary persistent path is the league hook. In `configs/league.toml`, each closed
 league round buys one 16-episode DQN rollout batch. The current twenty-batch threshold
 fits and gates the network once per twenty-round generation. `league run` performs the

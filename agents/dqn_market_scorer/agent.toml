@@ -1,0 +1,102 @@
+family_id = "dqn_market_scorer"
+name = "Market Scorer (frozen donor field policy)"
+entry_point = "agents.dqn_market_scorer.main:agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_market_scorer.main:evaluate_episode"
+
+# Inference only. `training/` is torch and is deliberately absent, so a bundle
+# built from this allowlist is submission-safe by construction.
+#
+# `donor.py` is a byte-for-byte copy of the pilkwang competitor snapshot and is
+# redistributed under Apache-2.0; LICENSE-pilkwang and NOTICE ship with it, as
+# that licence requires. No `competitor_*` path is ever bundled.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_market_scorer/__init__.py",
+  "agents/dqn_market_scorer/main.py",
+  "agents/dqn_market_scorer/donor.py",
+  "agents/dqn_market_scorer/market_exec.py",
+  "agents/dqn_market_scorer/market_policy.py",
+  "agents/dqn_market_scorer/policy.py",
+  "agents/dqn_market_scorer/weights.npz",
+  "agents/dqn_market_scorer/LICENSE-pilkwang",
+  "agents/dqn_market_scorer/NOTICE",
+]
+
+[[models]]
+model_id = "dqn_market_scorer.donor_market_q_v1"
+trainer = "agents.dqn_market_scorer.train:trainer"
+# One update per generation: the league schedules `rounds_per_generation` rounds
+# and each buys `batches_per_round`, so matching their product fires the update
+# on the last round.
+min_new_batches = 20
+
+[models.config]
+# Rollout batches bought per closed league round.
+batches_per_round = 1
+# Must be even: seeds are played in consecutive pairs so each one is seen from
+# both seats. Every rollout episode is also recorded as an ordinary league
+# episode under `pairing_kind = 'market_rollout'` (see `match_agent.toml`), so a
+# completed pair is what settles `pairing_results.paired_margin`.
+episodes_per_batch = 16
+
+# Opponent variation. `opponents` below is the fixed floor; league_opponents
+# adds the current generation's evolved revisions. Self-play mixes in past
+# promoted checkpoints once enough batches exist, held to `self_play_ratio` of
+# each batch -- evaluation is always against the benchmark, so a higher share
+# trains on a distribution the objective never measures.
+league_opponents = true
+self_play_after = 20
+self_play_pool = 5
+self_play_ratio = 0.3
+
+# One network, so one set of gradient knobs. An episode yields 60 market
+# decisions (two a day) against 719 turns of reward, so the sample budget is
+# ~48k decisions across an 800-episode buffer -- small enough that a large
+# per-update step overfits the buffer before the behaviour policy moves.
+market_gradient_steps_per_batch = 100
+market_batch_size = 256
+market_learning_rate = 0.0001
+market_target_sync = 2000
+gamma = 0.997
+# Counted in decisions, not turns: three decisions is a day and a half of game
+# time, which is roughly how long a purchase takes to show up in money.
+n_step = 3
+buffer_episodes = 800
+reservoir_fraction = 0.35
+warmup_episodes = 16
+
+# Exploration decays over market decisions collected, which accumulate ~12x
+# slower than the job scorer's per-unit transitions did.
+market_epsilon_start = 1.0
+market_epsilon_end = 0.05
+epsilon_decay_transitions = 40000
+
+# A zero network makes every argmax fall to index 0 -- the donor-default
+# modifier and a zero reserve -- so round one rolls out unmodified pilkwang
+# rather than a random market policy it would have to climb back from.
+initialization = "zeros"
+
+promotion_rule = "significant"
+resume_reset_after_rejections = 5
+eval_seeds = 100
+promotion_seeds = 100
+promotion_seed_base = 1000000
+promotion_seed_stride = 10000
+jobs = 8
+seed = 0
+
+# The donor itself. With the field policy held identical on both sides, this
+# match measures the learned market layer and nothing else.
+benchmark = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+opponents = [
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",
+  "agents/competitor_lucifer19_kaggriculture_night_harvest/main.py",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/main.py",
+  "agents/competitor_boatlee_v13_r3_top_meta_order_safe_premium_control/main.py",
+  "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/main.py",
+  "agents/competitor_romantamrazov_kaggriculture_hamburger/main.py",
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
+  "agents/configurable_crop_surrogate/main.py",
+]
