@@ -1,0 +1,2426 @@
+[
+  {
+    "round": 0,
+    "epsilon": 1.0,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 42416,
+    "buffer_mb": 23.5,
+    "buffer_recent": 16,
+    "buffer_reservoir": 0,
+    "loss": 0.087795,
+    "final_money": 25084.6,
+    "raw_return": 22084.6,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.4
+  },
+  {
+    "round": 1,
+    "epsilon": 0.988,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 84832,
+    "buffer_mb": 47.7,
+    "buffer_recent": 32,
+    "buffer_reservoir": 0,
+    "loss": 0.08176,
+    "final_money": 24356.4,
+    "raw_return": 21356.4,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.9
+  },
+  {
+    "round": 2,
+    "epsilon": 0.976,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 127248,
+    "buffer_mb": 71.1,
+    "buffer_recent": 48,
+    "buffer_reservoir": 0,
+    "loss": 0.076433,
+    "final_money": 25586.2,
+    "raw_return": 22586.3,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.7
+  },
+  {
+    "round": 3,
+    "epsilon": 0.9639,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 169523,
+    "buffer_mb": 96.1,
+    "buffer_recent": 64,
+    "buffer_reservoir": 0,
+    "loss": 0.069496,
+    "final_money": 22846.1,
+    "raw_return": 19846.1,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.9
+  },
+  {
+    "round": 4,
+    "epsilon": 0.952,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 211939,
+    "buffer_mb": 120.2,
+    "buffer_recent": 80,
+    "buffer_reservoir": 0,
+    "loss": 0.063359,
+    "final_money": 24880.5,
+    "raw_return": 21880.5,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.9
+  },
+  {
+    "round": 5,
+    "epsilon": 0.94,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 254355,
+    "buffer_mb": 143.2,
+    "buffer_recent": 96,
+    "buffer_reservoir": 0,
+    "loss": 0.058968,
+    "final_money": 25372.9,
+    "raw_return": 22372.9,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.9
+  },
+  {
+    "round": 6,
+    "epsilon": 0.9279,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 296607,
+    "buffer_mb": 169.0,
+    "buffer_recent": 112,
+    "buffer_reservoir": 0,
+    "loss": 0.055257,
+    "final_money": 25436.2,
+    "raw_return": 22436.2,
+    "job_truncations": 0,
+    "collect_s": 3.3,
+    "train_s": 12.9
+  },
+  {
+    "round": 7,
+    "epsilon": 0.916,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 338402,
+    "buffer_mb": 192.9,
+    "buffer_recent": 128,
+    "buffer_reservoir": 0,
+    "loss": 0.05301,
+    "final_money": 24550.7,
+    "raw_return": 21550.7,
+    "job_truncations": 0,
+    "collect_s": 3.3,
+    "train_s": 12.9
+  },
+  {
+    "round": 8,
+    "epsilon": 0.9041,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 380818,
+    "buffer_mb": 216.9,
+    "buffer_recent": 144,
+    "buffer_reservoir": 0,
+    "loss": 0.049896,
+    "final_money": 25107.9,
+    "raw_return": 22107.9,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.6
+  },
+  {
+    "round": 9,
+    "epsilon": 0.8921,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 423208,
+    "buffer_mb": 240.4,
+    "buffer_recent": 160,
+    "buffer_reservoir": 0,
+    "loss": 0.04947,
+    "final_money": 25739.6,
+    "raw_return": 22739.6,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.7
+  },
+  {
+    "round": 10,
+    "epsilon": 0.8801,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 465624,
+    "buffer_mb": 264.2,
+    "buffer_recent": 176,
+    "buffer_reservoir": 0,
+    "loss": 0.046472,
+    "final_money": 25194.7,
+    "raw_return": 22194.7,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.8,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.0,
+      "margin": -10120.041666666666,
+      "margin_ci": [
+        -10602.985716245865,
+        -9637.097617087467
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 11,
+    "epsilon": 0.8681,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 508040,
+    "buffer_mb": 288.4,
+    "buffer_recent": 192,
+    "buffer_reservoir": 0,
+    "loss": 0.042867,
+    "final_money": 25277.9,
+    "raw_return": 22277.9,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 12.7
+  },
+  {
+    "round": 12,
+    "epsilon": 0.8561,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 550456,
+    "buffer_mb": 312.7,
+    "buffer_recent": 208,
+    "buffer_reservoir": 0,
+    "loss": 0.042018,
+    "final_money": 25119.9,
+    "raw_return": 22119.9,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.9
+  },
+  {
+    "round": 13,
+    "epsilon": 0.844,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 592872,
+    "buffer_mb": 336.5,
+    "buffer_recent": 224,
+    "buffer_reservoir": 0,
+    "loss": 0.041224,
+    "final_money": 25465.0,
+    "raw_return": 22465.0,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 12.9
+  },
+  {
+    "round": 14,
+    "epsilon": 0.832,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 635288,
+    "buffer_mb": 360.7,
+    "buffer_recent": 240,
+    "buffer_reservoir": 0,
+    "loss": 0.040491,
+    "final_money": 25060.3,
+    "raw_return": 22060.3,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.1
+  },
+  {
+    "round": 15,
+    "epsilon": 0.82,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 677704,
+    "buffer_mb": 384.7,
+    "buffer_recent": 256,
+    "buffer_reservoir": 0,
+    "loss": 0.046573,
+    "final_money": 24151.4,
+    "raw_return": 21151.4,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 13.9
+  },
+  {
+    "round": 16,
+    "epsilon": 0.808,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 720120,
+    "buffer_mb": 409.7,
+    "buffer_recent": 272,
+    "buffer_reservoir": 0,
+    "loss": 0.043637,
+    "final_money": 26566.9,
+    "raw_return": 23566.9,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 13.7
+  },
+  {
+    "round": 17,
+    "epsilon": 0.796,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 762536,
+    "buffer_mb": 434.0,
+    "buffer_recent": 288,
+    "buffer_reservoir": 0,
+    "loss": 0.042979,
+    "final_money": 24259.2,
+    "raw_return": 21259.3,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.1
+  },
+  {
+    "round": 18,
+    "epsilon": 0.7839,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 804952,
+    "buffer_mb": 457.9,
+    "buffer_recent": 304,
+    "buffer_reservoir": 0,
+    "loss": 0.042204,
+    "final_money": 26390.8,
+    "raw_return": 23390.8,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.1
+  },
+  {
+    "round": 19,
+    "epsilon": 0.7719,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 847296,
+    "buffer_mb": 481.9,
+    "buffer_recent": 320,
+    "buffer_reservoir": 0,
+    "loss": 0.041196,
+    "final_money": 26407.1,
+    "raw_return": 23407.1,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 14.0
+  },
+  {
+    "round": 20,
+    "epsilon": 0.7599,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 889712,
+    "buffer_mb": 506.9,
+    "buffer_recent": 336,
+    "buffer_reservoir": 0,
+    "loss": 0.050667,
+    "final_money": 25103.6,
+    "raw_return": 22103.6,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.2,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.0,
+      "margin": -10684.895833333334,
+      "margin_ci": [
+        -11226.25836173378,
+        -10143.533304932887
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 21,
+    "epsilon": 0.7479,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 932128,
+    "buffer_mb": 532.2,
+    "buffer_recent": 352,
+    "buffer_reservoir": 0,
+    "loss": 0.047389,
+    "final_money": 25836.9,
+    "raw_return": 22836.9,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 25.3
+  },
+  {
+    "round": 22,
+    "epsilon": 0.7359,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 974544,
+    "buffer_mb": 557.1,
+    "buffer_recent": 368,
+    "buffer_reservoir": 0,
+    "loss": 0.046217,
+    "final_money": 24766.6,
+    "raw_return": 21766.6,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 19.1
+  },
+  {
+    "round": 23,
+    "epsilon": 0.7239,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1016960,
+    "buffer_mb": 581.0,
+    "buffer_recent": 384,
+    "buffer_reservoir": 0,
+    "loss": 0.045131,
+    "final_money": 26422.2,
+    "raw_return": 23422.2,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 20.8
+  },
+  {
+    "round": 24,
+    "epsilon": 0.7119,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1059376,
+    "buffer_mb": 605.9,
+    "buffer_recent": 400,
+    "buffer_reservoir": 0,
+    "loss": 0.044015,
+    "final_money": 26856.1,
+    "raw_return": 23856.1,
+    "job_truncations": 0,
+    "collect_s": 4.9,
+    "train_s": 14.3
+  },
+  {
+    "round": 25,
+    "epsilon": 0.6998,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1101766,
+    "buffer_mb": 630.1,
+    "buffer_recent": 416,
+    "buffer_reservoir": 0,
+    "loss": 0.054079,
+    "final_money": 26973.8,
+    "raw_return": 23973.8,
+    "job_truncations": 0,
+    "collect_s": 3.9,
+    "train_s": 29.3
+  },
+  {
+    "round": 26,
+    "epsilon": 0.6878,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1144159,
+    "buffer_mb": 654.5,
+    "buffer_recent": 432,
+    "buffer_reservoir": 0,
+    "loss": 0.049991,
+    "final_money": 26172.7,
+    "raw_return": 23172.7,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 14.5
+  },
+  {
+    "round": 27,
+    "epsilon": 0.6758,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1186431,
+    "buffer_mb": 679.5,
+    "buffer_recent": 448,
+    "buffer_reservoir": 0,
+    "loss": 0.048433,
+    "final_money": 26208.5,
+    "raw_return": 23208.5,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 21.7
+  },
+  {
+    "round": 28,
+    "epsilon": 0.6638,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1228847,
+    "buffer_mb": 703.7,
+    "buffer_recent": 464,
+    "buffer_reservoir": 0,
+    "loss": 0.04665,
+    "final_money": 26761.0,
+    "raw_return": 23761.0,
+    "job_truncations": 0,
+    "collect_s": 5.3,
+    "train_s": 13.9
+  },
+  {
+    "round": 29,
+    "epsilon": 0.6518,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1271263,
+    "buffer_mb": 727.8,
+    "buffer_recent": 480,
+    "buffer_reservoir": 0,
+    "loss": 0.045797,
+    "final_money": 24293.2,
+    "raw_return": 21293.3,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.8
+  },
+  {
+    "round": 30,
+    "epsilon": 0.6398,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1313653,
+    "buffer_mb": 752.7,
+    "buffer_recent": 496,
+    "buffer_reservoir": 0,
+    "loss": 0.056202,
+    "final_money": 23530.9,
+    "raw_return": 20530.9,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 14.8,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.0,
+      "margin": -6081.8125,
+      "margin_ci": [
+        -6644.604326467697,
+        -5519.020673532303
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 31,
+    "epsilon": 0.6278,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1356069,
+    "buffer_mb": 778.0,
+    "buffer_recent": 512,
+    "buffer_reservoir": 0,
+    "loss": 0.052569,
+    "final_money": 26724.5,
+    "raw_return": 23724.5,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.3
+  },
+  {
+    "round": 32,
+    "epsilon": 0.6158,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1397863,
+    "buffer_mb": 803.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 8,
+    "loss": 0.050348,
+    "final_money": 26072.9,
+    "raw_return": 23072.9,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.4
+  },
+  {
+    "round": 33,
+    "epsilon": 0.6039,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1440279,
+    "buffer_mb": 830.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 24,
+    "loss": 0.05062,
+    "final_money": 18064.8,
+    "raw_return": 15064.7,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 14.3
+  },
+  {
+    "round": 34,
+    "epsilon": 0.5919,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1482695,
+    "buffer_mb": 856.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 40,
+    "loss": 0.050384,
+    "final_money": 17957.1,
+    "raw_return": 14957.1,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.3
+  },
+  {
+    "round": 35,
+    "epsilon": 0.5799,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1525111,
+    "buffer_mb": 882.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 56,
+    "loss": 0.059348,
+    "final_money": 19295.3,
+    "raw_return": 16295.3,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.3
+  },
+  {
+    "round": 36,
+    "epsilon": 0.5679,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1567527,
+    "buffer_mb": 907.9,
+    "buffer_recent": 520,
+    "buffer_reservoir": 72,
+    "loss": 0.05588,
+    "final_money": 18716.1,
+    "raw_return": 15716.1,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.2
+  },
+  {
+    "round": 37,
+    "epsilon": 0.5559,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1609782,
+    "buffer_mb": 934.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 88,
+    "loss": 0.055409,
+    "final_money": 17796.6,
+    "raw_return": 14796.6,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.4
+  },
+  {
+    "round": 38,
+    "epsilon": 0.5439,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1652198,
+    "buffer_mb": 960.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 104,
+    "loss": 0.054393,
+    "final_money": 19643.8,
+    "raw_return": 16643.8,
+    "job_truncations": 0,
+    "collect_s": 4.4,
+    "train_s": 14.4
+  },
+  {
+    "round": 39,
+    "epsilon": 0.5319,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1694614,
+    "buffer_mb": 986.7,
+    "buffer_recent": 520,
+    "buffer_reservoir": 120,
+    "loss": 0.053615,
+    "final_money": 18794.5,
+    "raw_return": 15794.5,
+    "job_truncations": 0,
+    "collect_s": 4.4,
+    "train_s": 15.0
+  },
+  {
+    "round": 40,
+    "epsilon": 0.5199,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1737030,
+    "buffer_mb": 1012.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 136,
+    "loss": 0.060527,
+    "final_money": 20381.0,
+    "raw_return": 17381.0,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 15.0,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.041666666666666664,
+      "margin": -3180.8125,
+      "margin_ci": [
+        -3770.5154589815343,
+        -2591.1095410184657
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 41,
+    "epsilon": 0.5078,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1779446,
+    "buffer_mb": 1039.9,
+    "buffer_recent": 520,
+    "buffer_reservoir": 152,
+    "loss": 0.058722,
+    "final_money": 18495.5,
+    "raw_return": 15495.5,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 18.2
+  },
+  {
+    "round": 42,
+    "epsilon": 0.4958,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1821862,
+    "buffer_mb": 1067.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 168,
+    "loss": 0.057555,
+    "final_money": 20552.1,
+    "raw_return": 17552.1,
+    "job_truncations": 0,
+    "collect_s": 4.7,
+    "train_s": 18.9
+  },
+  {
+    "round": 43,
+    "epsilon": 0.4838,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1864278,
+    "buffer_mb": 1094.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 184,
+    "loss": 0.056912,
+    "final_money": 20094.4,
+    "raw_return": 17094.4,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 18.5
+  },
+  {
+    "round": 44,
+    "epsilon": 0.4718,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1906694,
+    "buffer_mb": 1121.0,
+    "buffer_recent": 520,
+    "buffer_reservoir": 200,
+    "loss": 0.055883,
+    "final_money": 19431.3,
+    "raw_return": 16431.3,
+    "job_truncations": 0,
+    "collect_s": 4.7,
+    "train_s": 18.8
+  },
+  {
+    "round": 45,
+    "epsilon": 0.4598,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1949110,
+    "buffer_mb": 1148.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 216,
+    "loss": 0.063073,
+    "final_money": 20895.3,
+    "raw_return": 17895.3,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 19.1
+  },
+  {
+    "round": 46,
+    "epsilon": 0.4478,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 1991526,
+    "buffer_mb": 1175.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 232,
+    "loss": 0.060937,
+    "final_money": 20118.5,
+    "raw_return": 17118.5,
+    "job_truncations": 0,
+    "collect_s": 4.9,
+    "train_s": 20.1
+  },
+  {
+    "round": 47,
+    "epsilon": 0.4357,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2033942,
+    "buffer_mb": 1202.0,
+    "buffer_recent": 520,
+    "buffer_reservoir": 248,
+    "loss": 0.059054,
+    "final_money": 20444.1,
+    "raw_return": 17444.1,
+    "job_truncations": 0,
+    "collect_s": 4.9,
+    "train_s": 19.3
+  },
+  {
+    "round": 48,
+    "epsilon": 0.4237,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2076358,
+    "buffer_mb": 1229.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 264,
+    "loss": 0.058673,
+    "final_money": 20176.6,
+    "raw_return": 17176.6,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 14.5
+  },
+  {
+    "round": 49,
+    "epsilon": 0.4117,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2118774,
+    "buffer_mb": 1255.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.057758,
+    "final_money": 20930.7,
+    "raw_return": 17930.7,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 13.5
+  },
+  {
+    "round": 50,
+    "epsilon": 0.3997,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2161167,
+    "buffer_mb": 1255.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.063417,
+    "final_money": 19299.4,
+    "raw_return": 16299.4,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.5,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.7916666666666666,
+      "margin": 1323.4166666666667,
+      "margin_ci": [
+        670.0077742887844,
+        1976.8255590445492
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 51,
+    "epsilon": 0.3877,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2203583,
+    "buffer_mb": 1258.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.0602,
+    "final_money": 19718.4,
+    "raw_return": 16718.4,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 13.8
+  },
+  {
+    "round": 52,
+    "epsilon": 0.3757,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2245999,
+    "buffer_mb": 1260.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.058065,
+    "final_money": 19910.1,
+    "raw_return": 16910.1,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 13.5
+  },
+  {
+    "round": 53,
+    "epsilon": 0.3636,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2288035,
+    "buffer_mb": 1263.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.057881,
+    "final_money": 15147.8,
+    "raw_return": 12147.8,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 13.9
+  },
+  {
+    "round": 54,
+    "epsilon": 0.3517,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2330311,
+    "buffer_mb": 1268.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.057222,
+    "final_money": 17380.6,
+    "raw_return": 14380.6,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 13.6
+  },
+  {
+    "round": 55,
+    "epsilon": 0.3397,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2372727,
+    "buffer_mb": 1271.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.061845,
+    "final_money": 19786.8,
+    "raw_return": 16786.8,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 13.6
+  },
+  {
+    "round": 56,
+    "epsilon": 0.3277,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2414556,
+    "buffer_mb": 1275.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.059551,
+    "final_money": 16126.1,
+    "raw_return": 13126.1,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 14.1
+  },
+  {
+    "round": 57,
+    "epsilon": 0.3159,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2456759,
+    "buffer_mb": 1281.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.058665,
+    "final_money": 17709.5,
+    "raw_return": 14709.5,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.0
+  },
+  {
+    "round": 58,
+    "epsilon": 0.3039,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2499083,
+    "buffer_mb": 1284.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.057567,
+    "final_money": 18504.7,
+    "raw_return": 15504.7,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 13.8
+  },
+  {
+    "round": 59,
+    "epsilon": 0.2919,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2541495,
+    "buffer_mb": 1288.7,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.057218,
+    "final_money": 15938.9,
+    "raw_return": 12938.9,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 14.1
+  },
+  {
+    "round": 60,
+    "epsilon": 0.2799,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2583911,
+    "buffer_mb": 1289.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.059622,
+    "final_money": 19627.4,
+    "raw_return": 16627.4,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.0,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.0,
+      "margin": -15310.833333333334,
+      "margin_ci": [
+        -17684.93434318368,
+        -12936.73232348299
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 61,
+    "epsilon": 0.2679,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2625971,
+    "buffer_mb": 1293.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.058437,
+    "final_money": 17159.1,
+    "raw_return": 14159.1,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.0
+  },
+  {
+    "round": 62,
+    "epsilon": 0.256,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2668387,
+    "buffer_mb": 1295.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.056785,
+    "final_money": 20330.2,
+    "raw_return": 17330.2,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 14.3
+  },
+  {
+    "round": 63,
+    "epsilon": 0.244,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2710803,
+    "buffer_mb": 1298.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.056569,
+    "final_money": 18866.7,
+    "raw_return": 15866.7,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.0
+  },
+  {
+    "round": 64,
+    "epsilon": 0.2319,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2752403,
+    "buffer_mb": 1302.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.056232,
+    "final_money": 13153.5,
+    "raw_return": 10153.5,
+    "job_truncations": 0,
+    "collect_s": 4.1,
+    "train_s": 15.4
+  },
+  {
+    "round": 65,
+    "epsilon": 0.2202,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2794818,
+    "buffer_mb": 1303.0,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.058671,
+    "final_money": 19570.5,
+    "raw_return": 16570.5,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 15.4
+  },
+  {
+    "round": 66,
+    "epsilon": 0.2081,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2837234,
+    "buffer_mb": 1303.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.057791,
+    "final_money": 21388.4,
+    "raw_return": 18388.4,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 15.3
+  },
+  {
+    "round": 67,
+    "epsilon": 0.1961,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2879650,
+    "buffer_mb": 1302.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.056266,
+    "final_money": 20908.9,
+    "raw_return": 17908.9,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 36.0
+  },
+  {
+    "round": 68,
+    "epsilon": 0.1841,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2922066,
+    "buffer_mb": 1302.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.055325,
+    "final_money": 20997.8,
+    "raw_return": 17997.7,
+    "job_truncations": 0,
+    "collect_s": 6.2,
+    "train_s": 23.0
+  },
+  {
+    "round": 69,
+    "epsilon": 0.1721,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 2964482,
+    "buffer_mb": 1302.7,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.055246,
+    "final_money": 20619.7,
+    "raw_return": 17619.7,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 20.1
+  },
+  {
+    "round": 70,
+    "epsilon": 0.1601,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3006898,
+    "buffer_mb": 1303.7,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.054902,
+    "final_money": 21494.1,
+    "raw_return": 18494.1,
+    "job_truncations": 0,
+    "collect_s": 6.0,
+    "train_s": 20.0,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.9583333333333334,
+      "margin": 1999.1458333333333,
+      "margin_ci": [
+        1479.405432073698,
+        2518.8862345929683
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 71,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3049314,
+    "buffer_mb": 1305.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.052397,
+    "final_money": 20864.4,
+    "raw_return": 17864.4,
+    "job_truncations": 0,
+    "collect_s": 5.7,
+    "train_s": 26.7
+  },
+  {
+    "round": 72,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3091730,
+    "buffer_mb": 1304.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.052781,
+    "final_money": 20664.0,
+    "raw_return": 17664.0,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.8
+  },
+  {
+    "round": 73,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3134146,
+    "buffer_mb": 1304.7,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.052352,
+    "final_money": 20994.2,
+    "raw_return": 17994.2,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 23.1
+  },
+  {
+    "round": 74,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3176562,
+    "buffer_mb": 1302.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.051137,
+    "final_money": 20815.1,
+    "raw_return": 17815.1,
+    "job_truncations": 0,
+    "collect_s": 5.7,
+    "train_s": 16.1
+  },
+  {
+    "round": 75,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3218978,
+    "buffer_mb": 1302.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.052537,
+    "final_money": 20705.8,
+    "raw_return": 17705.7,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.9
+  },
+  {
+    "round": 76,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3261394,
+    "buffer_mb": 1301.0,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.05055,
+    "final_money": 20676.4,
+    "raw_return": 17676.4,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 15.0
+  },
+  {
+    "round": 77,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3303810,
+    "buffer_mb": 1301.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.049496,
+    "final_money": 21222.1,
+    "raw_return": 18222.1,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 15.3
+  },
+  {
+    "round": 78,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3346226,
+    "buffer_mb": 1301.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.049214,
+    "final_money": 21702.6,
+    "raw_return": 18702.6,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 15.4
+  },
+  {
+    "round": 79,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3388642,
+    "buffer_mb": 1303.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.047919,
+    "final_money": 21759.5,
+    "raw_return": 18759.5,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 15.9
+  },
+  {
+    "round": 80,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3431058,
+    "buffer_mb": 1303.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.047342,
+    "final_money": 21031.2,
+    "raw_return": 18031.2,
+    "job_truncations": 0,
+    "collect_s": 4.4,
+    "train_s": 15.5,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.9166666666666666,
+      "margin": 1751.9791666666667,
+      "margin_ci": [
+        1154.3647135265412,
+        2349.593619806792
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 81,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3473474,
+    "buffer_mb": 1301.9,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.046478,
+    "final_money": 21023.7,
+    "raw_return": 18023.7,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 15.0
+  },
+  {
+    "round": 82,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3515890,
+    "buffer_mb": 1304.7,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.046236,
+    "final_money": 21814.0,
+    "raw_return": 18814.0,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 15.4
+  },
+  {
+    "round": 83,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3558306,
+    "buffer_mb": 1306.0,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.045402,
+    "final_money": 21522.4,
+    "raw_return": 18522.4,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 15.1
+  },
+  {
+    "round": 84,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3600722,
+    "buffer_mb": 1307.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.044477,
+    "final_money": 21906.9,
+    "raw_return": 18906.9,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.8
+  },
+  {
+    "round": 85,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3642902,
+    "buffer_mb": 1308.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.045837,
+    "final_money": 19177.9,
+    "raw_return": 16177.9,
+    "job_truncations": 25,
+    "collect_s": 4.3,
+    "train_s": 15.2
+  },
+  {
+    "round": 86,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3685318,
+    "buffer_mb": 1307.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.044901,
+    "final_money": 21608.9,
+    "raw_return": 18608.9,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.8
+  },
+  {
+    "round": 87,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3727734,
+    "buffer_mb": 1307.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.043458,
+    "final_money": 21213.0,
+    "raw_return": 18213.0,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 14.8
+  },
+  {
+    "round": 88,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3770150,
+    "buffer_mb": 1306.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.043047,
+    "final_money": 21604.9,
+    "raw_return": 18604.9,
+    "job_truncations": 0,
+    "collect_s": 4.6,
+    "train_s": 15.2
+  },
+  {
+    "round": 89,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3812566,
+    "buffer_mb": 1305.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.041795,
+    "final_money": 21771.4,
+    "raw_return": 18771.4,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 18.4
+  },
+  {
+    "round": 90,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3854814,
+    "buffer_mb": 1304.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.042529,
+    "final_money": 20227.1,
+    "raw_return": 17227.1,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 19.6,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.7916666666666666,
+      "margin": 1366.0416666666667,
+      "margin_ci": [
+        423.8858379536415,
+        2308.197495379692
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 91,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3897230,
+    "buffer_mb": 1302.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.040494,
+    "final_money": 21663.3,
+    "raw_return": 18663.3,
+    "job_truncations": 0,
+    "collect_s": 4.9,
+    "train_s": 18.8
+  },
+  {
+    "round": 92,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3939646,
+    "buffer_mb": 1302.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.040263,
+    "final_money": 21532.5,
+    "raw_return": 18532.5,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 18.2
+  },
+  {
+    "round": 93,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 3982062,
+    "buffer_mb": 1303.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.039585,
+    "final_money": 21294.1,
+    "raw_return": 18294.1,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 18.3
+  },
+  {
+    "round": 94,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4024478,
+    "buffer_mb": 1301.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.038382,
+    "final_money": 21281.6,
+    "raw_return": 18281.6,
+    "job_truncations": 0,
+    "collect_s": 4.8,
+    "train_s": 18.0
+  },
+  {
+    "round": 95,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4066894,
+    "buffer_mb": 1302.5,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.037822,
+    "final_money": 21649.4,
+    "raw_return": 18649.4,
+    "job_truncations": 0,
+    "collect_s": 4.9,
+    "train_s": 15.5
+  },
+  {
+    "round": 96,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4109166,
+    "buffer_mb": 1302.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.03639,
+    "final_money": 19823.6,
+    "raw_return": 16823.6,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 14.2
+  },
+  {
+    "round": 97,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4151582,
+    "buffer_mb": 1303.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.035647,
+    "final_money": 20616.8,
+    "raw_return": 17616.8,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 23.4
+  },
+  {
+    "round": 98,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4193854,
+    "buffer_mb": 1306.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.035789,
+    "final_money": 19575.6,
+    "raw_return": 16575.6,
+    "job_truncations": 0,
+    "collect_s": 5.3,
+    "train_s": 18.7
+  },
+  {
+    "round": 99,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4236270,
+    "buffer_mb": 1306.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.035902,
+    "final_money": 21177.9,
+    "raw_return": 18177.9,
+    "job_truncations": 0,
+    "collect_s": 6.1,
+    "train_s": 14.8
+  },
+  {
+    "round": 100,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4278686,
+    "buffer_mb": 1306.9,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.036422,
+    "final_money": 21771.0,
+    "raw_return": 18771.0,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 20.4,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.9583333333333334,
+      "margin": 2268.75,
+      "margin_ci": [
+        1471.8784541256919,
+        3065.621545874308
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 101,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4321030,
+    "buffer_mb": 1307.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.035003,
+    "final_money": 21036.4,
+    "raw_return": 18036.4,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 15.2
+  },
+  {
+    "round": 102,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4363446,
+    "buffer_mb": 1309.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.034846,
+    "final_money": 19625.9,
+    "raw_return": 16625.9,
+    "job_truncations": 0,
+    "collect_s": 5.9,
+    "train_s": 25.4
+  },
+  {
+    "round": 103,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4404719,
+    "buffer_mb": 1312.9,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.035206,
+    "final_money": 14463.2,
+    "raw_return": 11463.2,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.1
+  },
+  {
+    "round": 104,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4447135,
+    "buffer_mb": 1314.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.0358,
+    "final_money": 20763.8,
+    "raw_return": 17763.8,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 21.1
+  },
+  {
+    "round": 105,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4489482,
+    "buffer_mb": 1316.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.036726,
+    "final_money": 19526.9,
+    "raw_return": 16526.9,
+    "job_truncations": 0,
+    "collect_s": 5.6,
+    "train_s": 16.8
+  },
+  {
+    "round": 106,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4529839,
+    "buffer_mb": 1321.0,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.037662,
+    "final_money": 10715.3,
+    "raw_return": 7715.3,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.0
+  },
+  {
+    "round": 107,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4570907,
+    "buffer_mb": 1325.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.038328,
+    "final_money": 13242.6,
+    "raw_return": 10242.6,
+    "job_truncations": 0,
+    "collect_s": 4.2,
+    "train_s": 14.2
+  },
+  {
+    "round": 108,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4613323,
+    "buffer_mb": 1327.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.038385,
+    "final_money": 20531.8,
+    "raw_return": 17531.8,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 14.5
+  },
+  {
+    "round": 109,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py"
+    ],
+    "episodes": 16,
+    "transitions": 4655739,
+    "buffer_mb": 1327.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.03781,
+    "final_money": 20358.6,
+    "raw_return": 17358.6,
+    "job_truncations": 0,
+    "collect_s": 4.3,
+    "train_s": 15.0
+  },
+  {
+    "round": 110,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0060.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4695483,
+    "buffer_mb": 1332.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.042579,
+    "final_money": 9265.2,
+    "raw_return": 6265.2,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 14.6,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.0,
+      "margin": -22154.4375,
+      "margin_ci": [
+        -25462.496820683875,
+        -18846.378179316125
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 111,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4736854,
+    "buffer_mb": 1335.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.043667,
+    "final_money": 13016.4,
+    "raw_return": 10016.4,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 15.5
+  },
+  {
+    "round": 112,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4779270,
+    "buffer_mb": 1336.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.044617,
+    "final_money": 19859.2,
+    "raw_return": 16859.2,
+    "job_truncations": 0,
+    "collect_s": 4.6,
+    "train_s": 15.2
+  },
+  {
+    "round": 113,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4821686,
+    "buffer_mb": 1337.9,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.044626,
+    "final_money": 18987.3,
+    "raw_return": 15987.3,
+    "job_truncations": 0,
+    "collect_s": 4.6,
+    "train_s": 15.4
+  },
+  {
+    "round": 114,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4863958,
+    "buffer_mb": 1338.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.046734,
+    "final_money": 17841.6,
+    "raw_return": 14841.6,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 15.3
+  },
+  {
+    "round": 115,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4906374,
+    "buffer_mb": 1339.4,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.046662,
+    "final_money": 20420.1,
+    "raw_return": 17420.1,
+    "job_truncations": 9,
+    "collect_s": 4.5,
+    "train_s": 15.3
+  },
+  {
+    "round": 116,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4948790,
+    "buffer_mb": 1339.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.046034,
+    "final_money": 19343.5,
+    "raw_return": 16343.5,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 15.3
+  },
+  {
+    "round": 117,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 4991206,
+    "buffer_mb": 1336.6,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.045725,
+    "final_money": 19411.1,
+    "raw_return": 16411.1,
+    "job_truncations": 0,
+    "collect_s": 4.5,
+    "train_s": 16.3
+  },
+  {
+    "round": 118,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 5033622,
+    "buffer_mb": 1337.2,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.047277,
+    "final_money": 19686.2,
+    "raw_return": 16686.2,
+    "job_truncations": 0,
+    "collect_s": 4.6,
+    "train_s": 16.2
+  },
+  {
+    "round": 119,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 5076038,
+    "buffer_mb": 1338.1,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.047374,
+    "final_money": 18991.7,
+    "raw_return": 15991.7,
+    "job_truncations": 0,
+    "collect_s": 4.6,
+    "train_s": 16.3
+  },
+  {
+    "round": 120,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0070.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz"
+    ],
+    "episodes": 16,
+    "transitions": 5118454,
+    "buffer_mb": 1339.3,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.049667,
+    "final_money": 18064.4,
+    "raw_return": 15064.4,
+    "job_truncations": 0,
+    "collect_s": 4.7,
+    "train_s": 16.3,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 24,
+      "win_rate": 0.08333333333333333,
+      "margin": -4348.958333333333,
+      "margin_ci": [
+        -6225.5265629398855,
+        -2472.39010372678
+      ],
+      "significant": true,
+      "errors": {}
+    },
+    "best_round": -1,
+    "best_margin": 2401.625
+  },
+  {
+    "round": 121,
+    "epsilon": 0.15,
+    "opponents": [
+      "agents/configurable_crop_surrogate/main.py",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0080.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0090.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0100.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0110.npz",
+      "agents/dqn_job_scorer/main.py?weights=runs/dqn04/snapshots/round0120.npz"
+    ],
+    "episodes": 16,
+    "transitions": 5160870,
+    "buffer_mb": 1339.8,
+    "buffer_recent": 520,
+    "buffer_reservoir": 280,
+    "loss": 0.048895,
+    "final_money": 18747.3,
+    "raw_return": 15747.3,
+    "job_truncations": 0,
+    "collect_s": 5.0,
+    "train_s": 19.6
+  }
+]

@@ -37,6 +37,9 @@ packages = ["kaggriculture_lab", "sim", "agents"]
 [tool.pytest.ini_options]
 testpaths = ["tests", "sim"]
 addopts = "-q"
+markers = [
+  "slow: runs a full 720-turn episode; excluded with -m 'not slow'",
+]
 
 [tool.ruff]
 target-version = "py312"

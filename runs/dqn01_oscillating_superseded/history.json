@@ -1,0 +1,618 @@
+[
+  {
+    "round": 0,
+    "epsilon": 1.0,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 27972,
+    "buffer_mb": 23.8,
+    "loss": 0.023791,
+    "final_money": 300.0,
+    "raw_return": -2700.0,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.4
+  },
+  {
+    "round": 1,
+    "epsilon": 0.9911,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 54607,
+    "buffer_mb": 49.9,
+    "loss": 0.020471,
+    "final_money": 300.0,
+    "raw_return": -2700.0,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.1
+  },
+  {
+    "round": 2,
+    "epsilon": 0.9827,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 82257,
+    "buffer_mb": 73.3,
+    "loss": 0.01721,
+    "final_money": 347.1,
+    "raw_return": -2652.9,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 14.0
+  },
+  {
+    "round": 3,
+    "epsilon": 0.974,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 107998,
+    "buffer_mb": 100.5,
+    "loss": 0.015015,
+    "final_money": 300.0,
+    "raw_return": -2700.0,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 15.3
+  },
+  {
+    "round": 4,
+    "epsilon": 0.9658,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 135116,
+    "buffer_mb": 126.8,
+    "loss": 0.0137,
+    "final_money": 346.9,
+    "raw_return": -2653.1,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 14.9
+  },
+  {
+    "round": 5,
+    "epsilon": 0.9572,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 160532,
+    "buffer_mb": 154.0,
+    "loss": 0.012254,
+    "final_money": 381.4,
+    "raw_return": -2618.6,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 14.9
+  },
+  {
+    "round": 6,
+    "epsilon": 0.9492,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 184775,
+    "buffer_mb": 181.3,
+    "loss": 0.011346,
+    "final_money": 300.0,
+    "raw_return": -2700.0,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.7
+  },
+  {
+    "round": 7,
+    "epsilon": 0.9415,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 208483,
+    "buffer_mb": 209.4,
+    "loss": 0.01119,
+    "final_money": 300.0,
+    "raw_return": -2700.0,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.6
+  },
+  {
+    "round": 8,
+    "epsilon": 0.934,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 233878,
+    "buffer_mb": 237.2,
+    "loss": 0.011093,
+    "final_money": 517.3,
+    "raw_return": -2482.7,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 15.6
+  },
+  {
+    "round": 9,
+    "epsilon": 0.9259,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 258897,
+    "buffer_mb": 264.5,
+    "loss": 0.011087,
+    "final_money": 333.9,
+    "raw_return": -2666.1,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 15.1
+  },
+  {
+    "round": 10,
+    "epsilon": 0.918,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 283487,
+    "buffer_mb": 292.9,
+    "loss": 0.011819,
+    "final_money": 305.0,
+    "raw_return": -2695.0,
+    "job_truncations": 0,
+    "collect_s": 3.6,
+    "train_s": 14.7
+  },
+  {
+    "round": 11,
+    "epsilon": 0.9102,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 310149,
+    "buffer_mb": 320.1,
+    "loss": 0.010941,
+    "final_money": 378.8,
+    "raw_return": -2621.2,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 15.3
+  },
+  {
+    "round": 12,
+    "epsilon": 0.9018,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 340622,
+    "buffer_mb": 334.5,
+    "loss": 0.010922,
+    "final_money": 748.4,
+    "raw_return": -2251.6,
+    "job_truncations": 0,
+    "collect_s": 3.8,
+    "train_s": 15.1
+  },
+  {
+    "round": 13,
+    "epsilon": 0.8921,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 366399,
+    "buffer_mb": 337.7,
+    "loss": 0.010619,
+    "final_money": 376.0,
+    "raw_return": -2624.0,
+    "job_truncations": 0,
+    "collect_s": 3.7,
+    "train_s": 15.3
+  },
+  {
+    "round": 14,
+    "epsilon": 0.884,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 398148,
+    "buffer_mb": 341.4,
+    "loss": 0.010954,
+    "final_money": 1439.6,
+    "raw_return": -1560.4,
+    "job_truncations": 0,
+    "collect_s": 3.8,
+    "train_s": 14.1
+  },
+  {
+    "round": 15,
+    "epsilon": 0.8739,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 432152,
+    "buffer_mb": 342.3,
+    "loss": 0.010923,
+    "final_money": 1969.9,
+    "raw_return": -1030.1,
+    "job_truncations": 0,
+    "collect_s": 3.9,
+    "train_s": 14.5,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 16,
+      "win_rate": 0.125,
+      "margin": -2396.34375,
+      "margin_ci": [
+        -3262.9735564953885,
+        -1529.7139435046115
+      ],
+      "significant": true,
+      "errors": {}
+    }
+  },
+  {
+    "round": 16,
+    "epsilon": 0.8632,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 473012,
+    "buffer_mb": 344.8,
+    "loss": 0.011748,
+    "final_money": 4390.6,
+    "raw_return": 1390.6,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 15.2
+  },
+  {
+    "round": 17,
+    "epsilon": 0.8502,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 511984,
+    "buffer_mb": 346.1,
+    "loss": 0.012586,
+    "final_money": 3041.0,
+    "raw_return": 41.0,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 15.8
+  },
+  {
+    "round": 18,
+    "epsilon": 0.8379,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 548952,
+    "buffer_mb": 345.5,
+    "loss": 0.013717,
+    "final_money": 3577.6,
+    "raw_return": 577.6,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 16.6
+  },
+  {
+    "round": 19,
+    "epsilon": 0.8262,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 589544,
+    "buffer_mb": 346.2,
+    "loss": 0.015381,
+    "final_money": 4894.5,
+    "raw_return": 1894.5,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 16.0
+  },
+  {
+    "round": 20,
+    "epsilon": 0.8133,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 630912,
+    "buffer_mb": 346.0,
+    "loss": 0.014396,
+    "final_money": 5363.7,
+    "raw_return": 2363.7,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 16.2
+  },
+  {
+    "round": 21,
+    "epsilon": 0.8002,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 673328,
+    "buffer_mb": 346.9,
+    "loss": 0.015021,
+    "final_money": 5785.2,
+    "raw_return": 2785.2,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 14.7
+  },
+  {
+    "round": 22,
+    "epsilon": 0.7868,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 715744,
+    "buffer_mb": 346.5,
+    "loss": 0.016104,
+    "final_money": 7510.6,
+    "raw_return": 4510.6,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.4
+  },
+  {
+    "round": 23,
+    "epsilon": 0.7733,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 757992,
+    "buffer_mb": 347.3,
+    "loss": 0.017125,
+    "final_money": 6635.2,
+    "raw_return": 3635.2,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 14.2
+  },
+  {
+    "round": 24,
+    "epsilon": 0.76,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 800336,
+    "buffer_mb": 347.2,
+    "loss": 0.018368,
+    "final_money": 9213.8,
+    "raw_return": 6213.8,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.7
+  },
+  {
+    "round": 25,
+    "epsilon": 0.7466,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 842752,
+    "buffer_mb": 348.4,
+    "loss": 0.020804,
+    "final_money": 9496.1,
+    "raw_return": 6496.1,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 14.7
+  },
+  {
+    "round": 26,
+    "epsilon": 0.7331,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 885168,
+    "buffer_mb": 351.4,
+    "loss": 0.021471,
+    "final_money": 12503.8,
+    "raw_return": 9503.8,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 14.5
+  },
+  {
+    "round": 27,
+    "epsilon": 0.7197,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 927584,
+    "buffer_mb": 352.5,
+    "loss": 0.021935,
+    "final_money": 11791.9,
+    "raw_return": 8791.9,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.5
+  },
+  {
+    "round": 28,
+    "epsilon": 0.7063,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 969928,
+    "buffer_mb": 350.1,
+    "loss": 0.022237,
+    "final_money": 9291.0,
+    "raw_return": 6291.0,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 15.9
+  },
+  {
+    "round": 29,
+    "epsilon": 0.6929,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1012344,
+    "buffer_mb": 350.8,
+    "loss": 0.022522,
+    "final_money": 10854.7,
+    "raw_return": 7854.7,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 16.0
+  },
+  {
+    "round": 30,
+    "epsilon": 0.6794,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1054760,
+    "buffer_mb": 351.6,
+    "loss": 0.024509,
+    "final_money": 12016.6,
+    "raw_return": 9016.6,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.5,
+    "eval": {
+      "opponent": "agents/configurable_crop_surrogate/main.py",
+      "pairs": 16,
+      "win_rate": 0.0,
+      "margin": -24323.15625,
+      "margin_ci": [
+        -26459.918244207158,
+        -22186.394255792842
+      ],
+      "significant": true,
+      "errors": {}
+    }
+  },
+  {
+    "round": 31,
+    "epsilon": 0.666,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1097176,
+    "buffer_mb": 354.6,
+    "loss": 0.024045,
+    "final_money": 10023.6,
+    "raw_return": 7023.6,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 14.7
+  },
+  {
+    "round": 32,
+    "epsilon": 0.6526,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1139592,
+    "buffer_mb": 355.3,
+    "loss": 0.024256,
+    "final_money": 11495.2,
+    "raw_return": 8495.3,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 14.7
+  },
+  {
+    "round": 33,
+    "epsilon": 0.6391,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1182008,
+    "buffer_mb": 355.3,
+    "loss": 0.024551,
+    "final_money": 14141.5,
+    "raw_return": 11141.5,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 16.4
+  },
+  {
+    "round": 34,
+    "epsilon": 0.6257,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1224424,
+    "buffer_mb": 356.9,
+    "loss": 0.025235,
+    "final_money": 15546.8,
+    "raw_return": 12546.8,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 16.3
+  },
+  {
+    "round": 35,
+    "epsilon": 0.6123,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1266840,
+    "buffer_mb": 356.6,
+    "loss": 0.031143,
+    "final_money": 14374.1,
+    "raw_return": 11374.1,
+    "job_truncations": 0,
+    "collect_s": 3.5,
+    "train_s": 16.2
+  },
+  {
+    "round": 36,
+    "epsilon": 0.5988,
+    "opponents": [
+      "starter"
+    ],
+    "episodes": 16,
+    "transitions": 1309256,
+    "buffer_mb": 358.0,
+    "loss": 0.029499,
+    "final_money": 13690.2,
+    "raw_return": 10690.3,
+    "job_truncations": 0,
+    "collect_s": 3.4,
+    "train_s": 16.2
+  }
+]

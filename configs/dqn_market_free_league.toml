@@ -1,0 +1,20 @@
+[league]
+league = "dqn_market_free"
+name = "dqn-market-free-v1"
+
+# Trainer-only, same shape as the market scorer league: the trainer collects its
+# own full-length episodes, so there is no breedable population, no anchor
+# pairings and no hall of fame.
+manifest = "agents/dqn_market_free/agent.toml"
+anchor_manifests = []
+training_manifests = ["agents/dqn_market_free/agent.toml"]
+
+pairing_mode = "trainer_only"
+population_size = 0
+rounds_per_generation = 20
+hall_of_fame_rounds = 0
+episode_steps = 720
+seed = 2718
+jobs = 0
+tau = 0.5
+candidate_pool = 2

@@ -9,6 +9,10 @@ agents/dqn_job_scorer/submission/
 agents/dqn_job_scorer/dqn_job_scorer_submission.tgz
 agents/receding_horizon_planner/submission/
 agents/receding_horizon_planner/receding_horizon_planner_submission.tgz
+agents/dqn_market_scorer/submission/
+agents/dqn_market_scorer/dqn_market_scorer_submission.tgz
+agents/dqn_market_free/submission/
+agents/dqn_market_free/dqn_market_free_submission.tgz
 *.duckdb
 *.joblib
 .kaggriculture/

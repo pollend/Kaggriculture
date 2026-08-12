@@ -48,10 +48,10 @@ python train_mixed_farm.py
 # only the external yardstick the promotion gate measures against.
 python train_dqn.py
 
-# Train one market Q-network on top of a frozen field policy. The field play is
-# an unmodified copy of the pilkwang snapshot, and the promotion benchmark is
-# that same snapshot, so the paired margin measures the learned market layer and
-# nothing else.
+# Train one economic Q-network over a field policy derived from the pilkwang
+# snapshot. The learned modifier gates new crop and herd roles and funds the
+# matching demand; the promotion benchmark is the unmodified snapshot, so the
+# paired margin measures the complete learned residual over its source policy.
 python train_market_scorer.py
 
 # Compare named profiles directly.

@@ -16,33 +16,34 @@ Third-party component
   File:      donor.py
   Origin:    main.py from the notebook above, as imported into this repository at
              agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py
+  upstream
   sha256:    407b2fa7725f976df88995751ab17386aad0ce75c2cfa89df274561bc11289fa
-  notebook   12c25351a5319bb7b8e185563f03ffd45e34727a843ed39f7bfde24d32e887b0
-  sha256:
+  derivative
+  sha256:    a8da70675b6d5f02372f24ee37f8c832fafb0ca74351add28bbcaab06f661d91
+  notebook
+  sha256:    12c25351a5319bb7b8e185563f03ffd45e34727a843ed39f7bfde24d32e887b0
 
 Statement of modification
 -------------------------
 
-  donor.py is an UNMODIFIED, byte-for-byte copy of the file named above. Its
-  sha256 is asserted against the imported snapshot by
-  tests/test_dqn_market_scorer.py, so any edit to it fails the test suite.
+  donor.py IS A MODIFIED DERIVATIVE of the file named above. The derivative
+  work adds bounded Q-network guidance to `_role_plan`: `animal_gate` may block
+  new herd roles and `seed_scale` may reduce new crop roles. Existing plants and
+  animals remain assigned so learned choices cannot suppress their field care.
+  With the default guidance, role planning remains action-for-action compatible
+  with the upstream policy.
 
   market_exec.py IS A MODIFIED DERIVATIVE of the `_market_actions` function in
-  that file (donor.py:1706-1931). The derivative work by this repository's
-  authors consists of threading a learned `MarketModifier` and a learned
-  per-product sell reserve through the otherwise unchanged decision rules:
+  that file. The derivative work threads the same learned `MarketModifier` and
+  a learned per-product sell reserve through the original decision rules:
 
     - the sell loop retains `reserves[item]` units before sizing the sale,
-      and skips the retention while liquidating;
+      and skips retention while liquidating;
     - `_seed_needs` counts are scaled by `modifier.seed_scale`;
     - `_target_hands` is offset by `modifier.hand_delta`;
     - the animal-purchase gate is overridden by `modifier.animal_gate`;
     - the land-purchase day gate is shifted by `modifier.land_bias`;
-    - `FEED_STOCK_DAYS` is replaced by `modifier.feed_days` when sizing the
-      wheat feed buy;
-    - the seed and operating cash reserves are scaled by `modifier.cash_floor`.
+    - `FEED_STOCK_DAYS` is replaced by `modifier.feed_days` when sizing wheat;
+    - seed and operating cash reserves are scaled by `modifier.cash_floor`.
 
   Every other file in this directory is original work of this repository.
-
-  The field policy (`_role_plan`, `_unit_actions`) is used unmodified from
-  donor.py. Only the market layer is learned.

@@ -70,6 +70,15 @@ TRAINING_AGENTS = [
         "train": False,
     },
     {
+        # Same reasoning as the scorer above, and the same donor benchmark: it
+        # trains in `configs/dqn_market_free_league.toml`. It is the
+        # unscaffolded counterpart -- no donor market layer, raw orders learned
+        # from reward -- so here it is only an anchor.
+        "type": "dqn_market_free",
+        "name": "default",
+        "train": False,
+    },
+    {
         "type": "sp_psro_job_scorer",
         "name": "default",
         "train": False,

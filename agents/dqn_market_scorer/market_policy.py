@@ -1,13 +1,14 @@
-"""Factored market Q-policy layered on the frozen donor field policy.
+"""Factored economic Q-policy layered on the donor-derived field policy.
 
 The action is not a raw ten-order tuple, and it is not a portfolio target
 either. The donor already computes what it wants -- seed counts from its role
 plan, a hand target from its job backlog, an animal deficit from its herd plan.
 Choosing those independently would let the network buy MELON while the field
 policy intends to plant STRAWBERRY. So the learned action *modulates the donor's
-own demand*: one factor picks a `MarketModifier` (how much of what the donor
-asked for to actually fund), and one factor per product picks how many units to
-retain from the shed before the donor's sale sizing runs.
+own demand and field expansion*: one factor picks a `MarketModifier` (which new
+crop and herd roles to activate, and how much demand to fund), and one factor
+per product picks how many units to retain from the shed before the donor's sale
+sizing runs.
 
 Total Q is the sum over the 1 + len(PRODUCTS) factors, which is how
 `training/updater.py` trains it.
@@ -26,6 +27,18 @@ ANIMALS: tuple[str, ...] = tuple(donor.ANIMALS)
 PRODUCTS: tuple[str, ...] = tuple(donor.PRODUCTS)
 PHASES: tuple[str, ...] = ("BOOTSTRAP", "COMPOUND", "REALIZE", "CRISIS", "LIQUIDATE")
 
+# Stable semantic kinds for the four policies that are easy to conflate when
+# they all contain the word "donor" in prose. These values are persisted in
+# revision roles, training-batch metadata, and update gates; keep them distinct.
+POLICY_KINDS: dict[str, str] = {
+    "base_market_planner": "base_market_planner",
+    "market_learner": "joint_residual_q",
+    "field_policy": "q_guided_field_policy",
+    "promotion_baseline": "promotion_baseline",
+    "training_opponent": "training_opponent",
+    "fixed_benchmark": "fixed_benchmark",
+}
+
 RESERVE_LEVELS = (0, 1, 2, 4, 8, 16)
 
 MARKET_STATE_DIM = 117
@@ -35,7 +48,7 @@ MARKET_FEATURE_DIM = MARKET_STATE_DIM + MARKET_ACTION_DIM
 
 @dataclass(frozen=True, slots=True)
 class MarketModifier:
-    """Scalars threaded into the donor's market rules by `market_exec`.
+    """Scalars threaded into donor role planning and the market executor.
 
     The all-default instance reproduces the donor exactly, which is what makes
     an untrained network play pilkwang rather than noise.

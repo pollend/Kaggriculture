@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """Run the resumable market-scorer workflow.
 
-One learner, one session, one Q-network. The field policy is frozen -- an
-unmodified copy of the pilkwang snapshot -- so everything this session trains
-is the market layer sitting on top of it.
+One learner, one session, one Q-network. The field policy is donor-derived and
+the Q-selected modifier guides both field expansion and the market executor.
 
-That makes the measurement unusually clean, and the benchmark is chosen to keep
-it that way: the challenger plays the donor, with the same field policy on both
-sides of the board. A positive paired margin there is the learned market layer
-and nothing else. Point it at a weaker benchmark and the donor's field play
-carries the result, so promotion stops being evidence about the thing being
-trained.
+The benchmark remains the unmodified donor. A positive paired margin there is
+the complete learned residual over its source policy. Pointing the primary gate
+at a weaker benchmark would let inherited donor behavior carry the result.
 """
 
 from __future__ import annotations
@@ -23,6 +19,7 @@ import tomllib
 from dataclasses import replace
 from pathlib import Path
 
+from agents.dqn_market_scorer.market_policy import POLICY_KINDS
 from kaggriculture_lab.constants import ARTIFACTS_ROOT, REPO_ROOT
 from kaggriculture_lab.identity import TrainingAgentSpec
 from kaggriculture_lab.league import LeagueConfig
@@ -33,11 +30,11 @@ from kaggriculture_lab.runner import ensure_session, run_generations
 GENERATIONS = 5
 SYNC_ENVIRONMENT = True
 
-SESSION_ID = "market-scorer-v1"
+SESSION_ID = "market-scorer-joint03"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_scorer"
 LEAGUE_CONFIG = Path("configs/dqn_market_league.toml")
 MANIFEST = Path("agents/dqn_market_scorer/agent.toml")
-MODEL_NAME = "default"
+MODEL_NAME = "joint03"
 
 DONOR = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
 
@@ -54,11 +51,16 @@ BENCHMARKS = (
 # absent: training on a distribution the gate never measures is how a run
 # rejects update after update while looking healthy.
 MARKET_CONFIG = {
-    # A zero network makes every argmax fall to index 0, which is the donor
-    # default modifier and a zero reserve. Round one therefore rolls out
-    # unmodified pilkwang instead of a random market policy the learner would
-    # have to climb back from.
-    "initialization": "zeros",
+    # Stable semantic labels. The historical model ID contains "donor", but the
+    # learner is now the joint residual Q layer; the donor-derived planner and
+    # unmodified promotion opponent remain separate roles.
+    "policy_kinds": dict(POLICY_KINDS),
+    # A trainable zero-Q network makes every argmax fall to index 0, which is the
+    # donor default modifier and a zero reserve. Its hidden trunk is initialized
+    # normally and only its output layer is zeroed, so round one plays
+    # unmodified pilkwang without sacrificing gradients. The legacy spelling
+    # "zeros" is still accepted and resolves here.
+    "initialization": "donor_default",
     "benchmarks": list(BENCHMARKS),
     # `benchmark` remains for older readers; promotion evaluates `benchmarks`.
     "benchmark": DONOR,
