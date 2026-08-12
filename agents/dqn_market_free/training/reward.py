@@ -19,6 +19,7 @@ so `Phi` is free to price anything that is worth something, and it should.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
@@ -40,14 +41,19 @@ PRODUCTS: tuple[str, ...] = tuple(donor.PRODUCTS)
 #: DQN answer and is wrong here: the magnitude of a fill *is* the signal.
 MONEY_SCALE = 20_000.0
 
-#: Coins of final margin worth one unit of terminal reward.
+#: Coins of final margin at which the terminal term reaches tanh(1) = 0.76.
 #:
-#: At the scale above this is roughly a fifth of a donor-scale return, where
-#: under the scorer's it was about one percent -- small enough that the agent had
-#: no reason to care about the opponent while the promotion gate cared about
-#: nothing else. It is still the smaller term: the objective is to make money,
-#: and beating the incumbent is the tiebreak the gate measures.
-TERMINAL_MARGIN_SCALE = 20_000.0
+#: Sized from the observed margin range, because the previous 20,000 with a hard
+#: clip was informationless: measured across 640 recorded episodes the margin ran
+#: from -21,681 to -210,076, so `clip(margin / 20_000, -1, 1)` returned exactly
+#: -1.0 on every one of them. A constant on the terminal reward shifts every Q
+#: value uniformly and can never change an argmax, so the one term tying training
+#: to what the promotion gate measures was contributing nothing.
+#:
+#: At 100,000 that same range maps to -0.21 .. -0.97, which discriminates, and a
+#: run that closes on the donor sees the term shrink toward zero and cross into
+#: positive as it should.
+TERMINAL_MARGIN_SCALE = 100_000.0
 
 
 def _price(prices: dict, item: str) -> float:
@@ -117,18 +123,42 @@ def potential(farm: dict, private: dict, obs: Any) -> float:
     return value / MONEY_SCALE
 
 
+#: Charged on a turn that emitted an order the simulator then refused.
+#:
+#: The shaping deliberately leaves every sensible purchase at exactly zero
+#: immediate reward -- cash out, `Phi` in at the price paid -- so NOOP, BUY_SEED
+#: and an impossible order all score 0 on the turn they happen, and only differ
+#: many turns later. An untrained value function sees a flat plateau and picks
+#: off it arbitrarily. Measured: one run settled on `SELL WOOL 16` for 57% of its
+#: decisions while owning no sheep, with 98.4% of everything it emitted refused.
+#:
+#: This charges for the refusal alone, so it separates "interacted with the
+#: world" from "did not" without expressing any view on *which* trade is good --
+#: an impossible order falls below NOOP, a real purchase rises above it, and the
+#: choice among real purchases is left exactly where it was. It is not
+#: policy-invariant, unlike the potential shaping, so it is kept small.
+REJECTED_ORDER_PENALTY = 0.001
+
+
 def episode_rewards(
     money: list[float],
     potentials: list[float],
     final_money: float,
     opponent_money: float,
     gamma: float,
+    emitted: Sequence[bool] | None = None,
+    rejected_penalty: float = REJECTED_ORDER_PENALTY,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Turn one episode's money and potential traces into a reward stream.
 
     Returns `(shaped, raw, phi)`. Shared by live rollouts and by demonstrations
     read out of stored replays, so a cloned episode and a self-collected one are
     the same kind of sample and can sit in one buffer -- and cannot drift apart.
+
+    `emitted[t]` says whether the policy put an order on the wire that turn. A
+    turn that emitted one and moved no money had it refused: every order the
+    simulator accepts moves cash by at least a coin, since prices floor at 1 and
+    quantities start at 1.
     """
 
     money_array = np.asarray([*money, final_money], dtype=np.float32)
@@ -139,7 +169,17 @@ def episode_rewards(
 
     raw = (money_array[1:] - money_array[:-1]) / MONEY_SCALE
     shaped = raw + gamma * phi[1:] - phi[:-1]
-    shaped[-1] += float(
-        np.clip((final_money - opponent_money) / TERMINAL_MARGIN_SCALE, -1.0, 1.0)
-    )
+    # tanh rather than a hard clip. Both bound the term to (-1, 1) so one blowout
+    # episode cannot dominate a batch, but a clip is flat outside its range --
+    # and every margin this agent has produced so far was outside it, which made
+    # the term a constant. tanh keeps discriminating everywhere and still
+    # compresses the tail.
+    shaped[-1] += float(np.tanh((final_money - opponent_money) / TERMINAL_MARGIN_SCALE))
+
+    if emitted is not None and rejected_penalty:
+        tried = np.zeros(raw.shape[0], dtype=bool)
+        width = min(len(emitted), tried.shape[0])
+        tried[:width] = np.asarray(emitted[:width], dtype=bool)
+        shaped[tried & (raw == 0.0)] -= float(rejected_penalty)
+
     return shaped.astype(np.float32), raw.astype(np.float32), money_array

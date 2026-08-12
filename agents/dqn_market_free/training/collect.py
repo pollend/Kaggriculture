@@ -77,7 +77,8 @@ class EpisodeRecord:
         """Decision and order counts for the orders actually emitted."""
 
         return diagnose_order_lists(
-            ACTIONS[int(choice)].to_wire() for choice in self.order_chosen
+            [ACTIONS[int(choice)].to_wire() for choice in self.order_chosen],
+            [float(self.raw_reward[int(step)]) for step in self.order_step],
         )
 
     def nbytes(self) -> int:
@@ -178,8 +179,15 @@ class Recorder:
         if not self.decisions:
             raise ValueError("recorder captured no order decisions")
 
+        # Which turns put an order on the wire, indexed the same way the reward
+        # stream is. A turn that emitted one and moved no money had it refused.
+        emitted = [False] * len(self.money)
+        for step, decision in zip(self.order_steps, self.decisions):
+            if 0 <= step < len(emitted) and decision.chosen:
+                emitted[step] = True
+
         shaped, raw, money = episode_rewards(
-            self.money, self.potential, final_money, opponent_money, gamma
+            self.money, self.potential, final_money, opponent_money, gamma, emitted
         )
 
         count = len(self.decisions)
@@ -347,11 +355,32 @@ def _single_threaded_workers():
                 os.environ[name] = value
 
 
+def actor_epsilons(base: float, actors: int, alpha: float = 4.0) -> list[float]:
+    """One exploration rate per actor, spread geometrically around `base`.
+
+    A single epsilon for the whole batch means every episode is the same policy
+    at the same temperature, and the buffer fills with near-copies of one
+    trajectory. Measured on this agent at a base of 0.014: 81% mean pairwise
+    action agreement between the sixteen episodes of a batch, and on 38% of
+    turns all sixteen chose the identical action.
+
+    So spread it, as Ape-X does: actor `i` of `N` runs at
+    `base ** (1 + i/(N-1) * alpha)`. The low-index actors explore hard enough to
+    find something, the high-index ones are effectively greedy and show what the
+    policy actually does, and every batch contains both rather than alternating
+    between them as the schedule decays.
+    """
+
+    if actors <= 1:
+        return [base]
+    return [base ** (1.0 + (index / (actors - 1)) * alpha) for index in range(actors)]
+
+
 def collect_batch(
     weights_path: Path,
     opponents: list[str],
     seeds: list[int],
-    epsilon: float,
+    epsilons: list[float],
     gamma: float,
     trace_dir: Path,
     jobs: int,
@@ -365,6 +394,11 @@ def collect_batch(
     takes seat 0 in one orientation and seat 1 in the other. Drawing one
     opponent per pair rather than per episode is what lets the resulting pairing
     settle a seat-balanced margin.
+
+    `epsilons` is indexed by pair for the same reason the opponent is: both
+    orientations of a seed must be played by the same policy at the same
+    temperature, or the paired margin the league settles is a comparison between
+    two different agents.
     """
 
     payloads = []
@@ -377,7 +411,7 @@ def collect_batch(
                 opponent,
                 seed,
                 index % 2,
-                epsilon,
+                epsilons[pair_index % len(epsilons)],
                 gamma,
                 trace_dir,
                 exploration_seed + index,

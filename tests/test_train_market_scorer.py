@@ -2,6 +2,7 @@ from pathlib import Path
 
 import train_market_scorer
 from agents.dqn_market_scorer.market_policy import POLICY_KINDS
+from agents.dqn_market_scorer.training.benchmarks import promotion_benchmark
 from kaggriculture_lab.constants import ARTIFACTS_ROOT
 from kaggriculture_lab.identity import (
     effective_model_id,
@@ -33,8 +34,8 @@ def test_joint03_has_an_independent_model_identity_and_artifact_root(tmp_path: P
     assert train_market_scorer.MODEL_NAME == "joint03"
     assert train_market_scorer.SESSION_ID == "market-scorer-joint03"
     assert effective_model_id(
-        "dqn_market_scorer.donor_market_q_v1", train_market_scorer.MODEL_NAME
-    ) == "dqn_market_scorer.donor_market_q_v1@joint03"
+        "dqn_market_scorer.joint_residual_q_v1", train_market_scorer.MODEL_NAME
+    ) == "dqn_market_scorer.joint_residual_q_v1@joint03"
     assert training_instance_seed(
         "dqn_market_scorer", "joint03"
     ) != training_instance_seed("dqn_market_scorer", "default")
@@ -53,8 +54,10 @@ def test_promotion_is_measured_against_the_donor():
     """
     config = train_market_scorer.MARKET_CONFIG
 
-    assert config["benchmark"] == train_market_scorer.DONOR
-    assert config["benchmarks"][0] == train_market_scorer.DONOR
+    # Index 0 is the release baseline; there is no separate singular key that
+    # could name a different opponent than the list's first entry.
+    assert promotion_benchmark(config) == train_market_scorer.DONOR
+    assert "benchmark" not in config
     assert "competitor_pilkwang" in train_market_scorer.DONOR
 
 

@@ -7,6 +7,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from agents.dqn_market_scorer.market_policy import POLICY_KINDS
+from agents.dqn_market_scorer.training.benchmarks import promotion_benchmark
 from kaggriculture_lab.model_trainers import EvaluationPolicy
 
 SELF_SPEC = "agents/dqn_market_scorer/main.py"
@@ -97,13 +98,14 @@ class MarketProgressEvaluator:
         base = int(context.config.get("progress_seed_base", 1_500_000_000))
         phase_offset = 0 if phase == "start" else 500
         generation_offset = context.generation_index * 10_000
+        baseline = promotion_benchmark(context.config)
         matchups = []
         for opponent_index, opponent in enumerate(opponents):
             fixed = _opponent_policy(
                 opponent,
                 role=(
                     POLICY_KINDS["promotion_baseline"]
-                    if opponent == str(context.config.get("benchmark", ""))
+                    if opponent == baseline
                     else POLICY_KINDS["fixed_benchmark"]
                 ),
             )

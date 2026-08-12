@@ -58,12 +58,11 @@ MARKET_CONFIG = {
     # A trainable zero-Q network makes every argmax fall to index 0, which is the
     # donor default modifier and a zero reserve. Its hidden trunk is initialized
     # normally and only its output layer is zeroed, so round one plays
-    # unmodified pilkwang without sacrificing gradients. The legacy spelling
-    # "zeros" is still accepted and resolves here.
+    # unmodified pilkwang without sacrificing gradients.
     "initialization": "donor_default",
+    # Promotion baseline first: index 0 is what the release gate measures, the
+    # rest are non-regression diagnostics.
     "benchmarks": list(BENCHMARKS),
-    # `benchmark` remains for older readers; promotion evaluates `benchmarks`.
-    "benchmark": DONOR,
     # No live peers and no cross-instance history: an empty `history_peer_types`
     # routes opponent selection to `self_play_pool`, i.e. this model's own
     # promoted checkpoints.

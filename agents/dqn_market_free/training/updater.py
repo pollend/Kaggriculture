@@ -42,6 +42,7 @@ from agents.dqn_market_free.training.collect import (
     LEARNER_ENTRY_POINT,
     EpisodeRecord,
     _single_threaded_workers,
+    actor_epsilons,
     collect_batch,
     load_episode_batch,
     save_episode_batch,
@@ -377,8 +378,8 @@ def _epsilon(config: dict[str, Any], transitions: int) -> float:
     fraction = min(
         1.0, transitions / max(1, int(config.get("epsilon_decay_transitions", 2_000_000)))
     )
-    start = float(config.get("epsilon_start", 0.02))
-    end = float(config.get("epsilon_end", 0.002))
+    start = float(config.get("epsilon_start", 0.18))
+    end = float(config.get("epsilon_end", 0.01))
     return start + fraction * (end - start)
 
 
@@ -534,12 +535,22 @@ class FreeMarketCollector:
                 for value in rng.integers(0, 2**31 - 1, size=episodes // 2)
                 for _ in range(2)
             ]
+            # One rate per seed pair, spread around the schedule's current value
+            # so a single batch carries both exploratory and near-greedy data.
+            # The *identity* policy keeps the base rate: folding sixteen actor
+            # epsilons into it would mint eight revisions a batch, none of them
+            # with enough games to rate.
+            epsilons = actor_epsilons(
+                epsilon,
+                episodes // 2,
+                float(config.get("epsilon_actor_alpha", 4.0)),
+            )
             learner = _learner_policy(behavior_path, epsilon, gamma)
             rollouts = collect_batch(
                 behavior_path,
                 opponents,
                 seeds,
-                epsilon,
+                epsilons,
                 gamma,
                 trace_root,
                 jobs,
@@ -594,6 +605,7 @@ class FreeMarketCollector:
                     "transitions": transitions,
                     "turns": sum(record.steps for record in records),
                     "epsilon": epsilon,
+                    "actor_epsilons": epsilons,
                     "seeds": seeds,
                     # The two numbers that separate this agent's failure modes
                     # from each other. All-zero orders is the NOOP collapse;
@@ -940,8 +952,10 @@ class FreeMarketUpdater:
             "mean_loss": float(np.mean(losses)) if losses else None,
             "train_seconds": train_seconds,
             "action_count": ACTION_COUNT,
-            # Collapse detectors. `orders_per_decision` at 0 is the NOOP
-            # attractor; near 1.0 with money on the floor is bankruptcy.
+            # Collapse detectors. This is what the policy *emitted*; read it
+            # beside `own_order_diagnostics.trading_rate`, which is what the
+            # simulator accepted. A wide gap between the two is the disguised
+            # NOOP collapse -- ordering every turn and being refused every turn.
             "own_orders_per_decision": (
                 sum(record.orders_placed for record in own)
                 / max(1, sum(record.decisions for record in own))

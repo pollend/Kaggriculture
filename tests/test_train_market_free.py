@@ -8,8 +8,11 @@ for a generation before anyone notices.
 import tomllib
 from pathlib import Path
 
+import pytest
+
 import train_market_free
 from agents.dqn_market_free.training.updater import POLICY_KINDS
+from agents.dqn_market_scorer.training.benchmarks import promotion_benchmark
 from kaggriculture_lab.constants import ARTIFACTS_ROOT, REPO_ROOT
 
 
@@ -28,7 +31,7 @@ def test_effective_config_builds_a_single_learner_roster(tmp_path: Path, monkeyp
     assert config.anchor_manifests == ()
     assert config.training_manifests == ("agents/dqn_market_free/agent.toml",)
     assert [(item.type, item.name, item.train) for item in config.training_agents] == [
-        ("dqn_market_free", "simple_v1", True),
+        ("dqn_market_free", "simple_v2", True),
     ]
     assert config.pairing_mode == "trainer_only"
     assert config.population_size == 0
@@ -60,8 +63,10 @@ def test_promotion_is_measured_against_the_donor():
     """
 
     config = train_market_free.FREE_CONFIG
-    assert config["benchmark"] == train_market_free.DONOR
-    assert config["benchmarks"][0] == train_market_free.DONOR
+    # Index 0 is the release baseline; there is no separate singular key that
+    # could name a different opponent than the list's first entry.
+    assert promotion_benchmark(config) == train_market_free.DONOR
+    assert "benchmark" not in config
     assert "competitor_pilkwang" in train_market_free.DONOR
 
 
@@ -84,8 +89,8 @@ def test_demo_run_is_isolated_from_the_reward_only_control():
 
     model = _manifest()["models"][0]
     assert model["config"]["demonstration_episodes"] == 0
-    assert train_market_free.SESSION_ID == "market-free-simple-v1"
-    assert train_market_free.MODEL_NAME == "simple_v1"
+    assert train_market_free.SESSION_ID == "market-free-simple-v2"
+    assert train_market_free.MODEL_NAME == "simple_v2"
     assert train_market_free.FREE_CONFIG["demonstration_episodes"] == 200
     assert train_market_free.FREE_CONFIG["demonstration_min_money"] == 10_000.0
     assert train_market_free.FREE_CONFIG["behavior_clone_steps_per_update"] == 100
@@ -138,9 +143,15 @@ def test_exploration_rate_is_a_single_small_knob():
     """
 
     config = _manifest()["models"][0]["config"]
-    assert config["epsilon_start"] == 0.02
-    assert config["epsilon_end"] == 0.002
+    assert config["epsilon_start"] == 0.18
+    assert config["epsilon_end"] == 0.01
     assert config["epsilon_start"] > config["epsilon_end"] > 0.0
+    # The ten-slot scheme's per-turn probability of acting randomly was
+    # `epsilon * (1 - (1 - act_rate)^10)` = 0.183 at its start, not the 0.02 that
+    # reading `act_rate` alone suggests. Setting the single knob to 0.02 explored
+    # an order of magnitude less than the scheme it replaced.
+    assert config["epsilon_start"] == pytest.approx(1.0 * (1 - (1 - 0.02) ** 10), abs=0.01)
+    assert config["epsilon_actor_alpha"] > 0.0
 
 
 def test_demonstration_share_replaces_prioritised_sampling():

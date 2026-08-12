@@ -47,7 +47,7 @@ def market_actions(
     money = float(farm.get("money", 0) or 0)
     shed_capacity = int(donor._cfg(config, "shedCapacity", donor.SHED_CAPACITY))
     shed, post_field_inventories = donor._post_field_storage(private, field, shed_capacity)
-    market_inventory = dict(((obs.get("market", {}) or {}).get("inventory", {}) or {}))
+    market_inventory = dict((obs.get("market", {}) or {}).get("inventory", {}) or {})
     max_orders = int(donor._cfg(config, "maxMarketOrdersPerTurn", donor.MAX_MARKET_ORDERS))
     summary = donor._survey(farm, private, roles, day)
     phase = donor._policy_phase(obs, farm, private, summary)

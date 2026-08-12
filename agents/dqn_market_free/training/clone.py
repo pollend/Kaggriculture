@@ -221,8 +221,9 @@ def record_from_replay(
         else 0.0
     )
 
+    emitted = [bool(order_chosen[index]) for index in range(decisions)]
     shaped, raw, money_array = episode_rewards(
-        money, phi, final_money, opponent_money, gamma
+        money, phi, final_money, opponent_money, gamma, emitted
     )
 
     record = EpisodeRecord(

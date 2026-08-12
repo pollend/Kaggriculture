@@ -81,11 +81,11 @@ because the cold start is silent by design. `diagnostics.py` and
 
 ```bash
 python train_market_free.py
-python -m agents.dqn_market_free.cli model status --name simple_v1
+python -m agents.dqn_market_free.cli model status --name simple_v2
 ```
 
-`simple_v1` is a named training instance owning the effective model ID
-`dqn_market_free.raw_order_q_v1@simple_v1`. It pins solvent pilkwang
+`simple_v2` is a named training instance owning the effective model ID
+`dqn_market_free.raw_order_q_v1@simple_v2`. It pins solvent pilkwang
 demonstrations and clones their order choices before Double-DQN fine-tuning; the
 bare manifest (`demonstration_episodes = 0`) is the reward-only control.
 
@@ -94,7 +94,7 @@ export explicitly:
 
 ```bash
 python -m agents.dqn_market_free.cli model export-active \
-  --name simple_v1 --output agents/dqn_market_free/weights.npz \
+  --name simple_v2 --output agents/dqn_market_free/weights.npz \
   --confirm-release
 ```
 

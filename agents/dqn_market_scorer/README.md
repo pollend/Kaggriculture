@@ -5,9 +5,8 @@ bounded economic decision.
 
 ## Policy kinds
 
-The historical model ID `dqn_market_scorer.donor_market_q_v1` is retained so an
-active run keeps its lineage, but `donor` is not used as a catch-all role. SQL
-and model metadata distinguish:
+The model ID is `dqn_market_scorer.joint_residual_q_v1`, and `donor` is not used
+as a catch-all role. SQL and model metadata distinguish:
 
 | kind | responsibility |
 | --- | --- |
@@ -90,9 +89,10 @@ python -m agents.dqn_market_scorer.cli model status --name joint03
 ```
 
 `joint03` is a named training instance. It owns the effective model ID
-`dqn_market_scorer.donor_market_q_v1@joint03` and does not inherit the
-market-only `market02` batches, checkpoints, or self-play history. After
-reviewing a passed release gate, export it explicitly:
+`dqn_market_scorer.joint_residual_q_v1@joint03`, so its batches, checkpoints and
+self-play history are its own. Nothing has been trained under it yet — the
+database holds no rows for this agent at all. After reviewing a passed release
+gate, export it explicitly:
 
 ```bash
 python -m agents.dqn_market_scorer.cli model export-active \

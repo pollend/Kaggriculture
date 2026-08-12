@@ -401,19 +401,15 @@ def test_training_initialization_starts_at_the_donor_default(live_states):
     assert set(decision.reserves.values()) == {0}
 
 
-def test_the_legacy_zeros_spelling_resolves_to_the_trainable_cold_start():
-    """`zeros` is a deprecated alias, never a literal all-zero MLP.
+def test_an_unknown_initialization_is_rejected_rather_than_defaulted():
+    """Including `zeros`, which used to mean a literal all-zero MLP.
 
-    Sessions and configs written before the rename still carry it, and resolving
-    it to `MarketQNetwork.zeros()` would silently restore the untrainable run.
+    Silently resolving an unrecognised name to the cold start would let a typo,
+    or that old spelling, quietly select a policy nobody asked for.
     """
 
-    alias = initial_network({"initialization": "zeros", "seed": 5})
-    renamed = initial_network({"initialization": "donor_default", "seed": 5})
-    assert [
-        (weight.tolist(), bias.tolist()) for weight, bias in alias.layers
-    ] == [(weight.tolist(), bias.tolist()) for weight, bias in renamed.layers]
-    assert not _has_inert_hidden_trunk(alias)
+    with pytest.raises(ValueError, match="unsupported market initialization"):
+        initial_network({"initialization": "zeros"})
 
 
 def test_training_initialization_leaves_every_layer_trainable():
@@ -455,12 +451,14 @@ def test_an_inert_network_is_rejected_before_it_can_be_promoted():
         _reject_inert_network(MarketQNetwork.zeros())
 
 
-def test_a_fresh_run_replaces_a_cached_legacy_initial_policy(tmp_path):
+def test_a_fresh_run_replaces_a_cached_initial_policy(tmp_path):
+    """`initial.npz` is a fixed name, so a second session must overwrite it."""
+
     path = tmp_path / "rollout_policies" / "initial.npz"
     _materialize_behavior_policy(MarketQNetwork.zeros(), path)
     assert _has_inert_hidden_trunk(MarketQNetwork.load(path))
 
-    replacement = initial_network({"initialization": "zeros", "seed": 73})
+    replacement = initial_network({"initialization": "donor_default", "seed": 73})
     _materialize_behavior_policy(replacement, path, refresh=True)
 
     restored = MarketQNetwork.load(path)

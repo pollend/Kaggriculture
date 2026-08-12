@@ -24,7 +24,7 @@ A healthy run has `orders_per_decision` somewhere in between and
            metadata_json ->> 'mean_final_money'    AS money,
            metadata_json ->> 'solvent_episodes'    AS solvent
     FROM training_batches
-    WHERE model_id = 'dqn_market_free.raw_order_q_v1@simple_v1'
+    WHERE model_id = 'dqn_market_free.raw_order_q_v1@simple_v2'
     ORDER BY batch_seq;
 """
 
@@ -56,16 +56,25 @@ from kaggriculture_lab.runner import ensure_session, run_generations
 # advance. Ctrl-C after a generation closes; committed work stays resumable.
 SYNC_ENVIRONMENT = True
 
-# A fresh session and instance name. The action space changed from ten order
-# slots to one, which changes both the rollout record format and the network
-# shape, so no checkpoint or batch from `market-free-demo-v1` can be read. A new
-# instance also means a clean artifact root rather than one where new
+# A fresh session and instance name.
+#
+# `market-free-demo-v1` predates the action space changing from ten order slots
+# to one, which changed both the rollout record format and the network shape, so
+# none of its checkpoints or batches can be read.
+#
+# `market-free-simple-v1` is readable but not resumable: `ensure_session` hashes
+# the experiment manifest, and this config no longer carries the dead singular
+# `benchmark` key, so its digest no longer matches the stored one. Its 60 batches
+# and 2 rejected checkpoints stay queryable under `@simple_v1`; nothing was
+# promoted, so nothing trained is being discarded.
+#
+# A new instance also means a clean artifact root rather than one where new
 # `rollout-000000NN.npz` files land on top of the old run's.
-SESSION_ID = "market-free-simple-v1"
+SESSION_ID = "market-free-simple-v2"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_league.toml")
 MANIFEST = Path("agents/dqn_market_free/agent.toml")
-MODEL_NAME = "simple_v1"
+MODEL_NAME = "simple_v2"
 
 DONOR = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
 
@@ -78,8 +87,9 @@ BENCHMARKS = (
 # `[models.config]` and then applies this on top, so every key here is a
 # deliberate departure from the manifest.
 FREE_CONFIG = {
+    # Promotion baseline first: index 0 is what the release gate measures, the
+    # rest are non-regression diagnostics.
     "benchmarks": list(BENCHMARKS),
-    "benchmark": DONOR,
     "episode_steps": 720,
     # This named instance pins solvent trajectories from the matching pilkwang
     # donor family and clones their order choices before Double-DQN fine-tuning.

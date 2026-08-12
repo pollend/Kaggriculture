@@ -349,9 +349,9 @@ def test_order_diagnostics_count_decisions_and_orders():
 
     assert diagnostics.decisions == 4
     assert diagnostics.orders == 7
-    assert diagnostics.trading_decisions == 3
+    assert diagnostics.emitting_decisions == 3
     assert diagnostics.as_dict()["wire_orders_per_decision"] == pytest.approx(7 / 4)
-    assert diagnostics.as_dict()["trading_rate"] == pytest.approx(3 / 4)
+    assert diagnostics.as_dict()["emitted_rate"] == pytest.approx(3 / 4)
 
 
 def test_a_single_order_policy_reports_a_bounded_rate():
@@ -367,10 +367,14 @@ def test_a_single_order_policy_reports_a_bounded_rate():
     hire = Order("HIRE", None, HIRE_QUANTITIES[-1])
     assert len(hire.to_wire()) > 1
 
-    diagnostics = diagnose_order_lists([[], [["SELL", "WHEAT", 4]], hire.to_wire()])
+    # Both the sale and the hire moved money, so both count once each.
+    diagnostics = diagnose_order_lists(
+        [[], [["SELL", "WHEAT", 4]], hire.to_wire()], [0.0, 48.0, -609.0]
+    )
     payload = diagnostics.as_dict()
 
     assert payload["trading_rate"] == pytest.approx(2 / 3)
+    assert payload["emitted_rate"] == pytest.approx(2 / 3)
     assert payload["wire_orders_per_decision"] > 1.0
 
 
@@ -1388,11 +1392,210 @@ def test_reward_scale_keeps_a_full_season_in_the_huber_quadratic_zone():
     shaped, _, _ = episode_rewards(money, [0.0] * turns, 76_000.0, 40_000.0, 0.999)
 
     assert 1.0 < float(shaped.sum()) < 10.0
-    # Every ordinary turn is far inside the quadratic zone.
-    assert float(np.abs(shaped[:-1]).max()) < 0.1
-    # The last one is not, by design: it carries the clipped terminal margin,
-    # which at this scale is a real share of the return rather than the ~1%
-    # rounding error it was when money was scaled by 1,000.
-    assert float(shaped[-1]) == pytest.approx(1.0)
-    assert 0.15 < shaped[-1] / shaped.sum() < 0.45
+    # Every turn, including the last, is inside the quadratic zone.
+    assert float(np.abs(shaped).max()) < 1.0
     assert MONEY_SCALE >= 10_000.0
+
+
+def test_actor_epsilons_spread_a_batch_across_temperatures():
+    """One rate per batch means one policy at one temperature in the buffer.
+
+    Measured at a base of 0.014 with a single rate: 81% mean pairwise action
+    agreement between the sixteen episodes of a batch, and identical actions on
+    38% of turns. Spreading the rate is what puts exploratory and near-greedy
+    trajectories in the same buffer instead of in different generations.
+    """
+
+    from agents.dqn_market_free.training.collect import actor_epsilons
+
+    spread = actor_epsilons(0.18, 8, 4.0)
+    assert len(spread) == 8
+    # The first actor runs at the schedule's own rate; the rest are quieter.
+    assert spread[0] == pytest.approx(0.18)
+    assert spread == sorted(spread, reverse=True)
+    assert spread[-1] < 0.001
+    # Both ends present: something exploring, something effectively greedy.
+    assert sum(1 for value in spread if value > 0.01) >= 3
+    assert sum(1 for value in spread if value < 0.01) >= 3
+
+    # Degenerate widths must not divide by zero.
+    assert actor_epsilons(0.18, 1, 4.0) == [0.18]
+
+
+def test_paired_seats_explore_at_the_same_temperature():
+    """Both orientations of a seed must be one policy, or the margin is a fiction.
+
+    `collect_batch` indexes `epsilons` by pair for the same reason it indexes
+    the opponent by pair: the league settles a seat-balanced `paired_margin`
+    across the two orientations, and that number only means something if the
+    same agent played both.
+    """
+
+    from agents.dqn_market_free.training.collect import collect_batch
+
+    captured: list[tuple] = []
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "agents.dqn_market_free.training.collect._job",
+            lambda payload: captured.append(payload) or None,
+        )
+        collect_batch(
+            Path("weights.npz"),
+            ["opponent-a", "opponent-b"],
+            [11, 11, 22, 22, 33, 33],
+            [0.5, 0.05, 0.005],
+            0.999,
+            Path("traces"),
+            jobs=1,
+        )
+
+    # payload layout: (weights, opponent, seed, seat, epsilon, gamma, ...)
+    by_seed: dict[int, set] = {}
+    for payload in captured:
+        by_seed.setdefault(payload[2], set()).add(payload[4])
+    assert by_seed == {11: {0.5}, 22: {0.05}, 33: {0.005}}
+
+
+
+def test_terminal_margin_discriminates_across_the_observed_range():
+    """A hard clip at 20,000 made this term a constant, not a signal.
+
+    Measured across 640 recorded episodes the final margin ran from -21,681 to
+    -210,076 -- every one outside the clip -- so the term returned exactly -1.0
+    every time. A constant on the terminal reward shifts every Q value uniformly
+    and can never change an argmax, so the one term tying training to what the
+    promotion gate measures was contributing nothing at all.
+    """
+
+    from agents.dqn_market_free.training.reward import (
+        TERMINAL_MARGIN_SCALE,
+        episode_rewards,
+    )
+
+    def terminal(margin: float) -> float:
+        shaped, _, _ = episode_rewards([0.0, 0.0], [0.0, 0.0], 0.0, -margin, 1.0)
+        return float(shaped[-1])
+
+    observed = [-210_076.0, -126_975.0, -75_000.0, -21_681.0]
+    values = [terminal(m) for m in observed]
+
+    # Strictly ordered: a less bad loss must score better than a worse one.
+    assert values == sorted(values)
+    assert min(values) > -1.0 and max(values) < 0.0
+    # And the spread is usable, not four values crowded onto the bound.
+    assert max(values) - min(values) > 0.5
+
+    # Bounded either side, so one blowout episode cannot dominate a batch.
+    # tanh is open on (-1, 1) mathematically; float32 saturates at the bound.
+    assert -1.0 <= terminal(-10_000_000.0) <= -0.99
+    assert 0.99 <= terminal(10_000_000.0) <= 1.0
+    # Symmetric about parity.
+    assert terminal(0.0) == pytest.approx(0.0)
+    assert terminal(TERMINAL_MARGIN_SCALE) == pytest.approx(-terminal(-TERMINAL_MARGIN_SCALE))
+
+
+def test_activity_is_counted_by_effect_not_by_emission():
+    """An invalid order is a silent no-op, so emitting one is not activity.
+
+    Measured on a real batch: 57% of decisions were `SELL WOOL 16` from a farm
+    that owned no sheep, 98.4% of emissions were refused, and the old
+    emission-based count reported 59% activity for a policy whose real activity
+    was 1% -- clearing the promotion gate's activity floor, which exists
+    precisely to catch a silent policy.
+    """
+
+    from agents.dqn_market_free.diagnostics import diagnose_order_lists
+
+    orders = [[["SELL", "WOOL", 16]], [["SELL", "WOOL", 16]], [["BUY_SEED", "WHEAT", 6]], []]
+    # Only the seed purchase moved money; the wool sales were refused.
+    deltas = [0.0, 0.0, -120.0, 0.0]
+
+    d = diagnose_order_lists(orders, deltas).as_dict()
+    assert d["decisions"] == 4
+    assert d["emitting_decisions"] == 3
+    assert d["effective_decisions"] == 1
+    assert d["emitted_rate"] == pytest.approx(0.75)
+    assert d["trading_rate"] == pytest.approx(0.25)
+    assert d["rejected_order_rate"] == pytest.approx(2 / 3)
+
+
+def test_activity_fails_closed_without_money_information():
+    """A caller that forgets the deltas must trip the gate, not pass it.
+
+    The previous behaviour counted emissions as trades, which is the exact
+    failure mode this replaced, so the safe default is to prove nothing.
+    """
+
+    from agents.dqn_market_free.diagnostics import diagnose_order_lists
+
+    d = diagnose_order_lists([[["SELL", "WOOL", 16]]] * 5).as_dict()
+    assert d["emitting_decisions"] == 5
+    assert d["effective_decisions"] == 0
+    assert d["trading_rate"] == 0.0
+
+
+def test_replay_diagnostics_read_effect_from_the_replay_itself():
+    from agents.dqn_market_free.diagnostics import diagnose_replay
+
+    def seat(money, orders=None):
+        state = {"observation": {"player": 0, "farms": [{"money": money}, {"money": 0}]}}
+        if orders is not None:
+            state["action"] = {"market": orders}
+        return [state, state]
+
+    replay = {
+        "steps": [
+            seat(3000),
+            seat(3000, [["SELL", "WOOL", 16]]),   # refused: money unchanged
+            seat(2880, [["BUY_SEED", "WHEAT", 6]]),  # accepted: money fell
+            seat(2880, []),
+        ]
+    }
+    d = diagnose_replay(replay, seat=0).as_dict()
+    assert d["emitting_decisions"] == 2
+    assert d["effective_decisions"] == 1
+
+
+def test_rejected_orders_are_charged_and_valid_ones_are_not():
+    """Break the tie the policy was exploiting, without picking a trade for it.
+
+    Shaping leaves a real purchase at exactly zero immediate reward, so NOOP, a
+    seed buy and an impossible order all scored 0 on the turn they happened. The
+    charge separates "interacted with the world" from "did not" and says nothing
+    about which interaction is better.
+    """
+
+    from agents.dqn_market_free.training.reward import (
+        REJECTED_ORDER_PENALTY,
+        episode_rewards,
+    )
+
+    money = [3_000.0, 3_000.0, 2_880.0]
+    potentials = [0.0, 0.0, 0.0]
+    # turn 0 emitted and moved nothing (refused); turn 1 emitted and paid;
+    # turn 2 emitted nothing at all.
+    emitted = [True, True, False]
+
+    shaped, raw, _ = episode_rewards(money, potentials, 2_880.0, 2_880.0, 1.0, emitted)
+
+    assert shaped[0] == pytest.approx(-REJECTED_ORDER_PENALTY)
+    # The accepted order keeps its own cost and takes no charge on top.
+    assert shaped[1] == pytest.approx(raw[1])
+    # A turn that emitted nothing is never charged, so NOOP stays above a
+    # refused order rather than below it.
+    assert shaped[2] > shaped[0]
+
+    # Off by default for callers that cannot say what was emitted.
+    plain, _, _ = episode_rewards(money, potentials, 2_880.0, 2_880.0, 1.0)
+    assert plain[0] == pytest.approx(0.0)
+
+
+def test_the_penalty_is_smaller_than_the_terminal_signal():
+    """It is not policy-invariant, so it must not become the objective."""
+
+    from agents.dqn_market_free.training.reward import REJECTED_ORDER_PENALTY
+
+    # Worst case: every turn of a season emits a refused order.
+    worst = REJECTED_ORDER_PENALTY * 719
+    assert 0.1 < worst < 1.0

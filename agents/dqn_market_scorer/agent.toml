@@ -24,7 +24,11 @@ code_paths = [
 ]
 
 [[models]]
-model_id = "dqn_market_scorer.donor_market_q_v1"
+# Named for what it is: one value-decomposed Q layer learning a bounded residual
+# over the donor-derived field policy and its market executor. It replaces
+# `donor_market_q_v1`, which described the market-only agent this stopped being
+# and read as though the donor were the learner. No stored run carried that ID.
+model_id = "dqn_market_scorer.joint_residual_q_v1"
 trainer = "agents.dqn_market_scorer.train:trainer"
 # One update per generation: the league schedules `rounds_per_generation` rounds
 # and each buys `batches_per_round`, so matching their product fires the update
@@ -89,9 +93,12 @@ promotion_seed_stride = 10000
 jobs = 8
 seed = 0
 
-# The unmodified donor itself. This match measures the complete Q-guided
-# residual against the policy it derives from.
-benchmark = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+# The release suite, promotion baseline first. Index 0 is the unmodified donor
+# itself, so the gated match measures the complete Q-guided residual against the
+# policy it derives from; anything after it is a non-regression diagnostic.
+benchmarks = [
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+]
 opponents = [
   "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
   "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",

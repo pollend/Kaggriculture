@@ -23,6 +23,10 @@ from torch import nn
 from agents.dqn_market_scorer.market_policy import POLICY_KINDS
 from agents.dqn_market_scorer.policy import WEIGHTS_PATH, MarketQNetwork
 from agents.dqn_market_scorer.training import network as net_module
+from agents.dqn_market_scorer.training.benchmarks import (
+    configured_benchmarks,
+    promotion_benchmark,
+)
 from agents.dqn_market_scorer.training.collect import (
     LEARNER_ENTRY_POINT,
     EpisodeFormatError,
@@ -64,18 +68,16 @@ def initial_network(config: dict[str, Any]) -> MarketQNetwork:
     unmodified donor policy. Starting from a random market policy would spend
     the early batches learning its way back to a baseline it was handed free.
 
-    `zeros` is the deprecated spelling of the same thing and resolves here, but
-    it must never be taken literally. An all-zero MLP makes both hidden
+    Only the output layer is zeroed. An all-zero MLP makes both hidden
     activations identically zero for any input, which zeroes the gradient of
     every parameter but the output bias; `relu'(0) == 0` closes the path back to
-    the biases too. The symmetry never breaks, so the network stays
-    byte-identical to the donor for the life of the run while the gate reports a
-    healthy promotion. `MarketQNetwork.donor_default` gives the same round-one
-    behaviour with only the output layer zeroed, which trains.
+    the biases too. The symmetry would never break, so the network would stay
+    byte-identical to the donor for the life of the run while the gate reported
+    a healthy promotion.
     """
 
-    initialization = str(config.get("initialization", "zeros"))
-    if initialization in ("zeros", "donor_default"):
+    initialization = str(config.get("initialization", "donor_default"))
+    if initialization == "donor_default":
         return MarketQNetwork.donor_default(seed=int(config.get("seed", 0)))
     if initialization == "random":
         return MarketQNetwork.random(seed=int(config.get("seed", 0)))
@@ -306,10 +308,11 @@ def _materialize_behavior_policy(
 ) -> None:
     """Write the worker-visible policy, optionally replacing a cached cold start.
 
-    Checkpoint paths are content-addressed and therefore immutable. ``initial``
-    is not: a fresh SQL session can share an artifact root with an older run,
-    including v1's all-zero, untrainable cold-start file. Refresh that named
-    cache from the current initializer before each pre-checkpoint rollout.
+    Checkpoint paths are content-addressed and therefore immutable, so writing
+    one once is enough. ``initial`` is not content-addressed: it is a fixed name
+    that two sessions sharing an artifact root would both claim, and the second
+    one's cold start need not equal the first's. Rewrite it from the current
+    initializer before each pre-checkpoint rollout rather than trusting the name.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -411,7 +414,7 @@ class MarketCollector:
             base = (
                 [str(item) for item in configured_opponents]
                 if configured_opponents
-                else [str(config.get("benchmark", "starter"))]
+                else [promotion_benchmark(config)]
             )
             if config.get("league_opponents", True):
                 base += league_opponents(context, reader)
@@ -542,26 +545,6 @@ def _arena_evaluate(
     }
 
 
-def configured_benchmarks(config: dict[str, Any]) -> list[str]:
-    """Return the fixed release suite, accepting the legacy singular key.
-
-    The default is the unmodified donor itself, so the paired match measures the
-    complete Q-guided residual against its source policy.
-    """
-
-    configured = config.get("benchmarks")
-    if configured:
-        return list(dict.fromkeys(str(item) for item in configured))
-    return [
-        str(
-            config.get(
-                "benchmark",
-                "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
-            )
-        )
-    ]
-
-
 def _benchmark_kind(index: int) -> str:
     """Name the evaluation slot. Index 0 is the release baseline, by convention.
 
@@ -597,12 +580,6 @@ def _reject_degenerate(result: dict[str, Any], role: str) -> None:
             f"{result['pairs']} paired seeds against {result['opponent']}: "
             "the candidate is playing as the same policy"
         )
-
-
-def _reject_degenerate_head_to_head(result: dict[str, Any]) -> None:
-    """Apply `_reject_degenerate` to the challenger-vs-incumbent match."""
-
-    _reject_degenerate(result, "head-to-head")
 
 
 def _reject_inert_network(network: MarketQNetwork) -> None:
@@ -694,32 +671,19 @@ class MarketUpdater:
         gradient_steps = 0
         resumed = lineage_checkpoint(context, reader)
         resumed_from = resumed.checkpoint_id if resumed is not None else None
-        legacy_dead_checkpoint_reset = False
         if resumed is not None:
             state = torch.load(
                 resumed.trainer_artifact_path, map_location="cpu", weights_only=False
             )
             online.load_state_dict(state["market_online"])
             target.load_state_dict(state["market_target"])
-            legacy_dead_checkpoint_reset = (
-                str(config.get("initialization", "zeros")) in ("zeros", "donor_default")
-                and _has_inert_hidden_trunk(net_module.to_numpy(online))
-            )
-            if legacy_dead_checkpoint_reset:
-                # Preserve the off-policy replay already collected by the first
-                # run, but do not resume its mathematically dead network or
-                # optimizer. This makes an interrupted v1 session recoverable
-                # after the initializer fix instead of requiring database edits.
-                online = net_module.from_numpy(initial_network(config), online)
-                target.load_state_dict(online.state_dict())
-            else:
-                optimizer.load_state_dict(state["market_optimizer"])
-                move_optimizer(optimizer, device)
-                gradient_steps = int(state.get("market_gradient_steps", 0))
-                if "torch_rng_state" in state:
-                    torch.set_rng_state(state["torch_rng_state"])
-                if "replay_rng_state" in state:
-                    buffer.rng.bit_generator.state = state["replay_rng_state"]
+            optimizer.load_state_dict(state["market_optimizer"])
+            move_optimizer(optimizer, device)
+            gradient_steps = int(state.get("market_gradient_steps", 0))
+            if "torch_rng_state" in state:
+                torch.set_rng_state(state["torch_rng_state"])
+            if "replay_rng_state" in state:
+                buffer.rng.bit_generator.state = state["replay_rng_state"]
         else:
             online = net_module.from_numpy(initial_network(config), online)
             target.load_state_dict(online.state_dict())
@@ -822,7 +786,7 @@ class MarketUpdater:
             if context.active_checkpoint is not None
             else (
                 _incumbent_path(config)
-                if str(config.get("initialization", "zeros")) == "incumbent"
+                if str(config.get("initialization", "donor_default")) == "incumbent"
                 else None
             )
         )
@@ -839,10 +803,7 @@ class MarketUpdater:
             "challenger_benchmarks": challenger_benchmarks,
             "resumed_from_checkpoint_id": resumed_from,
             "rejection_streak": resumed.rejection_streak if resumed is not None else 0,
-            "lineage_reset": bool(
-                resumed is not None and (resumed.reset or legacy_dead_checkpoint_reset)
-            ),
-            "legacy_dead_checkpoint_reset": legacy_dead_checkpoint_reset,
+            "lineage_reset": resumed is not None and resumed.reset,
         }
         if incumbent_path is None:
             # The primary benchmark is the release baseline until a checkpoint
@@ -872,7 +833,7 @@ class MarketUpdater:
             head_to_head = _arena_evaluate(
                 inference_path, incumbent_spec, promotion_seeds, jobs, seed_start
             )
-            _reject_degenerate_head_to_head(head_to_head)
+            _reject_degenerate(head_to_head, "head-to-head")
             incumbent_benchmarks = [
                 _arena_evaluate(incumbent_path, benchmark, eval_seeds, jobs, seed_start)
                 for benchmark in benchmarks
@@ -923,10 +884,7 @@ class MarketUpdater:
             "resumed_from_checkpoint_id": resumed_from,
             "resumed_from_released": resumed is not None and resumed.released,
             "rejection_streak": resumed.rejection_streak if resumed is not None else 0,
-            "lineage_reset": bool(
-                resumed is not None and (resumed.reset or legacy_dead_checkpoint_reset)
-            ),
-            "legacy_dead_checkpoint_reset": legacy_dead_checkpoint_reset,
+            "lineage_reset": resumed is not None and resumed.reset,
             "episodes_in_buffer": len(buffer.episodes),
             "skipped_legacy_batches": skipped_legacy_batches,
             "market_transitions_in_buffer": buffer.market_transitions,

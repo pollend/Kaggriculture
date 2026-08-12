@@ -140,9 +140,7 @@ def build_submission(
 
 def main() -> int:
     output_dir, archive_path = build_submission()
-    files = sorted(
-        path.relative_to(output_dir).as_posix() for path in output_dir.rglob("*") if path.is_file()
-    )
+    files = sorted(path.relative_to(output_dir).as_posix() for path in output_dir.rglob("*") if path.is_file())
     print(f"Submission folder: {output_dir}")
     print(f"Submission archive: {archive_path}")
     print(f"Included files ({len(files)}):")
