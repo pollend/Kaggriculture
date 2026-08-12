@@ -51,7 +51,7 @@ def _sha256(path: Path) -> str:
 
 
 def _metadata(folder: Path) -> dict:
-    return json.loads((folder / "metadata.json").read_text())
+    return json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
 
 
 def test_competitor_snapshot_is_complete_and_hashes_are_unique():
@@ -72,7 +72,7 @@ def test_competitor_snapshot_is_complete_and_hashes_are_unique():
         assert metadata["source_url"].startswith("https://www.kaggle.com/code/")
         assert metadata["entrypoint_sha256"] == _sha256(entrypoint)
         assert metadata["notebook_sha256"] == _sha256(notebook)
-        json.loads(notebook.read_text())
+        json.loads(notebook.read_text(encoding="utf-8"))
         entrypoint_hashes.add(metadata["entrypoint_sha256"])
 
     assert len(entrypoint_hashes) == len(COMPETITORS)
@@ -80,7 +80,7 @@ def test_competitor_snapshot_is_complete_and_hashes_are_unique():
 
 @pytest.mark.parametrize("folder", COMPETITORS, ids=lambda path: path.name)
 def test_competitor_entrypoint_passes_static_safety_gate(folder: Path):
-    source = (folder / "main.py").read_text()
+    source = (folder / "main.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     has_agent = False
 
@@ -111,7 +111,8 @@ def test_competitor_manifests_are_fixed_unparameterized_agents():
         assert manifest.entry_point.startswith("agents.competitor_")
         assert manifest.training_adapter is None
         assert manifest.episode_evaluator is None
-        assert manifest.code_paths == (str((folder / "main.py").relative_to(ROOT)),)
+        # Manifests store posix separators; `str()` on a WindowsPath would not.
+        assert manifest.code_paths == ((folder / "main.py").relative_to(ROOT).as_posix(),)
         family_ids.add(manifest.family_id)
     assert len(family_ids) == len(COMPETITORS)
 

@@ -36,7 +36,7 @@ INFRA_ALLOWED_DIRS = ("training",)
 def _module_imports(path: Path) -> set[str]:
     """Top-level runtime imports. `if TYPE_CHECKING:` blocks are excluded --
     they cost nothing at runtime and exist only to type the hook signatures."""
-    tree = ast.parse(path.read_text())
+    tree = ast.parse(path.read_text(encoding="utf-8"))
 
     type_checking_nodes: set[int] = set()
     for node in ast.walk(tree):

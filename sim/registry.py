@@ -93,6 +93,22 @@ def split_spec(spec: str) -> tuple[str, dict[str, Any]]:
     return target, config
 
 
+def _split_module_attr(target: str) -> tuple[str, str] | None:
+    """Split ``pkg.mod:attr``, or None if `target` is a file path.
+
+    A colon alone does not mean the module form: a Windows path carries one in
+    its drive letter (``C:\\runs\\best\\main.py``), which would otherwise be
+    read as module ``C``. The module form is recognised by shape instead --
+    dotted identifiers either side of the last colon.
+    """
+    module_name, separator, attr = target.rpartition(":")
+    if not separator or not attr.isidentifier():
+        return None
+    if not all(part.isidentifier() for part in module_name.split(".")):
+        return None
+    return module_name, attr
+
+
 def _load_path(path: Path) -> Any:
     """Import a .py file and return its `agent` attribute, else its last callable."""
     module_name = f"_kagg_agent_{path.stem}_{abs(hash(str(path.resolve())))}"
@@ -143,8 +159,9 @@ def resolve(spec: str, env_name: str = DEFAULT_ENV) -> Callable[[dict], dict]:
     if config:
         os.environ[CONFIG_ENV_VAR] = json.dumps(config)
     try:
-        if ":" in target:
-            module_name, _, attr = target.partition(":")
+        module_attr = _split_module_attr(target)
+        if module_attr is not None:
+            module_name, attr = module_attr
             obj = getattr(importlib.import_module(module_name), attr)
         else:
             path = Path(target)

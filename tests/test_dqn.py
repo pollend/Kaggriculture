@@ -101,8 +101,14 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
     manifest = AgentManifest.load(manifest_path)
     artifact = save_episode_batch([episode], tmp_path / "rollout.npz")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    # The manifest points at a snapshot under `runs/`, which is training output
+    # and is never checked in. Seed the cold start from a local one instead, so
+    # the test does not depend on artifacts left behind by a previous run.
+    incumbent = tmp_path / "incumbent.npz"
+    QNetwork.random(seed=13).save(incumbent)
     config = {
         **(manifest.models[0].config or {}),
+        "incumbent_weights": str(incumbent),
         "gradient_steps_per_batch": 1,
         "batch_size": 8,
         "buffer_episodes": 16,
