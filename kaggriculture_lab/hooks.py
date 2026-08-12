@@ -12,8 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from kaggriculture_lab.read_only import fetchall_select
-
 
 @dataclass(frozen=True, slots=True)
 class EpisodeHookContext:
@@ -27,7 +25,7 @@ class EpisodeHookContext:
 
 
 class EpisodeReader:
-    """Narrow read-only view over one persisted episode."""
+    """Narrow view over one persisted episode."""
 
     def __init__(self, connection: Any, match_id: str, seat: int):
         self._connection = connection
@@ -39,7 +37,7 @@ class EpisodeReader:
             """
             SELECT status, failed, reward, final_money, opponent_money,
                    money_difference, win, metrics_json
-            FROM episode_players WHERE match_id = ? AND seat = ?
+            FROM episode_players WHERE match_id = %s AND seat = %s
             """,
             [self.match_id, self.seat],
         ).fetchone()
@@ -57,26 +55,32 @@ class EpisodeReader:
         }
 
     def replay(self) -> dict[str, Any]:
+        """The full replay for this episode.
+
+        Every episode keeps one, trainer rollouts included, so an absent payload
+        is a real fault rather than a storage policy and is raised as such. It
+        was briefly otherwise: rollouts were recorded without a payload to save
+        disk, the hook fired for them anyway, and every replay-reading evaluator
+        turned those episodes into `episode_evaluations` ERROR rows.
+        """
+
         row = self._connection.execute(
-            "SELECT replay_gzip FROM episode_payloads WHERE match_id = ?", [self.match_id]
+            "SELECT replay_gzip FROM episode_payloads WHERE match_id = %s", [self.match_id]
         ).fetchone()
-        if row is None:
+        if row is None or row[0] is None:
             raise ValueError(f"replay payload not found: {self.match_id}")
         return json.loads(gzip.decompress(bytes(row[0])))
 
     def fetchall(
         self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()
     ) -> list[tuple[Any, ...]]:
-        """Read-only query across the whole store.
+        """Run one query across the whole store.
 
         An evaluator often needs more than the episode it was fired for -- "is
         this revision trending down over its last N games" cannot be answered
-        from a single match. Guarded to SELECT/WITH so a hook cannot mutate the
-        league it is reporting on, the same rule `ModelTrainingReader` applies.
+        from a single match.
         """
-        return fetchall_select(
-            self._connection, sql, parameters, reader_name="episode reader"
-        )
+        return self._connection.execute(sql, list(parameters)).fetchall()
 
     def fetchone(
         self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()
@@ -97,7 +101,7 @@ class EpisodeReader:
             FROM pairing_episodes pe
             JOIN league_pairings lp USING (pairing_id)
             JOIN generations g USING (generation_id)
-            WHERE pe.match_id = ?
+            WHERE pe.match_id = %s
             """,
             [self.match_id],
         )
@@ -109,9 +113,9 @@ class EpisodeReader:
                 SELECT ep.match_id, ep.seed, ep.seat, ep.failed, ep.final_money,
                        ep.opponent_money, ep.money_difference, ep.win
                 FROM episode_players ep
-                WHERE ep.strategy_id = ? AND ep.match_id != ?
+                WHERE ep.strategy_id = %s AND ep.match_id != %s
                 ORDER BY ep.match_id DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 [revision_id, self.match_id, limit],
             )
@@ -125,12 +129,12 @@ class EpisodeReader:
                 JOIN pairing_episodes pe USING (match_id)
                 JOIN league_pairings lp USING (pairing_id)
                 JOIN generations g USING (generation_id)
-                WHERE ep.strategy_id = ? AND g.session_id = ?
+                WHERE ep.strategy_id = %s AND g.session_id = %s
                   AND (g.generation_index, lp.round_index, lp.pairing_id, pe.orientation)
-                      < (?, ?, ?, ?)
+                      < (%s, %s, %s, %s)
                 ORDER BY g.generation_index DESC, lp.round_index DESC,
                          lp.pairing_id DESC, pe.orientation DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 [
                     revision_id,

@@ -1,0 +1,62 @@
+family_id = "mixed_farm_rf_market"
+name = "Mixed-Farm Random-Forest Market"
+entry_point = "agents.mixed_farm_rf_market.agent:make_agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.mixed_farm_rf_market.main:evaluate_episode"
+
+# The established field policy is snapshotted here so this experiment remains
+# isolated from later changes to the original agent family.
+code_paths = [
+  "agents/__init__.py",
+  "agents/mixed_farm_rf_market/__init__.py",
+  "agents/mixed_farm_rf_market/main.py",
+  "agents/mixed_farm_rf_market/agent.py",
+  "agents/mixed_farm_rf_market/evaluation.py",
+  "agents/mixed_farm_rf_market/heuristic_market.py",
+  "agents/mixed_farm_rf_market/market.py",
+  "agents/mixed_farm_rf_market/policy.py",
+  "agents/mixed_farm_rf_market/portfolio.py",
+  "agents/mixed_farm_rf_market/rules.py",
+  "agents/mixed_farm_rf_market/scheduler.py",
+  "agents/mixed_farm_rf_market/strategy.py",
+]
+
+[[models]]
+model_id = "mixed_farm_rf_market.market_policy"
+trainer = "agents.mixed_farm_rf_market.train:trainer"
+min_new_batches = 5
+
+[models.config]
+n_estimators = 300
+criterion = "squared_error"
+min_samples_leaf = 5
+max_features = 0.7
+bootstrap = true
+seed = 4242
+# Paired heuristic rollouts collected for the warm start, not rows mined from
+# another family's session. Each one plays a full season in both seat orders.
+bootstrap_episodes = 40
+bootstrap_batches = 5
+max_training_batches = 200
+max_purchase_rows = 50000
+max_sale_rows = 250000
+episodes_per_batch = 8
+epsilon_start = 0.30
+epsilon_end = 0.05
+epsilon_decay_batches = 100
+promotion_seeds = 10
+promotion_seed_base = 1000000
+jobs = 8
+opponents = [
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
+  "agents/competitor_avikdas567_kaggriculture_microeconomic_dynamic_policy_engine/main.py",
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+  "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/main.py",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/main.py",
+]
+promotion_opponents = [
+  "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+  "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/main.py",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/main.py",
+]

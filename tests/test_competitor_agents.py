@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.postgres_support import postgres_database
+
 import ast
 import hashlib
 import json
@@ -126,7 +128,7 @@ def test_configured_competitors_seed_persistent_league_as_anchors(tmp_path: Path
         episode_steps=24,
         jobs=1,
     )
-    database = tmp_path / "league.duckdb"
+    database = postgres_database(tmp_path, "league")
     session_id = create_session(config, database, workspace=ROOT, session_id="competitor-anchors")
 
     with ExperimentStore(database) as store:

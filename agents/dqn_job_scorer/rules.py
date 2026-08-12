@@ -14,6 +14,8 @@ from __future__ import annotations
 from typing import Any
 
 CROPS = ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")
+ANIMALS = ("GOOSE", "COW", "SHEEP")
+PRODUCTS = (*CROPS, "EGG", "MILK", "WOOL", "FERTILIZER")
 
 # "yield" is the unfertilized peak, which is what this agent plans against.
 CROP_DATA: dict[str, dict[str, Any]] = {
@@ -24,13 +26,26 @@ CROP_DATA: dict[str, dict[str, Any]] = {
     "MELON": {"seed": 80, "base": 250, "first": 10, "peak": 12, "yield": 6, "ongoing": False},
 }
 
+ANIMAL_DATA: dict[str, dict[str, Any]] = {
+    "GOOSE": {"cost": 300, "structure": "COOP", "first": 4, "interval": 1, "held": 4, "product": "EGG", "base": 50},
+    "COW": {"cost": 400, "structure": "PASTURE", "first": 8, "interval": 2, "held": 6, "product": "MILK", "base": 160},
+    "SHEEP": {"cost": 500, "structure": "PASTURE", "first": 6, "interval": 3, "held": 6, "product": "WOOL", "base": 200},
+}
+
+PRODUCT_BASE = {
+    **{crop: int(data["base"]) for crop, data in CROP_DATA.items()},
+    **{str(data["product"]): int(data["base"]) for data in ANIMAL_DATA.values()},
+    "FERTILIZER": 100,
+}
+
 SHOP_DEMAND: dict[str, set[str]] = {
-    "BAKERY": {"WHEAT"},
-    "PIZZA_SHOP": {"WHEAT", "TOMATO"},
-    "BRUNCH_SPOT": {"WHEAT", "STRAWBERRY"},
-    "ICE_CREAM_SHOP": {"WHEAT", "STRAWBERRY"},
+    "BAKERY": {"EGG", "WHEAT"},
+    "PIZZA_SHOP": {"MILK", "WHEAT", "TOMATO"},
+    "BRUNCH_SPOT": {"EGG", "WHEAT", "STRAWBERRY"},
+    "YARN_STORE": {"WOOL"},
+    "ICE_CREAM_SHOP": {"STRAWBERRY", "MILK", "WHEAT"},
     "PET_CAFE": {"CARROT"},
-    "SMOOTHIE_SHOP": {"STRAWBERRY"},
+    "SMOOTHIE_SHOP": {"STRAWBERRY", "MILK"},
     "FARMERS_MARKET": {"WHEAT", "CARROT", "TOMATO", "STRAWBERRY"},
 }
 

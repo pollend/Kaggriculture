@@ -4,7 +4,7 @@ This guide walks you through building an agent, testing it locally, and submitti
 
 Training-capable strategy folders should include an `agent.toml` manifest. A `main.py`
 may also export `evaluate_episode(context, reader)`: the local league calls this hook
-after committing the episode to DuckDB. Use `reader.summary()` and `reader.replay()` to
+after committing the episode to PostgreSQL. Use `reader.summary()` and `reader.replay()` to
 derive family-specific features. Keep live episode memory inside the agent callable and
 reset it at the start of each episode; persistent ratings, training data, and model
 checkpoints belong to the league store, never to Kaggle submission-time globals.
@@ -26,9 +26,8 @@ class Trainer:
 ```
 
 The league owns matchups, rounds, and every promotion decision; the agent owns
-what training means. `reader` accepts SELECT/WITH only, and the round hook is
-offered at most once per round per model, so it is safe to resume an interrupted
-run without repeating expensive work. Which sessions drive which trainers is
+what training means. The round hook is offered at most once per round per model,
+so it is safe to resume an interrupted run without repeating expensive work. Which sessions drive which trainers is
 declared by `training_manifests` in the league config, not in code.
 
 The constants-driven runners may refine those manifests into named training

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from agents.dqn_job_scorer import features as F
+from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM, assemble_market
+from agents.dqn_job_scorer.rules import PRODUCTS
 from agents.dqn_job_scorer.training.collect import EpisodeRecord
 
 
@@ -30,6 +32,15 @@ class Batch:
     next_mask: np.ndarray       # bool    [B, J]
     reward: np.ndarray          # float32 [B]                     n-step discounted
     discount: np.ndarray        # float32 [B]                     gamma**n, 0 if terminal
+
+
+@dataclass
+class MarketBatch:
+    features: np.ndarray
+    next_features: np.ndarray
+    next_mask: np.ndarray
+    reward: np.ndarray
+    discount: np.ndarray
 
 
 class ReplayBuffer:
@@ -93,6 +104,10 @@ class ReplayBuffer:
     @property
     def transitions(self) -> int:
         return sum(int(record.unit_mask.sum()) for record in self.episodes)
+
+    @property
+    def market_transitions(self) -> int:
+        return sum(0 if record.market_step is None else len(record.market_step) for record in self.episodes)
 
     def nbytes(self) -> int:
         return sum(record.nbytes() for record in self.episodes)
@@ -165,3 +180,67 @@ class ReplayBuffer:
             next_mask[row, :count] = candidate_mask
 
         return Batch(chosen_features, next_features, next_mask, rewards, discounts)
+
+    def _market_candidates_at(self, record: EpisodeRecord, decision: int) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        assert record.market_state is not None
+        assert record.market_purchase_static is not None
+        assert record.market_purchase_mask is not None
+        assert record.market_reserve_static is not None
+        assert record.market_reserve_mask is not None
+        state = record.market_state[decision]
+        candidates = [assemble_market(state, record.market_purchase_static[decision])]
+        masks = [record.market_purchase_mask[decision]]
+        for product_index in range(len(PRODUCTS)):
+            candidates.append(assemble_market(state, record.market_reserve_static[decision, product_index]))
+            masks.append(record.market_reserve_mask[decision, product_index])
+        return candidates, masks
+
+    def sample_market(self, batch_size: int) -> MarketBatch:
+        eligible = [record for record in self.episodes if record.market_step is not None and len(record.market_step)]
+        if not eligible:
+            raise ValueError("market replay has no schema-v4 daily decisions")
+        factor_count = 1 + len(PRODUCTS)
+        selected = np.zeros((batch_size, factor_count, MARKET_FEATURE_DIM), dtype=np.float32)
+        rewards = np.zeros(batch_size, dtype=np.float32)
+        discounts = np.zeros(batch_size, dtype=np.float32)
+        future: list[list[np.ndarray] | None] = []
+        future_masks: list[list[np.ndarray] | None] = []
+        for row in range(batch_size):
+            record = eligible[int(self.rng.integers(0, len(eligible)))]
+            assert record.market_step is not None and record.market_chosen is not None
+            decision = int(self.rng.integers(0, len(record.market_step)))
+            candidates, _ = self._market_candidates_at(record, decision)
+            for factor in range(factor_count):
+                selected[row, factor] = candidates[factor][int(record.market_chosen[decision, factor])]
+
+            horizon = min(self.n_step, len(record.market_step) - decision)
+            bootstrap = decision + horizon
+            start_step = int(record.market_step[decision])
+            end_step = int(record.market_step[bootstrap]) if bootstrap < len(record.market_step) else record.steps
+            turn_discount = 1.0
+            for step in range(start_step, end_step):
+                rewards[row] += turn_discount * float(record.reward[step])
+                turn_discount *= self.gamma
+            if bootstrap >= len(record.market_step):
+                future.append(None)
+                future_masks.append(None)
+            else:
+                discounts[row] = turn_discount
+                candidates, masks = self._market_candidates_at(record, bootstrap)
+                future.append(candidates)
+                future_masks.append(masks)
+
+        width = max(
+            (candidate.shape[0] for rows in future if rows is not None for candidate in rows),
+            default=1,
+        )
+        next_features = np.zeros((batch_size, factor_count, width, MARKET_FEATURE_DIM), dtype=np.float32)
+        next_mask = np.zeros((batch_size, factor_count, width), dtype=bool)
+        for row, (rows, masks) in enumerate(zip(future, future_masks)):
+            if rows is None or masks is None:
+                continue
+            for factor, (candidates, mask) in enumerate(zip(rows, masks)):
+                count = candidates.shape[0]
+                next_features[row, factor, :count] = candidates
+                next_mask[row, factor, :count] = mask
+        return MarketBatch(selected, next_features, next_mask, rewards, discounts)

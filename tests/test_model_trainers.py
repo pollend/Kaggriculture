@@ -16,11 +16,14 @@ from kaggriculture_lab.league import (
 )
 from kaggriculture_lab.model_trainers import (
     GENERATION_ROUND_INDEX,
+    EvaluationPolicy,
+    RoundContext,
     TrainingBatchWriter,
     run_round_hooks,
 )
 from kaggriculture_lab.model_updates import record_training_batch
 from kaggriculture_lab.storage import ExperimentStore
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 MODEL_ID = "test.rounds"
 FAMILY_ID = "test_family"
@@ -40,7 +43,7 @@ class RecordingTrainer:
             RATING_COUNTS.append(
                 int(
                     reader.fetchone(
-                        "SELECT count(*) FROM rating_snapshots WHERE generation_id = ?",
+                        "SELECT count(*) FROM rating_snapshots WHERE generation_id = %s",
                         [context.generation_id],
                     )[0]
                 )
@@ -79,11 +82,15 @@ def _reset_recorders():
 
 
 def _register(store: ExperimentStore, trainer: str, model_id: str = MODEL_ID) -> None:
+    seed_reference_rows(
+        store.connection, session_id="s", generation_id="g0", family_id=FAMILY_ID
+    )
+    seed_reference_rows(store.connection, family_id="other_family")
     store.connection.execute(
         """
         INSERT INTO training_models (
             model_id, family_id, trainer_path, min_new_batches, config_json
-        ) VALUES (?, ?, ?, 1, '{}')
+        ) VALUES (%s, %s, %s, 1, '{}')
         """,
         [model_id, FAMILY_ID, trainer],
     )
@@ -105,8 +112,8 @@ def _fire(store: ExperimentStore, scope: str, round_index: int, **kwargs):
 def test_hook_runs_once_and_is_not_reoffered(tmp_path: Path):
     """The ledger is what makes a hook safe to re-enter after an interruption."""
 
-    with ExperimentStore(tmp_path / "rounds.duckdb") as store:
-        _register(store, "test_model_trainers:recording")
+    with ExperimentStore(postgres_database(tmp_path, "rounds")) as store:
+        _register(store, "tests.test_model_trainers:recording")
         first = _fire(store, "round", 0)
         assert [item.status for item in first] == ["complete"]
         assert first[0].batches and len(first[0].batches) == 1
@@ -122,8 +129,8 @@ def test_hook_runs_once_and_is_not_reoffered(tmp_path: Path):
 
 
 def test_round_and_generation_scopes_are_tracked_separately(tmp_path: Path):
-    with ExperimentStore(tmp_path / "scopes.duckdb") as store:
-        _register(store, "test_model_trainers:recording")
+    with ExperimentStore(postgres_database(tmp_path, "scopes")) as store:
+        _register(store, "tests.test_model_trainers:recording")
         _fire(store, "round", 0)
         _fire(store, "generation", GENERATION_ROUND_INDEX)
         _fire(store, "round", 0)
@@ -142,8 +149,8 @@ def test_round_and_generation_scopes_are_tracked_separately(tmp_path: Path):
 
 
 def test_a_raising_trainer_is_recorded_and_retried(tmp_path: Path):
-    with ExperimentStore(tmp_path / "error.duckdb") as store:
-        _register(store, "test_model_trainers:recording")
+    with ExperimentStore(postgres_database(tmp_path, "error")) as store:
+        _register(store, "tests.test_model_trainers:recording")
         FAIL_ROUNDS.add(0)
         failed = _fire(store, "round", 0)
         assert failed[0].status == "error"
@@ -159,8 +166,8 @@ def test_a_raising_trainer_is_recorded_and_retried(tmp_path: Path):
 
 
 def test_a_trainer_without_on_round_is_skipped_permanently(tmp_path: Path):
-    with ExperimentStore(tmp_path / "skip.duckdb") as store:
-        _register(store, "test_model_trainers:batch_only")
+    with ExperimentStore(postgres_database(tmp_path, "skip")) as store:
+        _register(store, "tests.test_model_trainers:batch_only")
         assert _fire(store, "round", 0)[0].status == "skipped"
         assert _fire(store, "round", 0)[0].status == "skipped"
         assert store.connection.execute(
@@ -169,9 +176,9 @@ def test_a_trainer_without_on_round_is_skipped_permanently(tmp_path: Path):
 
 
 def test_hooks_only_fire_for_declared_families(tmp_path: Path):
-    with ExperimentStore(tmp_path / "families.duckdb") as store:
-        _register(store, "test_model_trainers:recording")
-        _register(store, "test_model_trainers:recording", "other.model")
+    with ExperimentStore(postgres_database(tmp_path, "families")) as store:
+        _register(store, "tests.test_model_trainers:recording")
+        _register(store, "tests.test_model_trainers:recording", "other.model")
         store.connection.execute(
             "UPDATE training_models SET family_id = 'other_family' WHERE model_id = 'other.model'"
         )
@@ -183,9 +190,9 @@ def test_hooks_only_fire_for_declared_families(tmp_path: Path):
 def test_writer_is_bound_to_its_own_model(tmp_path: Path):
     """A trainer cannot record training data against a model it does not own."""
 
-    with ExperimentStore(tmp_path / "writer.duckdb") as store:
-        _register(store, "test_model_trainers:recording")
-        _register(store, "test_model_trainers:recording", "other.model")
+    with ExperimentStore(postgres_database(tmp_path, "writer")) as store:
+        _register(store, "tests.test_model_trainers:recording")
+        _register(store, "tests.test_model_trainers:recording", "other.model")
         writer = TrainingBatchWriter(store, MODEL_ID)
         assert writer.model_id == MODEL_ID
         batch = writer.record(source_kind="unit", source_id="one", sample_count=3)
@@ -195,25 +202,6 @@ def test_writer_is_bound_to_its_own_model(tmp_path: Path):
             "SELECT DISTINCT model_id FROM training_batches"
         ).fetchall()
         assert owners == [(MODEL_ID,)]
-
-
-def test_round_reader_rejects_mutating_sql(tmp_path: Path):
-    with ExperimentStore(tmp_path / "reader.duckdb") as store:
-        _register(store, "test_model_trainers:mutating")
-        report = _fire(store, "round", 0)[0]
-        assert report.status == "error"
-        assert "only permits SELECT/WITH" in (report.error or "")
-
-
-class MutatingTrainer:
-    def on_round(self, context, reader, writer) -> None:
-        reader.fetchall("DELETE FROM training_models")
-
-    def on_batch(self, context, reader):  # pragma: no cover - never reached here
-        raise AssertionError("on_batch must not run during round hooks")
-
-
-mutating = MutatingTrainer()
 
 
 def _league(tmp_path: Path) -> tuple[str, Path]:
@@ -227,7 +215,7 @@ def _league(tmp_path: Path) -> tuple[str, Path]:
         jobs=1,
         training_manifests=("agents/configurable_crop_surrogate/agent.toml",),
     )
-    database = tmp_path / "league.duckdb"
+    database = postgres_database(tmp_path, "league")
     return create_session(config, database, session_id="hooks"), database
 
 
@@ -239,7 +227,7 @@ def test_generation_hook_sees_closed_ratings_and_never_refires(tmp_path: Path):
         store.connection.execute(
             """
             UPDATE training_models
-            SET trainer_path = 'test_model_trainers:recording', min_new_batches = 1
+            SET trainer_path = 'tests.test_model_trainers:recording', min_new_batches = 1
             WHERE model_id = 'configurable_crop_surrogate.surrogate'
             """
         )
@@ -273,7 +261,7 @@ def test_session_config_round_trips_training_manifests(tmp_path: Path):
     with ExperimentStore(database) as store:
         stored = json.loads(
             store.connection.execute(
-                "SELECT config_json FROM training_sessions WHERE session_id = ?",
+                "SELECT config_json FROM training_sessions WHERE session_id = %s",
                 [session_id],
             ).fetchone()[0]
         )
@@ -283,16 +271,125 @@ def test_session_config_round_trips_training_manifests(tmp_path: Path):
 
 
 def test_record_training_batch_still_rejects_unknown_models(tmp_path: Path):
-    with ExperimentStore(tmp_path / "unknown.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "unknown")) as store:
         with pytest.raises(ValueError, match="unknown training model"):
             record_training_batch(
                 store, "nope.model", source_kind="unit", source_id="one", sample_count=1
             )
 
 
+def test_trainer_evaluation_round_is_paired_recorded_and_resumable(tmp_path: Path):
+    with ExperimentStore(postgres_database(tmp_path, "evaluation")) as store:
+        seed_reference_rows(store.connection, run_id="session")
+        store.connection.execute(
+            "INSERT INTO training_sessions VALUES (%s, %s, %s, %s, %s, %s, current_timestamp)",
+            ["session", "test", "session", "RUNNING", 1, "{}"],
+        )
+        store.connection.execute(
+            """
+            INSERT INTO generations (generation_id, session_id, generation_index, status)
+            VALUES (%s, %s, %s, %s)
+            """,
+            ["session:g0000", "session", 0, "RUNNING"],
+        )
+        _register(store, "tests.test_model_trainers:recording")
+        writer = TrainingBatchWriter(store, MODEL_ID)
+        context = RoundContext(
+            MODEL_ID,
+            FAMILY_ID,
+            "round",
+            "session",
+            "session:g0000",
+            0,
+            0,
+            None,
+            {},
+            tmp_path,
+        )
+        matchups = [
+            (
+                EvaluationPolicy("builtin:pass", "pass"),
+                EvaluationPolicy("builtin:starter", "starter"),
+                17,
+            )
+        ]
+        first = writer.run_evaluation_round(
+            context=context,
+            request_id="request-a",
+            pairing_kind="unit_evaluation",
+            matchups=matchups,
+            jobs=1,
+            episode_steps=2,
+        )
+        second = writer.run_evaluation_round(
+            context=context,
+            request_id="request-a",
+            pairing_kind="unit_evaluation",
+            matchups=matchups,
+            jobs=1,
+            episode_steps=2,
+        )
+        assert first == second
+        assert first["pairs"] == 1
+        assert store.connection.execute(
+            "SELECT count(*) FROM league_pairings WHERE pairing_kind = 'unit_evaluation'"
+        ).fetchone()[0] == 1
+        assert store.connection.execute("SELECT count(*) FROM pairing_episodes").fetchone()[0] == 2
+        assert store.connection.execute("SELECT count(*) FROM episode_payloads").fetchone()[0] == 2
+
+
+def test_meeting_a_manifest_does_not_rewrite_its_models_configuration(tmp_path: Path):
+    """Recording an opponent must not reset the model a runner is training.
+
+    A rollout pairing registers whatever manifest its opponent came from, and a
+    self-play opponent's manifest is the learner's own. `register_family` would
+    rewrite that model's `config_json` back to the manifest defaults, silently
+    discarding the runner's overlay mid-generation.
+    """
+    from kaggriculture_lab.model_trainers import _register_policies
+
+    manifest_path = "agents/dqn_job_scorer/agent.toml"
+    manifest = AgentManifest.load(manifest_path)
+    with ExperimentStore(postgres_database(tmp_path, "family-only")) as store:
+        store.register_training_agent(
+            manifest,
+            manifest_path,
+            TrainingAgentSpec(
+                "dqn_job_scorer", "default", model_config={"jobs": 3, "opponents": ["frozen"]}
+            ),
+        )
+        _register_policies(
+            store,
+            [
+                EvaluationPolicy(
+                    "opponent-a",
+                    "agents/dqn_job_scorer/main.py?weights=snapshot.npz",
+                    manifest_path,
+                    "rollout_opponent",
+                )
+            ],
+            source="policy_matchup",
+            register_families=True,
+        )
+        config = json.loads(
+            store.connection.execute(
+                "SELECT config_json FROM training_models WHERE model_id = %s",
+                ["dqn_job_scorer.adaptive_hybrid_q_v2"],
+            ).fetchone()[0]
+        )
+        family = store.connection.execute(
+            "SELECT manifest_path FROM agent_families WHERE family_id = %s",
+            ["dqn_job_scorer"],
+        ).fetchone()
+
+    assert config["jobs"] == 3
+    assert config["opponents"] == ["frozen"]
+    assert family == (manifest_path,)
+
+
 def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
     manifest = AgentManifest.load("agents/dqn_job_scorer/agent.toml")
-    with ExperimentStore(tmp_path / "named.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "named")) as store:
         first = store.register_training_agent(
             manifest,
             "agents/dqn_job_scorer/agent.toml",
@@ -301,7 +398,11 @@ def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
         second = store.register_training_agent(
             manifest,
             "agents/dqn_job_scorer/agent.toml",
-            TrainingAgentSpec("dqn_job_scorer", "dqn06"),
+            TrainingAgentSpec(
+                "dqn_job_scorer",
+                "dqn06",
+                model_config={"jobs": 3, "opponents": ["frozen-dqn"]},
+            ),
         )
         rows = store.connection.execute(
             """
@@ -310,65 +411,14 @@ def test_same_agent_type_registers_independent_named_models(tmp_path: Path):
             """
         ).fetchall()
 
-    assert first == ("dqn_job_scorer.q_network@dqn05",)
-    assert second == ("dqn_job_scorer.q_network@dqn06",)
+    assert first == ("dqn_job_scorer.adaptive_hybrid_q_v2@dqn05",)
+    assert second == ("dqn_job_scorer.adaptive_hybrid_q_v2@dqn06",)
     assert [(row[1], row[2], row[3]) for row in rows] == [
-        ("dqn_job_scorer", "dqn05", "dqn_job_scorer.q_network"),
-        ("dqn_job_scorer", "dqn06", "dqn_job_scorer.q_network"),
+        ("dqn_job_scorer", "dqn05", "dqn_job_scorer.adaptive_hybrid_q_v2"),
+        ("dqn_job_scorer", "dqn06", "dqn_job_scorer.adaptive_hybrid_q_v2"),
     ]
     configs = [json.loads(row[4]) for row in rows]
     assert [item["name"] for item in configs] == ["dqn05", "dqn06"]
     assert configs[0]["seed"] != configs[1]["seed"]
-
-
-def test_schema_migration_preserves_existing_model_as_default(tmp_path: Path):
-    import duckdb
-
-    database = tmp_path / "version4.duckdb"
-    connection = duckdb.connect(str(database))
-    connection.execute(
-        "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TIMESTAMP)"
-    )
-    connection.execute("INSERT INTO schema_migrations VALUES (4, current_timestamp)")
-    connection.execute(
-        """
-        CREATE TABLE training_models (
-            model_id VARCHAR PRIMARY KEY,
-            family_id VARCHAR NOT NULL,
-            trainer_path VARCHAR NOT NULL,
-            min_new_batches INTEGER NOT NULL,
-            config_json JSON NOT NULL,
-            active_checkpoint_id VARCHAR,
-            last_attempted_batch_seq BIGINT NOT NULL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT current_timestamp,
-            updated_at TIMESTAMP DEFAULT current_timestamp
-        )
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO training_models (
-            model_id, family_id, trainer_path, min_new_batches, config_json,
-            active_checkpoint_id, last_attempted_batch_seq
-        ) VALUES ('dqn_job_scorer.q_network', 'dqn_job_scorer', 'trainer:path',
-                  20, '{}', 'checkpoint', 17)
-        """
-    )
-    connection.close()
-
-    with ExperimentStore(database) as store:
-        row = store.connection.execute(
-            """
-            SELECT model_id, agent_type, agent_name, declared_model_id,
-                   active_checkpoint_id, last_attempted_batch_seq
-            FROM training_models
-            """
-        ).fetchone()
-    assert row == (
-        "dqn_job_scorer.q_network",
-        "dqn_job_scorer",
-        "default",
-        "dqn_job_scorer.q_network",
-        "checkpoint",
-        17,
-    )
+    assert configs[1]["jobs"] == 3
+    assert configs[1]["opponents"] == ["frozen-dqn"]

@@ -18,10 +18,10 @@ from pathlib import Path
 from agents.configurable_crop_surrogate.analysis import analyze_run, propose_strategies
 from agents.configurable_crop_surrogate.experiment import ExperimentConfig, run_experiment
 from agents.configurable_crop_surrogate.strategy import generate_population
+from kaggriculture_lab.database import database_target
 from kaggriculture_lab.model_admin import add_model_commands
 from kaggriculture_lab.storage import ExperimentStore
 
-DEFAULT_DATABASE = "artifacts/experiments.duckdb"
 DEFAULT_ARTIFACTS = "artifacts"
 STRATEGY_FOLDER = Path("agents/configurable_crop_surrogate")
 MANIFEST = Path(__file__).with_name("agent.toml")
@@ -29,8 +29,12 @@ SAFE_NAME = re.compile(r"[a-z][a-z0-9_]*")
 
 
 def _add_paths(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--database", default=DEFAULT_DATABASE)
+    parser.add_argument("--database-url")
     parser.add_argument("--artifacts", default=DEFAULT_ARTIFACTS)
+
+
+def _target(args: argparse.Namespace):
+    return database_target(url=args.database_url)
 
 
 def _cmd_strategies(args: argparse.Namespace) -> int:
@@ -50,20 +54,20 @@ def _cmd_strategies(args: argparse.Namespace) -> int:
 
 def _cmd_tournament(args: argparse.Namespace) -> int:
     config = ExperimentConfig.from_toml(args.config)
-    run_id = run_experiment(config, args.database, args.artifacts, args.run_id)
+    run_id = run_experiment(config, _target(args), args.artifacts, args.run_id)
     print(run_id)
     return 0
 
 
 def _cmd_analyze(args: argparse.Namespace) -> int:
-    with ExperimentStore(args.database) as store:
+    with ExperimentStore(_target(args)) as store:
         reports = analyze_run(store, args.run_id, args.artifacts)
     print(json.dumps(reports, indent=2, sort_keys=True))
     return 0
 
 
 def _cmd_propose(args: argparse.Namespace) -> int:
-    with ExperimentStore(args.database) as store:
+    with ExperimentStore(_target(args)) as store:
         strategies = propose_strategies(
             store,
             args.run_id,
@@ -77,8 +81,8 @@ def _cmd_propose(args: argparse.Namespace) -> int:
 
 def _cmd_cycle(args: argparse.Namespace) -> int:
     config = ExperimentConfig.from_toml(args.config)
-    run_id = run_experiment(config, args.database, args.artifacts, args.run_id)
-    with ExperimentStore(args.database) as store:
+    run_id = run_experiment(config, _target(args), args.artifacts, args.run_id)
+    with ExperimentStore(_target(args)) as store:
         reports = analyze_run(store, run_id, args.artifacts)
         proposed = propose_strategies(
             store,
@@ -95,7 +99,7 @@ def _cmd_cycle(args: argparse.Namespace) -> int:
 def _cmd_promote(args: argparse.Namespace) -> int:
     if not SAFE_NAME.fullmatch(args.name):
         raise ValueError("profile name must use lowercase letters, digits, and underscores")
-    with ExperimentStore(args.database) as store:
+    with ExperimentStore(_target(args)) as store:
         strategies = store.load_strategies([args.strategy_id])
     if args.strategy_id not in strategies:
         raise ValueError(f"unknown strategy_id: {args.strategy_id}")
@@ -163,13 +167,12 @@ def main(argv: list[str] | None = None) -> int:
     promote.add_argument("--name", required=True)
     promote.add_argument("--strategy-folder", default=str(STRATEGY_FOLDER))
     promote.add_argument("--force", action="store_true")
-    promote.add_argument("--database", default=DEFAULT_DATABASE)
+    promote.add_argument("--database-url")
     promote.set_defaults(func=_cmd_promote)
 
     add_model_commands(
         commands,
         manifest_path=MANIFEST,
-        default_database=DEFAULT_DATABASE,
         default_artifacts=DEFAULT_ARTIFACTS,
     )
 

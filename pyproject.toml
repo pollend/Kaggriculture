@@ -5,9 +5,12 @@ description = "Configurable Kaggriculture agents and surrogate-assisted tourname
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "duckdb>=1.4",
+    "kaggle>=2.2.4",
     "kaggle-environments>=1.32.6",
+    "matplotlib>=3.11",
     "pandas>=3.0",
+    "psycopg[binary]>=3.2",
+    "pyarrow>=20.0",
     "scikit-learn>=1.8",
 ]
 

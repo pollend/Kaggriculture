@@ -1,0 +1,20 @@
+[league]
+league = "adaptive_route"
+name = "adaptive-route-planner-training"
+manifest = "agents/adaptive_route_planner/agent.toml"
+anchor_manifests = [
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/agent.toml",
+  "agents/competitor_lucifer19_kaggriculture_night_harvest/agent.toml",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/agent.toml",
+  "agents/configurable_crop_surrogate/agent.toml",
+  "agents/receding_horizon_planner/agent.toml",
+]
+training_manifests = ["agents/adaptive_route_planner/agent.toml"]
+population_size = 20
+rounds_per_generation = 20
+hall_of_fame_rounds = 4
+episode_steps = 720
+seed = 70117
+jobs = 0
+tau = 0.5
+candidate_pool = 10000

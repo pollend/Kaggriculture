@@ -1,0 +1,22 @@
+family_id = "dqn_market_scorer_match_policy"
+name = "Market Scorer Match Policy"
+entry_point = "agents.dqn_market_scorer.match_agent:make_agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_market_scorer.main:evaluate_episode"
+
+# Training-only: rollout episodes are recorded as league pairings under this
+# identity so they are queryable like any match. It imports `training/`, so it
+# is never bundled for submission -- `agent.toml` remains the submission
+# manifest.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_market_scorer/__init__.py",
+  "agents/dqn_market_scorer/match_agent.py",
+  "agents/dqn_market_scorer/main.py",
+  "agents/dqn_market_scorer/donor.py",
+  "agents/dqn_market_scorer/market_exec.py",
+  "agents/dqn_market_scorer/market_policy.py",
+  "agents/dqn_market_scorer/policy.py",
+  "agents/dqn_market_scorer/training/__init__.py",
+  "agents/dqn_market_scorer/training/collect.py",
+]

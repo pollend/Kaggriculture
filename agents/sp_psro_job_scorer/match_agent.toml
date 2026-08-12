@@ -1,0 +1,20 @@
+family_id = "sp_psro_match_policy_v3"
+name = "SP-PSRO Joint Match Policy v3"
+entry_point = "agents.sp_psro_job_scorer.match_agent:make_agent"
+parameter_schema_version = 2
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_job_scorer/__init__.py",
+  "agents/dqn_job_scorer/main.py",
+  "agents/dqn_job_scorer/features.py",
+  "agents/dqn_job_scorer/hybrid.py",
+  "agents/dqn_job_scorer/jobs.py",
+  "agents/dqn_job_scorer/market.py",
+  "agents/dqn_job_scorer/market_policy.py",
+  "agents/dqn_job_scorer/policy.py",
+  "agents/dqn_job_scorer/rules.py",
+  "agents/sp_psro_job_scorer/__init__.py",
+  "agents/sp_psro_job_scorer/match_agent.py",
+  "agents/sp_psro_job_scorer/policy.py",
+  "agents/sp_psro_job_scorer/runtime.py",
+]

@@ -1,4 +1,7 @@
-"""DuckDB experiment catalog and portable exports."""
+"""Experiment storage and portable exports.
+
+PostgreSQL is the sole backend.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from kaggriculture_lab.database import DatabaseTarget, connect_postgres
 from kaggriculture_lab.identity import (
     DEFAULT_AGENT_NAME,
     AgentManifest,
@@ -19,17 +23,18 @@ from kaggriculture_lab.identity import (
 )
 from sim.runner import MatchResult
 
-SCHEMA_VERSION = 5
-
 
 class ExperimentStore:
-    def __init__(self, path: str | Path):
-        import duckdb
-
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = duckdb.connect(str(self.path))
-        self._initialize()
+    def __init__(
+        self,
+        database: str | DatabaseTarget,
+    ):
+        self.target = (
+            database
+            if isinstance(database, DatabaseTarget)
+            else DatabaseTarget(database)
+        )
+        self.connection = connect_postgres(self.target)
 
     def close(self) -> None:
         self.connection.close()
@@ -40,66 +45,52 @@ class ExperimentStore:
     def __exit__(self, *_: object) -> None:
         self.close()
 
-    def _initialize(self) -> None:
-        """Build missing tables, then migrate an older database forward.
-
-        `schema.sql` is `CREATE TABLE IF NOT EXISTS` only, so replaying it adds
-        new tables but never reshapes existing ones. That is why an unstamped
-        database can be treated as current -- the file always describes the
-        current shape, an invariant every schema change has to maintain -- while
-        a stamped one has to walk `migrations/` to get there.
-        """
-
-        schema_path = Path(__file__).with_name("schema.sql")
-        self.connection.execute(schema_path.read_text())
-        version = int(
-            self.connection.execute(
-                "SELECT coalesce(max(version), 0) FROM schema_migrations"
-            ).fetchone()[0]
-        )
-        if version == 0:
-            self.connection.execute(
-                "INSERT INTO schema_migrations (version) VALUES (?)", [SCHEMA_VERSION]
-            )
-            return
-        while version < SCHEMA_VERSION:
-            self._apply_migration(version + 1)
-            applied = int(
-                self.connection.execute(
-                    "SELECT max(version) FROM schema_migrations"
-                ).fetchone()[0]
-            )
-            if applied <= version:
-                raise RuntimeError(
-                    f"migration to schema version {version + 1} did not stamp itself"
-                )
-            version = applied
-        if version != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"unsupported experiment schema version {version!r}; "
-                f"expected {SCHEMA_VERSION}"
-            )
-
-    def _apply_migration(self, version: int) -> None:
-        matches = sorted(
-            (Path(__file__).parent / "migrations").glob(f"{version:03d}_*.sql")
-        )
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"expected exactly one migration script for schema version {version}, "
-                f"found {len(matches)}"
-            )
-        self.connection.execute(matches[0].read_text())
-
     def register_family(
         self, manifest: AgentManifest, manifest_path: str | Path
     ) -> None:
-        """Register a family and its backward-compatible default model instance."""
+        """Register a family and its default model instance."""
 
         self.register_training_agent(
             manifest,
             manifest_path,
             TrainingAgentSpec(type=manifest.family_id, name=DEFAULT_AGENT_NAME),
+        )
+
+    def register_agent_family(
+        self, manifest: AgentManifest, manifest_path: str | Path
+    ) -> None:
+        """Register the family row alone, declaring no model instance.
+
+        Distinct from `register_family` because that one also (re)writes the
+        manifest's models for the default instance, resetting their
+        `config_json` to the manifest defaults. A caller that has merely *met* a
+        manifest -- an opponent it played, say -- must not overwrite the
+        configuration a runner set for a model that may be mid-training.
+        """
+
+        self.connection.execute(
+            """
+            INSERT INTO agent_families VALUES (
+                %s, %s, %s, %s, %s, %s, %s, current_timestamp
+            )
+            ON CONFLICT (family_id) DO UPDATE SET
+                name = excluded.name,
+                manifest_path = excluded.manifest_path,
+                entry_point = excluded.entry_point,
+                training_adapter = excluded.training_adapter,
+                episode_evaluator = excluded.episode_evaluator,
+                parameter_schema_version = excluded.parameter_schema_version,
+                created_at = excluded.created_at
+            """,
+            [
+                manifest.family_id,
+                manifest.name,
+                str(manifest_path),
+                manifest.entry_point,
+                manifest.training_adapter,
+                manifest.episode_evaluator,
+                manifest.parameter_schema_version,
+            ],
         )
 
     def register_training_agent(
@@ -116,27 +107,13 @@ class ExperimentStore:
                 f"training agent type {instance.type!r} does not match manifest "
                 f"family_id {manifest.family_id!r}"
             )
-        self.connection.execute(
-            """
-            INSERT OR REPLACE INTO agent_families VALUES (
-                ?, ?, ?, ?, ?, ?, ?, current_timestamp
-            )
-            """,
-            [
-                manifest.family_id,
-                manifest.name,
-                str(manifest_path),
-                manifest.entry_point,
-                manifest.training_adapter,
-                manifest.episode_evaluator,
-                manifest.parameter_schema_version,
-            ],
-        )
+        self.register_agent_family(manifest, manifest_path)
         identifiers: list[str] = []
         for model in manifest.models:
             identifier = effective_model_id(model.model_id, instance.name)
             identifiers.append(identifier)
             config = dict(model.config or {})
+            config.update(instance.model_config or {})
             config["agent_type"] = instance.type
             config["name"] = instance.name
             if instance.seed is not None:
@@ -148,7 +125,7 @@ class ExperimentStore:
                 INSERT INTO training_models (
                     model_id, family_id, agent_type, agent_name, declared_model_id,
                     trainer_path, min_new_batches, config_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (model_id) DO UPDATE SET
                     family_id = excluded.family_id,
                     agent_type = excluded.agent_type,
@@ -172,7 +149,40 @@ class ExperimentStore:
             )
         return tuple(identifiers)
 
+    def ensure_agent_families(self, revisions: Iterable[AgentRevision]) -> None:
+        """Guarantee a parent row for every family a revision cites.
+
+        Built-in anchors (`identity.builtin_revision`) and ad-hoc evaluation
+        opponents name families -- `builtin`, `evaluation_opponent` -- that no
+        manifest ever registers, and `agent_revisions.family_id` references
+        `agent_families`. Placeholders are written with `DO NOTHING`, so a real
+        `register_family` still overwrites them whenever one arrives."""
+
+        first: dict[str, AgentRevision] = {}
+        for item in revisions:
+            first.setdefault(item.family_id, item)
+        if not first:
+            return
+        self.connection.executemany(
+            """
+            INSERT INTO agent_families
+            VALUES (%s, %s, '', %s, NULL, %s, %s, current_timestamp)
+            ON CONFLICT (family_id) DO NOTHING
+            """,
+            [
+                [
+                    family_id,
+                    family_id,
+                    item.entry_point,
+                    item.episode_evaluator,
+                    item.parameter_schema_version,
+                ]
+                for family_id, item in first.items()
+            ],
+        )
+
     def add_agent_revisions(self, revisions: Iterable[AgentRevision]) -> None:
+        items = list(revisions)
         rows = [
             [
                 item.revision_id,
@@ -188,16 +198,18 @@ class ExperimentStore:
                 item.source,
                 item.episode_evaluator,
             ]
-            for item in revisions
+            for item in items
         ]
         if rows:
+            self.ensure_agent_families(items)
             self.connection.executemany(
                 """
-                INSERT OR IGNORE INTO agent_revisions (
+                INSERT INTO agent_revisions (
                     revision_id, family_id, strategy_id, entry_point, agent_spec,
                     code_fingerprint, parameter_schema_version, params_json,
                     checkpoint_id, checkpoint_digest, source, episode_evaluator
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
                 """,
                 rows,
             )
@@ -207,7 +219,10 @@ class ExperimentStore:
         digest = hashlib.sha256(raw).hexdigest()
         payload = gzip.compress(raw, compresslevel=6)
         self.connection.execute(
-            "INSERT OR REPLACE INTO episode_payloads VALUES (?, ?, ?)",
+            """INSERT INTO episode_payloads VALUES (%s, %s, %s)
+            ON CONFLICT (match_id) DO UPDATE SET
+                replay_gzip = excluded.replay_gzip,
+                payload_sha256 = excluded.payload_sha256""",
             [match_id, payload, digest],
         )
         return digest
@@ -222,12 +237,20 @@ class ExperimentStore:
         git_commit: str | None,
     ) -> None:
         self.connection.execute(
-            "INSERT OR REPLACE INTO runs VALUES (?, ?, current_timestamp, 'RUNNING', ?, ?, ?, ?)",
+            """INSERT INTO runs VALUES (%s, %s, current_timestamp, 'RUNNING', %s, %s, %s, %s)
+            ON CONFLICT (run_id) DO UPDATE SET
+                name = excluded.name,
+                created_at = excluded.created_at,
+                status = excluded.status,
+                seed = excluded.seed,
+                config_json = excluded.config_json,
+                versions_json = excluded.versions_json,
+                git_commit = excluded.git_commit""",
             [run_id, name, seed, json.dumps(config), json.dumps(versions), git_commit],
         )
 
     def finish_run(self, run_id: str, status: str = "COMPLETE") -> None:
-        self.connection.execute("UPDATE runs SET status = ? WHERE run_id = ?", [status, run_id])
+        self.connection.execute("UPDATE runs SET status = %s WHERE run_id = %s", [status, run_id])
 
     def add_strategies(
         self, strategies: Iterable[Any], source: str, run_id: str | None = None
@@ -240,12 +263,12 @@ class ExperimentStore:
         ]
         if rows:
             self.connection.executemany(
-                "INSERT OR IGNORE INTO strategies VALUES (?, ?, ?, ?)", rows
+                "INSERT INTO strategies VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", rows
             )
 
     def completed_match_ids(self, run_id: str) -> set[str]:
         rows = self.connection.execute(
-            "SELECT match_id FROM episodes WHERE run_id = ?", [run_id]
+            "SELECT match_id FROM episodes WHERE run_id = %s", [run_id]
         ).fetchall()
         return {row[0] for row in rows}
 
@@ -262,7 +285,7 @@ class ExperimentStore:
         self.connection.execute("BEGIN")
         try:
             self.connection.execute(
-                "INSERT OR IGNORE INTO episodes VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO episodes VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                 [
                     match_id,
                     run_id,
@@ -290,9 +313,10 @@ class ExperimentStore:
                 metrics = seat.metrics
                 self.connection.execute(
                     """
-                    INSERT OR IGNORE INTO episode_players VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    INSERT INTO episode_players VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
                     )
+                    ON CONFLICT DO NOTHING
                     """,
                     [
                         match_id,
@@ -332,10 +356,10 @@ class ExperimentStore:
             """
             SELECT strategy_id, avg(money_difference) AS score
             FROM episode_players
-            WHERE run_id = ? AND stage = ? AND strategy_id NOT LIKE 'builtin:%' AND NOT failed
+            WHERE run_id = %s AND stage = %s AND strategy_id NOT LIKE 'builtin:%' AND NOT failed
             GROUP BY strategy_id
             ORDER BY score DESC, strategy_id
-            LIMIT ?
+            LIMIT %s
             """,
             [run_id, stage, limit],
         ).fetchall()
@@ -353,7 +377,7 @@ class ExperimentStore:
             ids = list(strategy_ids)
             if not ids:
                 return {}
-            placeholders = ",".join("?" for _ in ids)
+            placeholders = ",".join("%s" for _ in ids)
             rows = self.connection.execute(
                 f"SELECT strategy_id, params_json FROM strategies WHERE strategy_id IN ({placeholders})",
                 ids,
@@ -361,10 +385,10 @@ class ExperimentStore:
         return {row[0]: json.loads(row[1]) for row in rows}
 
     def save_ratings(self, run_id: str, ratings: dict[str, tuple[float, int]]) -> None:
-        self.connection.execute("DELETE FROM ratings WHERE run_id = ?", [run_id])
+        self.connection.execute("DELETE FROM ratings WHERE run_id = %s", [run_id])
         rows = [[run_id, key, value[0], value[1]] for key, value in ratings.items()]
         if rows:
-            self.connection.executemany("INSERT INTO ratings VALUES (?, ?, ?, ?)", rows)
+            self.connection.executemany("INSERT INTO ratings VALUES (%s, %s, %s, %s)", rows)
 
     def save_model(
         self,
@@ -375,14 +399,20 @@ class ExperimentStore:
         report: dict[str, Any],
     ) -> None:
         self.connection.execute(
-            "INSERT OR REPLACE INTO models VALUES (?, ?, ?, ?, ?, current_timestamp)",
+            """INSERT INTO models VALUES (%s, %s, %s, %s, %s, current_timestamp)
+            ON CONFLICT (model_id) DO UPDATE SET
+                run_id = excluded.run_id,
+                kind = excluded.kind,
+                artifact_path = excluded.artifact_path,
+                report_json = excluded.report_json,
+                created_at = excluded.created_at""",
             [model_id, run_id, kind, artifact_path, json.dumps(report, sort_keys=True)],
         )
 
     def save_proposals(self, run_id: str, rows: list[dict[str, Any]]) -> None:
-        self.connection.execute("DELETE FROM proposals WHERE run_id = ?", [run_id])
+        self.connection.execute("DELETE FROM proposals WHERE run_id = %s", [run_id])
         self.connection.executemany(
-            "INSERT INTO proposals VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO proposals VALUES (%s, %s, %s, %s, %s, %s, %s)",
             [
                 [
                     run_id,
@@ -403,14 +433,23 @@ class ExperimentStore:
         tables = ("runs", "strategies", "episodes", "episode_players", "ratings", "models", "proposals")
         written: list[Path] = []
         for table in tables:
-            run_filter = "run_id = ?" if table != "strategies" else "created_run_id = ?"
+            run_filter = "run_id = %s" if table != "strategies" else "created_run_id = %s"
             extension = "csv" if csv else "parquet"
             path = destination / f"{table}.{extension}"
-            escaped = str(path).replace("'", "''")
-            options = "(HEADER, DELIMITER ',')" if csv else "(FORMAT PARQUET, COMPRESSION ZSTD)"
-            self.connection.execute(
-                f"COPY (SELECT * FROM {table} WHERE {run_filter}) TO '{escaped}' {options}",
-                [run_id],
+            import pyarrow as pa
+            import pyarrow.csv as pa_csv
+            import pyarrow.parquet as pa_parquet
+
+            cursor = self.connection.execute(
+                f"SELECT * FROM {table} WHERE {run_filter}", [run_id]
             )
+            names = [column.name for column in cursor.description]
+            arrow_table = pa.Table.from_pylist(
+                [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
+            )
+            if csv:
+                pa_csv.write_csv(arrow_table, path)
+            else:
+                pa_parquet.write_table(arrow_table, path, compression="zstd")
             written.append(path)
         return written

@@ -19,7 +19,7 @@ batch.
   and post-episode evaluator
 - `train.py` — lab-facing `on_round` / `on_batch` trainer object
 - `training.py` — mutation, crossover, surrogate fitting, and held-out gating
-- `evaluation.py` — `main.py` hook that derives training metrics from DuckDB replays
+- `evaluation.py` — `main.py` hook that derives training metrics from PostgreSQL replays
 
 Run a named variant directly from the repository root:
 
@@ -52,9 +52,9 @@ Generation creation uses the active checkpoint and falls back to mutation/crosso
 before the first promotion.
 
 The batches, update watermark, candidates, and active checkpoint are stored under the
-model ID in the selected DuckDB catalog. Resuming or starting another session against
-that catalog reuses them; a separate database starts a separate learning history.
+model ID in PostgreSQL. Resuming or starting another session against the same database
+reuses them; a separate database starts a separate learning history.
 
 The configurable agent keeps routing targets and action counters in an `EpisodeState`
 owned by that callable. It resets when step zero starts a new game; persistent learning
-state lives in DuckDB and immutable checkpoint artifacts instead of module globals.
+state lives in PostgreSQL and immutable checkpoint artifacts instead of module globals.

@@ -7,6 +7,8 @@ import json
 import shutil
 from pathlib import Path
 
+from kaggriculture_lab.constants import default_database
+from kaggriculture_lab.database import DatabaseTarget, database_target
 from kaggriculture_lab.identity import (
     DEFAULT_AGENT_NAME,
     AgentManifest,
@@ -29,7 +31,7 @@ def _register_manifest(
     instance = TrainingAgentSpec(type=manifest.family_id, name=name)
     instance.validate()
     identifiers = [effective_model_id(model.model_id, name) for model in manifest.models]
-    placeholders = ",".join("?" for _ in identifiers)
+    placeholders = ",".join("%s" for _ in identifiers)
     existing = int(
         store.connection.execute(
             f"SELECT count(*) FROM training_models WHERE model_id IN ({placeholders})",
@@ -54,16 +56,16 @@ def _single_model_id(
 
 def model_status(
     manifest_path: str | Path,
-    database: str | Path,
+    database: str | DatabaseTarget | None = None,
     *,
     name: str = DEFAULT_AGENT_NAME,
 ) -> list[dict[str, object]]:
     """Return batch progress and the active checkpoint for one agent's models."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         manifest = _register_manifest(store, manifest_path, name)
         identifiers = [effective_model_id(model.model_id, name) for model in manifest.models]
-        placeholders = ",".join("?" for _ in identifiers)
+        placeholders = ",".join("%s" for _ in identifiers)
         rows = store.connection.execute(
             f"""
             SELECT tm.model_id, tm.min_new_batches, tm.active_checkpoint_id,
@@ -92,7 +94,7 @@ def model_status(
 
 def update_agent_model(
     manifest_path: str | Path,
-    database: str | Path,
+    database: str | DatabaseTarget | None = None,
     *,
     artifacts: str | Path,
     force: bool = False,
@@ -100,7 +102,7 @@ def update_agent_model(
 ) -> UpdateReport:
     """Try the sole model declared by an agent manifest."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         manifest = _register_manifest(store, manifest_path, name)
         return update_model_in_store(
             store,
@@ -112,7 +114,7 @@ def update_agent_model(
 
 def export_active_model(
     manifest_path: str | Path,
-    database: str | Path,
+    database: str | DatabaseTarget,
     output: str | Path,
     *,
     confirm_release: bool,
@@ -127,16 +129,19 @@ def export_active_model(
         model_id = _single_model_id(manifest, name)
         row = store.connection.execute(
             """
-            SELECT mtc.inference_artifact_path
+            SELECT mtc.inference_artifact_path, mtc.gate_json
             FROM training_models tm
             JOIN model_training_checkpoints mtc
               ON mtc.checkpoint_id = tm.active_checkpoint_id
-            WHERE tm.model_id = ?
+            WHERE tm.model_id = %s
             """,
             [model_id],
         ).fetchone()
     if row is None:
         raise ValueError(f"model has no active checkpoint: {model_id}")
+    gate = json.loads(str(row[1] or "{}"))
+    if gate.get("passed") is not True:
+        raise ValueError(f"active checkpoint has not passed its release gate: {model_id}")
     source = Path(str(row[0]))
     if not source.is_file():
         raise FileNotFoundError(f"active inference artifact is missing: {source}")
@@ -151,7 +156,6 @@ def add_model_commands(
     commands: argparse._SubParsersAction,
     *,
     manifest_path: str | Path,
-    default_database: str,
     default_artifacts: str,
     allow_export: bool = False,
 ) -> None:
@@ -162,7 +166,7 @@ def add_model_commands(
 
     status = actions.add_parser("status", help="show batch progress and active checkpoint")
     status.add_argument("--name", default=DEFAULT_AGENT_NAME)
-    status.add_argument("--database", default=default_database)
+    _add_database_options(status)
     status.set_defaults(
         func=_cmd_status,
         model_manifest=str(manifest_path),
@@ -171,7 +175,7 @@ def add_model_commands(
     update = actions.add_parser("update", help="retry this agent's eligible model update")
     update.add_argument("--name", default=DEFAULT_AGENT_NAME)
     update.add_argument("--force", action="store_true")
-    update.add_argument("--database", default=default_database)
+    _add_database_options(update)
     update.add_argument("--artifacts", default=default_artifacts)
     update.set_defaults(
         func=_cmd_update,
@@ -182,7 +186,7 @@ def add_model_commands(
         export = actions.add_parser("export-active", help="copy the promoted inference artifact for release")
         export.add_argument("--name", default=DEFAULT_AGENT_NAME)
         export.add_argument("--output", required=True)
-        export.add_argument("--database", default=default_database)
+        _add_database_options(export)
         export.add_argument("--confirm-release", action="store_true")
         export.set_defaults(
             func=_cmd_export_active,
@@ -190,10 +194,18 @@ def add_model_commands(
         )
 
 
+def _add_database_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database-url")
+
+
+def _target(args: argparse.Namespace) -> DatabaseTarget:
+    return database_target(url=args.database_url)
+
+
 def _cmd_status(args: argparse.Namespace) -> int:
     print(
         json.dumps(
-            model_status(args.model_manifest, args.database, name=args.name),
+            model_status(args.model_manifest, _target(args), name=args.name),
             indent=2,
             sort_keys=True,
         )
@@ -204,7 +216,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 def _cmd_update(args: argparse.Namespace) -> int:
     report = update_agent_model(
         args.model_manifest,
-        args.database,
+        _target(args),
         artifacts=args.artifacts,
         force=args.force,
         name=args.name,
@@ -216,7 +228,7 @@ def _cmd_update(args: argparse.Namespace) -> int:
 def _cmd_export_active(args: argparse.Namespace) -> int:
     output = export_active_model(
         args.model_manifest,
-        args.database,
+        _target(args),
         args.output,
         confirm_release=args.confirm_release,
         name=args.name,

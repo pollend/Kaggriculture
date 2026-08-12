@@ -30,9 +30,8 @@ python -m sim.arena match \
 
 ## Parameter tuning
 
-The separate constants-driven runner uses
-`artifacts/planner_experiments.duckdb`, so it does not touch the crop/DQN training
-history:
+The separate constants-driven runner labels its sessions `planner` and uses globally
+unique model IDs in the shared PostgreSQL database:
 
 ```bash
 python train_planner.py

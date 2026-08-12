@@ -6,7 +6,7 @@ mix, crops planted, plants lost, market orders, money -- lives here and is
 injected into `run_match` by the callers that want it.
 
 Used by the league to persist per-episode metrics, which agents' own evaluation
-hooks then read back out of DuckDB.
+hooks then read back out of PostgreSQL.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ def episode_metrics(steps: list, seat: int) -> dict[str, Any]:
 
     previous_plants: dict[tuple[int, int, int, str], dict] = {}
     previous_day: int | None = None
+    previous_hires_today = 0
     hires_observed = 0
 
     for state in steps:
@@ -81,8 +82,12 @@ def episode_metrics(steps: list, seat: int) -> dict[str, Any]:
             continue
         farm = farms[seat]
         if previous_day is not None and day != previous_day:
-            hires_observed += int(farm.get("hires_today", 0))
+            # `hires_today` resets at the day roll, so the outgoing day's total is the
+            # last value seen while that day was still current, not the first value of
+            # the new one.
+            hires_observed += previous_hires_today
         previous_day = day
+        previous_hires_today = int(farm.get("hires_today", 0))
 
         current_plants: dict[tuple[int, int, int, str], dict] = {}
         for y, row in enumerate(farm.get("tiles", [])):
@@ -101,6 +106,8 @@ def episode_metrics(steps: list, seat: int) -> dict[str, Any]:
             if isinstance(tile, dict) and tile.get("kind") == "WEED":
                 inferred_losses += 1
         previous_plants = current_plants
+
+    hires_observed += previous_hires_today
 
     final_obs = _observation(steps[-1], seat)
     private = _obs_get(final_obs, "private", {}) or {}

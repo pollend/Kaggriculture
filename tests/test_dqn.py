@@ -14,6 +14,7 @@ import json
 import pathlib
 import time
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +24,13 @@ import torch
 from agents.dqn_job_scorer import features as F
 from agents.dqn_job_scorer.jobs import MAX_JOBS, enumerate_jobs
 from agents.dqn_job_scorer.main import JobScorerAgent
-from agents.dqn_job_scorer.policy import QNetwork, select
+from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
+from agents.dqn_job_scorer.policy import PolicyBundle, QNetwork, select
 from agents.dqn_job_scorer.training import network as net_module
 from agents.dqn_job_scorer.training.collect import (
     EPISODE_ARRAY_FIELDS,
     MONEY_SCALE,
-    WIN_BONUS,
+    TERMINAL_MARGIN_SCALE,
     Recorder,
     collect_episode,
     load_episode_batch,
@@ -36,25 +38,31 @@ from agents.dqn_job_scorer.training.collect import (
     save_episode_batch,
 )
 from agents.dqn_job_scorer.training.replay import ReplayBuffer
-from kaggriculture_lab.identity import AgentManifest
+from kaggriculture_lab.identity import AgentManifest, TrainingAgentSpec
 from kaggriculture_lab.model_updates import record_training_batch, update_model_in_store
 from kaggriculture_lab.storage import ExperimentStore
 from sim.runner import run_match
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 GAMMA = 0.997
+MODEL_ID = "dqn_job_scorer.adaptive_hybrid_q_v2"
 
 
 @pytest.fixture(scope="module")
-def episode():
-    record = collect_episode(
-        QNetwork.random(seed=1).layers,
+def episode(tmp_path_factory):
+    root = tmp_path_factory.mktemp("rollout")
+    weights = root / "behavior.npz"
+    PolicyBundle(QNetwork.random(seed=1)).save(weights)
+    rollout = collect_episode(
+        weights,
         opponent_spec="starter",
         seed=3,
         epsilon=0.3,
         gamma=GAMMA,
+        trace_root=root,
     )
-    assert record is not None, "collection returned nothing -- the learner errored"
-    return record
+    assert rollout is not None, "collection returned nothing -- the learner errored"
+    return rollout.record
 
 
 # --- train / inference parity ------------------------------------------------
@@ -82,19 +90,40 @@ def test_export_round_trips():
         np.testing.assert_array_equal(b1, b2)
 
 
+def test_joint_policy_bundle_round_trips_and_legacy_falls_back(tmp_path):
+    joint_path = tmp_path / "joint.npz"
+    original = PolicyBundle.random(seed=23)
+    original.save(joint_path)
+    restored = PolicyBundle.load(joint_path)
+    assert restored.market is not None
+    assert restored.job.layers[0][0].shape[0] == F.FEATURE_DIM
+    assert restored.market.layers[0][0].shape[0] == MARKET_FEATURE_DIM
+
+    legacy_path = tmp_path / "legacy.npz"
+    original.job.save(legacy_path)
+    legacy = PolicyBundle.load(legacy_path)
+    assert legacy.market is None
+
+
+def test_explicit_network_seed_is_a_frozen_schema_current_policy():
+    from agents.dqn_job_scorer import main as main_module
+
+    observed = main_module._load_network(json.dumps({"network_seed": 17}))
+    expected = QNetwork.random(seed=17)
+    for (observed_w, observed_b), (expected_w, expected_b) in zip(observed.layers, expected.layers):
+        np.testing.assert_array_equal(observed_w, expected_w)
+        np.testing.assert_array_equal(observed_b, expected_b)
+
+
 def test_episode_batch_round_trips_without_pickle(episode, tmp_path):
     path = save_episode_batch([episode], tmp_path / "batch.npz")
     restored = load_episode_batch(path)
     assert len(restored) == 1
     for field_name in EPISODE_ARRAY_FIELDS:
-        np.testing.assert_array_equal(
-            getattr(restored[0], field_name), getattr(episode, field_name)
-        )
+        np.testing.assert_array_equal(getattr(restored[0], field_name), getattr(episode, field_name))
 
 
-def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
-    episode, tmp_path, monkeypatch
-):
+def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(episode, tmp_path, monkeypatch):
     from agents.dqn_job_scorer.training import updater as updater_module
 
     manifest_path = Path("agents/dqn_job_scorer/agent.toml")
@@ -105,16 +134,18 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
     # and is never checked in. Seed the cold start from a local one instead, so
     # the test does not depend on artifacts left behind by a previous run.
     incumbent = tmp_path / "incumbent.npz"
-    QNetwork.random(seed=13).save(incumbent)
+    PolicyBundle.random(seed=19).save(incumbent)
     config = {
         **(manifest.models[0].config or {}),
-        "incumbent_weights": str(incumbent),
         "gradient_steps_per_batch": 1,
         "batch_size": 8,
         "buffer_episodes": 16,
         "warmup_episodes": 1,
         "jobs": 1,
         "eval_seeds": 1,
+        "initialization": "incumbent",
+        "incumbent_weights": str(incumbent),
+        "benchmarks": ["starter", "crop.py", "planner.py"],
     }
     unresolved_evaluation = {
         "opponent": "test",
@@ -131,23 +162,21 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
         lambda _weights, opponent, *_args, **_kwargs: {
             **unresolved_evaluation,
             "margin": 10.0 if opponent.startswith(updater_module.SELF_SPEC) else 0.0,
-            "margin_ci": [1.0, 20.0]
-            if opponent.startswith(updater_module.SELF_SPEC)
-            else [-1.0, 1.0],
+            "margin_ci": [1.0, 20.0] if opponent.startswith(updater_module.SELF_SPEC) else [-1.0, 1.0],
         },
     )
 
-    with ExperimentStore(tmp_path / "dqn.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "dqn")) as store:
         store.register_family(manifest, manifest_path)
         store.connection.execute(
-            "UPDATE training_models SET config_json = ? WHERE model_id = ?",
-            [json.dumps(config), "dqn_job_scorer.q_network"],
+            "UPDATE training_models SET config_json = %s WHERE model_id = %s",
+            [json.dumps(config), MODEL_ID],
         )
         # Derived, not hardcoded: the threshold tracks the league's round count.
         for index in range(manifest.models[0].min_new_batches):
             record_training_batch(
                 store,
-                "dqn_job_scorer.q_network",
+                MODEL_ID,
                 source_kind="dqn_rollout",
                 source_id=f"rollout-{index}",
                 sample_count=1,
@@ -155,19 +184,152 @@ def test_persistent_dqn_trainer_resumes_once_its_threshold_is_met(
                 artifact_sha256=digest,
                 metadata={"transitions": int(episode.unit_mask.sum())},
             )
-        report = update_model_in_store(
-            store, "dqn_job_scorer.q_network", artifacts=tmp_path
-        )
+        report = update_model_in_store(store, MODEL_ID, artifacts=tmp_path)
         assert report.status == "promoted"
         checkpoint = store.connection.execute(
             """
             SELECT trainer_artifact_path, inference_artifact_path
-            FROM model_training_checkpoints WHERE checkpoint_id = ?
+            FROM model_training_checkpoints WHERE checkpoint_id = %s
             """,
             [report.checkpoint_id],
         ).fetchone()
         assert Path(checkpoint[0]).exists()
         assert Path(checkpoint[1]).exists()
+        evaluation = store.connection.execute(
+            """
+            SELECT opponent_checkpoint_id
+            FROM model_evaluations
+            WHERE update_id = %s AND evaluation_kind = 'incumbent_head_to_head'
+            """,
+            [report.update_id],
+        ).fetchone()
+        assert evaluation == (None,)
+        benchmark_evaluations = store.connection.execute(
+            """
+            SELECT evaluation_kind, passed FROM model_evaluations
+            WHERE update_id = %s AND evaluation_kind LIKE 'fixed_benchmark:%%'
+            ORDER BY evaluation_kind
+            """,
+            [report.update_id],
+        ).fetchall()
+        assert benchmark_evaluations == [
+            ("fixed_benchmark:0", True),
+            ("fixed_benchmark:1", True),
+            ("fixed_benchmark:2", True),
+        ]
+
+
+def test_rollout_episodes_are_recorded_as_league_pairings(tmp_path):
+    """The point of the match manifest: a rollout is an ordinary league episode.
+
+    Without this the only trace of ~1600 episodes per generation is one
+    `training_batches` row per batch, and questions like "what did the learner
+    actually play" have no answer in SQL.
+    """
+    from agents.dqn_job_scorer.training.updater import DQNCollector
+    from kaggriculture_lab.model_trainers import RoundContext, TrainingBatchWriter
+    from kaggriculture_lab.model_updates import ModelTrainingReader
+
+    manifest_path = Path("agents/dqn_job_scorer/agent.toml")
+    manifest = AgentManifest.load(manifest_path)
+    config = {
+        **(manifest.models[0].config or {}),
+        "batches_per_round": 1,
+        "episodes_per_batch": 4,
+        "episode_steps": 48,
+        "jobs": 1,
+        "league_opponents": False,
+        "self_play_after": 1000,
+        "opponents": ["starter", "pass"],
+    }
+
+    with ExperimentStore(postgres_database(tmp_path, "dqn-rollout-pairings")) as store:
+        store.register_family(manifest, manifest_path)
+        seed_reference_rows(
+            store.connection,
+            run_id="session",
+            session_id="session",
+            generation_id="session:g0000",
+        )
+        context = RoundContext(
+            MODEL_ID,
+            manifest.family_id,
+            "round",
+            "session",
+            "session:g0000",
+            0,
+            0,
+            None,
+            config,
+            tmp_path,
+        )
+        written = DQNCollector().collect(
+            context, ModelTrainingReader(store), TrainingBatchWriter(store, MODEL_ID)
+        )
+        assert written == ["rollout-00000000"]
+
+        pairings = store.connection.execute(
+            """
+            SELECT lp.pairing_id, count(pe.match_id), pr.paired_margin IS NOT NULL
+            FROM league_pairings lp
+            JOIN pairing_episodes pe USING (pairing_id)
+            LEFT JOIN pairing_results pr USING (pairing_id)
+            WHERE lp.pairing_kind = 'dqn_rollout'
+            GROUP BY lp.pairing_id, pr.paired_margin
+            """
+        ).fetchall()
+        # Four episodes, two seeds, both seat orientations of each: every
+        # pairing complete, so every paired margin is settled.
+        assert len(pairings) == 2
+        assert all(row[1] == 2 and row[2] for row in pairings)
+        assert store.connection.execute(
+            "SELECT count(*) FROM episode_players"
+        ).fetchone()[0] == 8
+        # A rollout is stored exactly like a scheduled match, replay included.
+        # Dropping the payload here saved disk and cost every replay-reading
+        # evaluation hook -- which fires for these episodes too -- so it became
+        # an `episode_evaluations` ERROR row instead of a diagnostic.
+        assert store.connection.execute(
+            "SELECT count(*) FROM episode_payloads"
+        ).fetchone()[0] == 4
+
+        # The manifest names an episode evaluator, so the rollout episodes carry
+        # the same per-seat evaluation league matches do.
+        evaluations = store.connection.execute(
+            "SELECT status, count(*) FROM episode_evaluations GROUP BY status"
+        ).fetchall()
+        assert evaluations == [("COMPLETE", 4)]
+
+        # The learner is one revision across the batch, not one per episode --
+        # and, because the behaviour policy is keyed by the checkpoint it came
+        # from rather than by round, one revision across rounds too while that
+        # checkpoint stands. Keying it by round minted 312 single-batch revisions
+        # in dqn-self-play-v1, none with enough games behind it to hold a rating.
+        def learner_revisions():
+            return store.connection.execute(
+                "SELECT count(*) FROM agent_revisions WHERE family_id = %s",
+                ["dqn_job_scorer_match_policy"],
+            ).fetchone()[0]
+
+        assert learner_revisions() == 1
+
+        # The transitions the updater trains on are linked to the episodes they
+        # came from, so a batch can be traced back to its matches.
+        assert store.connection.execute(
+            """
+            SELECT count(*) FROM training_batch_artifacts tba
+            JOIN training_batches tb USING (batch_id)
+            WHERE tb.model_id = %s
+            """,
+            [MODEL_ID],
+        ).fetchone()[0] == 4
+
+        DQNCollector().collect(
+            replace(context, round_index=1),
+            ModelTrainingReader(store),
+            TrainingBatchWriter(store, MODEL_ID),
+        )
+        assert learner_revisions() == 1
 
 
 def test_feature_dimensions_are_pinned():
@@ -189,13 +351,8 @@ def test_shaping_is_potential_based(episode):
     shaping = GAMMA * phi[1:] - phi[:-1]
     terminal_bonus = float(episode.reward[-1] - episode.raw_reward[-1] - shaping[-1])
 
-    assert terminal_bonus == pytest.approx(
-        min((-WIN_BONUS, 0.0, WIN_BONUS), key=lambda value: abs(value - terminal_bonus)),
-        abs=1e-5,
-    )
-    np.testing.assert_allclose(
-        episode.reward[:-1], episode.raw_reward[:-1] + shaping[:-1], atol=1e-5
-    )
+    assert -1.0 <= terminal_bonus <= 1.0
+    np.testing.assert_allclose(episode.reward[:-1], episode.raw_reward[:-1] + shaping[:-1], atol=1e-5)
     assert float(episode.reward[-1]) == pytest.approx(
         float(episode.raw_reward[-1] + shaping[-1] + terminal_bonus), abs=1e-5
     )
@@ -214,7 +371,7 @@ def test_potential_counts_unsold_value_but_not_cash():
     assert potential(farm, private, obs) == pytest.approx((3 * 35 + 2 * 25 + 4 * 25) / MONEY_SCALE)
 
 
-def test_terminal_potential_is_zero_and_draw_bonus_is_neutral():
+def test_terminal_potential_is_zero_and_money_margin_is_rewarded():
     recorder = Recorder()
     recorder.record(
         global_feats=np.zeros(F.GLOBAL_DIM, dtype=np.float32),
@@ -233,11 +390,11 @@ def test_terminal_potential_is_zero_and_draw_bonus_is_neutral():
         private={"shed": {}, "inventories": [{}]},
         truncated=0,
     )
-    record = recorder.finish(final_money=1000.0, outcome=0.5, gamma=GAMMA)
+    record = recorder.finish(final_money=3000.0, opponent_money=1000.0, gamma=GAMMA)
 
     assert record.potential[-1] == 0.0
-    assert record.raw_reward[-1] == 0.0
-    assert record.reward[-1] == pytest.approx(-record.potential[0])
+    assert record.raw_reward[-1] == 2.0
+    assert record.reward[-1] == pytest.approx(2.0 - record.potential[0] + 2000.0 / TERMINAL_MARGIN_SCALE)
 
 
 # --- replay fidelity ---------------------------------------------------------
@@ -257,14 +414,10 @@ def test_replay_reconstructs_the_features_the_agent_saw(episode):
             expected = F.assemble(
                 episode.global_feats[t],
                 episode.job_static[t, :count].astype(np.float32),
-                F.distance_features(
-                    episode.job_targets[t, :count], position, int(episode.committed[t, unit])
-                ),
+                F.distance_features(episode.job_targets[t, :count], position, int(episode.committed[t, unit])),
             )
             np.testing.assert_array_equal(rebuilt, expected)
-            np.testing.assert_array_equal(
-                available, episode.available[t, unit, :count]
-            )
+            np.testing.assert_array_equal(available, episode.available[t, unit, :count])
             assert available[int(episode.chosen[t, unit])]
 
 
@@ -281,6 +434,36 @@ def test_sampled_batch_shapes_and_terminal_discount(episode):
     terminal = batch.discount == 0.0
     assert not batch.next_mask[terminal].any()
     assert np.all(batch.discount[~terminal] > 0)
+
+
+def test_market_replay_uses_daily_factors_and_elapsed_turn_discount(tmp_path):
+    weights = tmp_path / "behavior.npz"
+    PolicyBundle(
+        QNetwork.random(seed=4), QNetwork.random(seed=5, feature_dim=MARKET_FEATURE_DIM)
+    ).save(weights)
+    rollout = collect_episode(
+        weights,
+        opponent_spec="pass",
+        seed=17,
+        epsilon=0.0,
+        gamma=GAMMA,
+        config={"episodeSteps": 48},
+        market_epsilon=0.0,
+        trace_root=tmp_path,
+    )
+    assert rollout is not None
+    record = rollout.record
+    assert record.market_step is not None
+    np.testing.assert_array_equal(record.market_step, [0, 24])
+    buffer = ReplayBuffer(capacity=4, gamma=GAMMA, n_step=1, seed=2)
+    buffer.add([record])
+    batch = buffer.sample_market(64)
+    assert batch.features.shape == (64, 10, MARKET_FEATURE_DIM)
+    assert batch.next_features.shape[:2] == (64, 10)
+    assert batch.next_mask.shape == batch.next_features.shape[:3]
+    nonterminal = batch.discount > 0
+    assert nonterminal.any()
+    np.testing.assert_allclose(batch.discount[nonterminal], GAMMA**24, rtol=1e-5)
 
 
 def test_masked_max_ignores_padding():
@@ -303,13 +486,32 @@ def test_pass_is_always_available_and_first():
 
 def test_enumeration_caps_and_reports_truncation():
     tiles = [[None] * 10 for _ in range(10)]
-    farm = {"tiles": tiles, "farmer": [0, 0]}
+    farm = {"tiles": tiles, "farmer": [4, 0]}
     private = {"seeds": {crop: 5 for crop in ("WHEAT", "CARROT", "TOMATO", "STRAWBERRY", "MELON")}}
 
     jobs, truncated = enumerate_jobs(farm, private, 0, [(0, 0)], [{}])
     assert len(jobs) == MAX_JOBS
     # 5 crops x 100 empty tiles + PASS, minus what survived the cap.
     assert truncated == 501 - MAX_JOBS
+
+
+def test_plant_candidates_are_compact_around_the_shed():
+    from agents.dqn_job_scorer.hybrid import HybridPlan
+
+    tiles = [["LOCKED"] * 10 for _ in range(10)]
+    for y in range(5):
+        for x in range(5):
+            tiles[y][x] = None
+    farm = {"tiles": tiles, "farmer": [0, 0]}
+    private = {"seeds": {"WHEAT": 4}}
+    plan = HybridPlan("CROP", "GOOSE", 0, 4, 0)
+
+    jobs, _ = enumerate_jobs(farm, private, 0, [(4, 0)], [{}], plan)
+    targets = [job.target for job in jobs if job.kind == "PLANT"]
+
+    # The nearest NW tiles to the centre shed access at (4, 4), rather than
+    # the row-major prefix (0, 0), (1, 0), ... far from the farm centre.
+    assert targets == [(4, 4), (4, 3), (3, 4), (4, 2)]
 
 
 def test_drop_jobs_stay_with_their_carrier():
@@ -336,9 +538,7 @@ def test_fertilize_jobs_require_and_follow_the_carrier():
     jobs, _ = enumerate_jobs(farm, shed_only, 1, [(0, 0), (0, 0)], [{}, {}])
     assert not [job for job in jobs if job.kind == "FERTILIZE"]
 
-    jobs, _ = enumerate_jobs(
-        farm, shed_only, 1, [(0, 0), (0, 0)], [{}, {"FERTILIZER": 1}]
-    )
+    jobs, _ = enumerate_jobs(farm, shed_only, 1, [(0, 0), (0, 0)], [{}, {"FERTILIZER": 1}])
     fertilize = [job for job in jobs if job.kind == "FERTILIZE"]
     assert len(fertilize) == 1
     assert fertilize[0].owner == 1
@@ -422,20 +622,40 @@ def test_units_stick_to_a_job_instead_of_oscillating():
 
     tiles = [[None] * 10 for _ in range(10)]
     tiles[0][0] = {
-        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "watered_today": False,
-        "consecutive_unwatered": 0, "yield_units": 1, "max_lifespan_step": -1,
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 0,
+        "watered_today": False,
+        "consecutive_unwatered": 0,
+        "yield_units": 1,
+        "max_lifespan_step": -1,
         "fertilized_until_day": -1,
     }
     tiles[9][9] = dict(tiles[0][0])
 
     def observation(position, step):
         return {
-            "player": 0, "step": step, "day": 1, "hour": step % 24,
+            "player": 0,
+            "step": step,
+            "day": 1,
+            "hour": step % 24,
             "farms": [
-                {"money": 3000.0, "tiles": tiles, "farmer": list(position), "hands": [],
-                 "unlocked_quadrants": ["NW", "NE", "SW", "SE"], "hires_today": 0},
-                {"money": 3000.0, "tiles": [[None]], "farmer": [0, 0], "hands": [],
-                 "unlocked_quadrants": ["NW"], "hires_today": 0},
+                {
+                    "money": 3000.0,
+                    "tiles": tiles,
+                    "farmer": list(position),
+                    "hands": [],
+                    "unlocked_quadrants": ["NW", "NE", "SW", "SE"],
+                    "hires_today": 0,
+                },
+                {
+                    "money": 3000.0,
+                    "tiles": [[None]],
+                    "farmer": [0, 0],
+                    "hands": [],
+                    "unlocked_quadrants": ["NW"],
+                    "hires_today": 0,
+                },
             ],
             "market": {"inventory": {}, "prices": {}},
             "town": {"unlocked_shops": []},
@@ -464,12 +684,27 @@ def test_commitment_clears_at_day_boundary():
     agent._day = 1
 
     obs = {
-        "player": 0, "step": 24, "day": 2, "hour": 0,
+        "player": 0,
+        "step": 24,
+        "day": 2,
+        "hour": 0,
         "farms": [
-            {"money": 3000.0, "tiles": [[None]], "farmer": [0, 0], "hands": [],
-             "unlocked_quadrants": ["NW"], "hires_today": 0},
-            {"money": 3000.0, "tiles": [[None]], "farmer": [0, 0], "hands": [],
-             "unlocked_quadrants": ["NW"], "hires_today": 0},
+            {
+                "money": 3000.0,
+                "tiles": [[None]],
+                "farmer": [0, 0],
+                "hands": [],
+                "unlocked_quadrants": ["NW"],
+                "hires_today": 0,
+            },
+            {
+                "money": 3000.0,
+                "tiles": [[None]],
+                "farmer": [0, 0],
+                "hands": [],
+                "unlocked_quadrants": ["NW"],
+                "hires_today": 0,
+            },
         ],
         "market": {"inventory": {}, "prices": {}},
         "town": {"unlocked_shops": []},
@@ -504,10 +739,41 @@ def test_epsilon_zero_play_is_deterministic(tmp_path):
     assert [s.reward for s in first.seats] == [s.reward for s in second.seats]
 
 
+def _played_actions(match) -> list:
+    return [state[0]["action"] for state in match.replay["steps"]]
+
+
+@pytest.mark.parametrize(
+    "target", ["agents/dqn_job_scorer/main.py", "agents.dqn_job_scorer.main:agent"]
+)
+def test_weights_query_selects_the_policy(tmp_path, target):
+    """`?weights=` must reach the agent, or every promotion gate is a no-op.
+
+    `sim.registry.resolve` only exports KAGG_AGENT_CONFIG for the duration of
+    the resolve, and `sim.runner.run_match` resolves both seats before either
+    one plays. An agent that reads the variable when its first observation
+    arrives sees nothing and silently falls back to the packaged weights, so
+    challenger and incumbent play as the same policy and every paired margin
+    collapses to exactly zero. The `module:attr` form additionally survives in
+    `sys.modules`, so a stale policy would outlive the process's first resolve.
+    """
+    left, right = tmp_path / "left.npz", tmp_path / "right.npz"
+    QNetwork.random(seed=5).save(left)
+    QNetwork.random(seed=97).save(right)
+
+    first = run_match((f"{target}?weights={left}", "starter"), seed=4)
+    second = run_match((f"{target}?weights={right}", "starter"), seed=4)
+    assert not first.failed and not second.failed
+    assert _played_actions(first) != _played_actions(second)
+
+
 def test_agent_emits_only_legal_actions(tmp_path):
     weights = tmp_path / "w.npz"
     QNetwork.random(seed=9).save(weights)
-    match = run_match((f"agents/dqn_job_scorer/main.py?weights={weights}", "starter"), seed=2, keep_replay=True)
+    match = run_match(
+        (f"agents/dqn_job_scorer/main.py?weights={weights}", "starter"),
+        seed=2,
+    )
     assert not match.failed
 
     for state in match.replay["steps"]:
@@ -526,18 +792,37 @@ def test_inference_stays_far_under_act_timeout():
     for y in range(5):
         for x in range(5):
             tiles[y][x] = {
-                "kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "watered_today": False,
-                "consecutive_unwatered": 0, "yield_units": 2, "max_lifespan_step": -1,
+                "kind": "PLANT",
+                "crop": "WHEAT",
+                "planted_day": 0,
+                "watered_today": False,
+                "consecutive_unwatered": 0,
+                "yield_units": 2,
+                "max_lifespan_step": -1,
                 "fertilized_until_day": -1,
             }
     obs = {
-        "player": 0, "step": 100, "day": 4, "hour": 4,
+        "player": 0,
+        "step": 100,
+        "day": 4,
+        "hour": 4,
         "farms": [
-            {"money": 5000.0, "tiles": tiles, "farmer": [4, 4],
-             "hands": [[i % 10, i // 10] for i in range(12)],
-             "unlocked_quadrants": ["NW", "NE", "SW", "SE"], "hires_today": 12},
-            {"money": 5000.0, "tiles": tiles, "farmer": [4, 4], "hands": [],
-             "unlocked_quadrants": ["NW"], "hires_today": 0},
+            {
+                "money": 5000.0,
+                "tiles": tiles,
+                "farmer": [4, 4],
+                "hands": [[i % 10, i // 10] for i in range(12)],
+                "unlocked_quadrants": ["NW", "NE", "SW", "SE"],
+                "hires_today": 12,
+            },
+            {
+                "money": 5000.0,
+                "tiles": tiles,
+                "farmer": [4, 4],
+                "hands": [],
+                "unlocked_quadrants": ["NW"],
+                "hires_today": 0,
+            },
         ],
         "market": {"inventory": {}, "prices": {}},
         "town": {"unlocked_shops": []},
@@ -559,10 +844,14 @@ def test_submission_agent_never_imports_torch():
     import sys
 
     result = subprocess.run(
-        [sys.executable, "-c",
-         "import sys; import agents.dqn_job_scorer.main; "
-         "assert 'torch' not in sys.modules, 'torch leaked into the submission agent'"],
-        capture_output=True, text=True,
+        [
+            sys.executable,
+            "-c",
+            "import sys; import agents.dqn_job_scorer.main; "
+            "assert 'torch' not in sys.modules, 'torch leaked into the submission agent'",
+        ],
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
 
@@ -600,8 +889,13 @@ def _context():
     from kaggriculture_lab.hooks import EpisodeHookContext
 
     return EpisodeHookContext(
-        session_id="s", generation_id="g", pairing_id="p", match_id="m",
-        revision_id="rev1", opponent_revision_id="rev2", seat=0,
+        session_id="s",
+        generation_id="g",
+        pairing_id="p",
+        match_id="m",
+        revision_id="rev1",
+        opponent_revision_id="rev2",
+        seat=0,
     )
 
 
@@ -646,22 +940,6 @@ def test_evaluator_ignores_failed_episodes():
     assert result["should_reevaluate"] is False
 
 
-def test_episode_reader_rejects_mutating_and_multi_statement_sql(tmp_path):
-    """A reporting hook must not be able to write to the league it reports on."""
-    from kaggriculture_lab.hooks import EpisodeReader
-
-    with ExperimentStore(tmp_path / "readonly.duckdb") as store:
-        reader = EpisodeReader(connection=store.connection, match_id="m", seat=0)
-        for statement in (
-            "DELETE FROM episode_players",
-            "UPDATE runs SET status = 'x'",
-            "DROP TABLE runs",
-            "SELECT 1; DELETE FROM episode_players",
-        ):
-            with pytest.raises(ValueError, match="only permits SELECT/WITH"):
-                reader.fetchall(statement)
-
-
 def test_truncation_keeps_maintenance_over_planting():
     """Only PLANT multiplies, so it must be what overflows the cap.
 
@@ -673,8 +951,13 @@ def test_truncation_keeps_maintenance_over_planting():
     tiles = [[None] * 10 for _ in range(10)]
     # One thirsty plant in the far corner, about to become a weed.
     tiles[9][9] = {
-        "kind": "PLANT", "crop": "WHEAT", "planted_day": 0, "watered_today": False,
-        "consecutive_unwatered": 1, "yield_units": 0, "max_lifespan_step": -1,
+        "kind": "PLANT",
+        "crop": "WHEAT",
+        "planted_day": 0,
+        "watered_today": False,
+        "consecutive_unwatered": 1,
+        "yield_units": 0,
+        "max_lifespan_step": -1,
         "fertilized_until_day": -1,
     }
     farm = {"tiles": tiles, "farmer": [0, 0]}
@@ -690,7 +973,7 @@ def test_truncation_keeps_maintenance_over_planting():
     assert all(job.kind == "PLANT" for job in jobs if job.kind not in {"PASS", "WATER"})
 
 
-def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
+def test_evaluator_runs_against_the_real_postgres_schema(tmp_path):
     """The fake-reader tests pin the logic; this pins the SQL.
 
     `EpisodeReader.history` joins `episode_players` by `strategy_id`, and a
@@ -704,9 +987,21 @@ def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
         return MatchResult(
             seed=1,
             seats=[
-                SeatResult("dqn", 0, mine, "DONE", False, None, None, 1, 0.0, 0.0, 0.0, mine,
-                           {"productive_action_percentage": 0.2, "movement_percentage": 0.6,
-                            "plants_lost_inferred": 3}),
+                SeatResult(
+                    "dqn",
+                    0,
+                    mine,
+                    "DONE",
+                    False,
+                    None,
+                    None,
+                    1,
+                    0.0,
+                    0.0,
+                    0.0,
+                    mine,
+                    {"productive_action_percentage": 0.2, "movement_percentage": 0.6, "plants_lost_inferred": 3},
+                ),
                 SeatResult("heur", 1, theirs, "DONE", False, None, None, 1, 0.0, 0.0, 0.0, theirs, {}),
             ],
             steps=1,
@@ -714,14 +1009,24 @@ def test_evaluator_runs_against_the_real_duckdb_schema(tmp_path):
             replay={"steps": [[{"observation": {"step": 0}}]]},
         )
 
-    with ExperimentStore(tmp_path / "league.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "league")) as store:
+        seed_reference_rows(
+            store.connection, run_id="run", family_id="family", revision_ids=("rev1", "rev2")
+        )
         # 30 prior games: the older half strong, the recent half collapsed.
         for index in range(30):
             mine = 21_000.0 if index < 15 else 8_000.0
-            store.add_match(f"m{index:03d}", "run", "league:t", ("rev1", "rev2"), ("rev1", "rev2"),
-                            match(f"m{index:03d}", mine, 19_000.0))
-        store.add_match("current", "run", "league:t", ("rev1", "rev2"), ("rev1", "rev2"),
-                        match("current", 8_000.0, 19_000.0))
+            store.add_match(
+                f"m{index:03d}",
+                "run",
+                "league:t",
+                ("rev1", "rev2"),
+                ("rev1", "rev2"),
+                match(f"m{index:03d}", mine, 19_000.0),
+            )
+        store.add_match(
+            "current", "run", "league:t", ("rev1", "rev2"), ("rev1", "rev2"), match("current", 8_000.0, 19_000.0)
+        )
 
         reader = EpisodeReader(store.connection, "current", 0)
         history = reader.history("rev1", limit=80)
@@ -807,6 +1112,178 @@ def test_promotion_rejects_collapses():
     resolved = _promotions(DQN03_EVALS, lambda margin, ci, best: best is None or ci[0] > best)
     assert 50 not in resolved  # -26,616
     assert 20 not in resolved  # -13,144
+
+
+def test_point_estimate_rule_admits_what_significance_withholds():
+    """`promotion_rule = "point_estimate"` is the looser of the two, not a third.
+
+    It promotes strictly more: round 70's +2,466 with a lower bound of +1,437
+    against an incumbent of +2,402 is the noise the resolved rule exists to drop,
+    and the point-estimate rule takes it. Both still reject every collapse,
+    because a negative mean is negative under either reading.
+    """
+    from agents.dqn_job_scorer.training.updater import _PROMOTION_RULES
+
+    assert _PROMOTION_RULES == {"significant", "point_estimate"}
+    loose = _promotions(DQN03_EVALS, lambda margin, ci, best: best is None or margin > best)
+    strict = _promotions(DQN03_EVALS, lambda margin, ci, best: best is None or ci[0] > best)
+
+    assert set(strict) < set(loose)
+    assert loose == [10, 30, 40, 60, 70]
+    assert 50 not in loose and 20 not in loose
+
+
+# --- learner lineage ---------------------------------------------------------
+
+
+class _StubReader:
+    """Answers the lineage lookup, then the rejection-streak count."""
+
+    def __init__(self, row, rejections=0):
+        self.row = row
+        self.rejections = rejections
+        self.statements: list[str] = []
+
+    def fetchone(self, sql, _parameters):
+        self.statements.append(sql)
+        if "model_updates" in sql:
+            return (self.rejections,)
+        return self.row
+
+
+def _lineage_context(tmp_path, active_id, active_trainer, config=None):
+    from kaggriculture_lab.model_updates import ActiveCheckpoint
+
+    return types.SimpleNamespace(
+        model_id=MODEL_ID,
+        config=config or {},
+        active_checkpoint=(
+            None
+            if active_id is None
+            else ActiveCheckpoint(
+                active_id, str(active_trainer), str(tmp_path / "released.npz"), "sha", {}
+            )
+        ),
+    )
+
+
+def test_learner_resumes_from_a_rejected_checkpoint(tmp_path):
+    """A rejected update still advances the run.
+
+    dqn-self-play-v1 rejected thirteen consecutive updates and reloaded the
+    released checkpoint every time, so cumulative `gradient_steps` sat at 24,000
+    for 3.8 hours. Release stays gated; the gradient trajectory does not restart.
+    """
+    from agents.dqn_job_scorer.training.updater import lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    rejected = tmp_path / "rejected.pt"
+    released.write_bytes(b"released")
+    rejected.write_bytes(b"rejected")
+    context = _lineage_context(tmp_path, "released-id", released)
+    reader = _StubReader(("rejected-id", str(rejected), str(tmp_path / "rejected.npz")))
+
+    resumed = lineage_checkpoint(context, reader)
+    assert resumed.checkpoint_id == "rejected-id"
+    assert resumed.trainer_artifact_path == rejected
+    assert not resumed.released
+
+
+def test_rollouts_follow_the_lineage_not_the_release(tmp_path):
+    """The inference artifact travels with the trainer state.
+
+    Sourcing the behaviour policy from `active_checkpoint` is what stalled
+    dqn-self-play-v1: batches 60 through 340 all came out of one checkpoint
+    frozen at 07:59, so the buffer saw a single stationary distribution while the
+    learner walked away from it.
+    """
+    from agents.dqn_job_scorer.training.updater import lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    rejected = tmp_path / "rejected.pt"
+    released.write_bytes(b"released")
+    rejected.write_bytes(b"rejected")
+    context = _lineage_context(tmp_path, "released-id", released)
+    reader = _StubReader(("rejected-id", str(rejected), str(tmp_path / "rejected.npz")))
+
+    resumed = lineage_checkpoint(context, reader)
+    assert resumed.inference_artifact_path == tmp_path / "rejected.npz"
+    assert resumed.inference_artifact_path != Path(
+        context.active_checkpoint.inference_artifact_path
+    )
+
+
+def test_lineage_resets_to_the_release_after_a_rejection_streak(tmp_path):
+    """Following the lineage forever locks a divergence in.
+
+    Fifteen consecutive rejections left the run 26,000 gradient steps into a
+    policy that lost 100 of 100 head-to-head and 92 of 100 to `starter`. Below
+    the limit the run carries on; at it, the lineage snaps back and says so.
+    """
+    from agents.dqn_job_scorer.training.updater import lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    rejected = tmp_path / "rejected.pt"
+    released.write_bytes(b"released")
+    rejected.write_bytes(b"rejected")
+    row = ("rejected-id", str(rejected), str(tmp_path / "rejected.npz"))
+    context = _lineage_context(
+        tmp_path, "released-id", released, {"resume_reset_after_rejections": 5}
+    )
+
+    below = lineage_checkpoint(context, _StubReader(row, rejections=4))
+    assert below.checkpoint_id == "rejected-id" and not below.reset
+    assert below.rejection_streak == 4
+
+    tripped_reader = _StubReader(row, rejections=5)
+    tripped = lineage_checkpoint(context, tripped_reader)
+    assert tripped.checkpoint_id == "released-id"
+    assert tripped.reset and tripped.released and tripped.rejection_streak == 5
+
+    # The streak restarts at a reset as well as at a promotion. Counting only
+    # from the last promotion would leave the streak permanently over the limit
+    # once it crossed it, so every later update would reset too and the run
+    # would be back to re-deriving one candidate from the release forever.
+    streak_query = next(s for s in tripped_reader.statements if "model_updates" in s)
+    assert "lineage_reset" in streak_query and "PROMOTED" in streak_query
+
+
+def test_lineage_reset_is_off_until_configured(tmp_path):
+    """No limit means no streak query, so a stub reader is never asked for one."""
+    from agents.dqn_job_scorer.training.updater import lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    rejected = tmp_path / "rejected.pt"
+    released.write_bytes(b"released")
+    rejected.write_bytes(b"rejected")
+    context = _lineage_context(tmp_path, "released-id", released)
+    row = ("rejected-id", str(rejected), str(tmp_path / "rejected.npz"))
+
+    resumed = lineage_checkpoint(context, _StubReader(row, rejections=99))
+    assert resumed.checkpoint_id == "rejected-id" and resumed.rejection_streak == 0
+
+
+def test_resume_falls_back_to_the_release_when_the_artifact_is_gone(tmp_path):
+    """A pruned trainer `.pt` must not silently restart from random weights."""
+    from agents.dqn_job_scorer.training.updater import lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    released.write_bytes(b"released")
+    context = _lineage_context(tmp_path, "released-id", released)
+    reader = _StubReader(
+        ("rejected-id", str(tmp_path / "missing.pt"), str(tmp_path / "missing.npz"))
+    )
+
+    resumed = lineage_checkpoint(context, reader)
+    assert resumed.checkpoint_id == "released-id"
+    assert resumed.trainer_artifact_path == released
+    assert resumed.released
+
+
+def test_resume_is_none_before_the_first_checkpoint(tmp_path):
+    from agents.dqn_job_scorer.training.updater import lineage_checkpoint
+
+    assert lineage_checkpoint(_lineage_context(tmp_path, None, None), _StubReader(None)) is None
 
 
 # --- replay retention --------------------------------------------------------
@@ -939,20 +1416,86 @@ def test_league_path_self_play_disabled_and_empty_pool():
     assert 0 < sum(1 for i in compose_opponents(base, pool, 1.0) if "weights=" in i)
 
 
-def test_rotation_covers_every_opponent_across_batches():
-    """`collect_batch` plays `opponents[i % len]` for 16 seeds only.
+def test_mixed_curriculum_uses_exact_quarter_self_play_and_rotates_history():
+    from agents.dqn_job_scorer.training.updater import compose_opponents
 
-    Once league revisions join, the list is longer than a batch, so a fixed
-    start would mean the tail never plays at all.
+    base = ["starter", "crop.py", "planner.py"]
+    pool = [f"agents/dqn_job_scorer/main.py?weights=c{n}.npz" for n in range(5)]
+    selected = []
+    for batch_index in range(5):
+        opponents = compose_opponents(
+            base, pool, 0.25, pool_offset=batch_index
+        )
+        played = [opponents[index % len(opponents)] for index in range(16)]
+        self_play = [item for item in played if "weights=" in item]
+        assert len(self_play) == 4
+        assert all(played.count(item) == 4 for item in base)
+        assert len(set(self_play)) == 1
+        selected.append(self_play[0])
+
+    assert selected == pool
+
+
+def test_every_fixed_benchmark_must_pass_non_regression():
+    from agents.dqn_job_scorer.training.updater import benchmark_non_regression
+
+    incumbent = {"errors": 0, "margin_ci": [-10.0, 10.0]}
+    passing = {"errors": 0, "margin_ci": [-20.0, 5.0]}
+    regressed = {"errors": 0, "margin_ci": [-30.0, -11.0]}
+    failed = {"errors": 1, "margin_ci": [0.0, 20.0]}
+
+    results = [
+        benchmark_non_regression(item, incumbent)
+        for item in (passing, regressed, failed)
+    ]
+    assert results == [True, False, False]
+    assert not all(results)
+
+
+def test_identical_policy_head_to_head_is_an_error_not_a_rejection():
+    """A zero-width paired interval means one policy on both seats.
+
+    Scoring it as "no significant improvement" is how a broken `?weights=`
+    hid for 140 batches: every update rejected, the session looked healthy.
+    """
+    from agents.dqn_job_scorer.training.updater import (
+        _reject_degenerate_head_to_head,
+    )
+
+    degenerate = {
+        "errors": {},
+        "pairs": 100,
+        "margin_ci": [0.0, 0.0],
+        "opponent": "agents/dqn_job_scorer/main.py?weights=incumbent.npz",
+    }
+    with pytest.raises(RuntimeError, match="same policy"):
+        _reject_degenerate_head_to_head(degenerate)
+
+    # A real tie has spread, a single pair cannot show any, and a failed
+    # evaluation is already reported through `errors`.
+    _reject_degenerate_head_to_head({**degenerate, "margin_ci": [-12.0, 9.0]})
+    _reject_degenerate_head_to_head({**degenerate, "pairs": 1})
+    _reject_degenerate_head_to_head({**degenerate, "errors": {"seat0": "boom"}})
+
+
+def test_rotation_covers_every_opponent_across_batches():
+    """`collect_batch` draws one opponent per seed *pair*, not per episode.
+
+    Once league revisions join, the list is longer than a batch, so a fixed start
+    would mean the tail never plays at all -- and the offset has to advance by
+    slots consumed, `episodes // 2`, or each batch steps over half the list and
+    the same slots keep coming up. `starter` was 4 of every 16 rollout episodes
+    in dqn-self-play-v1 for 40 batches running because of exactly that.
     """
     from agents.dqn_job_scorer.training.updater import rotate_opponents
 
     opponents = [f"o{n}.py" for n in range(35)]
     episodes = 16
+    slots = episodes // 2
     played: set[str] = set()
-    for batch_index in range(3):
-        rotated = rotate_opponents(opponents, batch_index * episodes)
-        played.update(rotated[index % len(rotated)] for index in range(episodes))
+    for batch_index in range(5):
+        rotated = rotate_opponents(opponents, batch_index * slots)
+        played.update(rotated[(index // 2) % len(rotated)] for index in range(episodes))
     assert played == set(opponents), sorted(set(opponents) - played)
     assert rotate_opponents([], 5) == []
 
@@ -969,20 +1512,18 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
     missing = tmp_path / "gone.npz"
 
     class Context:
-        model_id = "dqn_job_scorer.q_network"
+        model_id = MODEL_ID
         family_id = "dqn_job_scorer"
 
-    with ExperimentStore(tmp_path / "pool.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "pool")) as store:
         store.register_family(manifest, manifest_path)
-        for index, (path, promoted) in enumerate(
-            ((present, True), (missing, True), (present, False))
-        ):
+        for index, (path, promoted) in enumerate(((present, True), (missing, True), (present, False))):
             store.connection.execute(
                 """
                 INSERT INTO model_updates (
                     update_id, model_id, cutoff_batch_seq, new_batch_count,
                     dataset_sha256, status
-                ) VALUES (?, 'dqn_job_scorer.q_network', ?, 1, 'd', 'PROMOTED')
+                ) VALUES (%s, 'dqn_job_scorer.adaptive_hybrid_q_v2', %s, 1, 'd', 'PROMOTED')
                 """,
                 [f"update{index}", index + 1],
             )
@@ -992,7 +1533,7 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
                     checkpoint_id, model_id, update_id, trainer_artifact_path,
                     inference_artifact_path, artifact_sha256, dataset_sha256,
                     metrics_json, gate_json, promoted
-                ) VALUES (?, 'dqn_job_scorer.q_network', ?, ?, ?, 'a', 'd', '{}', '{}', ?)
+                ) VALUES (%s, 'dqn_job_scorer.adaptive_hybrid_q_v2', %s, %s, %s, 'a', 'd', '{}', '{}', %s)
                 """,
                 [f"checkpoint{index}", f"update{index}", str(path), str(path), promoted],
             )
@@ -1002,6 +1543,86 @@ def test_self_play_pool_takes_only_promoted_checkpoints_that_exist(tmp_path):
     # been swept would fail to resolve mid-episode rather than at selection.
     assert pool == [f"{SELF_SPEC}?weights={present}"]
     assert self_play_pool(Context(), None, 0) == []
+
+
+def test_joint_peer_pool_finds_active_instances_and_non_active_history(tmp_path):
+    from agents.dqn_job_scorer.training.peers import (
+        active_checkpoint_opponents,
+        historical_checkpoint_opponents,
+    )
+    from kaggriculture_lab.model_updates import ModelTrainingReader
+
+    dqn_manifest_path = Path("agents/dqn_job_scorer/agent.toml")
+    dqn_manifest = AgentManifest.load(dqn_manifest_path)
+    sp_manifest_path = Path("agents/sp_psro_job_scorer/agent.toml")
+    sp_manifest = AgentManifest.load(sp_manifest_path)
+    peer_model = f"{MODEL_ID}@peer_a"
+    sp_model = "sp_psro_job_scorer.joint_market_population_v3"
+
+    class Context:
+        model_id = MODEL_ID
+
+    with ExperimentStore(postgres_database(tmp_path, "joint-pool")) as store:
+        store.register_training_agent(
+            dqn_manifest,
+            dqn_manifest_path,
+            TrainingAgentSpec("dqn_job_scorer", "default"),
+        )
+        store.register_training_agent(
+            dqn_manifest,
+            dqn_manifest_path,
+            TrainingAgentSpec("dqn_job_scorer", "peer_a"),
+        )
+        store.register_training_agent(
+            sp_manifest,
+            sp_manifest_path,
+            TrainingAgentSpec("sp_psro_job_scorer", "default"),
+        )
+
+        def add_checkpoint(model_id, checkpoint_id, path, *, active):
+            path.write_bytes(checkpoint_id.encode())
+            update_id = f"update-{checkpoint_id}"
+            store.connection.execute(
+                """
+                INSERT INTO model_updates (
+                    update_id, model_id, cutoff_batch_seq, new_batch_count,
+                    dataset_sha256, status
+                ) VALUES (%s, %s, 1, 1, %s, 'PROMOTED')
+                """,
+                [update_id, model_id, checkpoint_id],
+            )
+            store.connection.execute(
+                """
+                INSERT INTO model_training_checkpoints (
+                    checkpoint_id, model_id, update_id, trainer_artifact_path,
+                    inference_artifact_path, artifact_sha256, dataset_sha256,
+                    metrics_json, gate_json, promoted
+                ) VALUES (%s, %s, %s, %s, %s, 'a', %s, '{}', '{}', true)
+                """,
+                [checkpoint_id, model_id, update_id, str(path), str(path), checkpoint_id],
+            )
+            if active:
+                store.connection.execute(
+                    "UPDATE training_models SET active_checkpoint_id = %s WHERE model_id = %s",
+                    [checkpoint_id, model_id],
+                )
+
+        peer_path = tmp_path / "peer.npz"
+        sp_path = tmp_path / "sp.npz"
+        history_path = tmp_path / "history.npz"
+        add_checkpoint(peer_model, "peer-active", peer_path, active=True)
+        add_checkpoint(sp_model, "sp-active", sp_path, active=True)
+        add_checkpoint(MODEL_ID, "dqn-history", history_path, active=False)
+
+        reader = ModelTrainingReader(store)
+        active = active_checkpoint_opponents(Context(), reader, ["dqn_job_scorer", "sp_psro_job_scorer"])
+        history = historical_checkpoint_opponents(Context(), reader, ["dqn_job_scorer"], 5)
+
+    assert active == [
+        f"agents.dqn_job_scorer.main:agent?weights={peer_path}",
+        f"agents.sp_psro_job_scorer.main:agent?weights={sp_path}",
+    ]
+    assert history == [f"agents.dqn_job_scorer.main:agent?weights={history_path}"]
 
 
 def test_duel_decides_promotion_not_benchmark_margin(tmp_path):

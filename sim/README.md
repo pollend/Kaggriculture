@@ -51,7 +51,6 @@ python -m sim.arena sweep  main.py --vs starter --param harvest_age=2,3,4,5 --se
 ```
 
 Flags: `--jobs`, `--steps` (shorten `episodeSteps` for coarse sweeps),
-`--replay-dir` (dump replay JSON for non-wins and errors only),
 `--config KEY=VALUE` (any env configuration key, repeatable).
 
 ## Agent specs
@@ -84,7 +83,7 @@ run_match(("a.py", "b.py"), seed=0)                             # metrics == {}
 ```
 
 The league opts in because it persists those metrics for agents' evaluation hooks to read
-back out of DuckDB. `tests/test_layering.py` enforces the direction: `sim` may not import
+back out of PostgreSQL. `tests/test_layering.py` enforces the direction: `sim` may not import
 `kaggriculture_lab` or any agent.
 
 ## Why it is built this way

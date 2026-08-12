@@ -1,0 +1,22 @@
+# Repository-wide workflow settings. Strategy hyperparameters remain in each
+# agent's agent.toml; this file describes the machine running the lab.
+
+[training]
+generations = 5
+session_id = "all-agents-training"
+sync_environment = true
+run_final_arena = true
+final_arena_seeds = 20
+final_arena_jobs = 8
+include_all_agent_anchors = true
+export_active_dqn_weights = false
+
+[compute]
+# auto selects Metal (MPS) on Apple Silicon when PyTorch supports it, CUDA on
+# machines with NVIDIA support, and otherwise falls back to CPU.
+device = "auto"
+
+[paths]
+artifacts = "artifacts"
+league_config = "configs/league.toml"
+dqn_weights_output = "agents/dqn_job_scorer/weights.npz"

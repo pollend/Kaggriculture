@@ -5,22 +5,33 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import numpy as np
 import torch
 from torch import nn
 
-from agents.dqn_job_scorer.policy import WEIGHTS_PATH, QNetwork
+from agents.dqn_job_scorer.market_policy import MARKET_FEATURE_DIM
+from agents.dqn_job_scorer.policy import WEIGHTS_PATH, PolicyBundle, QNetwork
 from agents.dqn_job_scorer.training import network as net_module
 from agents.dqn_job_scorer.training.collect import (
+    LEARNER_ENTRY_POINT,
     EpisodeFormatError,
     collect_batch,
     load_episode_batch,
     save_episode_batch,
 )
+from agents.dqn_job_scorer.training.device import move_optimizer, resolve_device
+from agents.dqn_job_scorer.training.peers import (
+    active_checkpoint_opponents,
+    historical_checkpoint_opponents,
+)
+from agents.dqn_job_scorer.training.progress import _opponent_policy, _policy_identity
 from agents.dqn_job_scorer.training.replay import ReplayBuffer
+from kaggriculture_lab.model_trainers import EvaluationPolicy
 from kaggriculture_lab.model_updates import (
     ModelEvaluation,
     ModelTrainingReader,
@@ -29,10 +40,40 @@ from kaggriculture_lab.model_updates import (
 )
 
 SELF_SPEC = "agents/dqn_job_scorer/main.py"
+LEARNER_MANIFEST = "agents/dqn_job_scorer/match_agent.toml"
+_PROMOTION_RULES = {"significant", "point_estimate"}
 
 
 def _incumbent_path(config: dict[str, Any]) -> Path:
     return Path(str(config.get("incumbent_weights", WEIGHTS_PATH)))
+
+
+def initial_bundle(config: dict[str, Any]) -> PolicyBundle:
+    """Build the first behavior policy for a new training instance.
+
+    Fixed-curriculum runs can continue from an inference-only checkpoint while
+    starting a fresh optimizer and replay buffer. Ordinary DQN experiments keep
+    their historical random initialization unless they opt in explicitly.
+    """
+
+    initialization = str(config.get("initialization", "random"))
+    if initialization == "random":
+        return PolicyBundle.random(seed=int(config.get("seed", 0)))
+    if initialization != "incumbent":
+        raise ValueError(f"unsupported DQN initialization: {initialization}")
+    path = _incumbent_path(config)
+    if not path.is_file():
+        raise FileNotFoundError(f"DQN incumbent checkpoint does not exist: {path}")
+    bundle = PolicyBundle.load(path)
+    if bundle.market is None:
+        bundle = PolicyBundle(
+            bundle.job,
+            QNetwork.random(
+                seed=int(config.get("seed", 0)) + 1,
+                feature_dim=MARKET_FEATURE_DIM,
+            ),
+        )
+    return bundle
 
 
 def _file_digest(path: Path) -> str:
@@ -56,8 +97,8 @@ def league_opponents(context, reader) -> list[str]:
         SELECT DISTINCT ar.agent_spec
         FROM generation_members gm
         JOIN agent_revisions ar USING (revision_id)
-        WHERE gm.generation_id = ? AND ar.agent_spec IS NOT NULL
-          AND ar.family_id != ?
+        WHERE gm.generation_id = %s AND ar.agent_spec IS NOT NULL
+          AND ar.family_id != %s
         ORDER BY ar.agent_spec
         """,
         [context.generation_id, context.family_id],
@@ -77,8 +118,8 @@ def self_play_pool(context, reader, limit: int) -> list[str]:
     rows = reader.fetchall(
         """
         SELECT inference_artifact_path FROM model_training_checkpoints
-        WHERE model_id = ? AND promoted
-        ORDER BY created_at DESC, checkpoint_id DESC LIMIT ?
+        WHERE model_id = %s AND promoted
+        ORDER BY created_at DESC, checkpoint_id DESC LIMIT %s
         """,
         [context.model_id, limit],
     )
@@ -87,7 +128,116 @@ def self_play_pool(context, reader, limit: int) -> list[str]:
     ]
 
 
-def compose_opponents(base: list[str], pool: list[str], ratio: float) -> list[str]:
+@dataclass(frozen=True, slots=True)
+class LineageCheckpoint:
+    """Where the run actually is, as opposed to what it has released."""
+
+    checkpoint_id: str
+    trainer_artifact_path: Path
+    inference_artifact_path: Path
+    #: True when this is `context.active_checkpoint` -- either because nothing
+    #: newer exists, or because the reset below sent the run back to it.
+    released: bool
+    #: Rejections since the last promotion, at the moment of the call.
+    rejection_streak: int = 0
+    #: Set when the streak tripped `resume_reset_after_rejections`.
+    reset: bool = False
+
+
+def _rejections_since_restart(reader, model_id: str) -> int:
+    """Rejections since the run last got a clean start.
+
+    A clean start is a promotion or a previous reset. Counting only from the
+    last promotion would make the reset fire on every update once it fired once
+    -- the streak never drops below the limit until something promotes, so the
+    run would go back to re-deriving the same candidate from the release, which
+    is the waste the lineage exists to avoid. Resetting buys another `limit`
+    updates, not a permanent policy.
+    """
+
+    row = reader.fetchone(
+        """
+        SELECT count(*) FROM model_updates
+        WHERE model_id = %s AND status = 'REJECTED' AND started_at > coalesce(
+            (SELECT max(started_at) FROM model_updates
+             WHERE model_id = %s AND (
+                 status = 'PROMOTED'
+                 OR coalesce((gate_json ->> 'lineage_reset')::boolean, false)
+             )),
+            '-infinity'::timestamp
+        )
+        """,
+        [model_id, model_id],
+    )
+    return 0 if row is None else int(row[0])
+
+
+def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
+    """The newest checkpoint on the model's lineage, promoted or not.
+
+    Release is gated; the learner is not. `context.active_checkpoint` is the
+    *released* policy, and both resuming gradient descent from it and rolling out
+    from it are wrong in the same way: the first discards every step a rejected
+    update took, and the second freezes the behaviour distribution for as long as
+    the gate says no. dqn-self-play-v1 did both -- it reloaded the released
+    weights thirteen times running while every rollout batch from 60 to 340 came
+    out of one checkpoint frozen at 07:59, and the learner drifted to a policy
+    that lost 100 of 100 to its own incumbent and 92 of 100 to `starter`.
+
+    Two escapes. Training and collection both follow the lineage, so the data
+    tracks the learner without shipping an ungated policy; and once the run has
+    been rejected `resume_reset_after_rejections` times in a row, the lineage
+    snaps back to the release, because carrying a diverged trajectory forward
+    forever is how it stays diverged.
+
+    Falls back to the released checkpoint when the newer artifact is missing --
+    trainer `.pt` files are large and a pruned artifact root must not silently
+    restart the run from random weights.
+    """
+
+    def released() -> LineageCheckpoint | None:
+        active = context.active_checkpoint
+        if active is None:
+            return None
+        return LineageCheckpoint(
+            active.checkpoint_id,
+            Path(active.trainer_artifact_path),
+            Path(active.inference_artifact_path),
+            released=True,
+        )
+
+    row = reader.fetchone(
+        """
+        SELECT checkpoint_id, trainer_artifact_path, inference_artifact_path
+        FROM model_training_checkpoints WHERE model_id = %s
+        ORDER BY created_at DESC, checkpoint_id DESC LIMIT 1
+        """,
+        [context.model_id],
+    )
+    if row is None or not Path(str(row[1])).is_file():
+        return released()
+    active = context.active_checkpoint
+    if active is not None and str(row[0]) == active.checkpoint_id:
+        return released()
+
+    limit = int(getattr(context, "config", {}).get("resume_reset_after_rejections", 0))
+    streak = _rejections_since_restart(reader, context.model_id) if limit > 0 else 0
+    if limit > 0 and streak >= limit:
+        fallback = released()
+        if fallback is not None:
+            return replace(fallback, rejection_streak=streak, reset=True)
+    return LineageCheckpoint(
+        str(row[0]),
+        Path(str(row[1])),
+        Path(str(row[2])),
+        released=False,
+        rejection_streak=streak,
+    )
+
+
+def compose_opponents(
+    base: list[str], pool: list[str], ratio: float, *, pool_offset: int = 0
+) -> list[str]:
     """Mix self-play into `base` so it lands on `ratio` of the episodes.
 
     `collect_batch` walks the returned list round-robin, so its composition *is*
@@ -108,7 +258,10 @@ def compose_opponents(base: list[str], pool: list[str], ratio: float) -> list[st
     repeats = max(1, math.ceil((1 - ratio) / (ratio * len(base))))
     widened = base * repeats
     slots = max(1, round(len(widened) * ratio / (1 - ratio)))
-    return [*widened, *(pool[index % len(pool)] for index in range(slots))]
+    return [
+        *widened,
+        *(pool[(pool_offset + index) % len(pool)] for index in range(slots)),
+    ]
 
 
 def rotate_opponents(opponents: list[str], offset: int) -> list[str]:
@@ -126,13 +279,54 @@ def rotate_opponents(opponents: list[str], offset: int) -> list[str]:
     return [*opponents[start:], *opponents[:start]]
 
 
+def _learner_policy(
+    weights_path: Path,
+    epsilon: float,
+    market_epsilon: float,
+    gamma: float,
+) -> EvaluationPolicy:
+    """Identity of the exploring behaviour policy for one batch.
+
+    The spec actually played also carries a per-episode trace path and
+    exploration seed; folding those into the identity would mint one revision
+    per rollout episode. What defines the policy is its weights and how much it
+    explores, so the identity spec carries only those -- and stays resolvable.
+
+    The exploration rates are bucketed to two decimals. They decay continuously,
+    so carrying full precision means a distinct revision every batch and no
+    revision with more than `episodes_per_batch` games to its name; the whole
+    decay from 1.0 to the floor is ~85 buckets, and once at the floor it is one.
+    The identity is therefore a rounding of the policy played, not the policy
+    played -- close enough to name it, and the exact rates stay on the batch.
+    """
+    spec = f"{LEARNER_ENTRY_POINT}?" + urlencode(
+        {
+            "weights": str(weights_path.resolve()),
+            "epsilon": round(epsilon, 2),
+            "market_epsilon": round(market_epsilon, 2),
+            "gamma": gamma,
+        }
+    )
+    return EvaluationPolicy(
+        _policy_identity("dqn-rollout-policy", spec),
+        spec,
+        LEARNER_MANIFEST,
+        "rollout_learner",
+    )
+
+
 class DQNCollector:
     """Roll out exploration episodes for one closed league round.
 
     Off-policy, so the league's population is irrelevant -- only its clock is.
     The round hook supplies the resolved config and active checkpoint, reads go
-    through the SELECT-only reader, and the one write goes through the writer,
-    which is already bound to this model.
+    through the SELECT-only reader, and writes go through the writer, which is
+    already bound to this model.
+
+    Every episode is recorded twice over: as transitions in the batch `.npz` the
+    updater trains from, and as an ordinary league pairing under
+    `pairing_kind = 'dqn_rollout'`, so what the learner actually played is
+    answerable in SQL rather than only inferable from an artifact.
     """
 
     def collect(self, context, reader, writer) -> list[str]:
@@ -140,24 +334,58 @@ class DQNCollector:
         count = int(config.get("batches_per_round", 1))
         if count < 1:
             raise ValueError("batches_per_round must be positive")
-        checkpoint = context.active_checkpoint
+        episodes = int(config.get("episodes_per_batch", 16))
+        if episodes < 2 or episodes % 2:
+            raise ValueError("episodes_per_batch must be a positive even number")
+        # The lineage checkpoint, not the released one. Gating release is a
+        # decision about what to ship; applying it to the behaviour policy as
+        # well means a run that stops promoting also stops seeing new states,
+        # which is the loop dqn-self-play-v1 could not get out of.
+        checkpoint = lineage_checkpoint(context, reader)
         if checkpoint is not None:
-            network = QNetwork.load(checkpoint.inference_artifact_path)
+            bundle = PolicyBundle.load(checkpoint.inference_artifact_path)
+            if bundle.market is None:
+                bundle = PolicyBundle(
+                    bundle.job,
+                    QNetwork.random(
+                        seed=int(config.get("seed", 0)) + 1,
+                        feature_dim=MARKET_FEATURE_DIM,
+                    ),
+                )
         else:
-            incumbent = _incumbent_path(config)
-            if not incumbent.is_file():
-                raise FileNotFoundError(f"configured DQN incumbent is missing: {incumbent}")
-            network = QNetwork.load(incumbent)
+            bundle = initial_bundle(config)
 
         total_transitions = int(
             reader.fetchone(
                 """
-                SELECT coalesce(sum(CAST(json_extract(metadata_json, '$.transitions') AS BIGINT)), 0)
-                FROM training_batches WHERE model_id = ?
+                SELECT coalesce(sum(CAST(metadata_json ->> 'transitions' AS BIGINT)), 0)
+                FROM training_batches WHERE model_id = %s
                 """,
                 [context.model_id],
             )[0]
         )
+        # Rollouts run in spawned workers and the pairing needs a stable policy
+        # identity, so the behaviour policy goes to a file both the workers and
+        # the league refer to. Keyed by the checkpoint it came from, not by
+        # generation and round: `_learner_policy` hashes this path into the
+        # revision id, and with `batches_per_round = 1` a per-round path minted a
+        # throwaway revision every batch -- 312 of them over 4,992 episodes, none
+        # with enough games behind it to carry a rating.
+        behavior_path = (
+            Path(context.artifacts)
+            / "rollout_policies"
+            / f"{checkpoint.checkpoint_id if checkpoint is not None else 'initial'}.npz"
+        )
+        behavior_path.parent.mkdir(parents=True, exist_ok=True)
+        if not behavior_path.is_file():
+            bundle.save(behavior_path)
+        trace_root = (
+            Path(context.artifacts)
+            / "episode_traces"
+            / context.generation_id
+            / f"round-{context.round_index:04d}"
+        )
+
         seed = int(config.get("seed", 0))
         rng = np.random.default_rng(seed + total_transitions)
         written: list[str] = []
@@ -171,17 +399,17 @@ class DQNCollector:
             )
             batch_index = int(
                 reader.fetchone(
-                    "SELECT count(*) FROM training_batches WHERE model_id = ?",
+                    "SELECT count(*) FROM training_batches WHERE model_id = %s",
                     [context.model_id],
                 )[0]
             )
+            # One seed per pair, played twice: the learner takes seat 0 in one
+            # orientation and seat 1 in the other, which is what lets the
+            # pairing settle a seat-balanced margin.
             seeds = [
                 int(value)
-                for value in rng.integers(
-                    0,
-                    2**31 - 1,
-                    size=int(config.get("episodes_per_batch", 16)),
-                )
+                for value in rng.integers(0, 2**31 - 1, size=episodes // 2)
+                for _ in range(2)
             ]
             configured_opponents = config.get("opponents")
             base = (
@@ -195,28 +423,84 @@ class DQNCollector:
             )
             if config.get("league_opponents", True):
                 base += league_opponents(context, reader)
-            # Dedupe: the league's anchors are the same competitor snapshots the
-            # static list already names, and a duplicate is a doubled weight.
+            base += active_checkpoint_opponents(
+                context,
+                reader,
+                [str(item) for item in config.get("active_peer_types", [])],
+            )
+            # Static, league, and active-peer sources may resolve to the same
+            # specification; a duplicate would unintentionally double its weight.
             base = list(dict.fromkeys(base))
-            pool = (
-                self_play_pool(context, reader, int(config.get("self_play_pool", 5)))
-                if batch_index >= int(config.get("self_play_after", 20))
-                else []
-            )
+            pool: list[str] = []
+            if batch_index >= int(config.get("self_play_after", 20)):
+                history_types = [
+                    str(item) for item in config.get("history_peer_types", [])
+                ]
+                pool = (
+                    historical_checkpoint_opponents(
+                        context,
+                        reader,
+                        history_types,
+                        int(config.get("self_play_pool", 5)),
+                    )
+                    if history_types
+                    else self_play_pool(
+                        context, reader, int(config.get("self_play_pool", 5))
+                    )
+                )
             opponents = rotate_opponents(
-                compose_opponents(base, pool, float(config.get("self_play_ratio", 0.3))),
-                batch_index * len(seeds),
+                compose_opponents(
+                    base,
+                    pool,
+                    float(config.get("self_play_ratio", 0.3)),
+                    pool_offset=batch_index,
+                ),
+                # Slots consumed, not episodes played: seat rotation makes
+                # `collect_batch` draw one opponent per seed *pair*, so a batch
+                # of 16 advances the list by 8. Offsetting by 16 would step over
+                # half of it every batch.
+                batch_index * (episodes // 2),
             )
-            records = collect_batch(
-                network.layers,
+            gamma = float(config.get("gamma", 0.997))
+            market_epsilon = float(config.get("market_epsilon_start", 1.0)) + fraction * (
+                float(config.get("market_epsilon_end", config.get("epsilon_end", 0.15)))
+                - float(config.get("market_epsilon_start", 1.0))
+            )
+            learner = _learner_policy(behavior_path, epsilon, market_epsilon, gamma)
+            rollouts = collect_batch(
+                behavior_path,
                 opponents,
                 seeds,
                 epsilon,
-                float(config.get("gamma", 0.997)),
+                gamma,
                 int(config.get("jobs", 1)),
+                config={"episodeSteps": int(config.get("episode_steps", 720))},
+                market_epsilon=market_epsilon,
+                trace_root=trace_root,
+                policy_revision_id=learner.revision_id,
             )
-            if not records:
+            if not rollouts:
                 raise RuntimeError("every DQN rollout episode failed")
+            records = [rollout.record for rollout in rollouts]
+            artifact_ids: list[str] = []
+            for rollout in rollouts:
+                artifact_ids.extend(
+                    writer.record_policy_episode(
+                        context=context,
+                        pairing_kind="dqn_rollout",
+                        pairing_index=batch_index * (episodes // 2) + rollout.pair_index,
+                        left=learner,
+                        right=_opponent_policy(
+                            rollout.opponent_spec,
+                            role="rollout_opponent",
+                            prefix="dqn-rollout-opponent",
+                        ),
+                        # Seat order as played: orientation 0 is (learner,
+                        # opponent), which is exactly the learner holding seat 0.
+                        orientation=rollout.learner_seat,
+                        result=rollout.match,
+                    )
+                )
             source_id = f"rollout-{batch_index:08d}"
             path = (
                 Path(context.artifacts)
@@ -225,7 +509,9 @@ class DQNCollector:
             )
             save_episode_batch(records, path)
             transitions = sum(int(record.unit_mask.sum()) for record in records)
-            writer.record(
+            market_transitions = sum(0 if record.market_step is None else len(record.market_step) for record in records)
+            played = [rollout.opponent_spec for rollout in rollouts]
+            batch = writer.record(
                 source_kind="dqn_rollout",
                 source_id=source_id,
                 sample_count=len(records),
@@ -234,26 +520,26 @@ class DQNCollector:
                 metadata={
                     "episodes": len(records),
                     "transitions": transitions,
+                    "market_transitions": market_transitions,
                     "epsilon": epsilon,
+                    "market_epsilon": market_epsilon,
                     "seeds": seeds,
                     "behavior_checkpoint_id": (
                         checkpoint.checkpoint_id if checkpoint is not None else None
                     ),
+                    "behavior_policy_revision_id": learner.revision_id,
                     "session_id": context.session_id,
                     "generation_id": context.generation_id,
                     "round_index": context.round_index,
                     # Which opponents actually played, so a collapse like dqn04's
                     # can be traced to the mix rather than guessed at.
-                    "opponents": [
-                        opponents[index % len(opponents)] for index in range(len(seeds))
-                    ],
+                    "opponents": played,
                     "self_play_episodes": sum(
-                        1
-                        for index in range(len(seeds))
-                        if opponents[index % len(opponents)].startswith(SELF_SPEC)
+                        1 for spec in played if "?weights=" in spec
                     ),
                 },
             )
+            writer.link_artifacts(batch.batch_id, artifact_ids)
             total_transitions += transitions
             written.append(source_id)
         return written
@@ -283,11 +569,65 @@ def _arena_evaluate(
     }
 
 
+def configured_benchmarks(config: dict[str, Any]) -> list[str]:
+    """Return the fixed release suite, accepting the legacy singular key."""
+
+    configured = config.get("benchmarks")
+    if configured:
+        return list(dict.fromkeys(str(item) for item in configured))
+    return [
+        str(
+            config.get(
+                "benchmark", "agents/configurable_crop_surrogate/main.py"
+            )
+        )
+    ]
+
+
+def _benchmark_kind(index: int, total: int) -> str:
+    return "fixed_benchmark" if total == 1 else f"fixed_benchmark:{index}"
+
+
+def _reject_degenerate_head_to_head(result: dict[str, Any]) -> None:
+    """Fail loudly when challenger and incumbent evaluate as the same policy.
+
+    Paired seeds cancel exactly only when both seats run one policy, so a
+    zero-width interval over many pairs is a harness fault -- a dropped
+    `?weights=`, a missing checkpoint -- not evidence about the candidate.
+    Scored as an ordinary result it reads as "no significant improvement" and
+    the session rejects every update forever while looking healthy.
+    """
+
+    if result["errors"] or int(result["pairs"]) <= 1:
+        return
+    low, high = (float(bound) for bound in result["margin_ci"])
+    if low == 0.0 and high == 0.0:
+        raise RuntimeError(
+            "head-to-head margin is identically zero over "
+            f"{result['pairs']} paired seeds against {result['opponent']}: "
+            "challenger and incumbent are playing as the same policy"
+        )
+
+
+def benchmark_non_regression(
+    challenger: dict[str, Any], incumbent: dict[str, Any]
+) -> bool:
+    """Apply the release gate to one fixed benchmark result pair."""
+
+    return (
+        not challenger["errors"]
+        and not incumbent["errors"]
+        and float(challenger["margin_ci"][1])
+        >= float(incumbent["margin_ci"][0])
+    )
+
+
 class DQNUpdater:
     def update(
         self, context: ModelUpdateContext, reader: ModelTrainingReader
     ) -> ModelUpdateResult:
         config = context.config
+        device = resolve_device(str(config.get("device", "auto")))
         torch.manual_seed(int(config.get("seed", 0)))
         buffer = ReplayBuffer(
             int(config.get("buffer_episodes", 200)),
@@ -316,35 +656,54 @@ class DQNUpdater:
         if len(buffer.episodes) < warmup:
             raise ValueError(f"DQN requires at least {warmup} replay episodes")
 
-        online = net_module.build()
-        target = net_module.build()
+        online = net_module.build().to(device)
+        target = net_module.build().to(device)
+        market_online = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
+        market_target = net_module.build(feature_dim=MARKET_FEATURE_DIM).to(device)
         optimizer = torch.optim.Adam(
             online.parameters(), lr=float(config.get("learning_rate", 1e-4))
         )
+        market_optimizer = torch.optim.Adam(
+            market_online.parameters(), lr=float(config.get("market_learning_rate", 1e-4))
+        )
         gradient_steps = 0
-        if context.active_checkpoint is not None:
+        market_gradient_steps = 0
+        resumed = lineage_checkpoint(context, reader)
+        resumed_from = resumed.checkpoint_id if resumed is not None else None
+        if resumed is not None:
             state = torch.load(
-                context.active_checkpoint.trainer_artifact_path,
+                resumed.trainer_artifact_path,
                 map_location="cpu",
                 weights_only=False,
             )
             online.load_state_dict(state["online"])
             target.load_state_dict(state["target"])
             optimizer.load_state_dict(state["optimizer"])
+            move_optimizer(optimizer, device)
             gradient_steps = int(state.get("gradient_steps", 0))
+            if "market_online" in state:
+                market_online.load_state_dict(state["market_online"])
+                market_target.load_state_dict(state["market_target"])
+                market_optimizer.load_state_dict(state["market_optimizer"])
+                move_optimizer(market_optimizer, device)
+                market_gradient_steps = int(state.get("market_gradient_steps", 0))
+            else:
+                market_target.load_state_dict(market_online.state_dict())
             if "torch_rng_state" in state:
                 torch.set_rng_state(state["torch_rng_state"])
             if "replay_rng_state" in state:
                 buffer.rng.bit_generator.state = state["replay_rng_state"]
         else:
-            incumbent = _incumbent_path(config)
-            if not incumbent.is_file():
-                raise FileNotFoundError(f"configured DQN incumbent is missing: {incumbent}")
-            net_module.from_numpy(QNetwork.load(incumbent), online)
+            bundle = initial_bundle(config)
+            online = net_module.from_numpy(bundle.job, online)
+            if bundle.market is not None:
+                market_online = net_module.from_numpy(bundle.market, market_online)
             target.load_state_dict(online.state_dict())
+            market_target.load_state_dict(market_online.state_dict())
 
         loss_fn = nn.SmoothL1Loss()
         losses: list[float] = []
+        market_losses: list[float] = []
         steps_to_run = int(config.get("gradient_steps_per_batch", 400)) * len(
             context.new_batches
         )
@@ -353,11 +712,11 @@ class DQNUpdater:
         started = time.perf_counter()
         for _ in range(steps_to_run):
             batch = buffer.sample(batch_size)
-            features = torch.from_numpy(batch.features)
-            next_features = torch.from_numpy(batch.next_features)
-            next_mask = torch.from_numpy(batch.next_mask)
-            reward = torch.from_numpy(batch.reward)
-            discount = torch.from_numpy(batch.discount)
+            features = torch.from_numpy(batch.features).to(device)
+            next_features = torch.from_numpy(batch.next_features).to(device)
+            next_mask = torch.from_numpy(batch.next_mask).to(device)
+            reward = torch.from_numpy(batch.reward).to(device)
+            discount = torch.from_numpy(batch.discount).to(device)
             with torch.no_grad():
                 flat = next_features.reshape(-1, next_features.shape[-1])
                 online_q = online(flat).reshape(next_features.shape[:2])
@@ -378,6 +737,40 @@ class DQNUpdater:
             gradient_steps += 1
             if gradient_steps % target_sync == 0:
                 target.load_state_dict(online.state_dict())
+
+        market_steps_to_run = (
+            int(config.get("market_gradient_steps_per_batch", 100)) * len(context.new_batches)
+            if buffer.market_transitions
+            else 0
+        )
+        market_batch_size = int(config.get("market_batch_size", 128))
+        market_target_sync = int(config.get("market_target_sync", target_sync))
+        for _ in range(market_steps_to_run):
+            batch = buffer.sample_market(market_batch_size)
+            features = torch.from_numpy(batch.features).to(device)
+            next_features = torch.from_numpy(batch.next_features).to(device)
+            next_mask = torch.from_numpy(batch.next_mask).to(device)
+            reward = torch.from_numpy(batch.reward).to(device)
+            discount = torch.from_numpy(batch.discount).to(device)
+            with torch.no_grad():
+                flat = next_features.reshape(-1, next_features.shape[-1])
+                shape = next_features.shape[:3]
+                online_q = market_online(flat).reshape(shape)
+                best = online_q.masked_fill(~next_mask, float("-inf")).argmax(dim=2)
+                target_q = market_target(flat).reshape(shape)
+                factor_values = target_q.gather(2, best.unsqueeze(2)).squeeze(2)
+                factor_values = torch.where(next_mask.any(dim=2), factor_values, torch.zeros_like(factor_values))
+                goal = reward + discount * factor_values.sum(dim=1)
+            predicted = market_online(features.reshape(-1, features.shape[-1])).reshape(features.shape[:2]).sum(dim=1)
+            loss = loss_fn(predicted, goal)
+            market_optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(market_online.parameters(), 10.0)
+            market_optimizer.step()
+            market_losses.append(float(loss.detach()))
+            market_gradient_steps += 1
+            if market_gradient_steps % market_target_sync == 0:
+                market_target.load_state_dict(market_online.state_dict())
         train_seconds = time.perf_counter() - started
 
         checkpoint_id = hashlib.sha256(
@@ -393,13 +786,21 @@ class DQNUpdater:
                 "target": target.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "gradient_steps": gradient_steps,
+                "market_online": market_online.state_dict(),
+                "market_target": market_target.state_dict(),
+                "market_optimizer": market_optimizer.state_dict(),
+                "market_gradient_steps": market_gradient_steps,
                 "torch_rng_state": torch.get_rng_state(),
                 "replay_rng_state": buffer.rng.bit_generator.state,
                 "dataset_sha256": context.dataset_sha256,
+                "device": str(device),
             },
             trainer_path,
         )
-        net_module.to_numpy(online).save(inference_path)
+        PolicyBundle(
+            net_module.to_numpy(online),
+            net_module.to_numpy(market_online),
+        ).save(inference_path)
 
         eval_seeds = int(config.get("eval_seeds", 40))
         promotion_seeds = int(config.get("promotion_seeds", 60))
@@ -407,74 +808,138 @@ class DQNUpdater:
         seed_stride = int(config.get("promotion_seed_stride", 10_000))
         seed_start = seed_base + context.cutoff_batch_seq * seed_stride
         jobs = int(config.get("jobs", 1))
-        benchmark = str(config.get("benchmark", "agents/configurable_crop_surrogate/main.py"))
-        challenger_benchmark = _arena_evaluate(
-            inference_path, benchmark, eval_seeds, jobs, seed_start
-        )
+        benchmarks = configured_benchmarks(config)
+        challenger_benchmarks = [
+            _arena_evaluate(inference_path, benchmark, eval_seeds, jobs, seed_start)
+            for benchmark in benchmarks
+        ]
         evaluations: list[ModelEvaluation] = []
         promote = False
         incumbent_path = (
             Path(context.active_checkpoint.inference_artifact_path)
             if context.active_checkpoint is not None
-            else _incumbent_path(config)
-        )
-        if not incumbent_path.is_file():
-            raise FileNotFoundError(f"DQN promotion incumbent is missing: {incumbent_path}")
-        gate: dict[str, Any] = {
-            "kind": "significant_incumbent_improvement_and_benchmark_non_regression",
-            "seed_start": seed_start,
-            "challenger_benchmark": challenger_benchmark,
-        }
-        incumbent_spec = f"{SELF_SPEC}?weights={incumbent_path}"
-        head_to_head = _arena_evaluate(
-            inference_path, incumbent_spec, promotion_seeds, jobs, seed_start
-        )
-        incumbent_benchmark = _arena_evaluate(
-            incumbent_path, benchmark, eval_seeds, jobs, seed_start
-        )
-        # Promotion is a release decision, not an absence-of-proof-of-harm
-        # decision. The paired lower bound must clear zero.
-        head_to_head_ok = (
-            not head_to_head["errors"] and float(head_to_head["margin_ci"][0]) > 0.0
-        )
-        benchmark_ok = (
-            not challenger_benchmark["errors"]
-            and not incumbent_benchmark["errors"]
-            and float(challenger_benchmark["margin_ci"][1])
-            >= float(incumbent_benchmark["margin_ci"][0])
-        )
-        promote = head_to_head_ok and benchmark_ok
-        gate.update(
-            {
-                "head_to_head": head_to_head,
-                "incumbent_benchmark": incumbent_benchmark,
-                "head_to_head_significantly_better": head_to_head_ok,
-                "benchmark_non_regression": benchmark_ok,
-            }
-        )
-        evaluations.append(
-            ModelEvaluation(
-                "incumbent_head_to_head",
-                head_to_head,
-                head_to_head_ok,
-                (
-                    context.active_checkpoint.checkpoint_id
-                    if context.active_checkpoint is not None
-                    else "packaged_incumbent"
-                ),
+            else (
+                _incumbent_path(config)
+                if str(config.get("initialization", "random")) == "incumbent"
+                else None
             )
         )
-        gate["passed"] = promote
-        evaluations.append(
-            ModelEvaluation("fixed_benchmark", challenger_benchmark, promote)
-        )
+        promotion_rule = str(config.get("promotion_rule", "significant"))
+        if promotion_rule not in _PROMOTION_RULES:
+            raise ValueError(
+                f"promotion_rule must be one of {sorted(_PROMOTION_RULES)}: {promotion_rule}"
+            )
+        gate: dict[str, Any] = {
+            "kind": f"{promotion_rule}_incumbent_improvement_and_benchmarks_non_regression",
+            "promotion_rule": promotion_rule,
+            "seed_start": seed_start,
+            "challenger_benchmarks": challenger_benchmarks,
+            "resumed_from_checkpoint_id": resumed_from,
+            "rejection_streak": resumed.rejection_streak if resumed is not None else 0,
+            "lineage_reset": resumed is not None and resumed.reset,
+        }
+        if incumbent_path is None:
+            benchmark_results = [not result["errors"] for result in challenger_benchmarks]
+            promote = all(benchmark_results)
+            gate.update({"initial_checkpoint": True, "passed": promote})
+            evaluations.extend(
+                ModelEvaluation(
+                    _benchmark_kind(index, len(benchmarks)),
+                    result,
+                    passed,
+                )
+                for index, (result, passed) in enumerate(
+                    zip(challenger_benchmarks, benchmark_results)
+                )
+            )
+            head_to_head = None
+        else:
+            incumbent_spec = f"{SELF_SPEC}?weights={incumbent_path}"
+            head_to_head = _arena_evaluate(
+                inference_path,
+                incumbent_spec,
+                promotion_seeds,
+                jobs,
+                seed_start,
+            )
+            _reject_degenerate_head_to_head(head_to_head)
+            incumbent_benchmarks = [
+                _arena_evaluate(
+                    incumbent_path, benchmark, eval_seeds, jobs, seed_start
+                )
+                for benchmark in benchmarks
+            ]
+            # Two rules, because "release" and "carry the run forward" are not
+            # the same decision. `significant` is the release rule: the paired
+            # lower bound must clear zero, which is what stops a +64-on-24-seeds
+            # coin flip from becoming the incumbent. `point_estimate` only asks
+            # the paired mean to be positive, which promotes noise about half the
+            # time it is offered -- acceptable when the point of promoting is to
+            # keep the rollout distribution and the self-play pool moving rather
+            # than to ship. Either way every fixed benchmark must stay
+            # statistically compatible with its incumbent.
+            head_to_head_ok = not head_to_head["errors"] and (
+                float(head_to_head["margin"]) > 0.0
+                if promotion_rule == "point_estimate"
+                else float(head_to_head["margin_ci"][0]) > 0.0
+            )
+            benchmark_results = [
+                benchmark_non_regression(challenger, incumbent)
+                for challenger, incumbent in zip(
+                    challenger_benchmarks, incumbent_benchmarks
+                )
+            ]
+            benchmarks_ok = all(benchmark_results)
+            promote = head_to_head_ok and benchmarks_ok
+            gate.update(
+                {
+                    "head_to_head": head_to_head,
+                    "incumbent_benchmarks": incumbent_benchmarks,
+                    "head_to_head_significantly_better": head_to_head_ok,
+                    "benchmark_non_regression": dict(
+                        zip(benchmarks, benchmark_results)
+                    ),
+                    "passed": promote,
+                }
+            )
+            opponent_checkpoint_id = (
+                context.active_checkpoint.checkpoint_id
+                if context.active_checkpoint is not None
+                else None
+            )
+            evaluations.append(
+                ModelEvaluation(
+                    "incumbent_head_to_head",
+                    head_to_head,
+                    head_to_head_ok,
+                    opponent_checkpoint_id,
+                )
+            )
+            evaluations.extend(
+                ModelEvaluation(
+                    _benchmark_kind(index, len(benchmarks)),
+                    challenger,
+                    passed,
+                )
+                for index, (challenger, passed) in enumerate(
+                    zip(challenger_benchmarks, benchmark_results)
+                )
+            )
         metrics = {
+            "resumed_from_checkpoint_id": resumed_from,
+            "resumed_from_released": resumed is not None and resumed.released,
+            "rejection_streak": resumed.rejection_streak if resumed is not None else 0,
+            "lineage_reset": resumed is not None and resumed.reset,
             "episodes_in_buffer": len(buffer.episodes),
             "skipped_legacy_batches": skipped_legacy_batches,
             "transitions_in_buffer": buffer.transitions,
+            "market_transitions_in_buffer": buffer.market_transitions,
             "gradient_steps": gradient_steps,
             "gradient_steps_this_update": steps_to_run,
             "mean_loss": float(np.mean(losses)) if losses else None,
+            "market_gradient_steps": market_gradient_steps,
+            "market_gradient_steps_this_update": market_steps_to_run,
+            "market_mean_loss": float(np.mean(market_losses)) if market_losses else None,
             "train_seconds": train_seconds,
         }
         combined_digest = hashlib.sha256(

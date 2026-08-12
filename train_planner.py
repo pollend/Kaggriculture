@@ -3,15 +3,20 @@
 
 from __future__ import annotations
 
-import json
 import shutil
 import subprocess
 import sys
-import tomllib
+from dataclasses import replace
 from pathlib import Path
 
+from kaggriculture_lab.constants import ARTIFACTS_ROOT, DEFAULT_GENERATIONS, REPO_ROOT
+from kaggriculture_lab.identity import TrainingAgentSpec
+from kaggriculture_lab.league import LeagueConfig
+from kaggriculture_lab.runner import ensure_session, run_generations, run_round_robin
+from sim.metrics import render
+
 # Edit these constants; this runner intentionally accepts no arguments.
-GENERATIONS = 48
+GENERATIONS = DEFAULT_GENERATIONS
 POPULATION_SIZE = 20
 ROUNDS_PER_GENERATION = 20
 HALL_OF_FAME_ROUNDS = 4
@@ -25,8 +30,7 @@ FINAL_ARENA_JOBS = 24
 SYNC_ENVIRONMENT = True
 
 SESSION_ID = "receding-horizon-planner-training"
-DATABASE = Path("artifacts/planner_experiments.duckdb")
-ARTIFACTS = Path("artifacts")
+ARTIFACTS = ARTIFACTS_ROOT
 LEAGUE_CONFIG = Path("configs/planner_league.toml")
 TRAINING_AGENTS = [
     {
@@ -36,8 +40,6 @@ TRAINING_AGENTS = [
         "train": True,
     }
 ]
-
-REPO_ROOT = Path(__file__).resolve().parent
 
 
 def _run(command: list[str], *, check: bool = True, quiet: bool = False):
@@ -51,30 +53,18 @@ def _run(command: list[str], *, check: bool = True, quiet: bool = False):
     )
 
 
-def _python() -> Path:
+def _prepare_environment() -> None:
     if SYNC_ENVIRONMENT:
         uv = shutil.which("uv")
         if uv is None:
             raise RuntimeError("uv is required to synchronize the environment")
         _run([uv, "sync", "--locked", "--python", "3.12"])
-    path = REPO_ROOT / ".venv" / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
-    if not path.is_file():
-        raise FileNotFoundError("project Python is missing; run setup first")
-    return path
 
 
-def _kaglab(python: Path, *arguments: str, check: bool = True, quiet: bool = False):
-    return _run(
-        [str(python), "-m", "kaggriculture_lab.cli", *arguments],
-        check=check,
-        quiet=quiet,
-    )
-
-
-def _effective_config() -> Path:
-    with (REPO_ROOT / LEAGUE_CONFIG).open("rb") as stream:
-        values = dict(tomllib.load(stream)["league"])
-    values.update(
+def _effective_config() -> LeagueConfig:
+    base = LeagueConfig.from_toml(REPO_ROOT / LEAGUE_CONFIG)
+    return replace(
+        base,
         population_size=POPULATION_SIZE,
         rounds_per_generation=ROUNDS_PER_GENERATION,
         hall_of_fame_rounds=HALL_OF_FAME_ROUNDS,
@@ -82,70 +72,20 @@ def _effective_config() -> Path:
         jobs=TRAINING_JOBS,
         seed=TRAINING_SEED,
         candidate_pool=CANDIDATE_POOL,
-        training_agents=TRAINING_AGENTS,
+        training_agents=tuple(TrainingAgentSpec.from_dict(item) for item in TRAINING_AGENTS),
     )
-    lines = ["[league]"]
-    for name, value in values.items():
-        if isinstance(value, list):
-            lines.append(f"{name} = [")
-            for item in value:
-                if isinstance(item, dict):
-                    fields = ", ".join(
-                        f"{key} = {json.dumps(field) if isinstance(field, str) else str(field).lower() if isinstance(field, bool) else field}"
-                        for key, field in item.items()
-                    )
-                    lines.append(f"  {{ {fields} }},")
-                else:
-                    lines.append(f"  {json.dumps(item)},")
-            lines.append("]")
-        elif isinstance(value, str):
-            lines.append(f"{name} = {json.dumps(value)}")
-        else:
-            lines.append(f"{name} = {value}")
-    destination = REPO_ROOT / ARTIFACTS / "planner_league.effective.toml"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text("\n".join(lines) + "\n")
-    return destination
 
 
-def _ensure_session(python: Path) -> None:
+def _ensure_session() -> None:
     config = _effective_config()
-    status = _kaglab(
-        python,
-        "league",
-        "status",
-        "--session-id",
+    created, _ = ensure_session(
+        config,
         SESSION_ID,
-        "--database",
-        str(DATABASE),
-        check=False,
-        quiet=True,
+        workspace=REPO_ROOT,
+        artifacts=ARTIFACTS,
+        runner="train_planner",
     )
-    if status.returncode == 0:
-        print(f"Resuming planner session: {SESSION_ID}", flush=True)
-        _kaglab(
-            python,
-            "league",
-            "trainers",
-            "--session-id",
-            SESSION_ID,
-            "--database",
-            str(DATABASE),
-            "--config",
-            str(config),
-        )
-        return
-    _kaglab(
-        python,
-        "league",
-        "init",
-        "--config",
-        str(config),
-        "--session-id",
-        SESSION_ID,
-        "--database",
-        str(DATABASE),
-    )
+    print(f"{'Creating' if created else 'Resuming'} planner session: {SESSION_ID}", flush=True)
 
 
 def main() -> int:
@@ -163,47 +103,26 @@ def main() -> int:
     invalid = [name for name, value in positive.items() if value < 1]
     if invalid or TRAINING_JOBS < 0:
         raise ValueError(f"invalid training constants: {invalid or ['TRAINING_JOBS']}")
-    python = _python()
-    _ensure_session(python)
-    for generation in range(1, GENERATIONS + 1):
-        print(f"\n=== Planner generation {generation}/{GENERATIONS} ===", flush=True)
-        _kaglab(
-            python,
-            "league",
-            "run",
-            "--session-id",
-            SESSION_ID,
-            "--database",
-            str(DATABASE),
-            "--artifacts",
-            str(ARTIFACTS),
-        )
-        if generation < GENERATIONS:
-            _kaglab(
-                python,
-                "league",
-                "next-generation",
-                "--session-id",
-                SESSION_ID,
-                "--database",
-                str(DATABASE),
-            )
+    _prepare_environment()
+    _ensure_session()
+    run_generations(
+        session_id=SESSION_ID,
+        artifacts=ARTIFACTS,
+        generations=GENERATIONS,
+        workspace=REPO_ROOT,
+        on_generation=lambda generation, _: print(
+            f"\n=== Planner generation {generation}/{GENERATIONS} complete ===",
+            flush=True,
+        ),
+    )
 
     if RUN_FINAL_ARENA:
         agents = sorted((REPO_ROOT / "agents").glob("*/main.py"))
-        command = [
-            str(python),
-            "-m",
-            "sim.arena",
-            "league",
-            *(str(path.relative_to(REPO_ROOT)) for path in agents),
-            "starter",
-            "--seeds",
-            str(FINAL_ARENA_SEEDS),
-            "--jobs",
-            str(FINAL_ARENA_JOBS),
-        ]
-        _run(command)
+        specs = [str(path.relative_to(REPO_ROOT)) for path in agents]
+        for summary in run_round_robin(
+            [*specs, "starter"], seeds=FINAL_ARENA_SEEDS, jobs=FINAL_ARENA_JOBS
+        ):
+            print(render(summary))
     print(f"Planner training complete. Session: {SESSION_ID}")
     return 0
 

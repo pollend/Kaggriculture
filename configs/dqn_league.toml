@@ -1,0 +1,20 @@
+[league]
+league = "dqn_self_play"
+name = "dqn-self-play-v1"
+
+# The job-scorer trainer collects its own full-length episodes, so the league
+# runs trainer-only: no breedable population, no anchor pairings, no hall of
+# fame. `rounds_per_generation` is the trainer's batch clock.
+manifest = "agents/dqn_job_scorer/agent.toml"
+anchor_manifests = []
+training_manifests = ["agents/dqn_job_scorer/agent.toml"]
+
+pairing_mode = "trainer_only"
+population_size = 0
+rounds_per_generation = 100
+hall_of_fame_rounds = 0
+episode_steps = 720
+seed = 2718
+jobs = 0
+tau = 0.5
+candidate_pool = 2

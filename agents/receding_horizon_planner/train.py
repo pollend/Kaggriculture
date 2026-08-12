@@ -35,7 +35,7 @@ class PlannerTrainer:
         if context.scope != "generation":
             return
         row = reader.fetchone(
-            "SELECT count(*) FROM rating_snapshots WHERE generation_id = ? AND NOT is_frozen",
+            "SELECT count(*) FROM rating_snapshots WHERE generation_id = %s AND NOT is_frozen",
             [context.generation_id],
         )
         writer.record(

@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Configurable Mixed-Farm Surrogate — Architecture Overview</title>
+  <style>
+    :root {
+      --bg: #f5f2e9;
+      --paper: #fffdf7;
+      --ink: #243229;
+      --muted: #68756d;
+      --line: #d8ddcf;
+      --green: #226a46;
+      --green-2: #36855c;
+      --leaf: #dcebd9;
+      --gold: #d69b2d;
+      --gold-soft: #f7e8bd;
+      --blue: #315f76;
+      --blue-soft: #dcecf2;
+      --red: #a8493f;
+      --shadow: 0 18px 50px rgba(44, 61, 48, .10);
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(214, 155, 45, .12), transparent 28rem),
+        radial-gradient(circle at 100% 16%, rgba(54, 133, 92, .12), transparent 32rem),
+        var(--bg);
+      font: 16px/1.62 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a { color: var(--green); text-underline-offset: 3px; }
+    code {
+      padding: .12rem .34rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: rgba(255, 255, 255, .55);
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: .88em;
+    }
+
+    .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; }
+    header { padding: 70px 0 42px; }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--green);
+      font-size: .78rem;
+      font-weight: 800;
+      letter-spacing: .13em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.14; letter-spacing: -.025em; }
+    h1 { max-width: 860px; margin: 0; font-size: clamp(2.35rem, 6vw, 5.3rem); }
+    h2 { margin: 0 0 18px; font-size: clamp(1.75rem, 3.4vw, 2.6rem); }
+    h3 { margin: 0 0 9px; font-size: 1.16rem; }
+    .lede { max-width: 830px; margin: 24px 0; color: var(--muted); font-size: 1.16rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 24px; }
+    .chip {
+      padding: 7px 11px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,.55);
+      color: var(--muted);
+      font-size: .86rem;
+      font-weight: 700;
+    }
+
+    .layout { display: grid; grid-template-columns: 224px minmax(0, 1fr); gap: 34px; align-items: start; }
+    nav {
+      position: sticky;
+      top: 18px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(255, 253, 247, .86);
+      backdrop-filter: blur(12px);
+      box-shadow: var(--shadow);
+    }
+    nav strong { display: block; margin-bottom: 8px; font-size: .78rem; letter-spacing: .1em; text-transform: uppercase; }
+    nav a { display: block; padding: 6px 0; color: var(--muted); text-decoration: none; font-size: .91rem; }
+    nav a:hover { color: var(--green); }
+
+    main { min-width: 0; }
+    section {
+      scroll-margin-top: 24px;
+      margin-bottom: 30px;
+      padding: clamp(23px, 4vw, 42px);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: rgba(255, 253, 247, .92);
+      box-shadow: var(--shadow);
+    }
+    section > :last-child { margin-bottom: 0; }
+    .subtle { color: var(--muted); }
+    .callout {
+      margin: 22px 0;
+      padding: 17px 19px;
+      border-left: 4px solid var(--gold);
+      border-radius: 0 11px 11px 0;
+      background: var(--gold-soft);
+    }
+    .callout strong { display: block; margin-bottom: 3px; }
+    .callout.green { border-color: var(--green); background: var(--leaf); }
+    .callout.blue { border-color: var(--blue); background: var(--blue-soft); }
+
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card {
+      min-width: 0;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: rgba(255,255,255,.46);
+    }
+    .card p { margin: 5px 0 0; color: var(--muted); }
+    .metric { color: var(--green); font-size: 1.5rem; font-weight: 850; letter-spacing: -.04em; }
+
+    .flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 26px; margin: 24px 0; }
+    .flow-step {
+      position: relative;
+      padding: 16px 13px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #f8fbf5;
+      text-align: center;
+    }
+    .flow-step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      top: 50%;
+      right: -22px;
+      color: var(--green-2);
+      font-size: 1.35rem;
+      font-weight: 900;
+      transform: translateY(-55%);
+    }
+    .flow-step b { display: block; color: var(--green); font-size: .82rem; }
+    .flow-step span { display: block; margin-top: 5px; font-size: .88rem; }
+
+    .lanes { display: grid; gap: 10px; margin: 22px 0; }
+    .lane { display: grid; grid-template-columns: 145px 1fr; gap: 12px; align-items: stretch; }
+    .lane-label {
+      display: grid;
+      place-items: center;
+      padding: 12px;
+      border-radius: 10px;
+      background: var(--ink);
+      color: white;
+      font-size: .82rem;
+      font-weight: 800;
+      text-align: center;
+    }
+    .lane-body { padding: 12px 15px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.45); }
+
+    .table-wrap { overflow-x: auto; margin: 20px 0; }
+    table { width: 100%; border-collapse: collapse; font-size: .91rem; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--green); font-size: .76rem; letter-spacing: .08em; text-transform: uppercase; }
+    tbody tr:hover { background: rgba(220, 235, 217, .35); }
+
+    .formula {
+      margin: 16px 0;
+      padding: 15px 17px;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 11px;
+      background: #f2f6ef;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: .88rem;
+      white-space: nowrap;
+    }
+    ol.tight, ul.tight { padding-left: 1.25rem; }
+    ol.tight li, ul.tight li { margin: 6px 0; }
+    details { margin: 10px 0; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.45); }
+    summary { cursor: pointer; padding: 13px 15px; color: var(--green); font-weight: 800; }
+    details > div { padding: 0 15px 15px; }
+
+    .timeline { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0; margin: 24px 0; }
+    .phase { position: relative; padding: 19px; border-top: 6px solid var(--green-2); background: #edf5eb; }
+    .phase:first-child { border-radius: 12px 0 0 12px; }
+    .phase:last-child { border-radius: 0 12px 12px 0; }
+    .phase:nth-child(2) { border-color: var(--gold); background: var(--gold-soft); }
+    .phase:nth-child(3) { border-color: var(--red); background: #f6dfdc; }
+    .phase b { display: block; margin-bottom: 5px; }
+
+    .file-map { display: grid; gap: 8px; }
+    .file-row { display: grid; grid-template-columns: minmax(180px, .8fr) 1.5fr; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+    .file-row:last-child { border-bottom: 0; }
+    .file-row a { font-family: "SFMono-Regular", Consolas, monospace; font-size: .88rem; }
+
+    footer { padding: 12px 0 54px; color: var(--muted); font-size: .84rem; text-align: center; }
+
+    @media (max-width: 880px) {
+      .layout { grid-template-columns: 1fr; }
+      nav { position: static; display: flex; flex-wrap: wrap; gap: 2px 16px; }
+      nav strong { width: 100%; }
+      .flow { grid-template-columns: 1fr; gap: 10px; }
+      .flow-step:not(:last-child)::after { content: "↓"; top: auto; right: 50%; bottom: -19px; transform: translateX(50%); }
+      .grid.three { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 620px) {
+      header { padding-top: 42px; }
+      .grid, .timeline { grid-template-columns: 1fr; }
+      .phase:first-child, .phase:last-child { border-radius: 0; }
+      .lane, .file-row { grid-template-columns: 1fr; }
+      .lane-label { place-items: start; text-align: left; }
+    }
+    @media print {
+      body { background: white; color: #111; }
+      .shell { width: 100%; }
+      nav { display: none; }
+      .layout { display: block; }
+      section { break-inside: avoid; box-shadow: none; background: white; }
+      details > div { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <header class="shell">
+    <p class="eyebrow">Kaggriculture · Strategy attempt #4</p>
+    <h1>Configurable Mixed-Farm Surrogate</h1>
+    <p class="lede">
+      A deterministic, full-economy policy that recalculates a target portfolio every turn,
+      converts it into field tasks, assigns those tasks to workers, and issues budgeted market
+      orders. Offline, a league and Random Forest surrogate search the same versioned parameter space.
+    </p>
+    <div class="chips" aria-label="Key traits">
+      <span class="chip">Crops + livestock</span>
+      <span class="chip">Greedy scheduling</span>
+      <span class="chip">Deadline aware</span>
+      <span class="chip">Deterministic at runtime</span>
+      <span class="chip">League-trainable parameters</span>
+      <span class="chip">Schema version 1</span>
+    </div>
+  </header>
+
+  <div class="shell layout">
+    <nav aria-label="Page contents">
+      <strong>Contents</strong>
+      <a href="#summary">At a glance</a>
+      <a href="#runtime">Turn pipeline</a>
+      <a href="#portfolio">Portfolio planner</a>
+      <a href="#scheduler">Task scheduler</a>
+      <a href="#market">Market policy</a>
+      <a href="#lifecycle">Season lifecycle</a>
+      <a href="#parameters">Parameters</a>
+      <a href="#encoding">Decision encoding</a>
+      <a href="#training">Offline training</a>
+      <a href="#evaluation">Evaluation</a>
+      <a href="#files">Source map</a>
+      <a href="#limitations">Design limits</a>
+    </nav>
+
+    <main>
+      <section id="summary">
+        <p class="eyebrow">At a glance</p>
+        <h2>One policy, two separate loops</h2>
+        <div class="grid">
+          <article class="card">
+            <div class="metric">Live match</div>
+            <h3>Rules and greedy decisions</h3>
+            <p>Loads <code>profiles/balanced.json</code>, rebuilds the economic plan every turn, and emits deterministic unit actions and market orders.</p>
+          </article>
+          <article class="card">
+            <div class="metric">Offline league</div>
+            <h3>Evolution plus a surrogate model</h3>
+            <p>Samples, mutates, and crosses strategies; a Random Forest ranks candidate parameter sets and is promoted only when held-out error does not regress.</p>
+          </article>
+        </div>
+        <div class="callout green">
+          <strong>The word “surrogate” does not mean inference happens during gameplay.</strong>
+          The submitted agent never loads the Random Forest. The model helps the local league propose promising configurations; shipping one still requires a reviewed change to <code>balanced.json</code>.
+        </div>
+        <p>
+          This is not a beam-search planner or reinforcement-learning controller. It is a configurable heuristic policy with a clean split between
+          <em>what assets should the farm own?</em> (portfolio), <em>what physical work is needed?</em> (task enumeration),
+          <em>who should do it?</em> (assignment), and <em>what should be traded?</em> (market policy).
+        </p>
+      </section>
+
+      <section id="runtime">
+        <p class="eyebrow">Runtime architecture</p>
+        <h2>What happens on every turn</h2>
+        <div class="flow" role="img" aria-label="Observation flows through plan, market, tasks, assignment and action output">
+          <div class="flow-step"><b>1 · Observe</b><span>Farm, private inventory, prices, town, clock</span></div>
+          <div class="flow-step"><b>2 · Plan</b><span>Target crops, herd, labor, reserves, land</span></div>
+          <div class="flow-step"><b>3 · Enumerate</b><span>Care, harvest, logistics, build, plant, drop</span></div>
+          <div class="flow-step"><b>4 · Assign</b><span>Emergency first, commitments, then utility</span></div>
+          <div class="flow-step"><b>5 · Emit</b><span>Farmer, hands, up to 10 market orders</span></div>
+        </div>
+        <ol class="tight">
+          <li><code>main.py</code> creates one callable from the checked-in balanced profile.</li>
+          <li><code>ConfigurableMixedFarmAgent.__call__</code> validates the observation, detects a new episode, and reads runtime values such as season length and hire-cost multiplier.</li>
+          <li><code>build_plan</code> recomputes economic targets from time remaining, current prices, town demand, opponent supply, owned assets, cash, and strategy parameters.</li>
+          <li><code>market_orders</code> independently constructs an ordered, cash-aware list of sales and purchases.</li>
+          <li><code>enumerate_tasks</code> turns the current board and portfolio gaps into scored, deadline-bearing physical tasks.</li>
+          <li><code>assign_actions</code> gives each unit at most one action, retaining travel commitments across turns.</li>
+        </ol>
+        <p class="subtle">
+          Episode-local state contains only the player, last step, operation counts, and per-unit task commitments. It resets on step 0, player changes, or non-increasing step numbers; no match data persists in submission-time globals.
+        </p>
+      </section>
+
+      <section id="portfolio">
+        <p class="eyebrow">Economic layer</p>
+        <h2>The greedy remaining-season portfolio</h2>
+        <p>
+          The planner scores every crop and animal without simulating paths or individual future turns. Scores represent an approximate remaining-season economic value adjusted by configured preferences, public demand, opponent supply, and labor or risk.
+        </p>
+
+        <h3>Crop scoring</h3>
+        <div class="formula">score = ((revenue × demand_boost ÷ supply_discount − seed_costs) × crop_weight) ÷ labor</div>
+        <ul class="tight">
+          <li>If there is not enough time to reach first yield, the score becomes negative seed cost.</li>
+          <li>One-time crops estimate repeated cycles using <code>peak_day + 1</code>; ongoing crops use their configured cumulative yield once.</li>
+          <li>Town shops boost demanded products; visible opponent production discounts crowded products.</li>
+          <li>The configured number of crop tiles is divided proportionally among positive scores using largest-remainder allocation.</li>
+        </ul>
+
+        <h3>Animal scoring</h3>
+        <div class="formula">net = (product_revenue × demand_boost ÷ supply_discount + fertilizer_value − feed_cost − animal_cost) ÷ risk_premium</div>
+        <p>
+          Product revenue includes an approximate care multiplier, while daily wheat and expected fertilizer are priced at current market values.
+          A species receives its configured target count only when its unweighted net is positive; its weight controls relative placement priority, not that profitability gate.
+        </p>
+
+        <div class="grid three">
+          <article class="card"><h3>Feed self-sufficiency</h3><p>Wheat is forced toward <code>ceil(total animals / 0.8)</code> tiles, displacing lower-scoring crops as needed.</p></article>
+          <article class="card"><h3>Labor target</h3><p>Daily care load is converted into hands with roughly 10 estimated useful actions per worker, then capped by <code>max_hands</code>.</p></article>
+          <article class="card"><h3>Reserves</h3><p>Wheat reserve equals herd size × reserve days. Fertilizer reserve is capped at 6 and grows with planted area.</p></article>
+        </div>
+
+        <h3>Land expansion gate</h3>
+        <p>Buying the next quadrant requires every condition below:</p>
+        <ul class="tight">
+          <li>the configured quadrant cap has not been reached;</li>
+          <li>the desired portfolio exceeds current tile capacity;</li>
+          <li>current assets and pending seeds/animals substantially commit the existing land (at least 80%, with a floor of 20);</li>
+          <li>cash after the configured reserve covers the land price; and</li>
+          <li>estimated marginal value of the added tiles clears <code>price × land_hurdle</code>.</li>
+        </ul>
+      </section>
+
+      <section id="scheduler">
+        <p class="eyebrow">Operational layer</p>
+        <h2>Tasks, deadlines, and joint assignment</h2>
+        <p>
+          A task records its kind, board target, executable action, approximate coin value, deadline, optional unit owner, and optional required carried item.
+          The scheduler generates a fresh task frontier every turn.
+        </p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Task family</th><th>Examples</th><th>Notable behavior</th></tr></thead>
+            <tbody>
+              <tr><td>Survival</td><td>WATER, FEED</td><td>Late-day or already-missed care becomes a 25k/30k emergency.</td></tr>
+              <tr><td>Production</td><td>HARVEST crop/animal, CARE, COLLECT_FERTILIZER</td><td>Values scale with current output prices and configured care/fertilizer preference.</td></tr>
+              <tr><td>Item logistics</td><td>PICKUP wheat, fertilizer, animals; PLACE animal; DROP</td><td>Pickup tasks precede later consumption; owner constraints keep inventory-dependent chains coherent.</td></tr>
+              <tr><td>Expansion</td><td>BUILD_COOP, BUILD_PASTURE, PLANT</td><td>Only runs before liquidation; new structures are created only for animals already owned or carried.</td></tr>
+              <tr><td>Cleanup</td><td>DIG weeds</td><td>Weeds receive a high fixed value.</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Three assignment passes</h3>
+        <div class="lanes">
+          <div class="lane"><div class="lane-label">Pass 1<br>Emergencies</div><div class="lane-body">Tasks worth at least 20,000 reserve only the workers needed for immediate survival or terminal logistics. Utility is value minus travel cost.</div></div>
+          <div class="lane"><div class="lane-label">Pass 2<br>Commitments</div><div class="lane-body">A worker continues toward its prior task if that exact task still exists and its inventory still satisfies the requirement. This reduces turn-to-turn thrashing.</div></div>
+          <div class="lane"><div class="lane-label">Pass 3<br>Greedy utility</div><div class="lane-body">Remaining workers and unique tasks are paired by value + deadline urgency − Manhattan travel penalty.</div></div>
+        </div>
+        <div class="formula">utility = task_value + deadline_weight × urgency(slack) − 125 × movement_cost × Manhattan_distance</div>
+        <p>
+          Negative deadline slack adds a large urgency penalty correction; otherwise urgency decays with available slack. If a worker is already at the target it executes the task action,
+          otherwise it moves horizontally first and then vertically on later turns. Each task can be assigned only once per turn.
+        </p>
+      </section>
+
+      <section id="market">
+        <p class="eyebrow">Market layer</p>
+        <h2>Strictly ordered and capped at ten</h2>
+        <p>Orders are assembled in this order, so earlier economic needs win when the per-turn cap is reached:</p>
+        <ol class="tight">
+          <li><strong>Sell shed products</strong> when liquidating, cash-starved, above the configured base-price ratio, or under shed pressure.</li>
+          <li><strong>Buy land</strong> when the portfolio gate passes and cash above reserve can cover it.</li>
+          <li><strong>Hire hands</strong> early in the day until the plan target or configured cap is reached.</li>
+          <li><strong>Buy emergency/operating wheat</strong> for the current herd. This can spend below the normal cash reserve.</li>
+          <li><strong>Buy animals</strong> by descending animal score, using only the remaining strategic budget.</li>
+          <li><strong>Buy seeds</strong> by descending crop score when enough season remains for first yield.</li>
+        </ol>
+        <div class="callout">
+          <strong>Reserves change with the clock.</strong>
+          Before the final day, wheat is retained for the herd. Fertilizer is retained until liquidation. On the final day, sale logic stops protecting both because unsold inventory has no terminal value.
+        </div>
+      </section>
+
+      <section id="lifecycle">
+        <p class="eyebrow">Season behavior</p>
+        <h2>Build, unwind, liquidate</h2>
+        <div class="timeline" role="img" aria-label="Normal operation, liquidation window, and final day">
+          <div class="phase"><b>Normal operation</b>Buy assets, expand land, plant, build, feed, care, fertilize, harvest, and sell opportunistically.</div>
+          <div class="phase"><b>Liquidation window</b>Default: final 72 turns. Stop new structures and planting; sell shed goods regardless of price and stop buying land, animals, or seeds.</div>
+          <div class="phase"><b>Final day</b>Final 24 turns. Strongly prioritize returning carried saleable output and stop protecting wheat/fertilizer reserves.</div>
+        </div>
+        <p>
+          Field logistics and market liquidation reinforce one another: terminal <code>DROP</code> tasks get a large value boost so carried output reaches the shed,
+          and market orders then sell shed contents. Animals themselves remain excluded from carried-output value because they are not saleable products.
+        </p>
+      </section>
+
+      <section id="parameters">
+        <p class="eyebrow">Versioned strategy schema</p>
+        <h2>The checked-in balanced profile</h2>
+        <p>All 30 knobs are validated, serializable, and hashed into a stable 16-character strategy ID. Unknown names fail fast.</p>
+
+        <details open>
+          <summary>Scale, budget, land, and labor</summary>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Balanced</th><th>Meaning</th></tr></thead><tbody>
+            <tr><td><code>max_hands</code></td><td>5</td><td>Upper bound on daily farm hands.</td></tr>
+            <tr><td><code>hire_until_hour</code></td><td>3</td><td>Latest hour at which hiring is allowed.</td></tr>
+            <tr><td><code>cash_reserve</code></td><td>1200</td><td>Cash normally protected from strategic purchases.</td></tr>
+            <tr><td><code>target_crop_tiles</code></td><td>24</td><td>Total crop slots allocated across species.</td></tr>
+            <tr><td><code>target_goose / cow / sheep</code></td><td>1 / 6 / 2</td><td>Herd targets when the species is economically positive.</td></tr>
+            <tr><td><code>max_quadrants</code></td><td>3</td><td>Maximum unlocked quadrants.</td></tr>
+            <tr><td><code>feed_reserve_days</code></td><td>2</td><td>Wheat buffer per current/target animal.</td></tr>
+            <tr><td><code>land_hurdle</code></td><td>1.15</td><td>Required multiple of land price in estimated marginal value.</td></tr>
+            <tr><td><code>liquidation_turns</code></td><td>72</td><td>Turns before season end when asset growth stops.</td></tr>
+          </tbody></table></div>
+        </details>
+
+        <details>
+          <summary>Portfolio weights</summary>
+          <div class="table-wrap"><table><thead><tr><th>Group</th><th>Balanced values</th><th>Effect</th></tr></thead><tbody>
+            <tr><td>Crops</td><td>Wheat 0.9 · Carrot 0.5 · Tomato 0.6 · Strawberry 0.8 · Melon 1.4</td><td>Scale crop scores before tile allocation.</td></tr>
+            <tr><td>Animals</td><td>Goose 0.8 · Cow 1.3 · Sheep 1.0</td><td>Scale species score and placement/purchase ordering.</td></tr>
+            <tr><td><code>animal_risk_premium</code></td><td>1.0</td><td>Divides estimated animal net value.</td></tr>
+            <tr><td><code>town_demand_weight</code></td><td>0.7</td><td>Strength of demand boost from unlocked shops.</td></tr>
+            <tr><td><code>opponent_supply_weight</code></td><td>0.5</td><td>Strength of discount for opponent production.</td></tr>
+          </tbody></table></div>
+        </details>
+
+        <details>
+          <summary>Operations and inventory behavior</summary>
+          <div class="table-wrap"><table><thead><tr><th>Parameter</th><th>Balanced</th><th>Meaning</th></tr></thead><tbody>
+            <tr><td><code>water_priority</code></td><td>2.0</td><td>Scales ordinary watering task value.</td></tr>
+            <tr><td><code>emergency_multiplier</code></td><td>8.0</td><td>Validated/searchable in schema; currently not read by runtime scheduling code.</td></tr>
+            <tr><td><code>movement_cost</code></td><td>0.8</td><td>Scales travel penalty during assignment.</td></tr>
+            <tr><td><code>deadline_weight</code></td><td>5.0</td><td>Scales urgency for low-slack tasks.</td></tr>
+            <tr><td><code>care_value_weight</code></td><td>0.8</td><td>Values CARE and expected animal output.</td></tr>
+            <tr><td><code>fertilizer_value_weight</code></td><td>0.8</td><td>Values fertilizer collection/use and expected animal by-product.</td></tr>
+            <tr><td><code>sell_price_ratio</code></td><td>1.0</td><td>Sell threshold relative to base price outside forced cases.</td></tr>
+            <tr><td><code>shed_pressure_fraction</code></td><td>0.75</td><td>Sell when shed occupancy reaches 75% of the hard-coded 100 capacity.</td></tr>
+          </tbody></table></div>
+        </details>
+      </section>
+
+      <section id="encoding">
+        <p class="eyebrow">Model representation</p>
+        <h2>How decisions are encoded</h2>
+        <p>
+          The Random Forest does <strong>not</strong> encode individual actions such as WATER, BUY_SEED, or MOVE.
+          It encodes an entire <code>Strategy</code> as one flat numeric feature vector: one column for each of the 30 configuration values.
+          An evaluated strategy becomes one training row, paired with an outcome score derived from its league results.
+        </p>
+
+        <div class="lanes">
+          <div class="lane"><div class="lane-label">Strategy object</div><div class="lane-body"><code>max_hands=5</code>, <code>target_cow=6</code>, <code>melon_weight=1.4</code>, <code>movement_cost=0.8</code>, …</div></div>
+          <div class="lane"><div class="lane-label">Feature row</div><div class="lane-body">A flat mapping produced by <code>Strategy.to_features()</code>. Integers and floats remain numeric; there are no categorical or one-hot fields.</div></div>
+          <div class="lane"><div class="lane-label">Training label</div><div class="lane-body">A scalar quality target: 45% conservative rating, 35% mean margin, and 20% final money after within-generation standardization.</div></div>
+        </div>
+
+        <h3>The forest learns cuts through parameter space</h3>
+        <p>
+          Yes: each decision tree repeatedly makes an axis-aligned cut on a single parameter. A simplified path might look like this:
+        </p>
+        <div class="formula">target_cow &gt; 4.5 → movement_cost ≤ 1.05 → liquidation_turns &gt; 55.5 → predicted strategy quality</div>
+        <p>
+          Integer settings can have half-step thresholds because scikit-learn treats every feature as numeric. Continuous weights can be cut at any learned midpoint.
+          Each leaf stores the average training target of rows that reached it; the Random Forest prediction is the average prediction across its trees.
+          With 300 trees fitted on bootstrap samples, the ensemble can approximate interactions and nonlinear regions—for example,
+          “larger cow targets work only when wheat, labor, and liquidation settings are also in compatible ranges.”
+        </p>
+
+        <div class="grid">
+          <article class="card">
+            <h3>Core forest</h3>
+            <p>Maps the 30 strategy parameters to overall league quality. It is trained from rating, margin, and final-money outcomes.</p>
+          </article>
+          <article class="card">
+            <h3>Optional Moon forest</h3>
+            <p>Uses the same 30 columns but predicts margin specifically against the Moon Counts Melons family.</p>
+          </article>
+        </div>
+
+        <h3>How a model prediction becomes a proposal</h3>
+        <ol class="tight">
+          <li>Randomly sample 10,000 valid strategy points from the bounded schema.</li>
+          <li>Encode all points into a 10,000 × 30 feature table in the checkpoint's recorded column order.</li>
+          <li>Predict core quality for every point; if the Moon model exists, standardize both prediction streams and blend them 70% / 30%.</li>
+          <li>Sort by predicted score and return the requested highest-ranked candidates to the league.</li>
+          <li>The league still evaluates those candidates in actual games. The prediction itself never directly promotes a strategy or chooses an in-game action.</li>
+        </ol>
+
+        <div class="callout green">
+          <strong>Two levels of “decision” are easy to confuse.</strong>
+          Offline, tree cuts choose which parameter regions look promising. Online, ordinary Python formulas and greedy task assignment turn the selected parameter vector into concrete farm actions.
+        </div>
+      </section>
+
+      <section id="training">
+        <p class="eyebrow">Offline learning loop</p>
+        <h2>Evolution proposes; the league judges</h2>
+        <div class="flow" role="img" aria-label="Strategies play league games, generations become batches, forests train, checkpoint is gated, model ranks new candidates">
+          <div class="flow-step"><b>1 · Compete</b><span>20 strategies play 24 rounds/generation</span></div>
+          <div class="flow-step"><b>2 · Record</b><span>Closed generation becomes a training batch</span></div>
+          <div class="flow-step"><b>3 · Fit</b><span>Random Forest learns parameter → outcome</span></div>
+          <div class="flow-step"><b>4 · Gate</b><span>Newest generation is held out</span></div>
+          <div class="flow-step"><b>5 · Propose</b><span>Rank 10,000 sampled strategies</span></div>
+        </div>
+
+        <h3>Population operators</h3>
+        <ul class="tight">
+          <li><strong>Sample:</strong> draw every parameter within its declared valid range.</li>
+          <li><strong>Mutate:</strong> replace 1 to roughly ¼ of fields with a blend of the parent and a random donor.</li>
+          <li><strong>Crossover:</strong> average or select integer fields, average float fields, then mutate the child.</li>
+          <li><strong>Model proposal:</strong> when an active checkpoint exists, ignore the supplied parent list, sample the candidate pool, score it, and return the highest-ranked requested count.</li>
+        </ul>
+
+        <h3>Core training target</h3>
+        <p>For each generation, three outcomes are standardized within that generation and combined:</p>
+        <div class="formula">target = 0.45 × z(conservative rating) + 0.35 × z(mean margin) + 0.20 × z(final money)</div>
+        <p>
+          A 300-tree Random Forest (default, leaf minimum 2) learns this core target. When at least 20 distinct strategies have games against the “Moon Counts Melons” family,
+          a second forest learns that head-to-head margin. Candidate ranking blends standardized core and Moon predictions at 70% / 30% by default.
+        </p>
+
+        <h3>Checkpoint gate and ownership</h3>
+        <ul class="tight">
+          <li>At least two closed generation batches and six rated strategies are required.</li>
+          <li>All generations except the newest train the candidate; the newest validates it.</li>
+          <li>The candidate is promoted only when weighted normalized MAE is no worse than the active checkpoint (or no incumbent exists).</li>
+          <li>The persisted checkpoint is refit on all available rows and stored as a Joblib artifact with a SHA-256 digest.</li>
+          <li>The league owns matchups, batches, checkpoints, and promotion. The strategy owns encoding, variation, candidate ranking, and model fitting.</li>
+        </ul>
+        <div class="callout blue">
+          <strong>Training promotion is not release promotion.</strong>
+          The active checkpoint affects future league proposals. It does not rewrite <code>profiles/balanced.json</code> or silently change the Kaggle submission.
+        </div>
+      </section>
+
+      <section id="evaluation">
+        <p class="eyebrow">Evidence and diagnostics</p>
+        <h2>How behavior is measured</h2>
+        <p>
+          After an episode is committed, <code>evaluate_episode</code> reads the stored summary and replay and emits family-specific diagnostics:
+          animal purchases and final herd, land purchases, feed/care/fertilizer actions, worst observed unfed streak, product sales, final money and margin,
+          action mix, inferred plant loss, and unsold terminal inventory.
+        </p>
+        <div class="grid">
+          <article class="card"><h3>Regression tests</h3><p>Cover strategy ID stability, feed-aware portfolio construction, land gating, animal logistics, reserve-breaking feed purchases, terminal behavior, action shape, episode reset, and a profitable full season.</p></article>
+          <article class="card"><h3>Acceptance arena</h3><p>Paired-seat series compare the mixed policy with the crop-only surrogate against Moon Counts Melons, with an optional broad competitor sweep and 95% confidence intervals.</p></article>
+        </div>
+        <p class="subtle">
+          The default isolated runner uses 48 generations, population 20, 24 rounds per generation, 12 Hall-of-Fame rounds, 720-step episodes, seed 2718, and a 10,000-strategy proposal pool.
+        </p>
+      </section>
+
+      <section id="files">
+        <p class="eyebrow">Source map</p>
+        <h2>Where each responsibility lives</h2>
+        <div class="file-map">
+          <div class="file-row"><a href="./main.py">main.py</a><span>Submission entry point; loads the balanced profile and exposes the episode evaluator lazily.</span></div>
+          <div class="file-row"><a href="./agent.py">agent.py</a><span>Top-level per-turn orchestration and episode-local state.</span></div>
+          <div class="file-row"><a href="./strategy.py">strategy.py</a><span>Schema, validation, serialization, stable IDs, and random sampling.</span></div>
+          <div class="file-row"><a href="./portfolio.py">portfolio.py</a><span>Remaining-season crop, herd, labor, reserve, and land targets.</span></div>
+          <div class="file-row"><a href="./scheduler.py">scheduler.py</a><span>Physical task frontier, priorities, deadlines, logistics, commitments, and unit assignment.</span></div>
+          <div class="file-row"><a href="./market.py">market.py</a><span>Cash budget, selling, land, hiring, feed, animal, and seed orders.</span></div>
+          <div class="file-row"><a href="./rules.py">rules.py</a><span>Submission-local crop/animal constants, town demand, asset counting, and geometry.</span></div>
+          <div class="file-row"><a href="./profiles/balanced.json">profiles/balanced.json</a><span>The strategy actually shipped by <code>main.py</code>.</span></div>
+          <div class="file-row"><a href="./training.py">training.py</a><span>Evolution adapter, Random Forest fitting, candidate proposal, and checkpoint gate.</span></div>
+          <div class="file-row"><a href="./train.py">train.py</a><span>League-facing generation batch hook and model update adapter.</span></div>
+          <div class="file-row"><a href="./agent.toml">agent.toml</a><span>Family identity, code bundle, trainer declaration, and model defaults.</span></div>
+          <div class="file-row"><a href="./evaluation.py">evaluation.py</a><span>Replay-derived post-episode mixed-economy metrics.</span></div>
+          <div class="file-row"><a href="./analysis.py">analysis.py</a><span>Paired acceptance testing against Moon and the broader competitor set.</span></div>
+          <div class="file-row"><a href="../../train_mixed_farm.py">../../train_mixed_farm.py</a><span>Isolated, resumable league runner with explicit training constants.</span></div>
+        </div>
+      </section>
+
+      <section id="limitations">
+        <p class="eyebrow">Interpretation notes</p>
+        <h2>What the design trades away</h2>
+        <ul class="tight">
+          <li><strong>No lookahead search:</strong> asset values are coarse remaining-season estimates, so the policy does not simulate congestion, exact action chains, or market trajectories.</li>
+          <li><strong>Greedy assignment:</strong> workers are paired one task at a time; this is fast and deterministic but not a globally optimal multi-worker schedule.</li>
+          <li><strong>Simple routing:</strong> movement is Manhattan, horizontal-first, and ignores future traffic because workers may cross locked tiles.</li>
+          <li><strong>Approximate economics:</strong> crop cycles, animal care value, fertilizer yield, labor load, and wheat productivity use fixed estimates rather than an exact simulator.</li>
+          <li><strong>Hard-coded game assumptions:</strong> several constants mirror the default environment, including 25 tiles per quadrant and shed capacity 100.</li>
+          <li><strong>One inert schema knob:</strong> <code>emergency_multiplier</code> is sampled and validated but is not currently referenced by the runtime scheduler; emergency values are fixed constants.</li>
+          <li><strong>No automatic release:</strong> training can improve candidate selection without changing the checked-in submission profile.</li>
+        </ul>
+        <p>
+          The resulting policy is best understood as a transparent, tunable baseline for the complete farm economy: much richer than a single-crop loop,
+          far cheaper and easier to inspect than receding-horizon search, and structured so league data can improve its configuration without putting training state inside the agent.
+        </p>
+      </section>
+    </main>
+  </div>
+
+  <footer class="shell">
+    Generated from the repository implementation · Configurable Mixed-Farm Surrogate · schema v1
+  </footer>
+</body>
+</html>

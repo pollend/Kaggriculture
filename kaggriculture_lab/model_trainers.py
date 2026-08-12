@@ -22,13 +22,22 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import math
+import multiprocessing
+import statistics
 import traceback
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from kaggriculture_lab.identity import training_artifact_root
+from kaggriculture_lab.identity import (
+    AgentManifest,
+    AgentRevision,
+    code_fingerprint,
+    training_artifact_root,
+)
 from kaggriculture_lab.model_updates import (
     ActiveCheckpoint,
     ModelTrainingReader,
@@ -43,7 +52,7 @@ from kaggriculture_lab.storage import ExperimentStore
 RoundScope = Literal["round", "generation"]
 
 #: `round_index` for generation-scope hooks. A sentinel rather than NULL because
-#: DuckDB's UNIQUE does not dedupe NULL-bearing keys, so a nullable column would
+#: A non-null sentinel keeps hook identity unambiguous across SQL engines.
 #: quietly admit a second generation row.
 GENERATION_ROUND_INDEX = -1
 
@@ -74,13 +83,89 @@ class RoundContext:
     artifacts: Path
 
 
-class TrainingBatchWriter:
-    """The single write a round hook is granted.
+@dataclass(frozen=True, slots=True)
+class EvaluationPolicy:
+    """One immutable policy identity used by a trainer-requested league round."""
 
-    `model_id` is bound at construction, so a trainer cannot record data against
-    another model. Everything else a hook needs is a read, and reads go through
-    `ModelTrainingReader` -- the same SELECT-only boundary the batch hook and
-    every episode evaluator already live under.
+    revision_id: str
+    agent_spec: str
+    manifest_path: str | None = None
+    role: str = "evaluation"
+
+
+def _register_policies(
+    store: ExperimentStore,
+    policies: Sequence[EvaluationPolicy],
+    *,
+    source: str,
+    register_families: bool = False,
+) -> None:
+    """Turn policy descriptions into the `agent_revisions` rows a pairing cites.
+
+    A trainer names its seats three different ways -- a builtin registry name, a
+    manifest-backed agent, or a bare spec with no manifest behind it (a
+    competitor `main.py`) -- and all three have to resolve to a revision before
+    the pairing referencing them can be written.
+
+    `register_families` additionally promotes a manifest to a real
+    `agent_families` row; without it `add_agent_revisions` only leaves the
+    placeholder `ensure_agent_families` writes. It registers the family alone --
+    an opponent's manifest may declare models that are mid-training under a
+    configuration this caller knows nothing about.
+    """
+
+    from kaggriculture_lab.identity import builtin_revision
+
+    revisions: list[AgentRevision] = []
+    manifests: dict[str, tuple[AgentManifest, str]] = {}
+    for policy in {policy.revision_id: policy for policy in policies}.values():
+        if policy.manifest_path is None and policy.revision_id.startswith("builtin:"):
+            revisions.append(
+                builtin_revision(policy.revision_id.removeprefix("builtin:"), policy.agent_spec)
+            )
+            continue
+        if policy.manifest_path is not None:
+            cached = manifests.get(policy.manifest_path)
+            if cached is None:
+                manifest = AgentManifest.load(policy.manifest_path)
+                cached = (manifest, code_fingerprint(manifest))
+                manifests[policy.manifest_path] = cached
+                if register_families:
+                    store.register_agent_family(manifest, policy.manifest_path)
+            manifest, fingerprint = cached
+            family_id = manifest.family_id
+            entry_point = manifest.entry_point
+            schema_version = manifest.parameter_schema_version
+            evaluator = manifest.episode_evaluator
+        else:
+            family_id = "evaluation_opponent"
+            entry_point = policy.agent_spec.partition("?")[0]
+            fingerprint = hashlib.sha256(policy.agent_spec.encode()).hexdigest()
+            schema_version = 1
+            evaluator = None
+        revisions.append(
+            AgentRevision(
+                revision_id=policy.revision_id,
+                family_id=family_id,
+                strategy_id=None,
+                entry_point=entry_point,
+                agent_spec=policy.agent_spec,
+                code_fingerprint=fingerprint,
+                parameter_schema_version=schema_version,
+                params_json=json.dumps({"role": policy.role}, sort_keys=True),
+                source=source,
+                episode_evaluator=evaluator,
+            )
+        )
+    store.add_agent_revisions(revisions)
+
+
+class TrainingBatchWriter:
+    """The batch-recording surface handed to a round hook.
+
+    `model_id` is bound at construction, so a trainer records batches against
+    its own model without having to name it on every call. Everything else a
+    hook needs is a read, and reads go through `ModelTrainingReader`.
     """
 
     def __init__(self, store: ExperimentStore, model_id: str):
@@ -118,6 +203,339 @@ class TrainingBatchWriter:
         )
         self._recorded.append(batch.batch_id)
         return batch
+
+    def record_policy_episode(
+        self,
+        *,
+        context: RoundContext,
+        pairing_kind: str,
+        pairing_index: int,
+        left: EvaluationPolicy,
+        right: EvaluationPolicy,
+        orientation: int,
+        result: Any,
+        mixture_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Commit one already-run manifest episode to the league ledger.
+
+        The trainer supplies the two policy identities and the match result; the
+        lab owns stable pairing/match IDs, revision registration, and artifact
+        linkage. `left` and `right` are the pairing's `revision_a`/`revision_b`,
+        and `orientation` says which seat order was actually played -- 0 for
+        (left, right), 1 for (right, left). Calling this again during resume is
+        idempotent.
+
+        Every episode keeps its replay, trainer rollouts included. Dropping the
+        payload for rollouts saved disk and cost the ability to answer anything
+        about them after the fact -- including the evaluation hooks, which fire
+        for these episodes and read the replay back.
+        """
+        from kaggriculture_lab.league import (
+            LeagueEpisodeTask,
+            _finish_pairing,
+            _get_revision,
+            _store_orientation_result,
+        )
+        from kaggriculture_lab.league import (
+            _stable_id as league_id,
+        )
+
+        if orientation not in (0, 1):
+            raise ValueError("policy episode orientation must be 0 or 1")
+        if not pairing_kind:
+            raise ValueError("policy episode pairing_kind cannot be empty")
+        _register_policies(
+            self._store,
+            (left, right),
+            source="policy_matchup",
+            register_families=True,
+        )
+        pairing_id = league_id(
+            "policy-pair",
+            context.generation_id,
+            context.round_index,
+            pairing_index,
+            left.revision_id,
+            right.revision_id,
+            result.seed,
+        )
+        self._store.connection.execute(
+            """
+            INSERT INTO league_pairings VALUES (
+                %s, %s, %s, %s, %s, %s, %s, 'PENDING'
+            )
+            ON CONFLICT DO NOTHING
+            """,
+            [
+                pairing_id,
+                context.generation_id,
+                context.round_index,
+                pairing_kind,
+                result.seed,
+                left.revision_id,
+                right.revision_id,
+            ],
+        )
+        task = LeagueEpisodeTask(
+            pairing_id,
+            orientation,
+            result.seed,
+            _get_revision(self._store, left.revision_id),
+            _get_revision(self._store, right.revision_id),
+            result.steps,
+        )
+        _store_orientation_result(
+            self._store,
+            context.session_id,
+            context.generation_id,
+            task,
+            result,
+        )
+        if mixture_id is not None:
+            self._store.connection.execute(
+                """
+                INSERT INTO pairing_policy_assignments VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                    pairing_id,
+                    mixture_id,
+                    f"{mixture_id}:composite",
+                    left.revision_id,
+                    right.revision_id,
+                ],
+            )
+        completed = self._store.connection.execute(
+            "SELECT count(*) FROM pairing_episodes WHERE pairing_id = %s", [pairing_id]
+        ).fetchone()[0]
+        if int(completed) == 2:
+            _finish_pairing(self._store, pairing_id, left.revision_id)
+        return tuple(
+            str(row[0])
+            for row in self._store.connection.execute(
+                """
+                SELECT eta.artifact_id FROM episode_training_artifacts eta
+                JOIN pairing_episodes pe USING (match_id)
+                WHERE pe.pairing_id = %s AND pe.orientation = %s
+                ORDER BY eta.artifact_id
+                """,
+                [pairing_id, orientation],
+            ).fetchall()
+        )
+
+    def run_evaluation_round(
+        self,
+        *,
+        context: RoundContext,
+        request_id: str,
+        pairing_kind: str,
+        matchups: Sequence[tuple[EvaluationPolicy, EvaluationPolicy, int]],
+        jobs: int,
+        episode_steps: int,
+    ) -> dict[str, Any]:
+        """Schedule, resume, and record a seat-swapped model evaluation.
+
+        Trainers describe immutable policy matchups; the lab owns their pairing
+        identities, execution, replay storage, and paired results.  Completed
+        orientations are reused after interruption instead of being replayed.
+        """
+
+        from kaggriculture_lab.league import (
+            LeagueEpisodeTask,
+            _finish_pairing,
+            _get_revision,
+            _league_worker,
+            _store_orientation_result,
+        )
+        from kaggriculture_lab.league import _stable_id as league_id
+
+        if not request_id:
+            raise ValueError("evaluation request_id cannot be empty")
+        if not pairing_kind:
+            raise ValueError("evaluation pairing_kind cannot be empty")
+        if jobs < 1:
+            raise ValueError("evaluation jobs must be positive")
+        if episode_steps < 1:
+            raise ValueError("evaluation episode_steps must be positive")
+
+        _register_policies(
+            self._store,
+            [policy for left, right, _ in matchups for policy in (left, right)],
+            source="model_evaluation",
+        )
+
+        pairing_ids: list[str] = []
+        tasks: list[Any] = []
+        for index, (left, right, seed) in enumerate(matchups):
+            pairing_id = league_id(
+                "model-eval-pair",
+                self._model_id,
+                request_id,
+                index,
+                left.revision_id,
+                right.revision_id,
+                seed,
+            )
+            pairing_ids.append(pairing_id)
+            self._store.connection.execute(
+                """
+                INSERT INTO league_pairings VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, 'PENDING'
+                )
+                ON CONFLICT DO NOTHING
+                """,
+                [
+                    pairing_id,
+                    context.generation_id,
+                    context.round_index,
+                    pairing_kind,
+                    int(seed),
+                    left.revision_id,
+                    right.revision_id,
+                ],
+            )
+            left_revision = _get_revision(self._store, left.revision_id)
+            right_revision = _get_revision(self._store, right.revision_id)
+            for orientation in (0, 1):
+                known = self._store.connection.execute(
+                    """
+                    SELECT 1 FROM pairing_episodes
+                    WHERE pairing_id = %s AND orientation = %s
+                    """,
+                    [pairing_id, orientation],
+                ).fetchone()
+                if known is None:
+                    tasks.append(
+                        LeagueEpisodeTask(
+                            pairing_id,
+                            orientation,
+                            int(seed),
+                            left_revision,
+                            right_revision,
+                            episode_steps,
+                        )
+                    )
+
+        if jobs == 1:
+            outcomes = map(_league_worker, tasks)
+            for task, result in outcomes:
+                _store_orientation_result(
+                    self._store, context.session_id, context.generation_id, task, result
+                )
+        elif tasks:
+            with ProcessPoolExecutor(
+                max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
+                for task, result in pool.map(_league_worker, tasks, chunksize=1):
+                    _store_orientation_result(
+                        self._store, context.session_id, context.generation_id, task, result
+                    )
+
+        for pairing_id in pairing_ids:
+            revision_a = self._store.connection.execute(
+                "SELECT revision_a FROM league_pairings WHERE pairing_id = %s",
+                [pairing_id],
+            ).fetchone()[0]
+            _finish_pairing(self._store, pairing_id, str(revision_a))
+
+        if not pairing_ids:
+            return {
+                "pairs": 0,
+                "errors": 0,
+                "wins": 0,
+                "losses": 0,
+                "draws": 0,
+                "win_rate": 0.0,
+                "margin": 0.0,
+                "margin_std": 0.0,
+                "money": 0.0,
+                "pairing_ids": [],
+            }
+        placeholders = ",".join("%s" for _ in pairing_ids)
+        rows = self._store.connection.execute(
+            f"""
+            SELECT pr.paired_margin, pr.outcome_a, pr.failed,
+                   avg(ep.final_money) AS candidate_money
+            FROM league_pairings lp
+            JOIN pairing_results pr USING (pairing_id)
+            LEFT JOIN pairing_episodes pe USING (pairing_id)
+            LEFT JOIN episode_players ep
+              ON ep.match_id = pe.match_id AND ep.strategy_id = lp.revision_a
+            WHERE lp.pairing_id IN ({placeholders})
+            GROUP BY lp.pairing_id, pr.paired_margin, pr.outcome_a, pr.failed
+            ORDER BY lp.pairing_id
+            """,
+            pairing_ids,
+        ).fetchall()
+        valid = [row for row in rows if not row[2] and row[0] is not None]
+        margins = [float(row[0]) for row in valid]
+        outcomes = [float(row[1]) for row in valid]
+        money = [float(row[3]) for row in valid if row[3] is not None]
+        return {
+            "pairs": len(valid),
+            "errors": len(pairing_ids) - len(valid),
+            "wins": sum(value > 0 for value in margins),
+            "losses": sum(value < 0 for value in margins),
+            "draws": sum(value == 0 for value in margins),
+            "win_rate": (sum(outcomes) / len(outcomes) if outcomes else 0.0),
+            "margin": (sum(margins) / len(margins) if margins else 0.0),
+            "margin_std": (statistics.stdev(margins) if len(margins) > 1 else 0.0),
+            "money": (sum(money) / len(money) if money else 0.0),
+            "pairing_ids": pairing_ids,
+        }
+
+    def record_policy_mixture(
+        self,
+        context: RoundContext,
+        revision_ids: Sequence[str],
+        *,
+        max_members: int,
+        weights: Sequence[float] | None = None,
+    ) -> str:
+        """Persist one immutable policy mixture; weights default to uniform."""
+        if not revision_ids:
+            raise ValueError("policy mixture cannot be empty")
+        if max_members < 1:
+            raise ValueError("max_members must be positive")
+        members = tuple(revision_ids[-max_members:])
+        if weights is None:
+            normalized = [1.0 / len(members)] * len(members)
+        else:
+            selected = list(weights[-max_members:])
+            if len(selected) != len(members) or any(
+                value < 0 or not math.isfinite(value) for value in selected
+            ):
+                raise ValueError("policy mixture weights must match members and be nonnegative")
+            total = sum(selected)
+            if total <= 0:
+                raise ValueError("policy mixture weights must have positive mass")
+            normalized = [value / total for value in selected]
+        mixture_id = _stable_id(
+            "mixture",
+            self._model_id,
+            context.generation_id,
+            *(f"{member}:{weight:.17g}" for member, weight in zip(members, normalized)),
+        )
+        self._store.connection.execute(
+            "INSERT INTO policy_mixtures VALUES (%s, %s, %s, %s, current_timestamp) ON CONFLICT DO NOTHING",
+            [mixture_id, self._model_id, context.generation_index, max_members],
+        )
+        self._store.connection.executemany(
+            "INSERT INTO policy_mixture_members VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            [
+                [mixture_id, revision_id, ordinal, normalized[ordinal]]
+                for ordinal, revision_id in enumerate(members)
+            ],
+        )
+        return mixture_id
+
+    def link_artifacts(self, batch_id: str, artifact_ids: Sequence[str]) -> None:
+        """Associate immutable episode sidecars with a consolidated batch."""
+        if artifact_ids:
+            self._store.connection.executemany(
+                "INSERT INTO training_batch_artifacts VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                [[batch_id, artifact_id] for artifact_id in artifact_ids],
+            )
 
 
 class Trainer(Protocol):
@@ -164,7 +582,7 @@ def session_training_models(
     selected = tuple(model_ids) if model_ids is not None else tuple(family_ids)
     if not selected:
         return []
-    placeholders = ",".join("?" for _ in selected)
+    placeholders = ",".join("%s" for _ in selected)
     column = "model_id" if model_ids is not None else "family_id"
     rows = store.connection.execute(
         f"""
@@ -189,7 +607,7 @@ def _ledger_status(
     row = store.connection.execute(
         """
         SELECT status FROM model_round_hooks
-        WHERE model_id = ? AND scope = ? AND generation_id = ? AND round_index = ?
+        WHERE model_id = %s AND scope = %s AND generation_id = %s AND round_index = %s
         """,
         [model_id, scope, generation_id, round_index],
     ).fetchone()
@@ -211,7 +629,7 @@ def _ledger_begin(
             """
             INSERT INTO model_round_hooks (
                 hook_id, model_id, session_id, generation_id, scope, round_index, status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'RUNNING')
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'RUNNING')
             """,
             [
                 _stable_id("hook", model_id, scope, generation_id, round_index),
@@ -227,7 +645,7 @@ def _ledger_begin(
         """
         UPDATE model_round_hooks SET status = 'RUNNING', error_text = NULL,
             started_at = current_timestamp, completed_at = NULL
-        WHERE model_id = ? AND scope = ? AND generation_id = ? AND round_index = ?
+        WHERE model_id = %s AND scope = %s AND generation_id = %s AND round_index = %s
         """,
         [model_id, scope, generation_id, round_index],
     )
@@ -246,9 +664,9 @@ def _ledger_finish(
 ) -> None:
     store.connection.execute(
         """
-        UPDATE model_round_hooks SET status = ?, batches_recorded = ?, error_text = ?,
+        UPDATE model_round_hooks SET status = %s, batches_recorded = %s, error_text = %s,
             completed_at = current_timestamp
-        WHERE model_id = ? AND scope = ? AND generation_id = ? AND round_index = ?
+        WHERE model_id = %s AND scope = %s AND generation_id = %s AND round_index = %s
         """,
         [status, batches, error, model_id, scope, generation_id, round_index],
     )

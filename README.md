@@ -9,7 +9,7 @@ Each player starts with an empty farm and a small amount of income (seed money, 
 ## Strategy Lab
 
 This repository includes a reproducible framework for generating configurable agents,
-running staged tournaments, recording results in DuckDB and Parquet, training Random
+running staged tournaments, recording results in PostgreSQL and Parquet, training Random
 Forest surrogate models, and proposing the next strategy population.
 
 Each independent approach lives in a descriptively named folder under `agents/`. The
@@ -36,8 +36,23 @@ uv sync --locked --python 3.12
 ./run-sim.sh competitors      # Round-robin against every imported competitor
 
 # Run the resumable crop-surrogate + DQN training loop, then a large arena.
-# Edit the constants at the top of train_all.py to change its scale.
+# Edit root main.toml to change machine-wide scale, paths, and compute settings.
 python train_all.py
+
+# Train mixed-farm v5 against every imported Kaggle snapshot. Generation zero
+# is drawn entirely from the bounded prior; v3/v4 champions are not inherited.
+python train_mixed_farm.py
+
+# Train one adaptive-hybrid DQN by self-play. Three of every four rollouts face
+# a frozen snapshot of its own promoted checkpoints; the fixed benchmarks are
+# only the external yardstick the promotion gate measures against.
+python train_dqn.py
+
+# Train one market Q-network on top of a frozen field policy. The field play is
+# an unmodified copy of the pilkwang snapshot, and the promotion benchmark is
+# that same snapshot, so the paired margin measures the learned market layer and
+# nothing else.
+python train_market_scorer.py
 
 # Compare named profiles directly.
 .venv/bin/python -m sim.arena league \
@@ -68,8 +83,18 @@ SESSION=$(.venv/bin/kaglab league init --config configs/league.toml)
 .venv/bin/kaglab league run --session-id "$SESSION"
 ```
 
+On Apple Silicon, `[compute] device = "auto"` in `main.toml` selects PyTorch's
+Metal (`mps`) backend when available. Set it to `"cpu"` to force CPU execution.
+This accelerates DQN gradient updates; game simulation, arena evaluation,
+PostgreSQL, and the scikit-learn surrogate models remain CPU workloads.
+
+The DQN candidate is an adaptive hybrid: public shop demand, prices, opponent
+supply, remaining season, feed cost, and labor capacity select crop,
+animal-dividend, or mixed mode. Its schema-v2 model ID and schema-v3 replay
+format intentionally isolate it from the former crop-only lineage.
+
 `TRAINING_AGENTS` at the top of `train_all.py` lists every manifest-backed agent. Each
-`{"type": ..., "name": ...}` pair has independent DuckDB history and writes beneath
+`{"type": ..., "name": ...}` pair has independent PostgreSQL history and writes beneath
 `artifacts/<type>/<name>/`. Rename an entry to start a reproducible fresh attempt, reuse
 the name to resume it, or set `"train": False` to lock its current weights without
 removing it. Named attempts get a stable seed derived from type + name unless the entry
@@ -78,27 +103,122 @@ provides `"seed"`. When several surrogate instances share a type, exactly one is
 `"train": False`; by default the runner discovers every other `agents/*/agent.toml`
 as a fixed league anchor.
 
-The canonical catalog is `artifacts/experiments.duckdb`. Each run also exports portable
-Parquet tables under `artifacts/parquet/<run-id>/`; use `kaglab export --csv` for CSV.
-Large research runs are never launched by tests or default commands.
+All league state lives in the `public` schema of the local PostgreSQL service. The
+required `league` value in each league TOML is copied onto every session so histories
+remain easy to group without separate schemas. Each run can also export portable Parquet
+tables under `artifacts/parquet/<run-id>/`; use
+`kaglab export --csv` for CSV. Large research runs are never launched by tests or default
+commands.
 
-Review every persistent league session in the read-only local dashboard:
+### PostgreSQL lab service
+
+The lab uses one PostgreSQL database, the `public` schema, and one long-running HTTP
+service for all human and agent access:
+
+| Interface | Shared endpoint |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:8000/` |
+| MCP | `http://127.0.0.1:8000/mcp` |
+
+Training processes are PostgreSQL writers only. They do not start dashboards, bind ports,
+choose fallback ports, or register MCP servers. This keeps every concurrent runner visible
+through the same dashboard and the same MCP client configuration.
+
+Start the complete local service in one terminal:
 
 ```bash
-.venv/bin/kaglab web
-# Or select another catalog or address.
-.venv/bin/kaglab web --database artifacts/experiments.duckdb \
-  --host 127.0.0.1 --port 8000
+# Bash / macOS / Linux
+./lab-stack.sh up
+# Or, when PostgreSQL is already running:
+.venv/bin/kaglab web --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/` to inspect generations, ratings, pairings, episodes,
-hook evaluations, and stored replays. Pairings identify each agent family, strategy,
-revision, and behavior-model checkpoint when present. Episode pages can open the full
-visual replay with play/pause and turn controls or download its JSON. Refreshing a page
-re-queries DuckDB. A
-separate dashboard process cannot read the catalog while `league run` owns DuckDB's
-write lock; the dashboard reports that state and can be refreshed once the run pauses
-or completes. The server binds to loopback by default and has no authentication.
+```powershell
+# PowerShell / Windows
+./lab-stack.ps1 up
+# Or, when PostgreSQL is already running:
+.venv/Scripts/kaglab.exe web --host 127.0.0.1 --port 8000
+```
+
+That command writes the local PostgreSQL environment file, starts the single
+`kaggriculture-postgres` container, bootstraps the schema, then runs the shared dashboard in the
+foreground. Docker Compose is not required. The persistent data lives in one named Docker
+volume. Run `train_*.py` or `kaglab league run` from another terminal. Useful lifecycle
+commands are:
+
+```bash
+./lab-stack.sh status
+./lab-stack.sh logs
+./lab-stack.sh down
+```
+
+Use the same `status`, `logs`, `down`, and `reset --yes` commands with
+`lab-stack.ps1` on Windows. `down` stops the container and preserves its volume;
+`reset --yes` removes the container, explicitly deletes the volume, and destroys all
+PostgreSQL data. On its first run, either script adopts the volume from the former
+Compose-managed container if one exists. Before a legacy migration, stop every trainer.
+The migration refuses active advisory locks, writes a timestamped SQL backup under
+`artifacts/postgres-backups/`, checks global key collisions and references, merges inside
+one transaction, then removes the legacy schemas only after validation succeeds.
+
+`kaglab web` writes exactly one managed Codex entry named `kaggriculture_progress` to
+`.codex/config.toml`. Starting it also replaces obsolete managed per-run entries. The MCP
+tools use the same database and require no schema selector.
+
+Open `http://127.0.0.1:8000/` to inspect every session across leagues in one table,
+including its League column, generations,
+ratings, pairings, episodes, hook evaluations, and stored replays. Pairings identify each
+agent family, strategy, revision, and behavior-model checkpoint when present. Episode
+pages can open the full visual replay with play/pause and turn controls or download its
+JSON. Training runners never bind HTTP ports; PostgreSQL allows this single dashboard to
+remain available while all session writers run concurrently. Trainer-only generation pages
+show their `model_round_hooks` rows directly, even when they do not create league pairings.
+The server binds to loopback
+by default and has no authentication.
+
+### Agent access through MCP
+
+The dashboard also exposes a stateless MCP Streamable HTTP endpoint at
+`http://127.0.0.1:8000/mcp`. Configure one MCP client with that URL while `kaglab web`
+is running. The endpoint supports protocol revisions
+2025-11-25, 2025-06-18, and 2025-03-26 and returns JSON responses rather than opening
+a server-sent event stream.
+
+At startup, `kaglab web` synchronizes its actual bound URL into the single managed
+`kaggriculture_progress` entry in `.codex/config.toml`. Old per-run managed entries are
+removed. Other Codex settings are preserved, and a same-named table not marked as
+dashboard-managed is treated as user-owned and left unchanged. Restart Codex after the
+first registration so it reloads the project MCP configuration.
+
+The model-facing tools are:
+
+- `list_training_sessions` — discover sessions, optionally filtered by `league`, and their latest completion/failure state
+- `get_session_progress` — inspect generation history, rating deltas, leaders, evaluations, and models
+- `get_generation_progress` — inspect work completion, outcomes, agents, hooks, and runtime
+- `get_model_progress` — inspect batch watermarks, updates, gates, checkpoints, and evaluations
+- `query_database` — run parameterized SQL against the shared database, reads and writes alike
+
+`query_database` accepts `sql`, an optional `parameters` array, and `max_rows` (default
+200, maximum 1000). It connects as the `kag_writer` role, so mutations and DDL are
+permitted and commit immediately — this is a playground, not a guarded production
+surface. Statements without a result set report `affected_rows` instead of rows.
+Schema discovery is available through
+`information_schema.tables` and `information_schema.columns`. For example:
+
+```json
+{
+  "name": "query_database",
+  "arguments": {
+    "sql": "SELECT generation_index, status FROM generations WHERE session_id = %s ORDER BY generation_index DESC",
+    "parameters": ["my-session"],
+    "max_rows": 20
+  }
+}
+```
+
+The MCP endpoint has no authentication, just like the HTML dashboard. Keep it bound to
+loopback unless it is placed behind an authenticated trusted-network proxy. Requests with
+a cross-origin browser `Origin` are rejected.
 
 The smoke configuration validates plumbing, not model quality: its tiny population and
 short season can produce noisy or negative held-out R². Use the research configuration
@@ -107,14 +227,31 @@ before interpreting feature importance or promoting a model-recommended profile.
 The persistent league uses immutable identities derived from agent behavior code,
 strategy parameters, schema version, and any behavior model checkpoint. A generation
 plays random pairings in both seats with the same seed, then updates Glicko-2 ratings as
-one frozen batch. Full replays are gzip-compressed inside DuckDB; generation statistics,
+one frozen batch. Full replays are gzip-compressed in PostgreSQL `BYTEA`; generation statistics,
 rating snapshots, lineage, surrogate checkpoints, and post-episode evaluations remain
 queryable alongside them. `league resume` safely continues missing episodes.
 
 `configs/league.toml` registers the 12 `competitor_` snapshots as fixed benchmark
-anchors. They receive paired games through the hall-of-fame rounds but are never bred,
-mutated, trained, or bundled with our agent. `configs/league_smoke.toml` intentionally
-omits them to keep plumbing tests small.
+anchors. A config may reserve `anchor_rounds` so every live policy receives deterministic
+seat-swapped coverage of those fixed opponents before separate historical hall-of-fame
+rounds. Anchors are never bred, mutated, trained, or bundled with our agent.
+`configs/league_smoke.toml` intentionally omits them to keep plumbing tests small.
+
+`configs/mixed_farm_league.toml` uses all twelve anchor rounds, twelve population rounds,
+and four historical rounds. Its v5 Random Forest keeps the v4 target weights: 40% conservative
+rating, 25% equal-opponent macro margin, 20% bottom-quartile opponent margin, and 15% final
+money. It can tune bounded economic preferences, but the deterministic controller owns
+feasibility: a normal 10-hand ceiling, an absolute 16-hand ceiling, exact Fibonacci costs,
+cash-reserve and daily-spend checks, useful-work requirements, and a doubled ROI hurdle for
+hands 11–16. The forest is trusted only after 60 rows and held-out error gates for performance,
+productive hand actions, and idle hand actions; otherwise evolution supplies the candidates.
+
+The v4 generation in `configurable-mixed-farm-v4-training` remains preserved and incomplete, but
+nothing runs it any more: v4 was not competitive, so its frozen baseline controller and the
+automated acceptance arena were both removed. The single mixed-farm agent is now
+`agents/mixed_farm_v5/` (family `mixed_farm_v5`), training in the
+`configurable-mixed-farm-v5-training` session from a fresh population rather than inherited
+v3/v4 champions. Compare a champion by hand with `sim.arena` against the 12 anchors.
 
 An agent may export an optional `evaluate_episode(context, reader)` hook from its
 `main.py`. The parent league process invokes it only after the episode and replay have
@@ -131,11 +268,11 @@ fingerprint after code changes—with:
 
 Episode-evaluator hooks derive diagnostics only. Trainer hooks are a separate seam that
 may collect model-specific data and create checkpoints. Neither hook runs inside the
-submitted Kaggle agent, and submission-time inference never opens DuckDB.
+submitted Kaggle agent, and submission-time inference never opens PostgreSQL.
 
 ## Incremental model updates
 
-Trainable families share the catalog at `artifacts/experiments.duckdb`, while large
+Trainable families share the PostgreSQL database, while large
 rollout and checkpoint files remain under `artifacts/`. Each `[[models]]` manifest
 entry names one `trainer = "agents.<name>.train:trainer"` object. Its optional
 `on_round(context, reader, writer)` hook records family-specific batches; once the
@@ -153,14 +290,14 @@ closed league round or generation
 
 This is also how an agent learns from previous sessions. Batches, per-model watermarks,
 round-hook ledgers, candidates, and active checkpoint pointers are keyed by `model_id` in
-DuckDB rather than kept in Python globals. A new or resumed league using the same database
-continues from that state. A different database is an intentionally isolated training
-history, as used by `train_planner.py`.
+PostgreSQL rather than kept in Python globals. A new or resumed league using the same
+model ID continues from that state. League values group sessions descriptively; they do
+not create separate model namespaces.
 
 `training_manifests` in the league config controls which families receive trainer hooks.
 Being present as an `anchor_manifest` does not train that family. Completed round hooks
 are ledgered and skipped when an interrupted league resumes, so expensive collection is
-not repeated. The current crop and planner surrogates each wait for two
+not repeated. The current crop, mixed-farm, and planner surrogates each wait for two
 closed-generation batches; the DQN waits for twenty 16-episode rollout batches.
 
 ```bash
@@ -177,7 +314,7 @@ closed-generation batches; the DQN waits for twenty 16-episode rollout batches.
 # automatically inside `league run`.
 .venv/bin/python -m agents.dqn_job_scorer.cli model update
 
-# Promotion changes only the catalog pointer. Export for a submission explicitly.
+# Promotion changes only the database pointer. Export for a submission explicitly.
 .venv/bin/python -m agents.dqn_job_scorer.cli model export-active \
   --output agents/dqn_job_scorer/weights.npz --confirm-release
 ```
@@ -186,10 +323,9 @@ An update below its threshold reports `deferred`. A trained challenger is retain
 even when its model-specific gate rejects it, and only promoted checkpoints become
 active. Rejected attempts advance their batch watermark; errored attempts remain
 retryable. An agent's `model update --force` bypasses the batch-count threshold but
-still requires at least one new batch; it does not replay a completed update. Recreate
-the disposable catalog from the single authoritative SQL file
-with `python scripts/rebuild_experiments_db.py --force`; an existing database is
-moved to a timestamped backup before replacement.
+still requires at least one new batch; it does not replay a completed update. Initialize
+the shared `public` schema from the authoritative SQL file with
+`python -m kaggriculture_lab.postgres_admin bootstrap`.
 
 Create a sibling folder for a fundamentally different future approach:
 

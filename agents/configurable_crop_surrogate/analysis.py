@@ -33,7 +33,7 @@ def calculate_elo(store: ExperimentStore, run_id: str, k_factor: float = 24.0) -
         SELECT stage, seed, match_id, seat0_id, seat1_id, p.money_difference
         FROM episodes e
         JOIN episode_players p USING (match_id, run_id, stage, seed)
-        WHERE e.run_id = ? AND p.seat = 0 AND NOT e.failed
+        WHERE e.run_id = %s AND p.seat = 0 AND NOT e.failed
         ORDER BY CASE stage WHEN 'stage1' THEN 1 WHEN 'stage2' THEN 2 ELSE 3 END,
                  seed, match_id
         """,
@@ -131,7 +131,7 @@ def _quality_dataset(store: ExperimentStore, run_id: str) -> tuple[pd.DataFrame,
         SELECT p.strategy_id, p.money_difference, s.params_json
         FROM episode_players p
         JOIN strategies s USING (strategy_id)
-        WHERE p.run_id = ? AND p.stage = 'stage1' AND NOT p.failed
+        WHERE p.run_id = %s AND p.stage = 'stage1' AND NOT p.failed
           AND p.strategy_id NOT LIKE 'builtin:%'
         ORDER BY p.strategy_id, p.match_id
         """,
@@ -153,7 +153,7 @@ def _matchup_dataset(store: ExperimentStore, run_id: str) -> tuple[pd.DataFrame,
         FROM episode_players p
         JOIN strategies mine ON mine.strategy_id = p.strategy_id
         JOIN strategies theirs ON theirs.strategy_id = p.opponent_id
-        WHERE p.run_id = ? AND p.stage IN ('stage2', 'stage3') AND NOT p.failed
+        WHERE p.run_id = %s AND p.stage IN ('stage2', 'stage3') AND NOT p.failed
         ORDER BY p.match_id, p.seat
         """,
         [run_id],
@@ -175,7 +175,7 @@ def train_surrogates(
     artifacts: str | Path = "artifacts",
 ) -> dict[str, dict[str, Any]]:
     run_row = store.connection.execute(
-        "SELECT seed FROM runs WHERE run_id = ?", [run_id]
+        "SELECT seed FROM runs WHERE run_id = %s", [run_id]
     ).fetchone()
     if run_row is None:
         raise ValueError(f"unknown run_id: {run_id}")
@@ -246,7 +246,7 @@ def propose_strategies(
     proposal_count: int | None = None,
 ) -> list[Strategy]:
     run_row = store.connection.execute(
-        "SELECT seed, config_json FROM runs WHERE run_id = ?", [run_id]
+        "SELECT seed, config_json FROM runs WHERE run_id = %s", [run_id]
     ).fetchone()
     if run_row is None:
         raise ValueError(f"unknown run_id: {run_id}")
@@ -264,7 +264,7 @@ def propose_strategies(
     frame = _strategy_frame(strategies)
 
     model_rows = store.connection.execute(
-        "SELECT kind, artifact_path FROM models WHERE run_id = ? ORDER BY created_at DESC",
+        "SELECT kind, artifact_path FROM models WHERE run_id = %s ORDER BY created_at DESC",
         [run_id],
     ).fetchall()
     paths = {kind: path for kind, path in model_rows}
@@ -281,7 +281,7 @@ def propose_strategies(
         elites_rows = store.connection.execute(
             """
             SELECT r.strategy_id FROM ratings r JOIN strategies s USING (strategy_id)
-            WHERE r.run_id = ? ORDER BY r.rating DESC LIMIT 20
+            WHERE r.run_id = %s ORDER BY r.rating DESC LIMIT 20
             """,
             [run_id],
         ).fetchall()

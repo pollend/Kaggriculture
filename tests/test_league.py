@@ -1,4 +1,5 @@
 import json
+import random
 from pathlib import Path
 
 import pytest
@@ -17,15 +18,18 @@ from kaggriculture_lab.league import (
     LeagueConfig,
     _primary_training_model_id,
     _run_hook,
+    _store_orientation_result,
     _training_model_ids,
     create_session,
+    run_generation,
     schedule_generation,
 )
 from kaggriculture_lab.model_trainers import load_trainer
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
-from kaggriculture_lab.storage import SCHEMA_VERSION, ExperimentStore
-from kaggriculture_lab.training import allocate_generation
+from kaggriculture_lab.storage import ExperimentStore
+from kaggriculture_lab.training import allocate_generation, initialize_population, propose
 from sim.runner import MatchResult, SeatResult
+from tests.postgres_support import postgres_database, seed_reference_rows
 
 
 def test_glicko2_matches_published_example():
@@ -52,6 +56,29 @@ def test_generation_allocation_is_exact():
     assert sum(allocate_generation(7).values()) == 7
 
 
+def test_training_hooks_receive_candidate_pool_and_seed_session():
+    class Adapter:
+        def sample(self, rng):
+            return rng.randrange(1000)
+
+        def propose(self, **kwargs):
+            assert kwargs["candidate_pool"] == 321
+            return ["proposed"]
+
+        def initialize_population(self, **kwargs):
+            assert kwargs["seed_session_id"] == "previous"
+            return [(index, "seed") for index in range(kwargs["count"])]
+
+    adapter = Adapter()
+    rng = random.Random(7)
+    assert propose(adapter, 1, [], rng, object(), candidate_pool=321) == ["proposed"]
+    assert initialize_population(adapter, 3, rng, object(), "previous") == [
+        (0, "seed"),
+        (1, "seed"),
+        (2, "seed"),
+    ]
+
+
 def test_revision_identity_tracks_behavior_code(tmp_path: Path):
     code = tmp_path / "agent.py"
     code.write_text("def agent(obs): return {}\n")
@@ -70,7 +97,7 @@ def test_revision_identity_tracks_behavior_code(tmp_path: Path):
     assert first.revision_id != changed.revision_id
 
 
-def test_replay_is_compressed_in_duckdb_and_read_through_narrow_reader(tmp_path: Path):
+def test_replay_is_compressed_in_postgres_and_read_through_narrow_reader(tmp_path: Path):
     result = MatchResult(
         seed=7,
         seats=[
@@ -81,15 +108,20 @@ def test_replay_is_compressed_in_duckdb_and_read_through_narrow_reader(tmp_path:
         wallclock=0.1,
         replay={"steps": [[{"observation": {"step": 0}}]]},
     )
-    with ExperimentStore(tmp_path / "episodes.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "episodes")) as store:
+        seed_reference_rows(
+            store.connection, run_id="run", family_id="family", revision_ids=("a", "b")
+        )
         store.add_match("match", "run", "league:test", ("a", "b"), ("a", "b"), result)
         store.add_replay_payload("match", result.replay)
         reader = EpisodeReader(store.connection, "match", 0)
         assert reader.summary()["money_difference"] == 10
         assert reader.replay() == result.replay
         assert store.connection.execute(
-            "SELECT max(version) FROM schema_migrations"
-        ).fetchone()[0] == SCHEMA_VERSION
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = %s AND table_name = 'training_sessions'",
+            ["public"],
+        ).fetchone()[0] == 1
 
         context = EpisodeHookContext("run", "generation", "pair", "match", "a", "b", 0)
         _run_hook(store, context, "missing_episode_evaluator:hook")
@@ -99,8 +131,78 @@ def test_replay_is_compressed_in_duckdb_and_read_through_narrow_reader(tmp_path:
         assert status == "ERROR"
 
 
+def test_every_episode_keeps_its_replay_including_trainer_rollouts(tmp_path: Path):
+    """Rollouts are stored exactly like scheduled matches, payload included.
+
+    Rollouts were briefly recorded without a payload to save disk. The
+    evaluation hook fires for them regardless, so every replay-reading
+    evaluator raised on those episodes and the league recorded 76
+    `episode_evaluations` ERROR rows instead of diagnostics. There is no longer
+    a way to store an episode without its replay, and a `MatchResult` that
+    arrives without one is a fault rather than a policy.
+    """
+
+    import inspect
+
+    from kaggriculture_lab.model_trainers import TrainingBatchWriter
+
+    assert "store_replay" not in inspect.signature(_store_orientation_result).parameters
+    assert (
+        "store_replay"
+        not in inspect.signature(TrainingBatchWriter.record_policy_episode).parameters
+    )
+
+    result = MatchResult(
+        seed=7,
+        seats=[
+            SeatResult("a", 0, 20, "DONE", False, None, None, 1, 0, 0, 0, 20, {"productive_actions": 1}),
+            SeatResult("b", 1, 10, "DONE", False, None, None, 1, 0, 0, 0, 10, {"productive_actions": 0}),
+        ],
+        steps=1,
+        wallclock=0.1,
+        replay=None,
+    )
+    with ExperimentStore(postgres_database(tmp_path, "no_replay")) as store:
+        seed_reference_rows(
+            store.connection, run_id="run", family_id="family", revision_ids=("a", "b")
+        )
+        store.add_match("match", "run", "league:test", ("a", "b"), ("a", "b"), result)
+        reader = EpisodeReader(store.connection, "match", 0)
+        with pytest.raises(ValueError, match="replay payload not found"):
+            reader.replay()
+
+
+def test_league_worker_retains_the_required_replay(monkeypatch):
+    from types import SimpleNamespace
+
+    from kaggriculture_lab import league
+
+    task = SimpleNamespace(
+        orientation=0,
+        left=SimpleNamespace(agent_spec="left"),
+        right=SimpleNamespace(agent_spec="right"),
+        seed=7,
+        episode_steps=24,
+    )
+    expected = object()
+
+    def fake_run_match(specs, seed, config, *, analyzer):
+        assert specs == ("left", "right")
+        assert seed == 7
+        assert config == {"episodeSteps": 24}
+        assert analyzer is league.episode_metrics
+        return expected
+
+    monkeypatch.setattr(league, "run_match", fake_run_match)
+
+    returned_task, result = league._league_worker(task)
+
+    assert returned_task is task
+    assert result is expected
+
+
 def test_scheduler_gives_every_member_each_round_and_avoids_self_play(tmp_path: Path):
-    database = tmp_path / "league.duckdb"
+    database = postgres_database(tmp_path, "league")
     config = LeagueConfig(
         population_size=6,
         rounds_per_generation=4,
@@ -114,11 +216,11 @@ def test_scheduler_gives_every_member_each_round_and_avoids_self_play(tmp_path: 
         members = {
             row[0]
             for row in store.connection.execute(
-                "SELECT revision_id FROM generation_members WHERE generation_id = ?", [generation_id]
+                "SELECT revision_id FROM generation_members WHERE generation_id = %s", [generation_id]
             ).fetchall()
         }
         rows = store.connection.execute(
-            "SELECT revision_a, revision_b, pairing_kind FROM league_pairings WHERE generation_id = ?",
+            "SELECT revision_a, revision_b, pairing_kind FROM league_pairings WHERE generation_id = %s",
             [generation_id],
         ).fetchall()
         assert all(left != right for left, right, _ in rows)
@@ -133,6 +235,115 @@ def test_scheduler_gives_every_member_each_round_and_avoids_self_play(tmp_path: 
             if right in appearances:
                 appearances[right] += 1
         assert set(appearances.values()) == {4}
+
+
+def test_scheduler_gives_every_member_every_fixed_anchor(tmp_path: Path):
+    database = postgres_database(tmp_path, "anchor-coverage")
+    config = LeagueConfig(
+        population_size=4,
+        rounds_per_generation=4,
+        anchor_rounds=2,
+        hall_of_fame_rounds=0,
+        anchor_manifests=(
+            "agents/competitor_prvsiyan_kaggriculture_frontier_the_moon_counts_melons/agent.toml",
+            "agents/competitor_lucifer19_kaggriculture_night_harvest/agent.toml",
+        ),
+        episode_steps=24,
+    )
+    session_id = create_session(config, database, session_id="anchor-coverage")
+    with ExperimentStore(database) as store:
+        assert schedule_generation(store, session_id) == 12
+        generation_id = "anchor-coverage:g0000"
+        anchors = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT revision_id FROM generation_members "
+                "WHERE generation_id = %s AND role = 'anchor'",
+                [generation_id],
+            ).fetchall()
+        }
+        members = {
+            row[0]
+            for row in store.connection.execute(
+                "SELECT revision_id FROM generation_members "
+                "WHERE generation_id = %s AND role != 'anchor'",
+                [generation_id],
+            ).fetchall()
+        }
+        rows = store.connection.execute(
+            "SELECT revision_a, revision_b, pairing_kind FROM league_pairings "
+            "WHERE generation_id = %s",
+            [generation_id],
+        ).fetchall()
+        fixed = [(left, right) for left, right, kind in rows if kind == "anchor"]
+        assert len(fixed) == len(members) * len(anchors)
+        for member in members:
+            assert {right for left, right in fixed if left == member} == anchors
+
+
+def test_running_generation_resumes_without_being_scheduled_again(
+    tmp_path: Path, monkeypatch
+):
+    from kaggriculture_lab import league
+
+    database = postgres_database(tmp_path, "resume")
+    config = LeagueConfig(
+        population_size=4,
+        rounds_per_generation=1,
+        hall_of_fame_rounds=0,
+        episode_steps=2,
+        jobs=1,
+    )
+    session_id = create_session(config, database, session_id="resume")
+    with ExperimentStore(database) as store:
+        scheduled = schedule_generation(store, session_id)
+        store.connection.execute(
+            "UPDATE generations SET status = 'RUNNING' WHERE generation_id = 'resume:g0000'"
+        )
+    monkeypatch.setattr(
+        league,
+        "schedule_generation",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("rescheduled")),
+    )
+    monkeypatch.setattr(league, "_run_round", lambda *args, **kwargs: None)
+    monkeypatch.setattr(league, "_close_generation", lambda *args, **kwargs: None)
+    report = run_generation(session_id, database, tmp_path / "artifacts")
+    assert report["status"] == "COMPLETE"
+    with ExperimentStore(database) as store:
+        assert store.connection.execute(
+            "SELECT count(*) FROM league_pairings WHERE generation_id = 'resume:g0000'"
+        ).fetchone()[0] == scheduled
+
+
+def test_trainer_only_generation_stops_on_round_hook_error(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+
+    from kaggriculture_lab import league
+
+    database = postgres_database(tmp_path, "trainer-error")
+    config = LeagueConfig(
+        pairing_mode="trainer_only",
+        population_size=0,
+        rounds_per_generation=1,
+        hall_of_fame_rounds=0,
+        episode_steps=2,
+        jobs=1,
+    )
+    session_id = create_session(config, database, session_id="trainer-error")
+    monkeypatch.setattr(league, "_run_round", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        league,
+        "run_round_hooks",
+        lambda *args, **kwargs: [
+            SimpleNamespace(model_id="broken", status="error", error="boom")
+        ],
+    )
+    with pytest.raises(RuntimeError, match="generation remains resumable"):
+        run_generation(session_id, database, tmp_path / "artifacts")
+    with ExperimentStore(database) as store:
+        assert store.connection.execute(
+            "SELECT status FROM generations WHERE generation_id = 'trainer-error:g0000'"
+        ).fetchone()[0] == "RUNNING"
 
 
 def test_manifest_file_is_valid():
@@ -218,7 +429,7 @@ def test_second_generation_schedules_with_a_hall_of_fame(tmp_path: Path):
     """
     from kaggriculture_lab.league import _hall_of_fame, create_next_generation, run_generation
 
-    database = tmp_path / "generations.duckdb"
+    database = postgres_database(tmp_path, "generations")
     config = LeagueConfig(
         population_size=4,
         rounds_per_generation=2,

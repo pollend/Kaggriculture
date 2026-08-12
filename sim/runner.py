@@ -61,6 +61,7 @@ class MatchResult:
     steps: int
     wallclock: float
     replay: Any | None = field(default=None, repr=False)
+    training_artifacts: list[dict[str, Any] | None] = field(default_factory=list, repr=False)
 
     @property
     def failed(self) -> bool:
@@ -108,7 +109,6 @@ def run_match(
     specs: tuple[str, str],
     seed: int,
     config: dict[str, Any] | None = None,
-    keep_replay: bool = False,
     env_name: str = ENV_NAME,
     analyzer: Callable[[list, int], dict[str, Any]] | None = None,
 ) -> MatchResult:
@@ -130,6 +130,13 @@ def run_match(
     env = make(env_name, configuration=configuration, debug=False)
     env.run(agents)
     wallclock = time.perf_counter() - started
+
+    training_artifacts: list[dict[str, Any] | None] = []
+    for seat, resolved in enumerate(agents):
+        finalize = getattr(resolved, "finalize_episode", None)
+        training_artifacts.append(
+            None if finalize is None else finalize(env.steps, seat)
+        )
 
     seats: list[SeatResult] = []
     for seat, spec in enumerate(specs):
@@ -160,7 +167,8 @@ def run_match(
         seats=seats,
         steps=len(env.steps),
         wallclock=wallclock,
-        replay=env.toJSON() if keep_replay else None,
+        replay=env.toJSON(),
+        training_artifacts=training_artifacts,
     )
 
 

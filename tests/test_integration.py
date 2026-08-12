@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from tests.postgres_support import postgres_database
 from agents.configurable_crop_surrogate.experiment import ExperimentConfig, ExperimentRunner
 from agents.configurable_crop_surrogate.strategy import generate_population
 from kaggriculture_lab.episode_metrics import episode_metrics
@@ -40,7 +41,7 @@ def test_tournament_schedules_are_paired_and_stable(tmp_path: Path):
         candidate_pool=20,
         proposal_count=4,
     )
-    with ExperimentStore(tmp_path / "test.duckdb") as store:
+    with ExperimentStore(postgres_database(tmp_path, "test")) as store:
         runner = ExperimentRunner(config, store, tmp_path, run_id="schedule-test")
         population = generate_population(6, config.seed)
         first = runner._stage1(population)

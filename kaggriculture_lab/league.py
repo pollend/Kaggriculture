@@ -12,13 +12,15 @@ import statistics
 import tomllib
 import traceback
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from kaggriculture_lab.constants import default_database
+from kaggriculture_lab.database import DatabaseTarget
 from kaggriculture_lab.episode_metrics import episode_metrics
 from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader, load_evaluator
 from kaggriculture_lab.identity import (
@@ -37,12 +39,18 @@ from kaggriculture_lab.model_trainers import (
 from kaggriculture_lab.model_updates import ModelTrainingReader, update_model_in_store
 from kaggriculture_lab.ratings import GlickoRating, RatingGame, update_glicko2
 from kaggriculture_lab.storage import ExperimentStore
-from kaggriculture_lab.training import allocate_generation, load_training_adapter, propose
+from kaggriculture_lab.training import (
+    allocate_generation,
+    initialize_population,
+    load_training_adapter,
+    propose,
+)
 from sim.runner import MatchResult, run_match
 
 
 @dataclass(frozen=True, slots=True)
 class LeagueConfig:
+    league: str = "experiments"
     name: str = "configurable-crop-league"
     manifest: str = "agents/configurable_crop_surrogate/agent.toml"
     anchor_manifests: tuple[str, ...] = ()
@@ -56,33 +64,52 @@ class LeagueConfig:
     training_agents: tuple[TrainingAgentSpec, ...] = ()
     population_size: int = 20
     rounds_per_generation: int = 20
+    anchor_rounds: int = 0
     hall_of_fame_rounds: int = 4
     episode_steps: int = 720
     seed: int = 42
     jobs: int = 1
     tau: float = 0.5
     candidate_pool: int = 2_000
+    seed_session_id: str | None = None
+    seed_session_ids: tuple[str, ...] = ()
+    pairing_mode: str = "league"
 
     @classmethod
     def from_toml(cls, path: str | Path) -> LeagueConfig:
         with Path(path).open("rb") as stream:
             raw = tomllib.load(stream)
         values = dict(raw.get("league", raw))
+        if "league" not in values:
+            raise ValueError("league configuration must declare a league value")
         values["anchor_manifests"] = tuple(values.get("anchor_manifests", ()))
         values["training_manifests"] = tuple(values.get("training_manifests", ()))
         values["training_agents"] = tuple(
             TrainingAgentSpec.from_dict(item)
             for item in values.get("training_agents", ())
         )
+        values["seed_session_ids"] = tuple(values.get("seed_session_ids", ()))
         return cls(**values)
 
     def validate(self) -> None:
-        if self.population_size < 2:
+        if not self.league or len(self.league) > 100 or "\x00" in self.league:
+            raise ValueError("league must be a non-empty string of at most 100 characters")
+        if self.pairing_mode not in {"league", "trainer_only"}:
+            raise ValueError("pairing_mode must be 'league' or 'trainer_only'")
+        if self.pairing_mode == "league" and self.population_size < 2:
             raise ValueError("population_size must be at least 2")
         if self.rounds_per_generation < 1:
             raise ValueError("rounds_per_generation must be positive")
         if not 0 <= self.hall_of_fame_rounds <= self.rounds_per_generation:
             raise ValueError("hall_of_fame_rounds must be between 0 and rounds_per_generation")
+        if not 0 <= self.anchor_rounds <= self.rounds_per_generation:
+            raise ValueError("anchor_rounds must be between 0 and rounds_per_generation")
+        if self.anchor_rounds + self.hall_of_fame_rounds > self.rounds_per_generation:
+            raise ValueError(
+                "anchor_rounds plus hall_of_fame_rounds cannot exceed rounds_per_generation"
+            )
+        if self.anchor_rounds and not self.anchor_manifests:
+            raise ValueError("anchor_rounds requires at least one anchor manifest")
         if self.episode_steps < 1:
             raise ValueError("episode_steps must be positive")
         if self.jobs < 0:
@@ -127,9 +154,8 @@ def _league_worker(task: LeagueEpisodeTask):
         (seats[0].agent_spec, seats[1].agent_spec),
         task.seed,
         {"episodeSteps": task.episode_steps},
-        keep_replay=True,
-        # The league persists per-episode metrics for agents' evaluation hooks
-        # to read back, so it opts into the kaggriculture analyzer explicitly.
+        # The league persists per-episode metrics for agents' evaluation hooks,
+        # so it opts into the kaggriculture analyzer explicitly.
         analyzer=episode_metrics,
     )
     return task, result
@@ -163,7 +189,7 @@ def _get_revision(store: ExperimentStore, revision_id: str) -> AgentRevision:
         SELECT revision_id, family_id, strategy_id, entry_point, agent_spec,
                code_fingerprint, parameter_schema_version, params_json,
                checkpoint_id, checkpoint_digest, source, episode_evaluator
-        FROM agent_revisions WHERE revision_id = ?
+        FROM agent_revisions WHERE revision_id = %s
         """,
         [revision_id],
     ).fetchone()
@@ -174,7 +200,7 @@ def _get_revision(store: ExperimentStore, revision_id: str) -> AgentRevision:
 
 def create_session(
     config: LeagueConfig,
-    database: str | Path,
+    database: str | DatabaseTarget | None = None,
     *,
     workspace: str | Path = ".",
     session_id: str | None = None,
@@ -190,58 +216,83 @@ def create_session(
     ]
     anchor_manifests = [AgentManifest.load(path) for path in anchor_manifest_paths]
     adapter = load_training_adapter(manifest)
-    if adapter is None:
+    if adapter is None and config.pairing_mode == "league":
         raise ValueError(f"agent family has no training_adapter: {manifest.family_id}")
     population_rng = random.Random(config.seed)
-    strategies = [adapter.sample(population_rng) for _ in range(config.population_size)]
-    revisions = [
-        build_revision(
-            manifest,
-            strategy,
-            workspace=workspace,
-            episode_steps=config.episode_steps,
-            source="random",
-        )
-        for strategy in strategies
-    ]
-    anchors = [
-        builtin_revision("starter"),
-        builtin_revision("seeded_random", f"kaggriculture_lab.opponents:make_seeded_random?seed={config.seed}"),
-        builtin_revision("pass"),
-    ]
+    anchors = (
+        [
+            builtin_revision("starter"),
+            builtin_revision(
+                "seeded_random",
+                f"kaggriculture_lab.opponents:make_seeded_random?seed={config.seed}",
+            ),
+            builtin_revision("pass"),
+        ]
+        if config.pairing_mode == "league"
+        else []
+    )
     competitor_anchors = [
         build_revision(item, workspace=workspace, source="competitor")
         for item in anchor_manifests
     ]
     generation_id = f"{session_id}:g0000"
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         if store.connection.execute(
-            "SELECT 1 FROM training_sessions WHERE session_id = ?", [session_id]
+            "SELECT 1 FROM training_sessions WHERE session_id = %s", [session_id]
         ).fetchone():
             raise ValueError(f"training session already exists: {session_id}")
+        initialized = (
+            initialize_population(
+                adapter,
+                config.population_size,
+                population_rng,
+                ModelTrainingReader(store),
+                config.seed_session_ids or ((config.seed_session_id,) if config.seed_session_id else ()),
+            )
+            if adapter is not None and config.pairing_mode == "league"
+            else []
+        )
+        strategies = [strategy for strategy, _ in initialized]
+        revisions = [
+            build_revision(
+                manifest,
+                strategy,
+                workspace=workspace,
+                episode_steps=config.episode_steps,
+                source=source,
+            )
+            for strategy, source in initialized
+        ]
         store.register_family(manifest, manifest_path)
         for anchor_manifest, anchor_path in zip(anchor_manifests, anchor_manifest_paths):
             store.register_family(anchor_manifest, anchor_path)
         _register_training_agents(store, config, workspace=workspace)
-        store.add_agent_revisions([*revisions, *anchors, *competitor_anchors])
+        # Parents before children: strategies own the revisions that cite them,
+        # and the run owns the strategies' `created_run_id`.
+        store.begin_run(session_id, config.name, config.seed, asdict(config), {}, None)
         store.add_strategies(strategies, "league-random", session_id)
+        store.add_agent_revisions([*revisions, *anchors, *competitor_anchors])
         config_json = json.dumps(asdict(config), sort_keys=True)
         store.connection.execute(
-            "INSERT INTO training_sessions VALUES (?, ?, 'ACTIVE', ?, ?, current_timestamp)",
-            [session_id, config.name, config.seed, config_json],
+            """
+            INSERT INTO training_sessions (
+                session_id, league, name, status, seed, config_json, created_at
+            ) VALUES (%s, %s, %s, 'ACTIVE', %s, %s, current_timestamp)
+            """,
+            [session_id, config.league, config.name, config.seed, config_json],
         )
-        store.begin_run(session_id, config.name, config.seed, asdict(config), {}, None)
         store.connection.execute(
-            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (?, ?, 0, 'OPEN')",
+            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, 0, 'OPEN')",
             [generation_id, session_id],
         )
-        store.connection.executemany(
-            "INSERT INTO generation_members VALUES (?, ?, 'population', 1500, 350, 0.06)",
-            [[generation_id, revision.revision_id] for revision in revisions],
-        )
+        if revisions:
+            store.connection.executemany(
+                "INSERT INTO generation_members VALUES (%s, %s, 'population', 1500, 350, 0.06)",
+                [[generation_id, revision.revision_id] for revision in revisions],
+            )
         if competitor_anchors:
             store.connection.executemany(
-                "INSERT INTO generation_members VALUES (?, ?, 'anchor', 1500, 350, 0.06)",
+                "INSERT INTO generation_members VALUES (%s, %s, 'anchor', 1500, 350, 0.06)",
                 [[generation_id, revision.revision_id] for revision in competitor_anchors],
             )
     return session_id
@@ -249,21 +300,23 @@ def create_session(
 
 def _load_session(store: ExperimentStore, session_id: str) -> LeagueConfig:
     row = store.connection.execute(
-        "SELECT config_json FROM training_sessions WHERE session_id = ?", [session_id]
+        "SELECT config_json, league FROM training_sessions WHERE session_id = %s", [session_id]
     ).fetchone()
     if row is None:
         raise ValueError(f"unknown training session: {session_id}")
     values = json.loads(row[0])
+    values.setdefault("league", row[1])
     values["anchor_manifests"] = tuple(values.get("anchor_manifests", ()))
     values["training_manifests"] = tuple(values.get("training_manifests", ()))
     values["training_agents"] = tuple(
         TrainingAgentSpec.from_dict(item) for item in values.get("training_agents", ())
     )
+    values["seed_session_ids"] = tuple(values.get("seed_session_ids", ()))
     return LeagueConfig(**values)
 
 
 def set_training_manifests(
-    session_id: str, database: str | Path, manifests: Sequence[str]
+    session_id: str, database: str | DatabaseTarget, manifests: Sequence[str]
 ) -> tuple[str, ...]:
     """Repoint an existing session at a different set of trainers.
 
@@ -277,7 +330,7 @@ def set_training_manifests(
     ) if manifests else ()
     with ExperimentStore(database) as store:
         row = store.connection.execute(
-            "SELECT config_json FROM training_sessions WHERE session_id = ?", [session_id]
+            "SELECT config_json FROM training_sessions WHERE session_id = %s", [session_id]
         ).fetchone()
         if row is None:
             raise ValueError(f"unknown training session: {session_id}")
@@ -285,7 +338,7 @@ def set_training_manifests(
         values["training_manifests"] = list(manifests)
         values["training_agents"] = []
         store.connection.execute(
-            "UPDATE training_sessions SET config_json = ? WHERE session_id = ?",
+            "UPDATE training_sessions SET config_json = %s WHERE session_id = %s",
             [json.dumps(values, sort_keys=True), session_id],
         )
     return families
@@ -293,7 +346,7 @@ def set_training_manifests(
 
 def set_training_agents(
     session_id: str,
-    database: str | Path,
+    database: str | DatabaseTarget,
     config: LeagueConfig,
     *,
     workspace: str | Path = ".",
@@ -303,7 +356,7 @@ def set_training_agents(
     config.validate()
     with ExperimentStore(database) as store:
         row = store.connection.execute(
-            "SELECT config_json FROM training_sessions WHERE session_id = ?", [session_id]
+            "SELECT config_json FROM training_sessions WHERE session_id = %s", [session_id]
         ).fetchone()
         if row is None:
             raise ValueError(f"unknown training session: {session_id}")
@@ -312,7 +365,7 @@ def set_training_agents(
         values["training_manifests"] = list(config.training_manifests)
         values["training_agents"] = [asdict(item) for item in config.training_agents]
         store.connection.execute(
-            "UPDATE training_sessions SET config_json = ? WHERE session_id = ?",
+            "UPDATE training_sessions SET config_json = %s WHERE session_id = %s",
             [json.dumps(values, sort_keys=True), session_id],
         )
     return identifiers
@@ -322,7 +375,7 @@ def _current_generation(store: ExperimentStore, session_id: str) -> tuple[str, i
     row = store.connection.execute(
         """
         SELECT generation_id, generation_index, status FROM generations
-        WHERE session_id = ? ORDER BY generation_index DESC LIMIT 1
+        WHERE session_id = %s ORDER BY generation_index DESC LIMIT 1
         """,
         [session_id],
     ).fetchone()
@@ -337,7 +390,7 @@ def _member_ids(store: ExperimentStore, generation_id: str) -> list[str]:
         for row in store.connection.execute(
             """
             SELECT revision_id FROM generation_members
-            WHERE generation_id = ? AND role != 'anchor' ORDER BY revision_id
+            WHERE generation_id = %s AND role != 'anchor' ORDER BY revision_id
             """,
             [generation_id],
         ).fetchall()
@@ -353,7 +406,7 @@ def _hall_of_fame(
             """
             SELECT gm.revision_id FROM generation_members gm
             JOIN generations g USING (generation_id)
-            WHERE g.session_id = ? AND gm.role = 'anchor'
+            WHERE g.session_id = %s AND gm.role = 'anchor'
             ORDER BY gm.revision_id
             """,
             [session_id],
@@ -369,19 +422,60 @@ def _hall_of_fame(
         JOIN generations g ON g.generation_id = rs.generation_id
         -- Explicit ON, not USING: the join above leaves both rs.generation_id and
         -- g.generation_id in scope, so `USING (generation_id, ...)` is ambiguous
-        -- and DuckDB rejects it. Only reachable from generation 1 onward, since
+        -- and PostgreSQL rejects it. Only reachable from generation 1 onward, since
         -- generation 0 returns before this query.
         LEFT JOIN generation_stats gs
           ON gs.generation_id = rs.generation_id AND gs.revision_id = rs.revision_id
-        WHERE g.session_id = ? AND g.generation_index < ? AND NOT rs.is_frozen
+        WHERE g.session_id = %s AND g.generation_index < %s AND NOT rs.is_frozen
         GROUP BY rs.revision_id
         ORDER BY conservative DESC, margin DESC NULLS LAST, rs.revision_id
-        LIMIT ?
+        LIMIT %s
         """,
         [session_id, generation_index, limit],
     ).fetchall()
     historical = [row[0] for row in rows]
     return [*anchors, *historical] or ["builtin:starter"]
+
+
+def _anchor_ids(store: ExperimentStore, session_id: str) -> list[str]:
+    return [
+        str(row[0])
+        for row in store.connection.execute(
+            """
+            SELECT DISTINCT gm.revision_id
+            FROM generation_members gm
+            JOIN generations g USING (generation_id)
+            WHERE g.session_id = %s AND gm.role = 'anchor'
+            ORDER BY gm.revision_id
+            """,
+            [session_id],
+        ).fetchall()
+    ]
+
+
+def _historical_hall_of_fame(
+    store: ExperimentStore, session_id: str, generation_index: int, limit: int
+) -> list[str]:
+    if generation_index == 0:
+        return ["builtin:starter", "builtin:seeded_random", "builtin:pass"]
+    rows = store.connection.execute(
+        """
+        SELECT rs.revision_id, max(rs.rating - 2 * rs.deviation) AS conservative,
+               max(gs.mean_margin) AS margin
+        FROM rating_snapshots rs
+        JOIN generations g ON g.generation_id = rs.generation_id
+        LEFT JOIN generation_stats gs
+          ON gs.generation_id = rs.generation_id AND gs.revision_id = rs.revision_id
+        JOIN agent_revisions ar ON ar.revision_id = rs.revision_id
+        WHERE g.session_id = %s AND g.generation_index < %s
+          AND NOT rs.is_frozen AND ar.family_id != 'builtin'
+        GROUP BY rs.revision_id
+        ORDER BY conservative DESC, margin DESC NULLS LAST, rs.revision_id
+        LIMIT %s
+        """,
+        [session_id, generation_index, limit],
+    ).fetchall()
+    return [str(row[0]) for row in rows] or ["builtin:starter"]
 
 
 def schedule_generation(store: ExperimentStore, session_id: str) -> int:
@@ -390,17 +484,27 @@ def schedule_generation(store: ExperimentStore, session_id: str) -> int:
     config = _load_session(store, session_id)
     generation_id, generation_index, status = _current_generation(store, session_id)
     existing = store.connection.execute(
-        "SELECT count(*) FROM league_pairings WHERE generation_id = ?", [generation_id]
+        "SELECT count(*) FROM league_pairings WHERE generation_id = %s", [generation_id]
     ).fetchone()[0]
     if existing:
         return int(existing)
     if status != "OPEN":
         raise ValueError(f"generation is not open: {generation_id} ({status})")
+    if config.pairing_mode == "trainer_only":
+        store.connection.execute(
+            "UPDATE generations SET status = 'SCHEDULED' WHERE generation_id = %s",
+            [generation_id],
+        )
+        return 0
 
     members = _member_ids(store, generation_id)
     rng = random.Random(config.seed + generation_index * 1_000_003)
     rows: list[list[Any]] = []
-    intra_rounds = config.rounds_per_generation - config.hall_of_fame_rounds
+    intra_rounds = (
+        config.rounds_per_generation
+        - config.anchor_rounds
+        - config.hall_of_fame_rounds
+    )
     rotation: list[str | None] = members[:]
     rng.shuffle(rotation)
     if len(rotation) % 2:
@@ -425,9 +529,39 @@ def schedule_generation(store: ExperimentStore, session_id: str) -> int:
             rows.append([pairing_id, generation_id, round_index, "population", seed, left, right, "PENDING"])
         rotation = [rotation[0], rotation[-1], *rotation[1:-1]]
 
-    hall = _hall_of_fame(store, session_id, generation_index, max(3, math.ceil(len(members) * 0.2)))
+    if config.anchor_rounds:
+        anchors = _anchor_ids(store, session_id)
+        if not anchors:
+            raise ValueError("session config requests anchor rounds but has no anchors")
+        for offset in range(config.anchor_rounds):
+            round_index = intra_rounds + offset
+            for index, member in enumerate(members):
+                opponent = anchors[(index + offset) % len(anchors)]
+                seed = rng.randrange(0, 2**31)
+                pairing_id = _stable_id(
+                    "pair", generation_id, round_index, member, opponent, seed
+                )
+                rows.append(
+                    [
+                        pairing_id,
+                        generation_id,
+                        round_index,
+                        "anchor",
+                        seed,
+                        member,
+                        opponent,
+                        "PENDING",
+                    ]
+                )
+        hall = _historical_hall_of_fame(
+            store, session_id, generation_index, max(3, math.ceil(len(members) * 0.2))
+        )
+    else:
+        hall = _hall_of_fame(
+            store, session_id, generation_index, max(3, math.ceil(len(members) * 0.2))
+        )
     for offset in range(config.hall_of_fame_rounds):
-        round_index = intra_rounds + offset
+        round_index = intra_rounds + config.anchor_rounds + offset
         shuffled = members[:]
         rng.shuffle(shuffled)
         for index, member in enumerate(shuffled):
@@ -442,10 +576,10 @@ def schedule_generation(store: ExperimentStore, session_id: str) -> int:
 
     if rows:
         store.connection.executemany(
-            "INSERT INTO league_pairings VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows
+            "INSERT INTO league_pairings VALUES (%s, %s, %s, %s, %s, %s, %s, %s)", rows
         )
     store.connection.execute(
-        "UPDATE generations SET status = 'SCHEDULED' WHERE generation_id = ?", [generation_id]
+        "UPDATE generations SET status = 'SCHEDULED' WHERE generation_id = %s", [generation_id]
     )
     return len(rows)
 
@@ -467,14 +601,14 @@ def _run_hook(
             "eval", context.match_id, context.revision_id, context.seat, fingerprint
         )
         store.connection.execute(
-            "DELETE FROM episode_evaluations WHERE evaluation_id = ?", [evaluation_id]
+            "DELETE FROM episode_evaluations WHERE evaluation_id = %s", [evaluation_id]
         )
         store.connection.execute(
             """
             INSERT INTO episode_evaluations (
                 evaluation_id, match_id, revision_id, seat, evaluator_path,
                 evaluator_fingerprint, status, result_json, error_text, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'ERROR', NULL, ?, current_timestamp)
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'ERROR', NULL, %s, current_timestamp)
             """,
             [
                 evaluation_id,
@@ -491,7 +625,7 @@ def _run_hook(
         "eval", context.match_id, context.revision_id, context.seat, fingerprint
     )
     existing = store.connection.execute(
-        "SELECT status FROM episode_evaluations WHERE evaluation_id = ?", [evaluation_id]
+        "SELECT status FROM episode_evaluations WHERE evaluation_id = %s", [evaluation_id]
     ).fetchone()
     if existing and existing[0] == "COMPLETE" and not force:
         return
@@ -500,14 +634,14 @@ def _run_hook(
             context, EpisodeReader(store.connection, context.match_id, context.seat)
         )
         store.connection.execute(
-            "DELETE FROM episode_evaluations WHERE evaluation_id = ?", [evaluation_id]
+            "DELETE FROM episode_evaluations WHERE evaluation_id = %s", [evaluation_id]
         )
         store.connection.execute(
             """
             INSERT INTO episode_evaluations (
                 evaluation_id, match_id, revision_id, seat, evaluator_path,
                 evaluator_fingerprint, status, result_json, error_text, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'COMPLETE', ?, NULL, current_timestamp)
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'COMPLETE', %s, NULL, current_timestamp)
             """,
             [
                 evaluation_id,
@@ -521,14 +655,14 @@ def _run_hook(
         )
     except Exception:
         store.connection.execute(
-            "DELETE FROM episode_evaluations WHERE evaluation_id = ?", [evaluation_id]
+            "DELETE FROM episode_evaluations WHERE evaluation_id = %s", [evaluation_id]
         )
         store.connection.execute(
             """
             INSERT INTO episode_evaluations (
                 evaluation_id, match_id, revision_id, seat, evaluator_path,
                 evaluator_fingerprint, status, result_json, error_text, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 'ERROR', NULL, ?, current_timestamp)
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'ERROR', NULL, %s, current_timestamp)
             """,
             [
                 evaluation_id,
@@ -555,7 +689,7 @@ def _persist_orientation(
 ) -> None:
     match_id = _stable_id("match", pairing_id, orientation)
     existing = store.connection.execute(
-        "SELECT match_id FROM pairing_episodes WHERE pairing_id = ? AND orientation = ?",
+        "SELECT match_id FROM pairing_episodes WHERE pairing_id = %s AND orientation = %s",
         [pairing_id, orientation],
     ).fetchone()
     seats = (left, right) if orientation == 0 else (right, left)
@@ -592,6 +726,14 @@ def _store_orientation_result(
     task: LeagueEpisodeTask,
     result: MatchResult,
 ) -> None:
+    """Persist one played orientation, replay included.
+
+    Every episode keeps its payload -- scheduled matches and trainer rollouts
+    alike. The evaluation hooks fire for both and read the replay back, so an
+    episode stored without one is a row that can never answer anything.
+    """
+    if result.replay is None:
+        raise ValueError("league match result is missing its required replay payload")
     pairing_id = task.pairing_id
     orientation = task.orientation
     match_id = _stable_id("match", pairing_id, orientation)
@@ -604,12 +746,37 @@ def _store_orientation_result(
         (seats[0].agent_spec, seats[1].agent_spec),
         result,
     )
-    if result.replay is not None:
-        store.add_replay_payload(match_id, result.replay)
+    store.add_replay_payload(match_id, result.replay)
     store.connection.execute(
-        "INSERT OR IGNORE INTO pairing_episodes VALUES (?, ?, ?)",
+        "INSERT INTO pairing_episodes VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
         [pairing_id, orientation, match_id],
     )
+    for seat, artifact in enumerate(result.training_artifacts):
+        if artifact is None:
+            continue
+        revision = seats[seat]
+        artifact_id = _stable_id(
+            "training-artifact", match_id, revision.revision_id, artifact["role"]
+        )
+        store.connection.execute(
+            """
+            INSERT INTO episode_training_artifacts (
+                artifact_id, match_id, revision_id, policy_revision_id, role,
+                artifact_path, artifact_sha256, sample_count
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            [
+                artifact_id,
+                match_id,
+                revision.revision_id,
+                str(artifact["policy_revision_id"]),
+                str(artifact["role"]),
+                str(artifact["artifact_path"]),
+                str(artifact["artifact_sha256"]),
+                int(artifact["sample_count"]),
+            ],
+        )
     for seat, revision in enumerate(seats):
         _run_hook(
             store,
@@ -632,7 +799,7 @@ def _finish_pairing(store: ExperimentStore, pairing_id: str, revision_a: str) ->
         SELECT pe.orientation, ep.strategy_id, ep.money_difference, ep.failed
         FROM pairing_episodes pe
         JOIN episode_players ep ON ep.match_id = pe.match_id
-        WHERE pe.pairing_id = ? AND ep.strategy_id = ?
+        WHERE pe.pairing_id = %s AND ep.strategy_id = %s
         ORDER BY pe.orientation
         """,
         [pairing_id, revision_a],
@@ -643,7 +810,13 @@ def _finish_pairing(store: ExperimentStore, pairing_id: str, revision_a: str) ->
     outcome = None if paired_margin is None else (1.0 if paired_margin > 0 else 0.0 if paired_margin < 0 else 0.5)
     store.connection.execute(
         """
-        INSERT OR REPLACE INTO pairing_results VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO pairing_results VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (pairing_id) DO UPDATE SET
+            paired_margin = excluded.paired_margin,
+            outcome_a = excluded.outcome_a,
+            failed = excluded.failed,
+            episodes_completed = excluded.episodes_completed,
+            metrics_json = excluded.metrics_json
         """,
         [
             pairing_id,
@@ -655,7 +828,7 @@ def _finish_pairing(store: ExperimentStore, pairing_id: str, revision_a: str) ->
         ],
     )
     store.connection.execute(
-        "UPDATE league_pairings SET status = ? WHERE pairing_id = ?",
+        "UPDATE league_pairings SET status = %s WHERE pairing_id = %s",
         ["FAILED" if failed else "COMPLETE", pairing_id],
     )
 
@@ -781,7 +954,7 @@ def _run_round(
     pairings = store.connection.execute(
         """
         SELECT pairing_id, seed, revision_a, revision_b FROM league_pairings
-        WHERE generation_id = ? AND round_index = ?
+        WHERE generation_id = %s AND round_index = %s
           AND status NOT IN ('COMPLETE', 'FAILED')
         ORDER BY pairing_id
         """,
@@ -795,7 +968,7 @@ def _run_round(
         right = _get_revision(store, revision_b)
         for orientation in (0, 1):
             existing = store.connection.execute(
-                "SELECT 1 FROM pairing_episodes WHERE pairing_id = ? AND orientation = ?",
+                "SELECT 1 FROM pairing_episodes WHERE pairing_id = %s AND orientation = %s",
                 [pairing_id, orientation],
             ).fetchone()
             if existing:
@@ -829,10 +1002,11 @@ def _run_round(
 
 def run_generation(
     session_id: str,
-    database: str | Path,
+    database: str | DatabaseTarget | None = None,
     artifacts: str | Path = "artifacts",
     *,
     update_models: bool = False,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Resume all missing paired episodes and close ratings as one batch.
 
@@ -846,7 +1020,13 @@ def run_generation(
     training dependencies in; the CLI turns it on.
     """
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
+        # A duplicate invocation of the same session waits here, while other
+        # globally unique sessions continue independently.
+        store.connection.execute(
+            "SELECT pg_advisory_lock(hashtextextended(%s, 0))",
+            [f"session:{session_id}"],
+        )
         config = _load_session(store, session_id)
         model_ids = _training_model_ids(config)
         generation_id, generation_index, status = _current_generation(store, session_id)
@@ -861,21 +1041,27 @@ def run_generation(
                 update_models,
             )
             return generation_status(store, session_id)
-        schedule_generation(store, session_id)
-        store.connection.execute(
-            "UPDATE generations SET status = 'RUNNING' WHERE generation_id = ?",
-            [generation_id],
-        )
+        if status == "OPEN":
+            schedule_generation(store, session_id)
+        if status in {"OPEN", "SCHEDULED"}:
+            store.connection.execute(
+                "UPDATE generations SET status = 'RUNNING' WHERE generation_id = %s",
+                [generation_id],
+            )
+        elif status != "RUNNING":
+            raise ValueError(f"generation cannot be run: {generation_id} ({status})")
         rounds = [
             int(row[0])
             for row in store.connection.execute(
                 """
                 SELECT DISTINCT round_index FROM league_pairings
-                WHERE generation_id = ? ORDER BY round_index
+                WHERE generation_id = %s ORDER BY round_index
                 """,
                 [generation_id],
             ).fetchall()
         ]
+        if config.pairing_mode == "trainer_only":
+            rounds = list(range(config.rounds_per_generation))
         jobs = config.jobs if config.jobs > 0 else max(1, (os.cpu_count() or 2) - 1)
         pool = (
             None
@@ -885,11 +1071,23 @@ def run_generation(
             )
         )
         try:
-            for round_index in rounds:
+            for round_number, round_index in enumerate(rounds, start=1):
+                if on_progress is not None:
+                    on_progress(
+                        {
+                            "event": "round_started",
+                            "session_id": session_id,
+                            "generation_id": generation_id,
+                            "generation_index": generation_index,
+                            "round_index": round_index,
+                            "round_number": round_number,
+                            "round_count": len(rounds),
+                        }
+                    )
                 _run_round(
                     store, session_id, generation_id, config, round_index, pool
                 )
-                run_round_hooks(
+                round_reports = run_round_hooks(
                     store,
                     session_id=session_id,
                     generation_id=generation_id,
@@ -899,6 +1097,15 @@ def run_generation(
                     model_ids=model_ids,
                     artifacts=artifacts,
                 )
+                round_errors = [report for report in round_reports if report.status == "error"]
+                if config.pairing_mode == "trainer_only" and round_errors:
+                    details = "; ".join(
+                        f"{report.model_id}: {report.error}" for report in round_errors
+                    )
+                    raise RuntimeError(
+                        f"trainer-only round {round_index} failed; generation remains resumable: "
+                        f"{details}"
+                    )
                 if update_models:
                     _update_session_models(store, model_ids, artifacts)
         finally:
@@ -917,7 +1124,7 @@ def run_generation(
         store.connection.execute(
             """
             UPDATE generations SET status = 'COMPLETE', completed_at = current_timestamp
-            WHERE generation_id = ?
+            WHERE generation_id = %s
             """,
             [generation_id],
         )
@@ -965,14 +1172,14 @@ def _update_session_models(
 
 def reevaluate_hooks(
     session_id: str,
-    database: str | Path,
+    database: str | DatabaseTarget | None = None,
     *,
     generation_id: str | None = None,
     force: bool = False,
 ) -> dict[str, int]:
     """Run each revision's current evaluator against already-persisted episodes."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         if generation_id is None:
             generation_id, _, _ = _current_generation(store, session_id)
         rows = store.connection.execute(
@@ -981,7 +1188,7 @@ def reevaluate_hooks(
                    lp.revision_a, lp.revision_b
             FROM league_pairings lp
             JOIN pairing_episodes pe USING (pairing_id)
-            WHERE lp.generation_id = ?
+            WHERE lp.generation_id = %s
             ORDER BY lp.pairing_id, pe.orientation
             """,
             [generation_id],
@@ -1016,7 +1223,7 @@ def reevaluate_hooks(
             SELECT ee.status, count(*) FROM episode_evaluations ee
             JOIN pairing_episodes pe USING (match_id)
             JOIN league_pairings lp USING (pairing_id)
-            WHERE lp.generation_id = ? GROUP BY ee.status
+            WHERE lp.generation_id = %s GROUP BY ee.status
             """,
             [generation_id],
         ).fetchall()
@@ -1031,7 +1238,7 @@ def _previous_rating(
         SELECT rs.rating, rs.deviation, rs.volatility, rs.games
         FROM rating_snapshots rs
         JOIN generations g ON g.generation_id = rs.generation_id
-        WHERE g.session_id = ? AND rs.revision_id = ?
+        WHERE g.session_id = %s AND rs.revision_id = %s
         ORDER BY g.generation_index DESC LIMIT 1
         """,
         [session_id, revision_id],
@@ -1046,13 +1253,13 @@ def _close_generation(
     config: LeagueConfig,
 ) -> None:
     if store.connection.execute(
-        "SELECT 1 FROM rating_snapshots WHERE generation_id = ? LIMIT 1", [generation_id]
+        "SELECT 1 FROM rating_snapshots WHERE generation_id = %s LIMIT 1", [generation_id]
     ).fetchone():
         return
     member_rows = store.connection.execute(
         """
         SELECT revision_id, initial_rating, initial_deviation, initial_volatility
-        FROM generation_members WHERE generation_id = ? AND role != 'anchor'
+        FROM generation_members WHERE generation_id = %s AND role != 'anchor'
         """,
         [generation_id],
     ).fetchall()
@@ -1064,7 +1271,7 @@ def _close_generation(
         """
         SELECT p.revision_a, p.revision_b, r.outcome_a, r.paired_margin
         FROM league_pairings p JOIN pairing_results r USING (pairing_id)
-        WHERE p.generation_id = ? AND NOT r.failed
+        WHERE p.generation_id = %s AND NOT r.failed
         """,
         [generation_id],
     ).fetchall()
@@ -1106,33 +1313,42 @@ def _close_generation(
         stat_rows.append(
             [generation_id, revision_id, len(values), wins, draws, losses, mean, median, low, high, len(opponents[revision_id])]
         )
-    store.connection.executemany(
-        "INSERT INTO rating_snapshots VALUES (?, ?, ?, ?, ?, ?, ?)", snapshot_rows
-    )
-    store.connection.executemany(
-        "INSERT INTO generation_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", stat_rows
-    )
+    if snapshot_rows:
+        store.connection.executemany(
+            "INSERT INTO rating_snapshots VALUES (%s, %s, %s, %s, %s, %s, %s)", snapshot_rows
+        )
+        store.connection.executemany(
+            "INSERT INTO generation_stats VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", stat_rows
+        )
 
 
 def create_next_generation(
     session_id: str,
-    database: str | Path,
+    database: str | DatabaseTarget | None = None,
     *,
     workspace: str | Path = ".",
 ) -> str:
     """Build a 20/50/20/10 elite/evolution/surrogate/random population."""
 
-    with ExperimentStore(database) as store:
+    with ExperimentStore(database or default_database()) as store:
         config = _load_session(store, session_id)
         current_id, current_index, status = _current_generation(store, session_id)
         if status != "COMPLETE":
             raise ValueError("current generation must be complete before breeding")
+        if config.pairing_mode == "trainer_only":
+            next_index = current_index + 1
+            generation_id = f"{session_id}:g{next_index:04d}"
+            store.connection.execute(
+                "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, %s, 'OPEN')",
+                [generation_id, session_id, next_index],
+            )
+            return generation_id
         manifest_row = store.connection.execute(
             """
             SELECT af.manifest_path FROM generation_members gm
             JOIN agent_revisions ar USING (revision_id)
             JOIN agent_families af USING (family_id)
-            WHERE gm.generation_id = ? AND gm.role != 'anchor' AND af.family_id != 'builtin'
+            WHERE gm.generation_id = %s AND gm.role != 'anchor' AND af.family_id != 'builtin'
             LIMIT 1
             """,
             [current_id],
@@ -1151,7 +1367,7 @@ def create_next_generation(
                    ar.episode_evaluator, rs.rating, rs.deviation, rs.volatility, rs.games
             FROM rating_snapshots rs JOIN agent_revisions ar USING (revision_id)
             LEFT JOIN generation_stats gs USING (generation_id, revision_id)
-            WHERE rs.generation_id = ?
+            WHERE rs.generation_id = %s
             ORDER BY rs.rating - 2 * rs.deviation DESC,
                      gs.mean_margin DESC NULLS LAST, ar.revision_id
             """,
@@ -1201,6 +1417,7 @@ def create_next_generation(
             model_id=_primary_training_model_id(
                 config, manifest.family_id, workspace=workspace
             ),
+            candidate_pool=config.candidate_pool,
         )
         surrogate_iter = iter(proposed)
         while sum(item[1] == "surrogate" for item in selected) < allocation["surrogate"]:
@@ -1215,12 +1432,12 @@ def create_next_generation(
         next_index = current_index + 1
         generation_id = f"{session_id}:g{next_index:04d}"
         new_revisions = [item[0] for item in selected if item[1] != "elite"]
-        store.add_agent_revisions(new_revisions)
         store.add_strategies(
             [adapter.decode(item) for item in new_revisions], "league-next-generation", session_id
         )
+        store.add_agent_revisions(new_revisions)
         store.connection.execute(
-            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (?, ?, ?, 'OPEN')",
+            "INSERT INTO generations (generation_id, session_id, generation_index, status) VALUES (%s, %s, %s, 'OPEN')",
             [generation_id, session_id, next_index],
         )
         member_rows = []
@@ -1232,10 +1449,10 @@ def create_next_generation(
             )
             lineage_rows.append([generation_id, revision.revision_id, parent_a, parent_b, method])
         store.connection.executemany(
-            "INSERT INTO generation_members VALUES (?, ?, ?, ?, ?, ?)", member_rows
+            "INSERT INTO generation_members VALUES (%s, %s, %s, %s, %s, %s)", member_rows
         )
         store.connection.executemany(
-            "INSERT INTO lineage VALUES (?, ?, ?, ?, ?)", lineage_rows
+            "INSERT INTO lineage VALUES (%s, %s, %s, %s, %s)", lineage_rows
         )
         return generation_id
 
@@ -1246,7 +1463,7 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
         store.connection.execute(
             """
             SELECT status, count(*) FROM league_pairings
-            WHERE generation_id = ? GROUP BY status
+            WHERE generation_id = %s GROUP BY status
             """,
             [generation_id],
         ).fetchall()
@@ -1257,7 +1474,7 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
             SELECT ee.status, count(*) FROM episode_evaluations ee
             JOIN pairing_episodes pe USING (match_id)
             JOIN league_pairings lp USING (pairing_id)
-            WHERE lp.generation_id = ? GROUP BY ee.status
+            WHERE lp.generation_id = %s GROUP BY ee.status
             """,
             [generation_id],
         ).fetchall()
@@ -1268,9 +1485,9 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
             SELECT count(*) FROM episode_evaluations ee
             JOIN pairing_episodes pe USING (match_id)
             JOIN league_pairings lp USING (pairing_id)
-            WHERE lp.generation_id = ? AND ee.status = 'COMPLETE'
+            WHERE lp.generation_id = %s AND ee.status = 'COMPLETE'
               AND coalesce(
-                    CAST(json_extract(ee.result_json, '$.should_reevaluate') AS BOOLEAN),
+                    CAST(ee.result_json ->> 'should_reevaluate' AS BOOLEAN),
                     false
                   )
             """,
@@ -1288,13 +1505,17 @@ def generation_status(store: ExperimentStore, session_id: str) -> dict[str, Any]
     }
 
 
-def session_status(session_id: str, database: str | Path) -> dict[str, Any]:
-    with ExperimentStore(database) as store:
+def session_status(
+    session_id: str, database: str | DatabaseTarget | None = None
+) -> dict[str, Any]:
+    with ExperimentStore(database or default_database()) as store:
         return generation_status(store, session_id)
 
 
-def leaderboard(session_id: str, database: str | Path, limit: int = 20) -> list[dict[str, Any]]:
-    with ExperimentStore(database) as store:
+def leaderboard(
+    session_id: str, database: str | DatabaseTarget | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    with ExperimentStore(database or default_database()) as store:
         generation_id, _, _ = _current_generation(store, session_id)
         rows = store.connection.execute(
             """
@@ -1304,10 +1525,10 @@ def leaderboard(session_id: str, database: str | Path, limit: int = 20) -> list[
             JOIN agent_revisions ar USING (revision_id)
             JOIN generation_members gm USING (generation_id, revision_id)
             LEFT JOIN generation_stats gs USING (generation_id, revision_id)
-            WHERE rs.generation_id = ?
+            WHERE rs.generation_id = %s
             ORDER BY rs.rating - 2 * rs.deviation DESC,
                      gs.mean_margin DESC NULLS LAST, rs.revision_id
-            LIMIT ?
+            LIMIT %s
             """,
             [generation_id, limit],
         ).fetchall()

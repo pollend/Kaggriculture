@@ -24,6 +24,7 @@ class TrainingAgentSpec:
     primary: bool = False
     train: bool = True
     seed: int | None = None
+    model_config: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> TrainingAgentSpec:
@@ -33,6 +34,11 @@ class TrainingAgentSpec:
             primary=bool(values.get("primary", False)),
             train=bool(values.get("train", True)),
             seed=(None if values.get("seed") is None else int(values["seed"])),
+            model_config=(
+                None
+                if values.get("model_config") is None
+                else dict(values["model_config"])
+            ),
         )
 
     def validate(self) -> None:
