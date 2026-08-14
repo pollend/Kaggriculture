@@ -37,8 +37,13 @@ import numpy as np
 
 from agents.dqn_market_free import donor
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
-from agents.dqn_market_free.market_state import market_state_features
-from agents.dqn_market_free.order_space import ACTIONS, order_index
+from agents.dqn_market_free.market_state import MarketHistory, market_state_features
+from agents.dqn_market_free.order_space import (
+    ACTION_COUNT,
+    ACTIONS,
+    feasible_actions,
+    order_index,
+)
 from agents.dqn_market_free.training.collect import EpisodeRecord
 from agents.dqn_market_free.training.reward import episode_rewards, potential
 
@@ -62,6 +67,10 @@ class CloneStats:
     orders_mapped: int = 0
     orders_unrepresentable: int = 0
     orders_over_budget: int = 0
+    #: Turns where the feasibility mask forbade the order the demonstrator
+    #: actually placed. Should be ~0: a solvent donor's accepted orders are
+    #: feasible by definition, so anything here is the mask being wrong.
+    orders_masked_infeasible: int = 0
 
     @property
     def mapped_fraction(self) -> float:
@@ -131,12 +140,16 @@ def record_from_replay(
     replay: dict[str, Any],
     seat: int,
     gamma: float = 0.999,
+    mode: str = "shaped",
 ) -> tuple[EpisodeRecord | None, CloneStats]:
     """Convert one seat of one replay into a trainable episode record.
 
     Reward, shaping and the terminal margin bonus come from the same
     `episode_rewards` a live rollout uses, so a cloned episode and a
-    self-collected one are the same kind of sample and can share a buffer.
+    self-collected one are the same kind of sample and can share a buffer. That
+    is why `mode` is threaded here too: a buffer holding demonstrations scored
+    one way and rollouts scored another would be bootstrapping across two
+    different reward functions.
     """
 
     steps = replay.get("steps") or []
@@ -148,10 +161,17 @@ def record_from_replay(
     order_state = np.zeros((len(steps) - 1, STATE_DIM), dtype=np.float32)
     order_chosen = np.zeros(len(steps) - 1, dtype=np.int16)
     order_step = np.zeros(len(steps) - 1, dtype=np.int16)
+    order_mask = np.ones((len(steps) - 1, ACTION_COUNT), dtype=np.bool_)
     configuration = replay.get("configuration")
 
-    seen = mapped = unrepresentable = over_budget = 0
+    seen = mapped = unrepresentable = over_budget = masked_infeasible = 0
     decisions = 0
+    # The history block of the state schema is the one part that cannot be read
+    # off a single step, so it is replayed here exactly as `main.py` builds it
+    # live: observe the turn, encode the state, record the decision. Any drift
+    # between the two orderings silently poisons every demonstration, which is
+    # what `test_clone_matches_live_features` exists to catch.
+    history = MarketHistory()
     for index in range(1, len(steps)):
         previous = steps[index - 1][seat]
         current = steps[index][seat]
@@ -165,6 +185,7 @@ def record_from_replay(
 
         money.append(float(farm.get("money", 0) or 0))
         phi.append(potential(farm, private, obs))
+        history.observe(obs, farm)
 
         orders = (current.get("action") or {}).get("market") or []
         action, dropped, extra = _chosen_index(orders)
@@ -186,8 +207,25 @@ def record_from_replay(
             config=configuration,
             episode_steps=int(donor._cfg(configuration, "episodeSteps", len(steps))),
             turns_per_day=int(donor._cfg(configuration, "turnsPerDay", 24)),
+            history=history,
         )
+        history.record_decision(ACTIONS[action])
         order_chosen[decisions] = action
+        # The same feasibility the live agent is held to, built from the same
+        # `field` that encoded the state so the two describe one turn.
+        mask = feasible_actions(obs, farm, private, field, configuration)
+        # The demonstrator's order was accepted by the simulator, so it is
+        # feasible by demonstration whatever the model of feasibility says.
+        # Forced rather than dropped: the invariant the learner depends on is
+        # that a stored action is allowed by its stored mask, and violating it
+        # would put the clone's cross-entropy target on a masked class and the
+        # TD gather on an action the argmax can never reach. Counted, because
+        # the count is the direct measure of how over-restrictive the mask is
+        # against an agent that really farms.
+        if not mask[action]:
+            masked_infeasible += 1
+            mask[action] = True
+        order_mask[decisions] = mask
         # Index into this record's own compacted reward stream, not into the
         # replay. A step the loop skipped above appends no money and so no
         # reward, and `replay.sample` walks `reward[order_step[d]:...]` -- with
@@ -223,7 +261,13 @@ def record_from_replay(
 
     emitted = [bool(order_chosen[index]) for index in range(decisions)]
     shaped, raw, money_array = episode_rewards(
-        money, phi, final_money, opponent_money, gamma, emitted
+        money,
+        phi,
+        final_money,
+        opponent_money,
+        gamma,
+        emitted,
+        mode=mode,
     )
 
     record = EpisodeRecord(
@@ -233,6 +277,7 @@ def record_from_replay(
         order_state=order_state[:decisions],
         order_chosen=order_chosen[:decisions],
         order_step=order_step[:decisions],
+        order_mask=order_mask[:decisions],
     )
     stats = CloneStats(
         episodes=1,
@@ -241,6 +286,7 @@ def record_from_replay(
         orders_mapped=mapped,
         orders_unrepresentable=unrepresentable,
         orders_over_budget=over_budget,
+        orders_masked_infeasible=masked_infeasible,
     )
     return record, stats
 
@@ -265,6 +311,7 @@ def load_demonstrations(
     min_final_money: float = 10_000.0,
     family_id: str | None = None,
     gamma: float = 0.999,
+    mode: str = "shaped",
 ) -> tuple[list[EpisodeRecord], CloneStats]:
     """Pull the best stored episodes and convert the demonstrator's seat.
 
@@ -283,7 +330,7 @@ def load_demonstrations(
             replay = decode_replay(bytes(blob))
         except (OSError, ValueError):
             continue
-        record, stats = record_from_replay(replay, int(seat), gamma)
+        record, stats = record_from_replay(replay, int(seat), gamma, mode=mode)
         if record is None:
             continue
         records.append(record)
@@ -294,5 +341,8 @@ def load_demonstrations(
             orders_mapped=totals.orders_mapped + stats.orders_mapped,
             orders_unrepresentable=totals.orders_unrepresentable + stats.orders_unrepresentable,
             orders_over_budget=totals.orders_over_budget + stats.orders_over_budget,
+            orders_masked_infeasible=(
+                totals.orders_masked_infeasible + stats.orders_masked_infeasible
+            ),
         )
     return records, totals

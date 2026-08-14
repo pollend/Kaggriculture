@@ -1,0 +1,1178 @@
+Resolved 169 packages in 0.65ms
+Checked 166 packages in 1ms
+Resuming market-free session: market-free-noisy-v6
+[market-free-noisy-v6] generation 1 started
+[market-free-noisy-v6] generation g0014 training round 1/20 started
+[market-free-noisy-v6] generation g0014 training round 2/20 started
+[market-free-noisy-v6] generation g0014 training round 3/20 started
+[market-free-noisy-v6] generation g0014 training round 4/20 started
+[market-free-noisy-v6] generation g0014 training round 5/20 started
+[market-free-noisy-v6] generation g0014 training round 6/20 started
+[market-free-noisy-v6] generation g0014 training round 7/20 started
+[market-free-noisy-v6] generation g0014 training round 8/20 started
+[market-free-noisy-v6] generation g0014 training round 9/20 started
+[market-free-noisy-v6] generation g0014 training round 10/20 started
+[market-free-noisy-v6] generation g0014 training round 11/20 started
+[market-free-noisy-v6] generation g0014 training round 12/20 started
+[market-free-noisy-v6] generation g0014 training round 13/20 started
+[market-free-noisy-v6] generation g0014 training round 14/20 started
+[market-free-noisy-v6] generation g0014 training round 15/20 started
+[market-free-noisy-v6] generation g0014 training round 16/20 started
+[market-free-noisy-v6] generation g0014 training round 17/20 started
+[market-free-noisy-v6] generation g0014 training round 18/20 started
+[market-free-noisy-v6] generation g0014 training round 19/20 started
+[market-free-noisy-v6] generation g0014 training round 20/20 started
+
+=== market-free generation 1 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '5cc4753cd854dbc0869ccc46', 'last_attempted_batch_seq': 300, 'latest_batch_seq': 300, 'new_batches': 0}]
+[market-free-noisy-v6] generation 2 started
+[market-free-noisy-v6] generation g0015 training round 1/20 started
+[market-free-noisy-v6] generation g0015 training round 2/20 started
+[market-free-noisy-v6] generation g0015 training round 3/20 started
+[market-free-noisy-v6] generation g0015 training round 4/20 started
+[market-free-noisy-v6] generation g0015 training round 5/20 started
+[market-free-noisy-v6] generation g0015 training round 6/20 started
+[market-free-noisy-v6] generation g0015 training round 7/20 started
+[market-free-noisy-v6] generation g0015 training round 8/20 started
+[market-free-noisy-v6] generation g0015 training round 9/20 started
+[market-free-noisy-v6] generation g0015 training round 10/20 started
+[market-free-noisy-v6] generation g0015 training round 11/20 started
+[market-free-noisy-v6] generation g0015 training round 12/20 started
+[market-free-noisy-v6] generation g0015 training round 13/20 started
+[market-free-noisy-v6] generation g0015 training round 14/20 started
+[market-free-noisy-v6] generation g0015 training round 15/20 started
+[market-free-noisy-v6] generation g0015 training round 16/20 started
+[market-free-noisy-v6] generation g0015 training round 17/20 started
+[market-free-noisy-v6] generation g0015 training round 18/20 started
+[market-free-noisy-v6] generation g0015 training round 19/20 started
+[market-free-noisy-v6] generation g0015 training round 20/20 started
+
+=== market-free generation 2 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '5cc4753cd854dbc0869ccc46', 'last_attempted_batch_seq': 320, 'latest_batch_seq': 320, 'new_batches': 0}]
+[market-free-noisy-v6] generation 3 started
+[market-free-noisy-v6] generation g0016 training round 1/20 started
+[market-free-noisy-v6] generation g0016 training round 2/20 started
+[market-free-noisy-v6] generation g0016 training round 3/20 started
+[market-free-noisy-v6] generation g0016 training round 4/20 started
+[market-free-noisy-v6] generation g0016 training round 5/20 started
+[market-free-noisy-v6] generation g0016 training round 6/20 started
+[market-free-noisy-v6] generation g0016 training round 7/20 started
+[market-free-noisy-v6] generation g0016 training round 8/20 started
+[market-free-noisy-v6] generation g0016 training round 9/20 started
+[market-free-noisy-v6] generation g0016 training round 10/20 started
+[market-free-noisy-v6] generation g0016 training round 11/20 started
+[market-free-noisy-v6] generation g0016 training round 12/20 started
+[market-free-noisy-v6] generation g0016 training round 13/20 started
+[market-free-noisy-v6] generation g0016 training round 14/20 started
+[market-free-noisy-v6] generation g0016 training round 15/20 started
+[market-free-noisy-v6] generation g0016 training round 16/20 started
+[market-free-noisy-v6] generation g0016 training round 17/20 started
+[market-free-noisy-v6] generation g0016 training round 18/20 started
+[market-free-noisy-v6] generation g0016 training round 19/20 started
+[market-free-noisy-v6] generation g0016 training round 20/20 started
+
+=== market-free generation 3 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'efe30df503948bea6676d65f', 'last_attempted_batch_seq': 340, 'latest_batch_seq': 340, 'new_batches': 0}]
+[market-free-noisy-v6] generation 4 started
+[market-free-noisy-v6] generation g0017 training round 1/20 started
+[market-free-noisy-v6] generation g0017 training round 2/20 started
+[market-free-noisy-v6] generation g0017 training round 3/20 started
+[market-free-noisy-v6] generation g0017 training round 4/20 started
+[market-free-noisy-v6] generation g0017 training round 5/20 started
+[market-free-noisy-v6] generation g0017 training round 6/20 started
+[market-free-noisy-v6] generation g0017 training round 7/20 started
+[market-free-noisy-v6] generation g0017 training round 8/20 started
+[market-free-noisy-v6] generation g0017 training round 9/20 started
+[market-free-noisy-v6] generation g0017 training round 10/20 started
+[market-free-noisy-v6] generation g0017 training round 11/20 started
+[market-free-noisy-v6] generation g0017 training round 12/20 started
+[market-free-noisy-v6] generation g0017 training round 13/20 started
+[market-free-noisy-v6] generation g0017 training round 14/20 started
+[market-free-noisy-v6] generation g0017 training round 15/20 started
+[market-free-noisy-v6] generation g0017 training round 16/20 started
+[market-free-noisy-v6] generation g0017 training round 17/20 started
+[market-free-noisy-v6] generation g0017 training round 18/20 started
+[market-free-noisy-v6] generation g0017 training round 19/20 started
+[market-free-noisy-v6] generation g0017 training round 20/20 started
+
+=== market-free generation 4 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'ec312015c4e37973521cbdcf', 'last_attempted_batch_seq': 360, 'latest_batch_seq': 360, 'new_batches': 0}]
+[market-free-noisy-v6] generation 5 started
+[market-free-noisy-v6] generation g0018 training round 1/20 started
+[market-free-noisy-v6] generation g0018 training round 2/20 started
+[market-free-noisy-v6] generation g0018 training round 3/20 started
+[market-free-noisy-v6] generation g0018 training round 4/20 started
+[market-free-noisy-v6] generation g0018 training round 5/20 started
+[market-free-noisy-v6] generation g0018 training round 6/20 started
+[market-free-noisy-v6] generation g0018 training round 7/20 started
+[market-free-noisy-v6] generation g0018 training round 8/20 started
+[market-free-noisy-v6] generation g0018 training round 9/20 started
+[market-free-noisy-v6] generation g0018 training round 10/20 started
+[market-free-noisy-v6] generation g0018 training round 11/20 started
+[market-free-noisy-v6] generation g0018 training round 12/20 started
+[market-free-noisy-v6] generation g0018 training round 13/20 started
+[market-free-noisy-v6] generation g0018 training round 14/20 started
+[market-free-noisy-v6] generation g0018 training round 15/20 started
+[market-free-noisy-v6] generation g0018 training round 16/20 started
+[market-free-noisy-v6] generation g0018 training round 17/20 started
+[market-free-noisy-v6] generation g0018 training round 18/20 started
+[market-free-noisy-v6] generation g0018 training round 19/20 started
+[market-free-noisy-v6] generation g0018 training round 20/20 started
+
+=== market-free generation 5 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '130d21b48faf8c646cb6d36a', 'last_attempted_batch_seq': 380, 'latest_batch_seq': 380, 'new_batches': 0}]
+[market-free-noisy-v6] generation 6 started
+[market-free-noisy-v6] generation g0019 training round 1/20 started
+[market-free-noisy-v6] generation g0019 training round 2/20 started
+[market-free-noisy-v6] generation g0019 training round 3/20 started
+[market-free-noisy-v6] generation g0019 training round 4/20 started
+[market-free-noisy-v6] generation g0019 training round 5/20 started
+[market-free-noisy-v6] generation g0019 training round 6/20 started
+[market-free-noisy-v6] generation g0019 training round 7/20 started
+[market-free-noisy-v6] generation g0019 training round 8/20 started
+[market-free-noisy-v6] generation g0019 training round 9/20 started
+[market-free-noisy-v6] generation g0019 training round 10/20 started
+[market-free-noisy-v6] generation g0019 training round 11/20 started
+[market-free-noisy-v6] generation g0019 training round 12/20 started
+[market-free-noisy-v6] generation g0019 training round 13/20 started
+[market-free-noisy-v6] generation g0019 training round 14/20 started
+[market-free-noisy-v6] generation g0019 training round 15/20 started
+[market-free-noisy-v6] generation g0019 training round 16/20 started
+[market-free-noisy-v6] generation g0019 training round 17/20 started
+[market-free-noisy-v6] generation g0019 training round 18/20 started
+[market-free-noisy-v6] generation g0019 training round 19/20 started
+[market-free-noisy-v6] generation g0019 training round 20/20 started
+
+=== market-free generation 6 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '130d21b48faf8c646cb6d36a', 'last_attempted_batch_seq': 400, 'latest_batch_seq': 400, 'new_batches': 0}]
+[market-free-noisy-v6] generation 7 started
+[market-free-noisy-v6] generation g0020 training round 1/20 started
+[market-free-noisy-v6] generation g0020 training round 2/20 started
+[market-free-noisy-v6] generation g0020 training round 3/20 started
+[market-free-noisy-v6] generation g0020 training round 4/20 started
+[market-free-noisy-v6] generation g0020 training round 5/20 started
+[market-free-noisy-v6] generation g0020 training round 6/20 started
+[market-free-noisy-v6] generation g0020 training round 7/20 started
+[market-free-noisy-v6] generation g0020 training round 8/20 started
+[market-free-noisy-v6] generation g0020 training round 9/20 started
+[market-free-noisy-v6] generation g0020 training round 10/20 started
+[market-free-noisy-v6] generation g0020 training round 11/20 started
+[market-free-noisy-v6] generation g0020 training round 12/20 started
+[market-free-noisy-v6] generation g0020 training round 13/20 started
+[market-free-noisy-v6] generation g0020 training round 14/20 started
+[market-free-noisy-v6] generation g0020 training round 15/20 started
+[market-free-noisy-v6] generation g0020 training round 16/20 started
+[market-free-noisy-v6] generation g0020 training round 17/20 started
+[market-free-noisy-v6] generation g0020 training round 18/20 started
+[market-free-noisy-v6] generation g0020 training round 19/20 started
+[market-free-noisy-v6] generation g0020 training round 20/20 started
+
+=== market-free generation 7 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'dbc5354cf4b9d53ed83a12f1', 'last_attempted_batch_seq': 420, 'latest_batch_seq': 420, 'new_batches': 0}]
+[market-free-noisy-v6] generation 8 started
+[market-free-noisy-v6] generation g0021 training round 1/20 started
+[market-free-noisy-v6] generation g0021 training round 2/20 started
+[market-free-noisy-v6] generation g0021 training round 3/20 started
+[market-free-noisy-v6] generation g0021 training round 4/20 started
+[market-free-noisy-v6] generation g0021 training round 5/20 started
+[market-free-noisy-v6] generation g0021 training round 6/20 started
+[market-free-noisy-v6] generation g0021 training round 7/20 started
+[market-free-noisy-v6] generation g0021 training round 8/20 started
+[market-free-noisy-v6] generation g0021 training round 9/20 started
+[market-free-noisy-v6] generation g0021 training round 10/20 started
+[market-free-noisy-v6] generation g0021 training round 11/20 started
+[market-free-noisy-v6] generation g0021 training round 12/20 started
+[market-free-noisy-v6] generation g0021 training round 13/20 started
+[market-free-noisy-v6] generation g0021 training round 14/20 started
+[market-free-noisy-v6] generation g0021 training round 15/20 started
+[market-free-noisy-v6] generation g0021 training round 16/20 started
+[market-free-noisy-v6] generation g0021 training round 17/20 started
+[market-free-noisy-v6] generation g0021 training round 18/20 started
+[market-free-noisy-v6] generation g0021 training round 19/20 started
+[market-free-noisy-v6] generation g0021 training round 20/20 started
+
+=== market-free generation 8 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'dbc5354cf4b9d53ed83a12f1', 'last_attempted_batch_seq': 440, 'latest_batch_seq': 440, 'new_batches': 0}]
+[market-free-noisy-v6] generation 9 started
+[market-free-noisy-v6] generation g0022 training round 1/20 started
+[market-free-noisy-v6] generation g0022 training round 2/20 started
+[market-free-noisy-v6] generation g0022 training round 3/20 started
+[market-free-noisy-v6] generation g0022 training round 4/20 started
+[market-free-noisy-v6] generation g0022 training round 5/20 started
+[market-free-noisy-v6] generation g0022 training round 6/20 started
+[market-free-noisy-v6] generation g0022 training round 7/20 started
+[market-free-noisy-v6] generation g0022 training round 8/20 started
+[market-free-noisy-v6] generation g0022 training round 9/20 started
+[market-free-noisy-v6] generation g0022 training round 10/20 started
+[market-free-noisy-v6] generation g0022 training round 11/20 started
+[market-free-noisy-v6] generation g0022 training round 12/20 started
+[market-free-noisy-v6] generation g0022 training round 13/20 started
+[market-free-noisy-v6] generation g0022 training round 14/20 started
+[market-free-noisy-v6] generation g0022 training round 15/20 started
+[market-free-noisy-v6] generation g0022 training round 16/20 started
+[market-free-noisy-v6] generation g0022 training round 17/20 started
+[market-free-noisy-v6] generation g0022 training round 18/20 started
+[market-free-noisy-v6] generation g0022 training round 19/20 started
+[market-free-noisy-v6] generation g0022 training round 20/20 started
+
+=== market-free generation 9 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'dbc5354cf4b9d53ed83a12f1', 'last_attempted_batch_seq': 460, 'latest_batch_seq': 460, 'new_batches': 0}]
+[market-free-noisy-v6] generation 10 started
+[market-free-noisy-v6] generation g0023 training round 1/20 started
+[market-free-noisy-v6] generation g0023 training round 2/20 started
+[market-free-noisy-v6] generation g0023 training round 3/20 started
+[market-free-noisy-v6] generation g0023 training round 4/20 started
+[market-free-noisy-v6] generation g0023 training round 5/20 started
+[market-free-noisy-v6] generation g0023 training round 6/20 started
+[market-free-noisy-v6] generation g0023 training round 7/20 started
+[market-free-noisy-v6] generation g0023 training round 8/20 started
+[market-free-noisy-v6] generation g0023 training round 9/20 started
+[market-free-noisy-v6] generation g0023 training round 10/20 started
+[market-free-noisy-v6] generation g0023 training round 11/20 started
+[market-free-noisy-v6] generation g0023 training round 12/20 started
+[market-free-noisy-v6] generation g0023 training round 13/20 started
+[market-free-noisy-v6] generation g0023 training round 14/20 started
+[market-free-noisy-v6] generation g0023 training round 15/20 started
+[market-free-noisy-v6] generation g0023 training round 16/20 started
+[market-free-noisy-v6] generation g0023 training round 17/20 started
+[market-free-noisy-v6] generation g0023 training round 18/20 started
+[market-free-noisy-v6] generation g0023 training round 19/20 started
+[market-free-noisy-v6] generation g0023 training round 20/20 started
+
+=== market-free generation 10 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd82053103687f8a00b840241', 'last_attempted_batch_seq': 480, 'latest_batch_seq': 480, 'new_batches': 0}]
+[market-free-noisy-v6] generation 11 started
+[market-free-noisy-v6] generation g0024 training round 1/20 started
+[market-free-noisy-v6] generation g0024 training round 2/20 started
+[market-free-noisy-v6] generation g0024 training round 3/20 started
+[market-free-noisy-v6] generation g0024 training round 4/20 started
+[market-free-noisy-v6] generation g0024 training round 5/20 started
+[market-free-noisy-v6] generation g0024 training round 6/20 started
+[market-free-noisy-v6] generation g0024 training round 7/20 started
+[market-free-noisy-v6] generation g0024 training round 8/20 started
+[market-free-noisy-v6] generation g0024 training round 9/20 started
+[market-free-noisy-v6] generation g0024 training round 10/20 started
+[market-free-noisy-v6] generation g0024 training round 11/20 started
+[market-free-noisy-v6] generation g0024 training round 12/20 started
+[market-free-noisy-v6] generation g0024 training round 13/20 started
+[market-free-noisy-v6] generation g0024 training round 14/20 started
+[market-free-noisy-v6] generation g0024 training round 15/20 started
+[market-free-noisy-v6] generation g0024 training round 16/20 started
+[market-free-noisy-v6] generation g0024 training round 17/20 started
+[market-free-noisy-v6] generation g0024 training round 18/20 started
+[market-free-noisy-v6] generation g0024 training round 19/20 started
+[market-free-noisy-v6] generation g0024 training round 20/20 started
+
+=== market-free generation 11 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '2976279763e7e4597d96b778', 'last_attempted_batch_seq': 500, 'latest_batch_seq': 500, 'new_batches': 0}]
+[market-free-noisy-v6] generation 12 started
+[market-free-noisy-v6] generation g0025 training round 1/20 started
+[market-free-noisy-v6] generation g0025 training round 2/20 started
+[market-free-noisy-v6] generation g0025 training round 3/20 started
+[market-free-noisy-v6] generation g0025 training round 4/20 started
+[market-free-noisy-v6] generation g0025 training round 5/20 started
+[market-free-noisy-v6] generation g0025 training round 6/20 started
+[market-free-noisy-v6] generation g0025 training round 7/20 started
+[market-free-noisy-v6] generation g0025 training round 8/20 started
+[market-free-noisy-v6] generation g0025 training round 9/20 started
+[market-free-noisy-v6] generation g0025 training round 10/20 started
+[market-free-noisy-v6] generation g0025 training round 11/20 started
+[market-free-noisy-v6] generation g0025 training round 12/20 started
+[market-free-noisy-v6] generation g0025 training round 13/20 started
+[market-free-noisy-v6] generation g0025 training round 14/20 started
+[market-free-noisy-v6] generation g0025 training round 15/20 started
+[market-free-noisy-v6] generation g0025 training round 16/20 started
+[market-free-noisy-v6] generation g0025 training round 17/20 started
+[market-free-noisy-v6] generation g0025 training round 18/20 started
+[market-free-noisy-v6] generation g0025 training round 19/20 started
+[market-free-noisy-v6] generation g0025 training round 20/20 started
+
+=== market-free generation 12 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd396bbad143f9d38198bbcc4', 'last_attempted_batch_seq': 520, 'latest_batch_seq': 520, 'new_batches': 0}]
+[market-free-noisy-v6] generation 13 started
+[market-free-noisy-v6] generation g0026 training round 1/20 started
+[market-free-noisy-v6] generation g0026 training round 2/20 started
+[market-free-noisy-v6] generation g0026 training round 3/20 started
+[market-free-noisy-v6] generation g0026 training round 4/20 started
+[market-free-noisy-v6] generation g0026 training round 5/20 started
+[market-free-noisy-v6] generation g0026 training round 6/20 started
+[market-free-noisy-v6] generation g0026 training round 7/20 started
+[market-free-noisy-v6] generation g0026 training round 8/20 started
+[market-free-noisy-v6] generation g0026 training round 9/20 started
+[market-free-noisy-v6] generation g0026 training round 10/20 started
+[market-free-noisy-v6] generation g0026 training round 11/20 started
+[market-free-noisy-v6] generation g0026 training round 12/20 started
+[market-free-noisy-v6] generation g0026 training round 13/20 started
+[market-free-noisy-v6] generation g0026 training round 14/20 started
+[market-free-noisy-v6] generation g0026 training round 15/20 started
+[market-free-noisy-v6] generation g0026 training round 16/20 started
+[market-free-noisy-v6] generation g0026 training round 17/20 started
+[market-free-noisy-v6] generation g0026 training round 18/20 started
+[market-free-noisy-v6] generation g0026 training round 19/20 started
+[market-free-noisy-v6] generation g0026 training round 20/20 started
+
+=== market-free generation 13 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd396bbad143f9d38198bbcc4', 'last_attempted_batch_seq': 540, 'latest_batch_seq': 540, 'new_batches': 0}]
+[market-free-noisy-v6] generation 14 started
+[market-free-noisy-v6] generation g0027 training round 1/20 started
+[market-free-noisy-v6] generation g0027 training round 2/20 started
+[market-free-noisy-v6] generation g0027 training round 3/20 started
+[market-free-noisy-v6] generation g0027 training round 4/20 started
+[market-free-noisy-v6] generation g0027 training round 5/20 started
+[market-free-noisy-v6] generation g0027 training round 6/20 started
+[market-free-noisy-v6] generation g0027 training round 7/20 started
+[market-free-noisy-v6] generation g0027 training round 8/20 started
+[market-free-noisy-v6] generation g0027 training round 9/20 started
+[market-free-noisy-v6] generation g0027 training round 10/20 started
+[market-free-noisy-v6] generation g0027 training round 11/20 started
+[market-free-noisy-v6] generation g0027 training round 12/20 started
+[market-free-noisy-v6] generation g0027 training round 13/20 started
+[market-free-noisy-v6] generation g0027 training round 14/20 started
+[market-free-noisy-v6] generation g0027 training round 15/20 started
+[market-free-noisy-v6] generation g0027 training round 16/20 started
+[market-free-noisy-v6] generation g0027 training round 17/20 started
+[market-free-noisy-v6] generation g0027 training round 18/20 started
+[market-free-noisy-v6] generation g0027 training round 19/20 started
+[market-free-noisy-v6] generation g0027 training round 20/20 started
+
+=== market-free generation 14 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd396bbad143f9d38198bbcc4', 'last_attempted_batch_seq': 560, 'latest_batch_seq': 560, 'new_batches': 0}]
+[market-free-noisy-v6] generation 15 started
+[market-free-noisy-v6] generation g0028 training round 1/20 started
+[market-free-noisy-v6] generation g0028 training round 2/20 started
+[market-free-noisy-v6] generation g0028 training round 3/20 started
+[market-free-noisy-v6] generation g0028 training round 4/20 started
+[market-free-noisy-v6] generation g0028 training round 5/20 started
+[market-free-noisy-v6] generation g0028 training round 6/20 started
+[market-free-noisy-v6] generation g0028 training round 7/20 started
+[market-free-noisy-v6] generation g0028 training round 8/20 started
+[market-free-noisy-v6] generation g0028 training round 9/20 started
+[market-free-noisy-v6] generation g0028 training round 10/20 started
+[market-free-noisy-v6] generation g0028 training round 11/20 started
+[market-free-noisy-v6] generation g0028 training round 12/20 started
+[market-free-noisy-v6] generation g0028 training round 13/20 started
+[market-free-noisy-v6] generation g0028 training round 14/20 started
+[market-free-noisy-v6] generation g0028 training round 15/20 started
+[market-free-noisy-v6] generation g0028 training round 16/20 started
+[market-free-noisy-v6] generation g0028 training round 17/20 started
+[market-free-noisy-v6] generation g0028 training round 18/20 started
+[market-free-noisy-v6] generation g0028 training round 19/20 started
+[market-free-noisy-v6] generation g0028 training round 20/20 started
+
+=== market-free generation 15 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '9c6aff9e910dac76e418e1ce', 'last_attempted_batch_seq': 580, 'latest_batch_seq': 580, 'new_batches': 0}]
+[market-free-noisy-v6] generation 16 started
+[market-free-noisy-v6] generation g0029 training round 1/20 started
+[market-free-noisy-v6] generation g0029 training round 2/20 started
+[market-free-noisy-v6] generation g0029 training round 3/20 started
+[market-free-noisy-v6] generation g0029 training round 4/20 started
+[market-free-noisy-v6] generation g0029 training round 5/20 started
+[market-free-noisy-v6] generation g0029 training round 6/20 started
+[market-free-noisy-v6] generation g0029 training round 7/20 started
+[market-free-noisy-v6] generation g0029 training round 8/20 started
+[market-free-noisy-v6] generation g0029 training round 9/20 started
+[market-free-noisy-v6] generation g0029 training round 10/20 started
+[market-free-noisy-v6] generation g0029 training round 11/20 started
+[market-free-noisy-v6] generation g0029 training round 12/20 started
+[market-free-noisy-v6] generation g0029 training round 13/20 started
+[market-free-noisy-v6] generation g0029 training round 14/20 started
+[market-free-noisy-v6] generation g0029 training round 15/20 started
+[market-free-noisy-v6] generation g0029 training round 16/20 started
+[market-free-noisy-v6] generation g0029 training round 17/20 started
+[market-free-noisy-v6] generation g0029 training round 18/20 started
+[market-free-noisy-v6] generation g0029 training round 19/20 started
+[market-free-noisy-v6] generation g0029 training round 20/20 started
+
+=== market-free generation 16 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '9c6aff9e910dac76e418e1ce', 'last_attempted_batch_seq': 600, 'latest_batch_seq': 600, 'new_batches': 0}]
+[market-free-noisy-v6] generation 17 started
+[market-free-noisy-v6] generation g0030 training round 1/20 started
+[market-free-noisy-v6] generation g0030 training round 2/20 started
+[market-free-noisy-v6] generation g0030 training round 3/20 started
+[market-free-noisy-v6] generation g0030 training round 4/20 started
+[market-free-noisy-v6] generation g0030 training round 5/20 started
+[market-free-noisy-v6] generation g0030 training round 6/20 started
+[market-free-noisy-v6] generation g0030 training round 7/20 started
+[market-free-noisy-v6] generation g0030 training round 8/20 started
+[market-free-noisy-v6] generation g0030 training round 9/20 started
+[market-free-noisy-v6] generation g0030 training round 10/20 started
+[market-free-noisy-v6] generation g0030 training round 11/20 started
+[market-free-noisy-v6] generation g0030 training round 12/20 started
+[market-free-noisy-v6] generation g0030 training round 13/20 started
+[market-free-noisy-v6] generation g0030 training round 14/20 started
+[market-free-noisy-v6] generation g0030 training round 15/20 started
+[market-free-noisy-v6] generation g0030 training round 16/20 started
+[market-free-noisy-v6] generation g0030 training round 17/20 started
+[market-free-noisy-v6] generation g0030 training round 18/20 started
+[market-free-noisy-v6] generation g0030 training round 19/20 started
+[market-free-noisy-v6] generation g0030 training round 20/20 started
+
+=== market-free generation 17 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'ca2c4a5a47d17433e50adba7', 'last_attempted_batch_seq': 620, 'latest_batch_seq': 620, 'new_batches': 0}]
+[market-free-noisy-v6] generation 18 started
+[market-free-noisy-v6] generation g0031 training round 1/20 started
+[market-free-noisy-v6] generation g0031 training round 2/20 started
+[market-free-noisy-v6] generation g0031 training round 3/20 started
+[market-free-noisy-v6] generation g0031 training round 4/20 started
+[market-free-noisy-v6] generation g0031 training round 5/20 started
+[market-free-noisy-v6] generation g0031 training round 6/20 started
+[market-free-noisy-v6] generation g0031 training round 7/20 started
+[market-free-noisy-v6] generation g0031 training round 8/20 started
+[market-free-noisy-v6] generation g0031 training round 9/20 started
+[market-free-noisy-v6] generation g0031 training round 10/20 started
+[market-free-noisy-v6] generation g0031 training round 11/20 started
+[market-free-noisy-v6] generation g0031 training round 12/20 started
+[market-free-noisy-v6] generation g0031 training round 13/20 started
+[market-free-noisy-v6] generation g0031 training round 14/20 started
+[market-free-noisy-v6] generation g0031 training round 15/20 started
+[market-free-noisy-v6] generation g0031 training round 16/20 started
+[market-free-noisy-v6] generation g0031 training round 17/20 started
+[market-free-noisy-v6] generation g0031 training round 18/20 started
+[market-free-noisy-v6] generation g0031 training round 19/20 started
+[market-free-noisy-v6] generation g0031 training round 20/20 started
+
+=== market-free generation 18 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 640, 'latest_batch_seq': 640, 'new_batches': 0}]
+[market-free-noisy-v6] generation 19 started
+[market-free-noisy-v6] generation g0032 training round 1/20 started
+[market-free-noisy-v6] generation g0032 training round 2/20 started
+[market-free-noisy-v6] generation g0032 training round 3/20 started
+[market-free-noisy-v6] generation g0032 training round 4/20 started
+[market-free-noisy-v6] generation g0032 training round 5/20 started
+[market-free-noisy-v6] generation g0032 training round 6/20 started
+[market-free-noisy-v6] generation g0032 training round 7/20 started
+[market-free-noisy-v6] generation g0032 training round 8/20 started
+[market-free-noisy-v6] generation g0032 training round 9/20 started
+[market-free-noisy-v6] generation g0032 training round 10/20 started
+[market-free-noisy-v6] generation g0032 training round 11/20 started
+[market-free-noisy-v6] generation g0032 training round 12/20 started
+[market-free-noisy-v6] generation g0032 training round 13/20 started
+[market-free-noisy-v6] generation g0032 training round 14/20 started
+[market-free-noisy-v6] generation g0032 training round 15/20 started
+[market-free-noisy-v6] generation g0032 training round 16/20 started
+[market-free-noisy-v6] generation g0032 training round 17/20 started
+[market-free-noisy-v6] generation g0032 training round 18/20 started
+[market-free-noisy-v6] generation g0032 training round 19/20 started
+[market-free-noisy-v6] generation g0032 training round 20/20 started
+
+=== market-free generation 19 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 660, 'latest_batch_seq': 660, 'new_batches': 0}]
+[market-free-noisy-v6] generation 20 started
+[market-free-noisy-v6] generation g0033 training round 1/20 started
+[market-free-noisy-v6] generation g0033 training round 2/20 started
+[market-free-noisy-v6] generation g0033 training round 3/20 started
+[market-free-noisy-v6] generation g0033 training round 4/20 started
+[market-free-noisy-v6] generation g0033 training round 5/20 started
+[market-free-noisy-v6] generation g0033 training round 6/20 started
+[market-free-noisy-v6] generation g0033 training round 7/20 started
+[market-free-noisy-v6] generation g0033 training round 8/20 started
+[market-free-noisy-v6] generation g0033 training round 9/20 started
+[market-free-noisy-v6] generation g0033 training round 10/20 started
+[market-free-noisy-v6] generation g0033 training round 11/20 started
+[market-free-noisy-v6] generation g0033 training round 12/20 started
+[market-free-noisy-v6] generation g0033 training round 13/20 started
+[market-free-noisy-v6] generation g0033 training round 14/20 started
+[market-free-noisy-v6] generation g0033 training round 15/20 started
+[market-free-noisy-v6] generation g0033 training round 16/20 started
+[market-free-noisy-v6] generation g0033 training round 17/20 started
+[market-free-noisy-v6] generation g0033 training round 18/20 started
+[market-free-noisy-v6] generation g0033 training round 19/20 started
+[market-free-noisy-v6] generation g0033 training round 20/20 started
+
+=== market-free generation 20 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 680, 'latest_batch_seq': 680, 'new_batches': 0}]
+[market-free-noisy-v6] generation 21 started
+[market-free-noisy-v6] generation g0034 training round 1/20 started
+[market-free-noisy-v6] generation g0034 training round 2/20 started
+[market-free-noisy-v6] generation g0034 training round 3/20 started
+[market-free-noisy-v6] generation g0034 training round 4/20 started
+[market-free-noisy-v6] generation g0034 training round 5/20 started
+[market-free-noisy-v6] generation g0034 training round 6/20 started
+[market-free-noisy-v6] generation g0034 training round 7/20 started
+[market-free-noisy-v6] generation g0034 training round 8/20 started
+[market-free-noisy-v6] generation g0034 training round 9/20 started
+[market-free-noisy-v6] generation g0034 training round 10/20 started
+[market-free-noisy-v6] generation g0034 training round 11/20 started
+[market-free-noisy-v6] generation g0034 training round 12/20 started
+[market-free-noisy-v6] generation g0034 training round 13/20 started
+[market-free-noisy-v6] generation g0034 training round 14/20 started
+[market-free-noisy-v6] generation g0034 training round 15/20 started
+[market-free-noisy-v6] generation g0034 training round 16/20 started
+[market-free-noisy-v6] generation g0034 training round 17/20 started
+[market-free-noisy-v6] generation g0034 training round 18/20 started
+[market-free-noisy-v6] generation g0034 training round 19/20 started
+[market-free-noisy-v6] generation g0034 training round 20/20 started
+
+=== market-free generation 21 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 700, 'latest_batch_seq': 700, 'new_batches': 0}]
+[market-free-noisy-v6] generation 22 started
+[market-free-noisy-v6] generation g0035 training round 1/20 started
+[market-free-noisy-v6] generation g0035 training round 2/20 started
+[market-free-noisy-v6] generation g0035 training round 3/20 started
+[market-free-noisy-v6] generation g0035 training round 4/20 started
+[market-free-noisy-v6] generation g0035 training round 5/20 started
+[market-free-noisy-v6] generation g0035 training round 6/20 started
+[market-free-noisy-v6] generation g0035 training round 7/20 started
+[market-free-noisy-v6] generation g0035 training round 8/20 started
+[market-free-noisy-v6] generation g0035 training round 9/20 started
+[market-free-noisy-v6] generation g0035 training round 10/20 started
+[market-free-noisy-v6] generation g0035 training round 11/20 started
+[market-free-noisy-v6] generation g0035 training round 12/20 started
+[market-free-noisy-v6] generation g0035 training round 13/20 started
+[market-free-noisy-v6] generation g0035 training round 14/20 started
+[market-free-noisy-v6] generation g0035 training round 15/20 started
+[market-free-noisy-v6] generation g0035 training round 16/20 started
+[market-free-noisy-v6] generation g0035 training round 17/20 started
+[market-free-noisy-v6] generation g0035 training round 18/20 started
+[market-free-noisy-v6] generation g0035 training round 19/20 started
+[market-free-noisy-v6] generation g0035 training round 20/20 started
+
+=== market-free generation 22 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 720, 'latest_batch_seq': 720, 'new_batches': 0}]
+[market-free-noisy-v6] generation 23 started
+[market-free-noisy-v6] generation g0036 training round 1/20 started
+[market-free-noisy-v6] generation g0036 training round 2/20 started
+[market-free-noisy-v6] generation g0036 training round 3/20 started
+[market-free-noisy-v6] generation g0036 training round 4/20 started
+[market-free-noisy-v6] generation g0036 training round 5/20 started
+[market-free-noisy-v6] generation g0036 training round 6/20 started
+[market-free-noisy-v6] generation g0036 training round 7/20 started
+[market-free-noisy-v6] generation g0036 training round 8/20 started
+[market-free-noisy-v6] generation g0036 training round 9/20 started
+[market-free-noisy-v6] generation g0036 training round 10/20 started
+[market-free-noisy-v6] generation g0036 training round 11/20 started
+[market-free-noisy-v6] generation g0036 training round 12/20 started
+[market-free-noisy-v6] generation g0036 training round 13/20 started
+[market-free-noisy-v6] generation g0036 training round 14/20 started
+[market-free-noisy-v6] generation g0036 training round 15/20 started
+[market-free-noisy-v6] generation g0036 training round 16/20 started
+[market-free-noisy-v6] generation g0036 training round 17/20 started
+[market-free-noisy-v6] generation g0036 training round 18/20 started
+[market-free-noisy-v6] generation g0036 training round 19/20 started
+[market-free-noisy-v6] generation g0036 training round 20/20 started
+
+=== market-free generation 23 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 740, 'latest_batch_seq': 740, 'new_batches': 0}]
+[market-free-noisy-v6] generation 24 started
+[market-free-noisy-v6] generation g0037 training round 1/20 started
+[market-free-noisy-v6] generation g0037 training round 2/20 started
+[market-free-noisy-v6] generation g0037 training round 3/20 started
+[market-free-noisy-v6] generation g0037 training round 4/20 started
+[market-free-noisy-v6] generation g0037 training round 5/20 started
+[market-free-noisy-v6] generation g0037 training round 6/20 started
+[market-free-noisy-v6] generation g0037 training round 7/20 started
+[market-free-noisy-v6] generation g0037 training round 8/20 started
+[market-free-noisy-v6] generation g0037 training round 9/20 started
+[market-free-noisy-v6] generation g0037 training round 10/20 started
+[market-free-noisy-v6] generation g0037 training round 11/20 started
+[market-free-noisy-v6] generation g0037 training round 12/20 started
+[market-free-noisy-v6] generation g0037 training round 13/20 started
+[market-free-noisy-v6] generation g0037 training round 14/20 started
+[market-free-noisy-v6] generation g0037 training round 15/20 started
+[market-free-noisy-v6] generation g0037 training round 16/20 started
+[market-free-noisy-v6] generation g0037 training round 17/20 started
+[market-free-noisy-v6] generation g0037 training round 18/20 started
+[market-free-noisy-v6] generation g0037 training round 19/20 started
+[market-free-noisy-v6] generation g0037 training round 20/20 started
+
+=== market-free generation 24 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'd85db286eed8e46030eadfd9', 'last_attempted_batch_seq': 760, 'latest_batch_seq': 760, 'new_batches': 0}]
+[market-free-noisy-v6] generation 25 started
+[market-free-noisy-v6] generation g0038 training round 1/20 started
+[market-free-noisy-v6] generation g0038 training round 2/20 started
+[market-free-noisy-v6] generation g0038 training round 3/20 started
+[market-free-noisy-v6] generation g0038 training round 4/20 started
+[market-free-noisy-v6] generation g0038 training round 5/20 started
+[market-free-noisy-v6] generation g0038 training round 6/20 started
+[market-free-noisy-v6] generation g0038 training round 7/20 started
+[market-free-noisy-v6] generation g0038 training round 8/20 started
+[market-free-noisy-v6] generation g0038 training round 9/20 started
+[market-free-noisy-v6] generation g0038 training round 10/20 started
+[market-free-noisy-v6] generation g0038 training round 11/20 started
+[market-free-noisy-v6] generation g0038 training round 12/20 started
+[market-free-noisy-v6] generation g0038 training round 13/20 started
+[market-free-noisy-v6] generation g0038 training round 14/20 started
+[market-free-noisy-v6] generation g0038 training round 15/20 started
+[market-free-noisy-v6] generation g0038 training round 16/20 started
+[market-free-noisy-v6] generation g0038 training round 17/20 started
+[market-free-noisy-v6] generation g0038 training round 18/20 started
+[market-free-noisy-v6] generation g0038 training round 19/20 started
+[market-free-noisy-v6] generation g0038 training round 20/20 started
+
+=== market-free generation 25 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '99891a1dddf208c486484511', 'last_attempted_batch_seq': 780, 'latest_batch_seq': 780, 'new_batches': 0}]
+[market-free-noisy-v6] generation 26 started
+[market-free-noisy-v6] generation g0039 training round 1/20 started
+[market-free-noisy-v6] generation g0039 training round 2/20 started
+[market-free-noisy-v6] generation g0039 training round 3/20 started
+[market-free-noisy-v6] generation g0039 training round 4/20 started
+[market-free-noisy-v6] generation g0039 training round 5/20 started
+[market-free-noisy-v6] generation g0039 training round 6/20 started
+[market-free-noisy-v6] generation g0039 training round 7/20 started
+[market-free-noisy-v6] generation g0039 training round 8/20 started
+[market-free-noisy-v6] generation g0039 training round 9/20 started
+[market-free-noisy-v6] generation g0039 training round 10/20 started
+[market-free-noisy-v6] generation g0039 training round 11/20 started
+[market-free-noisy-v6] generation g0039 training round 12/20 started
+[market-free-noisy-v6] generation g0039 training round 13/20 started
+[market-free-noisy-v6] generation g0039 training round 14/20 started
+[market-free-noisy-v6] generation g0039 training round 15/20 started
+[market-free-noisy-v6] generation g0039 training round 16/20 started
+[market-free-noisy-v6] generation g0039 training round 17/20 started
+[market-free-noisy-v6] generation g0039 training round 18/20 started
+[market-free-noisy-v6] generation g0039 training round 19/20 started
+[market-free-noisy-v6] generation g0039 training round 20/20 started
+
+=== market-free generation 26 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '99891a1dddf208c486484511', 'last_attempted_batch_seq': 800, 'latest_batch_seq': 800, 'new_batches': 0}]
+[market-free-noisy-v6] generation 27 started
+[market-free-noisy-v6] generation g0040 training round 1/20 started
+[market-free-noisy-v6] generation g0040 training round 2/20 started
+[market-free-noisy-v6] generation g0040 training round 3/20 started
+[market-free-noisy-v6] generation g0040 training round 4/20 started
+[market-free-noisy-v6] generation g0040 training round 5/20 started
+[market-free-noisy-v6] generation g0040 training round 6/20 started
+[market-free-noisy-v6] generation g0040 training round 7/20 started
+[market-free-noisy-v6] generation g0040 training round 8/20 started
+[market-free-noisy-v6] generation g0040 training round 9/20 started
+[market-free-noisy-v6] generation g0040 training round 10/20 started
+[market-free-noisy-v6] generation g0040 training round 11/20 started
+[market-free-noisy-v6] generation g0040 training round 12/20 started
+[market-free-noisy-v6] generation g0040 training round 13/20 started
+[market-free-noisy-v6] generation g0040 training round 14/20 started
+[market-free-noisy-v6] generation g0040 training round 15/20 started
+[market-free-noisy-v6] generation g0040 training round 16/20 started
+[market-free-noisy-v6] generation g0040 training round 17/20 started
+[market-free-noisy-v6] generation g0040 training round 18/20 started
+[market-free-noisy-v6] generation g0040 training round 19/20 started
+[market-free-noisy-v6] generation g0040 training round 20/20 started
+
+=== market-free generation 27 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '99891a1dddf208c486484511', 'last_attempted_batch_seq': 820, 'latest_batch_seq': 820, 'new_batches': 0}]
+[market-free-noisy-v6] generation 28 started
+[market-free-noisy-v6] generation g0041 training round 1/20 started
+[market-free-noisy-v6] generation g0041 training round 2/20 started
+[market-free-noisy-v6] generation g0041 training round 3/20 started
+[market-free-noisy-v6] generation g0041 training round 4/20 started
+[market-free-noisy-v6] generation g0041 training round 5/20 started
+[market-free-noisy-v6] generation g0041 training round 6/20 started
+[market-free-noisy-v6] generation g0041 training round 7/20 started
+[market-free-noisy-v6] generation g0041 training round 8/20 started
+[market-free-noisy-v6] generation g0041 training round 9/20 started
+[market-free-noisy-v6] generation g0041 training round 10/20 started
+[market-free-noisy-v6] generation g0041 training round 11/20 started
+[market-free-noisy-v6] generation g0041 training round 12/20 started
+[market-free-noisy-v6] generation g0041 training round 13/20 started
+[market-free-noisy-v6] generation g0041 training round 14/20 started
+[market-free-noisy-v6] generation g0041 training round 15/20 started
+[market-free-noisy-v6] generation g0041 training round 16/20 started
+[market-free-noisy-v6] generation g0041 training round 17/20 started
+[market-free-noisy-v6] generation g0041 training round 18/20 started
+[market-free-noisy-v6] generation g0041 training round 19/20 started
+[market-free-noisy-v6] generation g0041 training round 20/20 started
+
+=== market-free generation 28 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '67fe069d31487a4c2a9073db', 'last_attempted_batch_seq': 840, 'latest_batch_seq': 840, 'new_batches': 0}]
+[market-free-noisy-v6] generation 29 started
+[market-free-noisy-v6] generation g0042 training round 1/20 started
+[market-free-noisy-v6] generation g0042 training round 2/20 started
+[market-free-noisy-v6] generation g0042 training round 3/20 started
+[market-free-noisy-v6] generation g0042 training round 4/20 started
+[market-free-noisy-v6] generation g0042 training round 5/20 started
+[market-free-noisy-v6] generation g0042 training round 6/20 started
+[market-free-noisy-v6] generation g0042 training round 7/20 started
+[market-free-noisy-v6] generation g0042 training round 8/20 started
+[market-free-noisy-v6] generation g0042 training round 9/20 started
+[market-free-noisy-v6] generation g0042 training round 10/20 started
+[market-free-noisy-v6] generation g0042 training round 11/20 started
+[market-free-noisy-v6] generation g0042 training round 12/20 started
+[market-free-noisy-v6] generation g0042 training round 13/20 started
+[market-free-noisy-v6] generation g0042 training round 14/20 started
+[market-free-noisy-v6] generation g0042 training round 15/20 started
+[market-free-noisy-v6] generation g0042 training round 16/20 started
+[market-free-noisy-v6] generation g0042 training round 17/20 started
+[market-free-noisy-v6] generation g0042 training round 18/20 started
+[market-free-noisy-v6] generation g0042 training round 19/20 started
+[market-free-noisy-v6] generation g0042 training round 20/20 started
+
+=== market-free generation 29 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'fd4288b90aa789861e679156', 'last_attempted_batch_seq': 860, 'latest_batch_seq': 860, 'new_batches': 0}]
+[market-free-noisy-v6] generation 30 started
+[market-free-noisy-v6] generation g0043 training round 1/20 started
+[market-free-noisy-v6] generation g0043 training round 2/20 started
+[market-free-noisy-v6] generation g0043 training round 3/20 started
+[market-free-noisy-v6] generation g0043 training round 4/20 started
+[market-free-noisy-v6] generation g0043 training round 5/20 started
+[market-free-noisy-v6] generation g0043 training round 6/20 started
+[market-free-noisy-v6] generation g0043 training round 7/20 started
+[market-free-noisy-v6] generation g0043 training round 8/20 started
+[market-free-noisy-v6] generation g0043 training round 9/20 started
+[market-free-noisy-v6] generation g0043 training round 10/20 started
+[market-free-noisy-v6] generation g0043 training round 11/20 started
+[market-free-noisy-v6] generation g0043 training round 12/20 started
+[market-free-noisy-v6] generation g0043 training round 13/20 started
+[market-free-noisy-v6] generation g0043 training round 14/20 started
+[market-free-noisy-v6] generation g0043 training round 15/20 started
+[market-free-noisy-v6] generation g0043 training round 16/20 started
+[market-free-noisy-v6] generation g0043 training round 17/20 started
+[market-free-noisy-v6] generation g0043 training round 18/20 started
+[market-free-noisy-v6] generation g0043 training round 19/20 started
+[market-free-noisy-v6] generation g0043 training round 20/20 started
+
+=== market-free generation 30 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'fbbac17d6106c616dfd80adb', 'last_attempted_batch_seq': 880, 'latest_batch_seq': 880, 'new_batches': 0}]
+[market-free-noisy-v6] generation 31 started
+[market-free-noisy-v6] generation g0044 training round 1/20 started
+[market-free-noisy-v6] generation g0044 training round 2/20 started
+[market-free-noisy-v6] generation g0044 training round 3/20 started
+[market-free-noisy-v6] generation g0044 training round 4/20 started
+[market-free-noisy-v6] generation g0044 training round 5/20 started
+[market-free-noisy-v6] generation g0044 training round 6/20 started
+[market-free-noisy-v6] generation g0044 training round 7/20 started
+[market-free-noisy-v6] generation g0044 training round 8/20 started
+[market-free-noisy-v6] generation g0044 training round 9/20 started
+[market-free-noisy-v6] generation g0044 training round 10/20 started
+[market-free-noisy-v6] generation g0044 training round 11/20 started
+[market-free-noisy-v6] generation g0044 training round 12/20 started
+[market-free-noisy-v6] generation g0044 training round 13/20 started
+[market-free-noisy-v6] generation g0044 training round 14/20 started
+[market-free-noisy-v6] generation g0044 training round 15/20 started
+[market-free-noisy-v6] generation g0044 training round 16/20 started
+[market-free-noisy-v6] generation g0044 training round 17/20 started
+[market-free-noisy-v6] generation g0044 training round 18/20 started
+[market-free-noisy-v6] generation g0044 training round 19/20 started
+[market-free-noisy-v6] generation g0044 training round 20/20 started
+
+=== market-free generation 31 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'fbbac17d6106c616dfd80adb', 'last_attempted_batch_seq': 900, 'latest_batch_seq': 900, 'new_batches': 0}]
+[market-free-noisy-v6] generation 32 started
+[market-free-noisy-v6] generation g0045 training round 1/20 started
+[market-free-noisy-v6] generation g0045 training round 2/20 started
+[market-free-noisy-v6] generation g0045 training round 3/20 started
+[market-free-noisy-v6] generation g0045 training round 4/20 started
+[market-free-noisy-v6] generation g0045 training round 5/20 started
+[market-free-noisy-v6] generation g0045 training round 6/20 started
+[market-free-noisy-v6] generation g0045 training round 7/20 started
+[market-free-noisy-v6] generation g0045 training round 8/20 started
+[market-free-noisy-v6] generation g0045 training round 9/20 started
+[market-free-noisy-v6] generation g0045 training round 10/20 started
+[market-free-noisy-v6] generation g0045 training round 11/20 started
+[market-free-noisy-v6] generation g0045 training round 12/20 started
+[market-free-noisy-v6] generation g0045 training round 13/20 started
+[market-free-noisy-v6] generation g0045 training round 14/20 started
+[market-free-noisy-v6] generation g0045 training round 15/20 started
+[market-free-noisy-v6] generation g0045 training round 16/20 started
+[market-free-noisy-v6] generation g0045 training round 17/20 started
+[market-free-noisy-v6] generation g0045 training round 18/20 started
+[market-free-noisy-v6] generation g0045 training round 19/20 started
+[market-free-noisy-v6] generation g0045 training round 20/20 started
+
+=== market-free generation 32 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'fbbac17d6106c616dfd80adb', 'last_attempted_batch_seq': 920, 'latest_batch_seq': 920, 'new_batches': 0}]
+[market-free-noisy-v6] generation 33 started
+[market-free-noisy-v6] generation g0046 training round 1/20 started
+[market-free-noisy-v6] generation g0046 training round 2/20 started
+[market-free-noisy-v6] generation g0046 training round 3/20 started
+[market-free-noisy-v6] generation g0046 training round 4/20 started
+[market-free-noisy-v6] generation g0046 training round 5/20 started
+[market-free-noisy-v6] generation g0046 training round 6/20 started
+[market-free-noisy-v6] generation g0046 training round 7/20 started
+[market-free-noisy-v6] generation g0046 training round 8/20 started
+[market-free-noisy-v6] generation g0046 training round 9/20 started
+[market-free-noisy-v6] generation g0046 training round 10/20 started
+[market-free-noisy-v6] generation g0046 training round 11/20 started
+[market-free-noisy-v6] generation g0046 training round 12/20 started
+[market-free-noisy-v6] generation g0046 training round 13/20 started
+[market-free-noisy-v6] generation g0046 training round 14/20 started
+[market-free-noisy-v6] generation g0046 training round 15/20 started
+[market-free-noisy-v6] generation g0046 training round 16/20 started
+[market-free-noisy-v6] generation g0046 training round 17/20 started
+[market-free-noisy-v6] generation g0046 training round 18/20 started
+[market-free-noisy-v6] generation g0046 training round 19/20 started
+[market-free-noisy-v6] generation g0046 training round 20/20 started
+
+=== market-free generation 33 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'fbbac17d6106c616dfd80adb', 'last_attempted_batch_seq': 940, 'latest_batch_seq': 940, 'new_batches': 0}]
+[market-free-noisy-v6] generation 34 started
+[market-free-noisy-v6] generation g0047 training round 1/20 started
+[market-free-noisy-v6] generation g0047 training round 2/20 started
+[market-free-noisy-v6] generation g0047 training round 3/20 started
+[market-free-noisy-v6] generation g0047 training round 4/20 started
+[market-free-noisy-v6] generation g0047 training round 5/20 started
+[market-free-noisy-v6] generation g0047 training round 6/20 started
+[market-free-noisy-v6] generation g0047 training round 7/20 started
+[market-free-noisy-v6] generation g0047 training round 8/20 started
+[market-free-noisy-v6] generation g0047 training round 9/20 started
+[market-free-noisy-v6] generation g0047 training round 10/20 started
+[market-free-noisy-v6] generation g0047 training round 11/20 started
+[market-free-noisy-v6] generation g0047 training round 12/20 started
+[market-free-noisy-v6] generation g0047 training round 13/20 started
+[market-free-noisy-v6] generation g0047 training round 14/20 started
+[market-free-noisy-v6] generation g0047 training round 15/20 started
+[market-free-noisy-v6] generation g0047 training round 16/20 started
+[market-free-noisy-v6] generation g0047 training round 17/20 started
+[market-free-noisy-v6] generation g0047 training round 18/20 started
+[market-free-noisy-v6] generation g0047 training round 19/20 started
+[market-free-noisy-v6] generation g0047 training round 20/20 started
+
+=== market-free generation 34 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '6fa61af33b0545ff937ebdb2', 'last_attempted_batch_seq': 960, 'latest_batch_seq': 960, 'new_batches': 0}]
+[market-free-noisy-v6] generation 35 started
+[market-free-noisy-v6] generation g0048 training round 1/20 started
+[market-free-noisy-v6] generation g0048 training round 2/20 started
+[market-free-noisy-v6] generation g0048 training round 3/20 started
+[market-free-noisy-v6] generation g0048 training round 4/20 started
+[market-free-noisy-v6] generation g0048 training round 5/20 started
+[market-free-noisy-v6] generation g0048 training round 6/20 started
+[market-free-noisy-v6] generation g0048 training round 7/20 started
+[market-free-noisy-v6] generation g0048 training round 8/20 started
+[market-free-noisy-v6] generation g0048 training round 9/20 started
+[market-free-noisy-v6] generation g0048 training round 10/20 started
+[market-free-noisy-v6] generation g0048 training round 11/20 started
+[market-free-noisy-v6] generation g0048 training round 12/20 started
+[market-free-noisy-v6] generation g0048 training round 13/20 started
+[market-free-noisy-v6] generation g0048 training round 14/20 started
+[market-free-noisy-v6] generation g0048 training round 15/20 started
+[market-free-noisy-v6] generation g0048 training round 16/20 started
+[market-free-noisy-v6] generation g0048 training round 17/20 started
+[market-free-noisy-v6] generation g0048 training round 18/20 started
+[market-free-noisy-v6] generation g0048 training round 19/20 started
+[market-free-noisy-v6] generation g0048 training round 20/20 started
+
+=== market-free generation 35 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '6fa61af33b0545ff937ebdb2', 'last_attempted_batch_seq': 980, 'latest_batch_seq': 980, 'new_batches': 0}]
+[market-free-noisy-v6] generation 36 started
+[market-free-noisy-v6] generation g0049 training round 1/20 started
+[market-free-noisy-v6] generation g0049 training round 2/20 started
+[market-free-noisy-v6] generation g0049 training round 3/20 started
+[market-free-noisy-v6] generation g0049 training round 4/20 started
+[market-free-noisy-v6] generation g0049 training round 5/20 started
+[market-free-noisy-v6] generation g0049 training round 6/20 started
+[market-free-noisy-v6] generation g0049 training round 7/20 started
+[market-free-noisy-v6] generation g0049 training round 8/20 started
+[market-free-noisy-v6] generation g0049 training round 9/20 started
+[market-free-noisy-v6] generation g0049 training round 10/20 started
+[market-free-noisy-v6] generation g0049 training round 11/20 started
+[market-free-noisy-v6] generation g0049 training round 12/20 started
+[market-free-noisy-v6] generation g0049 training round 13/20 started
+[market-free-noisy-v6] generation g0049 training round 14/20 started
+[market-free-noisy-v6] generation g0049 training round 15/20 started
+[market-free-noisy-v6] generation g0049 training round 16/20 started
+[market-free-noisy-v6] generation g0049 training round 17/20 started
+[market-free-noisy-v6] generation g0049 training round 18/20 started
+[market-free-noisy-v6] generation g0049 training round 19/20 started
+[market-free-noisy-v6] generation g0049 training round 20/20 started
+
+=== market-free generation 36 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '6fa61af33b0545ff937ebdb2', 'last_attempted_batch_seq': 1000, 'latest_batch_seq': 1000, 'new_batches': 0}]
+[market-free-noisy-v6] generation 37 started
+[market-free-noisy-v6] generation g0050 training round 1/20 started
+[market-free-noisy-v6] generation g0050 training round 2/20 started
+[market-free-noisy-v6] generation g0050 training round 3/20 started
+[market-free-noisy-v6] generation g0050 training round 4/20 started
+[market-free-noisy-v6] generation g0050 training round 5/20 started
+[market-free-noisy-v6] generation g0050 training round 6/20 started
+[market-free-noisy-v6] generation g0050 training round 7/20 started
+[market-free-noisy-v6] generation g0050 training round 8/20 started
+[market-free-noisy-v6] generation g0050 training round 9/20 started
+[market-free-noisy-v6] generation g0050 training round 10/20 started
+[market-free-noisy-v6] generation g0050 training round 11/20 started
+[market-free-noisy-v6] generation g0050 training round 12/20 started
+[market-free-noisy-v6] generation g0050 training round 13/20 started
+[market-free-noisy-v6] generation g0050 training round 14/20 started
+[market-free-noisy-v6] generation g0050 training round 15/20 started
+[market-free-noisy-v6] generation g0050 training round 16/20 started
+[market-free-noisy-v6] generation g0050 training round 17/20 started
+[market-free-noisy-v6] generation g0050 training round 18/20 started
+[market-free-noisy-v6] generation g0050 training round 19/20 started
+[market-free-noisy-v6] generation g0050 training round 20/20 started
+
+=== market-free generation 37 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '44481a49e83f2d0b22fc9da4', 'last_attempted_batch_seq': 1020, 'latest_batch_seq': 1020, 'new_batches': 0}]
+[market-free-noisy-v6] generation 38 started
+[market-free-noisy-v6] generation g0051 training round 1/20 started
+[market-free-noisy-v6] generation g0051 training round 2/20 started
+[market-free-noisy-v6] generation g0051 training round 3/20 started
+[market-free-noisy-v6] generation g0051 training round 4/20 started
+[market-free-noisy-v6] generation g0051 training round 5/20 started
+[market-free-noisy-v6] generation g0051 training round 6/20 started
+[market-free-noisy-v6] generation g0051 training round 7/20 started
+[market-free-noisy-v6] generation g0051 training round 8/20 started
+[market-free-noisy-v6] generation g0051 training round 9/20 started
+[market-free-noisy-v6] generation g0051 training round 10/20 started
+[market-free-noisy-v6] generation g0051 training round 11/20 started
+[market-free-noisy-v6] generation g0051 training round 12/20 started
+[market-free-noisy-v6] generation g0051 training round 13/20 started
+[market-free-noisy-v6] generation g0051 training round 14/20 started
+[market-free-noisy-v6] generation g0051 training round 15/20 started
+[market-free-noisy-v6] generation g0051 training round 16/20 started
+[market-free-noisy-v6] generation g0051 training round 17/20 started
+[market-free-noisy-v6] generation g0051 training round 18/20 started
+[market-free-noisy-v6] generation g0051 training round 19/20 started
+[market-free-noisy-v6] generation g0051 training round 20/20 started
+
+=== market-free generation 38 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '44481a49e83f2d0b22fc9da4', 'last_attempted_batch_seq': 1040, 'latest_batch_seq': 1040, 'new_batches': 0}]
+[market-free-noisy-v6] generation 39 started
+[market-free-noisy-v6] generation g0052 training round 1/20 started
+[market-free-noisy-v6] generation g0052 training round 2/20 started
+[market-free-noisy-v6] generation g0052 training round 3/20 started
+[market-free-noisy-v6] generation g0052 training round 4/20 started
+[market-free-noisy-v6] generation g0052 training round 5/20 started
+[market-free-noisy-v6] generation g0052 training round 6/20 started
+[market-free-noisy-v6] generation g0052 training round 7/20 started
+[market-free-noisy-v6] generation g0052 training round 8/20 started
+[market-free-noisy-v6] generation g0052 training round 9/20 started
+[market-free-noisy-v6] generation g0052 training round 10/20 started
+[market-free-noisy-v6] generation g0052 training round 11/20 started
+[market-free-noisy-v6] generation g0052 training round 12/20 started
+[market-free-noisy-v6] generation g0052 training round 13/20 started
+[market-free-noisy-v6] generation g0052 training round 14/20 started
+[market-free-noisy-v6] generation g0052 training round 15/20 started
+[market-free-noisy-v6] generation g0052 training round 16/20 started
+[market-free-noisy-v6] generation g0052 training round 17/20 started
+[market-free-noisy-v6] generation g0052 training round 18/20 started
+[market-free-noisy-v6] generation g0052 training round 19/20 started
+[market-free-noisy-v6] generation g0052 training round 20/20 started
+
+=== market-free generation 39 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '2ea997e2dbaada6828e1fcb1', 'last_attempted_batch_seq': 1060, 'latest_batch_seq': 1060, 'new_batches': 0}]
+[market-free-noisy-v6] generation 40 started
+[market-free-noisy-v6] generation g0053 training round 1/20 started
+[market-free-noisy-v6] generation g0053 training round 2/20 started
+[market-free-noisy-v6] generation g0053 training round 3/20 started
+[market-free-noisy-v6] generation g0053 training round 4/20 started
+[market-free-noisy-v6] generation g0053 training round 5/20 started
+[market-free-noisy-v6] generation g0053 training round 6/20 started
+[market-free-noisy-v6] generation g0053 training round 7/20 started
+[market-free-noisy-v6] generation g0053 training round 8/20 started
+[market-free-noisy-v6] generation g0053 training round 9/20 started
+[market-free-noisy-v6] generation g0053 training round 10/20 started
+[market-free-noisy-v6] generation g0053 training round 11/20 started
+[market-free-noisy-v6] generation g0053 training round 12/20 started
+[market-free-noisy-v6] generation g0053 training round 13/20 started
+[market-free-noisy-v6] generation g0053 training round 14/20 started
+[market-free-noisy-v6] generation g0053 training round 15/20 started
+[market-free-noisy-v6] generation g0053 training round 16/20 started
+[market-free-noisy-v6] generation g0053 training round 17/20 started
+[market-free-noisy-v6] generation g0053 training round 18/20 started
+[market-free-noisy-v6] generation g0053 training round 19/20 started
+[market-free-noisy-v6] generation g0053 training round 20/20 started
+
+=== market-free generation 40 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '2ea997e2dbaada6828e1fcb1', 'last_attempted_batch_seq': 1080, 'latest_batch_seq': 1080, 'new_batches': 0}]
+[market-free-noisy-v6] generation 41 started
+[market-free-noisy-v6] generation g0054 training round 1/20 started
+[market-free-noisy-v6] generation g0054 training round 2/20 started
+[market-free-noisy-v6] generation g0054 training round 3/20 started
+[market-free-noisy-v6] generation g0054 training round 4/20 started
+[market-free-noisy-v6] generation g0054 training round 5/20 started
+[market-free-noisy-v6] generation g0054 training round 6/20 started
+[market-free-noisy-v6] generation g0054 training round 7/20 started
+[market-free-noisy-v6] generation g0054 training round 8/20 started
+[market-free-noisy-v6] generation g0054 training round 9/20 started
+[market-free-noisy-v6] generation g0054 training round 10/20 started
+[market-free-noisy-v6] generation g0054 training round 11/20 started
+[market-free-noisy-v6] generation g0054 training round 12/20 started
+[market-free-noisy-v6] generation g0054 training round 13/20 started
+[market-free-noisy-v6] generation g0054 training round 14/20 started
+[market-free-noisy-v6] generation g0054 training round 15/20 started
+[market-free-noisy-v6] generation g0054 training round 16/20 started
+[market-free-noisy-v6] generation g0054 training round 17/20 started
+[market-free-noisy-v6] generation g0054 training round 18/20 started
+[market-free-noisy-v6] generation g0054 training round 19/20 started
+[market-free-noisy-v6] generation g0054 training round 20/20 started
+
+=== market-free generation 41 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '2a4f4d637c4a698b6a41a910', 'last_attempted_batch_seq': 1100, 'latest_batch_seq': 1100, 'new_batches': 0}]
+[market-free-noisy-v6] generation 42 started
+[market-free-noisy-v6] generation g0055 training round 1/20 started
+[market-free-noisy-v6] generation g0055 training round 2/20 started
+[market-free-noisy-v6] generation g0055 training round 3/20 started
+[market-free-noisy-v6] generation g0055 training round 4/20 started
+[market-free-noisy-v6] generation g0055 training round 5/20 started
+[market-free-noisy-v6] generation g0055 training round 6/20 started
+[market-free-noisy-v6] generation g0055 training round 7/20 started
+[market-free-noisy-v6] generation g0055 training round 8/20 started
+[market-free-noisy-v6] generation g0055 training round 9/20 started
+[market-free-noisy-v6] generation g0055 training round 10/20 started
+[market-free-noisy-v6] generation g0055 training round 11/20 started
+[market-free-noisy-v6] generation g0055 training round 12/20 started
+[market-free-noisy-v6] generation g0055 training round 13/20 started
+[market-free-noisy-v6] generation g0055 training round 14/20 started
+[market-free-noisy-v6] generation g0055 training round 15/20 started
+[market-free-noisy-v6] generation g0055 training round 16/20 started
+[market-free-noisy-v6] generation g0055 training round 17/20 started
+[market-free-noisy-v6] generation g0055 training round 18/20 started
+[market-free-noisy-v6] generation g0055 training round 19/20 started
+[market-free-noisy-v6] generation g0055 training round 20/20 started
+
+=== market-free generation 42 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '3a9077a71f7fe2a578df0b65', 'last_attempted_batch_seq': 1120, 'latest_batch_seq': 1120, 'new_batches': 0}]
+[market-free-noisy-v6] generation 43 started
+[market-free-noisy-v6] generation g0056 training round 1/20 started
+[market-free-noisy-v6] generation g0056 training round 2/20 started
+[market-free-noisy-v6] generation g0056 training round 3/20 started
+[market-free-noisy-v6] generation g0056 training round 4/20 started
+[market-free-noisy-v6] generation g0056 training round 5/20 started
+[market-free-noisy-v6] generation g0056 training round 6/20 started
+[market-free-noisy-v6] generation g0056 training round 7/20 started
+[market-free-noisy-v6] generation g0056 training round 8/20 started
+[market-free-noisy-v6] generation g0056 training round 9/20 started
+[market-free-noisy-v6] generation g0056 training round 10/20 started
+[market-free-noisy-v6] generation g0056 training round 11/20 started
+[market-free-noisy-v6] generation g0056 training round 12/20 started
+[market-free-noisy-v6] generation g0056 training round 13/20 started
+[market-free-noisy-v6] generation g0056 training round 14/20 started
+[market-free-noisy-v6] generation g0056 training round 15/20 started
+[market-free-noisy-v6] generation g0056 training round 16/20 started
+[market-free-noisy-v6] generation g0056 training round 17/20 started
+[market-free-noisy-v6] generation g0056 training round 18/20 started
+[market-free-noisy-v6] generation g0056 training round 19/20 started
+[market-free-noisy-v6] generation g0056 training round 20/20 started
+
+=== market-free generation 43 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '3a9077a71f7fe2a578df0b65', 'last_attempted_batch_seq': 1140, 'latest_batch_seq': 1140, 'new_batches': 0}]
+[market-free-noisy-v6] generation 44 started
+[market-free-noisy-v6] generation g0057 training round 1/20 started
+[market-free-noisy-v6] generation g0057 training round 2/20 started
+[market-free-noisy-v6] generation g0057 training round 3/20 started
+[market-free-noisy-v6] generation g0057 training round 4/20 started
+[market-free-noisy-v6] generation g0057 training round 5/20 started
+[market-free-noisy-v6] generation g0057 training round 6/20 started
+[market-free-noisy-v6] generation g0057 training round 7/20 started
+[market-free-noisy-v6] generation g0057 training round 8/20 started
+[market-free-noisy-v6] generation g0057 training round 9/20 started
+[market-free-noisy-v6] generation g0057 training round 10/20 started
+[market-free-noisy-v6] generation g0057 training round 11/20 started
+[market-free-noisy-v6] generation g0057 training round 12/20 started
+[market-free-noisy-v6] generation g0057 training round 13/20 started
+[market-free-noisy-v6] generation g0057 training round 14/20 started
+[market-free-noisy-v6] generation g0057 training round 15/20 started
+[market-free-noisy-v6] generation g0057 training round 16/20 started
+[market-free-noisy-v6] generation g0057 training round 17/20 started
+[market-free-noisy-v6] generation g0057 training round 18/20 started
+[market-free-noisy-v6] generation g0057 training round 19/20 started
+[market-free-noisy-v6] generation g0057 training round 20/20 started
+
+=== market-free generation 44 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '7b61deab37336d2b7b23dd52', 'last_attempted_batch_seq': 1160, 'latest_batch_seq': 1160, 'new_batches': 0}]
+[market-free-noisy-v6] generation 45 started
+[market-free-noisy-v6] generation g0058 training round 1/20 started
+[market-free-noisy-v6] generation g0058 training round 2/20 started
+[market-free-noisy-v6] generation g0058 training round 3/20 started
+[market-free-noisy-v6] generation g0058 training round 4/20 started
+[market-free-noisy-v6] generation g0058 training round 5/20 started
+[market-free-noisy-v6] generation g0058 training round 6/20 started
+[market-free-noisy-v6] generation g0058 training round 7/20 started
+[market-free-noisy-v6] generation g0058 training round 8/20 started
+[market-free-noisy-v6] generation g0058 training round 9/20 started
+[market-free-noisy-v6] generation g0058 training round 10/20 started
+[market-free-noisy-v6] generation g0058 training round 11/20 started
+[market-free-noisy-v6] generation g0058 training round 12/20 started
+[market-free-noisy-v6] generation g0058 training round 13/20 started
+[market-free-noisy-v6] generation g0058 training round 14/20 started
+[market-free-noisy-v6] generation g0058 training round 15/20 started
+[market-free-noisy-v6] generation g0058 training round 16/20 started
+[market-free-noisy-v6] generation g0058 training round 17/20 started
+[market-free-noisy-v6] generation g0058 training round 18/20 started
+[market-free-noisy-v6] generation g0058 training round 19/20 started
+[market-free-noisy-v6] generation g0058 training round 20/20 started
+
+=== market-free generation 45 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': '7b61deab37336d2b7b23dd52', 'last_attempted_batch_seq': 1180, 'latest_batch_seq': 1180, 'new_batches': 0}]
+[market-free-noisy-v6] generation 46 started
+[market-free-noisy-v6] generation g0059 training round 1/20 started
+[market-free-noisy-v6] generation g0059 training round 2/20 started
+[market-free-noisy-v6] generation g0059 training round 3/20 started
+[market-free-noisy-v6] generation g0059 training round 4/20 started
+[market-free-noisy-v6] generation g0059 training round 5/20 started
+[market-free-noisy-v6] generation g0059 training round 6/20 started
+[market-free-noisy-v6] generation g0059 training round 7/20 started
+[market-free-noisy-v6] generation g0059 training round 8/20 started
+[market-free-noisy-v6] generation g0059 training round 9/20 started
+[market-free-noisy-v6] generation g0059 training round 10/20 started
+[market-free-noisy-v6] generation g0059 training round 11/20 started
+[market-free-noisy-v6] generation g0059 training round 12/20 started
+[market-free-noisy-v6] generation g0059 training round 13/20 started
+[market-free-noisy-v6] generation g0059 training round 14/20 started
+[market-free-noisy-v6] generation g0059 training round 15/20 started
+[market-free-noisy-v6] generation g0059 training round 16/20 started
+[market-free-noisy-v6] generation g0059 training round 17/20 started
+[market-free-noisy-v6] generation g0059 training round 18/20 started
+[market-free-noisy-v6] generation g0059 training round 19/20 started
+[market-free-noisy-v6] generation g0059 training round 20/20 started
+
+=== market-free generation 46 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'ffb2e7ea735854d53353ae59', 'last_attempted_batch_seq': 1200, 'latest_batch_seq': 1200, 'new_batches': 0}]
+[market-free-noisy-v6] generation 47 started
+[market-free-noisy-v6] generation g0060 training round 1/20 started
+[market-free-noisy-v6] generation g0060 training round 2/20 started
+[market-free-noisy-v6] generation g0060 training round 3/20 started
+[market-free-noisy-v6] generation g0060 training round 4/20 started
+[market-free-noisy-v6] generation g0060 training round 5/20 started
+[market-free-noisy-v6] generation g0060 training round 6/20 started
+[market-free-noisy-v6] generation g0060 training round 7/20 started
+[market-free-noisy-v6] generation g0060 training round 8/20 started
+[market-free-noisy-v6] generation g0060 training round 9/20 started
+[market-free-noisy-v6] generation g0060 training round 10/20 started
+[market-free-noisy-v6] generation g0060 training round 11/20 started
+[market-free-noisy-v6] generation g0060 training round 12/20 started
+[market-free-noisy-v6] generation g0060 training round 13/20 started
+[market-free-noisy-v6] generation g0060 training round 14/20 started
+[market-free-noisy-v6] generation g0060 training round 15/20 started
+[market-free-noisy-v6] generation g0060 training round 16/20 started
+[market-free-noisy-v6] generation g0060 training round 17/20 started
+[market-free-noisy-v6] generation g0060 training round 18/20 started
+[market-free-noisy-v6] generation g0060 training round 19/20 started
+[market-free-noisy-v6] generation g0060 training round 20/20 started
+
+=== market-free generation 47 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'ffb2e7ea735854d53353ae59', 'last_attempted_batch_seq': 1220, 'latest_batch_seq': 1220, 'new_batches': 0}]
+[market-free-noisy-v6] generation 48 started
+[market-free-noisy-v6] generation g0061 training round 1/20 started
+[market-free-noisy-v6] generation g0061 training round 2/20 started
+[market-free-noisy-v6] generation g0061 training round 3/20 started
+[market-free-noisy-v6] generation g0061 training round 4/20 started
+[market-free-noisy-v6] generation g0061 training round 5/20 started
+[market-free-noisy-v6] generation g0061 training round 6/20 started
+[market-free-noisy-v6] generation g0061 training round 7/20 started
+[market-free-noisy-v6] generation g0061 training round 8/20 started
+[market-free-noisy-v6] generation g0061 training round 9/20 started
+[market-free-noisy-v6] generation g0061 training round 10/20 started
+[market-free-noisy-v6] generation g0061 training round 11/20 started
+[market-free-noisy-v6] generation g0061 training round 12/20 started
+[market-free-noisy-v6] generation g0061 training round 13/20 started
+[market-free-noisy-v6] generation g0061 training round 14/20 started
+[market-free-noisy-v6] generation g0061 training round 15/20 started
+[market-free-noisy-v6] generation g0061 training round 16/20 started
+[market-free-noisy-v6] generation g0061 training round 17/20 started
+[market-free-noisy-v6] generation g0061 training round 18/20 started
+[market-free-noisy-v6] generation g0061 training round 19/20 started
+[market-free-noisy-v6] generation g0061 training round 20/20 started
+
+=== market-free generation 48 complete ===
+[{'model_id': 'dqn_market_free.raw_order_q_v1@outcome_v4', 'min_new_batches': 20, 'active_checkpoint_id': 'ffb2e7ea735854d53353ae59', 'last_attempted_batch_seq': 1240, 'latest_batch_seq': 1240, 'new_batches': 0}]
+[market-free-noisy-v6] generation 49 started
+[market-free-noisy-v6] generation g0062 training round 1/20 started
+[market-free-noisy-v6] generation g0062 training round 2/20 started
+[market-free-noisy-v6] generation g0062 training round 3/20 started
+[market-free-noisy-v6] generation g0062 training round 4/20 started
+[market-free-noisy-v6] generation g0062 training round 5/20 started
+[market-free-noisy-v6] generation g0062 training round 6/20 started
+[market-free-noisy-v6] generation g0062 training round 7/20 started
+[market-free-noisy-v6] generation g0062 training round 8/20 started
+[market-free-noisy-v6] generation g0062 training round 9/20 started
+[market-free-noisy-v6] generation g0062 training round 10/20 started
+[market-free-noisy-v6] generation g0062 training round 11/20 started
+[market-free-noisy-v6] generation g0062 training round 12/20 started
+[market-free-noisy-v6] generation g0062 training round 13/20 started
+[market-free-noisy-v6] generation g0062 training round 14/20 started
+[market-free-noisy-v6] generation g0062 training round 15/20 started
+[market-free-noisy-v6] generation g0062 training round 16/20 started
+[market-free-noisy-v6] generation g0062 training round 17/20 started
+[market-free-noisy-v6] generation g0062 training round 18/20 started
+[market-free-noisy-v6] generation g0062 training round 19/20 started
+[market-free-noisy-v6] generation g0062 training round 20/20 started
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 10 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

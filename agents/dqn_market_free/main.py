@@ -34,8 +34,8 @@ from typing import Any
 import numpy as np
 
 from agents.dqn_market_free import donor
-from agents.dqn_market_free.market_state import market_state_features
-from agents.dqn_market_free.order_space import choose_order
+from agents.dqn_market_free.market_state import MarketHistory, market_state_features
+from agents.dqn_market_free.order_space import choose_order, feasible_actions
 from agents.dqn_market_free.planting import market_influenced_roles
 from agents.dqn_market_free.policy import WEIGHTS_PATH, OrderQNetwork
 
@@ -66,13 +66,57 @@ class MarketFreeAgent:
         recorder: Any | None = None,
         episode_steps: int = 720,
         turns_per_day: int = 24,
+        noise_cadence: str = "none",
+        noise_scale: float = 1.0,
     ):
         self.network = network
         self.epsilon = float(epsilon)
         self.rng = rng
+        # Multiplier on the perturbation this actor plays at, applied to the
+        # *draw* rather than to the checkpoint's sigma. Scaling sigma in place --
+        # which is how the per-actor spread used to arrive -- works only because
+        # it happened exactly once at load; a second application squares it, and
+        # nothing about the object says so.
+        self.noise_scale = float(noise_scale)
+        # How often a NoisyNet weight perturbation is redrawn: "none", or one of
+        # "decision" / "day" / "episode". The default is what makes evaluation
+        # determinism structural rather than a promise -- the arena, the
+        # viability gates, the promotion head-to-head and the Kaggle entry point
+        # all reach this class through `agent()` below, which never sets it, so
+        # nothing on any of those paths can draw noise even from a checkpoint
+        # that carries sigma.
+        self.noise_cadence = str(noise_cadence)
         self.recorder = recorder
         self.episode_steps = int(episode_steps)
         self.turns_per_day = int(turns_per_day)
+        # The simulator's observation is a snapshot, so the only place a price
+        # trend or a refused order can be remembered is here.
+        self.history = MarketHistory()
+
+    def _sample_noise(self, step: int, turns_per_day: int) -> None:
+        """Redraw the network's weight perturbation, if this turn is due one.
+
+        Cadence is a free parameter, not a cost trade: factorized noise costs
+        `in + out` draws per layer rather than `in * out` -- 314 for the 186-wide
+        head -- which is tens of microseconds against a simulator turn measured
+        in milliseconds. "decision" matches how the TD loop resamples, so the
+        behaviour and training distributions agree; "episode" is the setting that
+        can express a coherent multi-turn plan, because at 720 decisions
+        per-decision noise is near-independent across turns and cannot hold a
+        seed purchase and its harvest inside one perturbed policy.
+        """
+
+        if self.noise_cadence == "none" or self.rng is None:
+            return
+        if self.network is None or not getattr(self.network, "is_noisy", False):
+            return
+        due = (
+            self.noise_cadence == "decision"
+            or (self.noise_cadence == "episode" and step == 0)
+            or (self.noise_cadence == "day" and turns_per_day > 0 and step % turns_per_day == 0)
+        )
+        if due:
+            self.network.sample_noise(self.rng, self.noise_scale)
 
     def __call__(self, obs: Any, configuration: Any | None = None) -> dict[str, list]:
         farms = obs.get("farms", []) or []
@@ -90,8 +134,15 @@ class MarketFreeAgent:
 
         if step == 0:
             _reset_donor_state()
+            self.history.reset()
             if self.recorder is not None:
                 self.recorder.reset()
+
+        # Before the state is encoded, and before this turn's decision: the money
+        # in `farm` has already been through last turn's market phase, so this is
+        # the first moment last turn's order is known to have filled or been
+        # refused. `training/clone.py` pushes at the same point in its own loop.
+        self.history.observe(obs, farm)
 
         roles = market_influenced_roles(
             obs,
@@ -120,9 +171,16 @@ class MarketFreeAgent:
                 config=configuration,
                 episode_steps=episode_steps,
                 turns_per_day=turns_per_day,
+                history=self.history,
             )
-            decision = choose_order(state, self.network, self.epsilon, self.rng)
+            # Feasibility only: orders the simulator would refuse outright are
+            # withheld from both the argmax and the exploring draw. It decides
+            # nothing about which of the remaining orders is worth making.
+            mask = feasible_actions(obs, farm, private, field, configuration)
+            self._sample_noise(step, turns_per_day)
+            decision = choose_order(state, self.network, self.epsilon, self.rng, mask)
             orders = decision.wire()
+            self.history.record_decision(decision.order)
             if self.recorder is not None:
                 self.recorder.record_decision(decision=decision)
 

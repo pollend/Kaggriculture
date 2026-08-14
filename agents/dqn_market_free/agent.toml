@@ -75,11 +75,64 @@ gamma = 0.999
 # Share of every minibatch drawn from the pinned demonstrations rather than from
 # self-collected episodes. Solvent trajectories are rare enough that an
 # unweighted draw over the agent's own data is almost entirely bankruptcies, and
-# the only policy consistent with that is NOOP. This is what replaced rank-based
-# prioritisation over episode final money: it puts the same solvent signal in
-# every batch by construction, with no sampling bias to correct and no
-# importance-sampling exponent to anneal. Ignored when nothing is pinned.
+# the only policy consistent with that is NOOP. Drawing a fixed share from the
+# demonstrations puts solvent transitions in every batch by construction, with no
+# sampling bias to correct.
+#
+# The catch, and the reason `priority_alpha` below exists: this is conditional on
+# having a demonstrator. It is ignored when nothing is pinned, and nothing is --
+# `demonstration_episodes` is 0, so the share silently resolves to zero and the
+# mechanism contributes nothing while reporting nothing.
 demo_fraction = 0.25
+
+# Rank exponent for the return-weighted draw over the agent's *own* episodes.
+# 0.0 is the uniform draw, byte for byte, down to the bit-generator state.
+#
+# Self-imitation, and it covers the case `demo_fraction` cannot: with no
+# demonstrator to pin, the best episodes the policy has actually produced are the
+# only positive signal there is. Episodes are ranked by shaped return descending
+# and drawn at P(i) proportional to rank^-alpha, with the resulting bias undone
+# by a per-row weight in the TD loss. The two mechanisms compose -- demonstrations
+# stay uniform inside their share, own episodes are ranked inside theirs.
+#
+# The buffer this is aimed at, measured over 432 of the live run's own episodes:
+# a quarter finish below a shaped return of -1.0, and the solvent fraction reads
+# 0.0023. A uniform draw over that teaches NOOP, because NOOP is the policy it is
+# consistent with.
+#
+# Rank-based, not proportional, because the shaped return is *signed*: it spans
+# -1.94 to +0.65 with a mode at 0, so there is no exponent of it that is even
+# defined. Shifting by the buffer minimum would make one episode's priority
+# depend on the worst episode currently held; clamping at zero would delete the
+# reservoir segment. A rank is invariant to all of it and bounded by
+# construction, so one blowout episode cannot take the batch.
+#
+# Held at 0.0 for now: the mechanism is landed inert so the uniform draw is
+# provably unchanged before the behaviour changes. 0.7 is the intended value --
+# Schaul et al.'s rank-based alpha, and note their proportional value is 0.6 and
+# the two are not interchangeable.
+priority_alpha = 0.0
+
+# Importance-sampling exponent, fixed. There is no anneal schedule and that is
+# deliberate. An anneal is state: it has to key off `gradient_steps`, and
+# `resume_reset_after_rejections` snaps that backwards on a lineage reset while
+# the buffer contents do not move -- so the correction and the data drift apart
+# exactly on the updates where the run is already failing. A constant is re-read
+# from this file every update, the way `learning_rate` now is, and cannot
+# desynchronise. That drift was the real half of the objection prioritisation was
+# retired over; the exponents themselves were not the problem.
+#
+# Strictly below 1.0, and not as an approximation. At 1.0 the correction is
+# exact, P(i) * w(i) is flat, and the weighted gradient equals the uniform one in
+# expectation -- prioritisation would then buy nothing but variance. Beta is the
+# bias dial, not a correctness knob climbing toward 1: the bias toward the
+# agent's own best episodes is the entire mechanism.
+#
+# Measured at (alpha 0.7, beta 0.5) over 400 real episodes: the best episode is
+# drawn 23x more often than uniform and carries weight 0.12, for a net 2.8x; the
+# expected return of a sampled episode rises from 0.213 to 0.406; effective
+# sample size holds at 93% of the batch.
+priority_beta = 0.5
 
 # The bootstrap is a max over the 186-wide action head, not over an expanded
 # candidate grid, so there is nothing left to chunk and a wide batch is cheap.
@@ -118,6 +171,248 @@ epsilon_end = 0.01
 epsilon_actor_alpha = 4.0
 # Counted in decisions, which accumulate 12x faster than the scorer's.
 epsilon_decay_transitions = 2000000
+
+# NoisyNet. Off here: the manifest is the epsilon-greedy control, and every key
+# below defaults to the behaviour this file had before they existed.
+#
+# The problem it addresses is structural rather than a tuning miss. The explore
+# branch draws uniformly over feasible actions with NOOP removed, so every
+# exploring turn is forced to place a real order -- and 97 of the 186 actions
+# spend money against 88 that sell. At 720 decisions an episode that is ~130
+# forced random orders, a majority of them purchases, chosen without reference
+# to what the network thinks anything is worth. Perturbing the *weights* instead
+# moves the argmax only where actions are already near-tied in Q, so a purchase
+# the policy has learned is ruinous stays unreachable.
+#
+# "head" rather than "all" to start. It leaves `has_inert_hidden_trunk` -- the
+# only structural guard against the NOOP collapse -- correct as written, and
+# keeps the trunk shared with the behaviour-clone cross-entropy head
+# deterministic. "all" is the honest follow-up, not the safe default.
+noisy = false
+noisy_layers = "head"
+noisy_sigma0 = 0.5
+
+# How often the perturbation is redrawn. Not a cost trade: factorized noise
+# costs `in + out` draws per layer rather than `in * out` -- 314 for the 186-wide
+# head -- which is tens of microseconds against a simulator turn measured in
+# milliseconds. So this is chosen for exploration quality alone, and note it does
+# not bear on the overbuying at all: every setting perturbs the weights and is
+# therefore value-proportional, so all three kill the epsilon purchase pump
+# equally. What it decides is whether the exploration can express a *plan*.
+#
+# "day" -- redraw every `turnsPerDay` turns -- for two reasons specific to this
+# simulator rather than to NoisyNet:
+#
+# It matches `n_step` above, which is one in-game day because that is the crop
+# cycle's unit. Under per-decision noise a 24-step return is produced by 24
+# different perturbed policies, so the bootstrap values a return no single policy
+# would ever generate; under day cadence each n-step return belongs to one.
+#
+# And the day is a real economic boundary here, the one that caused the original
+# bankruptcy: hire cost is fibonacci in `hires_today` and resets daily, hands are
+# wiped at the day boundary, and `simple_v2` died on eighteen `HIRE 13` orders.
+# HIRE is inherently a daily posture, so perturbing it sub-day perturbs something
+# the economy does not vary at that rate.
+#
+# The alternatives, and what they cost. "decision" maximises state coverage but
+# cannot hold a multi-turn plan. "episode" holds one perturbed policy for the
+# whole season -- the only setting that can discover "buy seed day 1, sell day
+# 10" -- but yields 8 distinct policies per batch against day cadence's 480, and
+# one bad draw wastes a full 720-turn episode rather than 24 turns, which is a
+# poor trade for a family with this one's record of bankrupting in the first few
+# turns. Day cadence does *not* span the 48-96 turn BUY_SEED-to-harvest cycle;
+# that gap is why "episode" stays the follow-up experiment.
+noisy_cadence = "decision"
+
+# Actor `i` of `N` scales sigma by `alpha ** (-i/(N-1))`, one scale per seed
+# pair, so actor 0 plays the learned sigma and the last is effectively greedy.
+# The same Ape-X trick `epsilon_actor_alpha` applies, and it exists for the same
+# measured reason -- one temperature per batch fills the buffer with near-copies
+# of one trajectory. At alpha 32 and eight pairs: 1.0 down to 0.031.
+noisy_actor_alpha = 32.0
+
+# Periodic exploration bursts: every `noisy_burst_every` rounds, every actor
+# collects at the sigma that lands on `noisy_burst_order_rate` instead of the
+# ladder around `noisy_order_rate_target`. 0 turns the schedule off, which is what
+# every run through `explore-v7` played.
+#
+# A burst round is *flat*, and that is v8's measurement rather than a preference.
+# Rebasing the 32x ladder left only two of eight rungs above an ordinary round's
+# hardest actor, so a burst was really "two of eight episodes explore twice as
+# hard" -- ~5% of the run at one round in five. Over 560 seats it moved nothing:
+# 4.6% of burst-round seats bought land against 4.9% of ordinary ones, and burst
+# money came out higher rather than lower. The ladder's own justification does not
+# survive the move to `noisy_cadence = "episode"` either: it exists because one
+# temperature per batch fills the buffer with near-copies at 81% pairwise action
+# agreement, which was measured under epsilon, where a shared rate really does
+# produce near-copies. Under per-episode noise, eight episodes at one sigma are
+# eight different policies. The near-greedy read the ladder also provides comes
+# from the four ordinary rounds between every burst.
+#
+# The ladder above spreads sigma within a batch but only *downward* -- actor 0 at
+# the controller's setpoint, the other seven below it -- so no episode anywhere
+# ever explores harder than the setpoint, and the rarest behaviours are precisely
+# the ones collection is structurally blind to.
+#
+# `explore-v7` measured what that ceiling costs. Restoring sigma brought land
+# purchases back from extinct (0 seats in v6's last two generations, 38 then 56 in
+# v7's first two) but every one lands on day 0, where `feasible_actions` opens
+# BUY_LAND the moment `money >= LAND_PRICES[extra]` and 1,000 of a 3,000 stake
+# buys it: land-buying seats finish at a 304 median against 13,844 for the rest.
+# The timed purchase the donor makes on day 5 is a rarer draw than the setpoint
+# reaches, and raising the setpoint permanently would just buy more day-0 ruin.
+#
+# Rounds rather than actors, and that is the whole design. Raising every batch
+# puts a permanent noise floor in every minibatch -- `priority_alpha` is 0.0, so
+# high-sigma episodes are sampled uniformly beside the good ones -- which is the
+# epsilon purchase pump with a different name. Alternating concentrates it: a
+# burst round fills the ring with exploratory trajectories, the ordinary rounds
+# after it refill the FIFO with on-policy data, and `reservoir_fraction` keeps a
+# sample of the burst alive to learn from. Exploration and consolidation get their
+# own rounds instead of averaging into every batch.
+#
+# A rate, not a sigma multiplier, and that is not cosmetic. The base a multiplier
+# would scale moves every update as the controller tracks the setpoint, and what a
+# given scale buys moves with the network, so a fixed multiplier drifts twice
+# over. `resolve_sigma_scale` reads this off the same `noisy_flip_to_order_curve`
+# the setpoint uses and the burst re-sizes itself as both move.
+#
+# It also puts a measured bound on how hard a burst may go. Measured on v7: scale
+# 4 puts `flip_to_order` at 0.536 and scale 8 at 0.739 -- an order on most of the
+# turns the policy would have sat out, which with ~97 of 186 actions spending
+# money bankrupts the episode in its first turns and leaves ~700 turns of the dead
+# NOOP state that was 99% of `simple_v2`'s buffer. A burst that detonates collects
+# nothing, so the useful range is under that knee: v8 ran 0.20 and measured no
+# effect at all, v9 runs 0.35.
+#
+# The phase counts `training_batches` for this `model_id`, so it is continuous
+# across restarts and session ids rather than restarting at a burst every launch.
+#
+# Read the run with `metadata_json ->> 'noisy_burst'`: a burst round is *meant*
+# to look bad on `mean_final_money`, and without splitting on that flag the money
+# series alternates between two regimes with nothing to say why.
+#
+# The manifest keeps the schedule off, so the control arm is unchanged.
+noisy_burst_every = 0
+noisy_burst_order_rate = 0.0
+
+# The other trigger, and the one worth having. When the previous batch's
+# `trading_rate` is at or below this, the next batch collects at the burst sigma.
+# 0.0 turns it off.
+#
+# A NOOP policy produces no learning signal at all, so bankruptcy is strictly the
+# better failure: it at least generates transitions with a gradient in them.
+# Bursting on idleness therefore costs nothing -- the episodes it replaces were
+# worth nothing -- and it stops by itself as soon as trading resumes. That is the
+# trigger the periodic schedule above should have been: on a fixed cadence the
+# burst fires when the policy is *healthy*, which is exactly when high sigma is
+# pure damage (v9, sigma 3.159: 49% of 212 seats bankrupt, nothing discovered).
+#
+# Set it well under `viability_min_orders_per_decision` so the escape answers
+# genuine silence rather than merely cautious trading.
+#
+# Read `trading_rate`, not the wire order count: `HIRE 13` is one decision that
+# expands to thirteen rows, so the wire count reads as activity for a policy that
+# acted once in a hundred turns.
+noisy_idle_trading_rate = 0.0
+
+# Ceiling on the scale a burst may resolve to. Defaults to
+# `noisy_sigma_scale_limit`, so a config that never names it is unchanged.
+#
+# It exists because that default is far too loose to bound a burst, and v9 proved
+# it: at a limit of 8.0 a burst rate of 0.35 resolved to 3.159, and per-episode
+# attribution over 212 seats at that sigma found 49% of them bankrupt against
+# 8-26% across the ordinary ladder -- and *zero* land purchases, the thing the
+# burst existed to find. Above roughly 2 the perturbation stops being a search:
+# 97 of 186 actions spend money, so the wallet is gone in the first turns and
+# `feasible_actions` then offers nothing but NOOP for the remaining ~700.
+#
+# A rate target alone cannot express that bound, because what a rate costs in
+# sigma depends on a curve that moves with the network. This is the hard stop.
+noisy_burst_scale_limit = 8.0
+
+# Flip rate the collection sigma is aimed at: the share of visited states where
+# the perturbation changes the argmax. 0.0 turns the controller off and leaves
+# collection at the learned sigma, which is what every run before this key did.
+#
+# It exists because sigma has no floor. The documented failure mode is that it
+# anneals toward zero, exploration stops, the run goes greedy-only, and nothing
+# else in `metrics_json` moves -- and the Ape-X ladder above cannot catch it,
+# because it spreads *around* whatever sigma has become rather than holding it
+# anywhere. Each update sweeps a ladder of multipliers, records the resulting
+# flip rate at each (`noisy_flip_rate_curve`), and the next round's collection
+# plays at the multiplier that lands on this number.
+#
+# 0.05 because this is the quantity epsilon named directly, and the manifest's
+# epsilon control arm anneals 0.18 -> 0.01, so the setpoint sits inside the range
+# the comparable arm actually spends most of its life in.
+#
+# What it does *not* do, since the two collapses are easy to confuse: this cannot
+# prevent the NOOP collapse. A collapsed policy sits on a flat plateau where
+# every action is near-tied, so flips are cheap and its flip rate reads *high*
+# while it trades nothing -- targeting the rate there would turn sigma down.
+# `viability_min_orders_per_decision` and `noisy_order_rate_target` below are what
+# read on that; this key is about exploration collapse only.
+noisy_flip_rate_target = 0.05
+
+# The same controller, aimed at the flip-*to-order* rate instead: the share of
+# states the greedy policy would sit out that the perturbation talks into a real
+# order. 0.0 leaves it off. Set this and `noisy_flip_rate_target` is ignored --
+# exactly one curve may move sigma, or a run cannot say which number moved it.
+#
+# This exists because the warning three paragraphs up came true. On
+# `market-free-noisy-v6` the policy collapsed onto NOOP, the flip rate read
+# 0.28-0.39 against the 0.05 setpoint above, and the controller divided sigma by
+# up to six for it: `actor_sigma_scales` went to [0.33 .. 0.010], so not one of
+# the eight actors played at the learned sigma and the greediest played at a
+# hundredth of it. Exploration was throttled at the one moment it needed raising.
+# Twelve updates, zero promotions, `trading_rate` 0.0 on every gate.
+#
+# The flip-to-order rate cannot be fooled that way: near-ties around NOOP are
+# what makes the flip rate high, and they are precisely what leaves this one low.
+# It saturates once the perturbation always leaves NOOP, which `resolve_sigma_
+# scale` handles -- a target above the whole ladder takes the top rung.
+#
+# The manifest keeps this off, so it stays the epsilon-greedy control arm.
+noisy_order_rate_target = 0.0
+
+# Bound on how far the resolved multiplier may depart from the learned sigma, in
+# both directions -- the range is `[1/limit, limit]`. It also clips the probe
+# ladder, so a run cannot be measured at a scale it is not allowed to play.
+#
+# The bound matters most when sigma has genuinely collapsed: no multiplier can
+# recover exploration from a sigma of zero, and without a limit the resolver
+# would chase the target upward forever while every ladder point reads zero.
+# `resolve_sigma_scale` returns 1.0 on a flat curve for that reason, so the
+# saturation signature to watch for is `noisy_sigma_scale_target` pinned at this
+# value with `noisy_argmax_flip_rate` still under target -- which means a sigma
+# reset (`noisy_sigma0`, new lineage), not a larger limit.
+noisy_sigma_scale_limit = 8.0
+
+# Lower bound on the resolved scale. 0.0 keeps the implicit `1 / limit`, which is
+# what every run before this key played, so it is opt-in.
+#
+# The implicit clamp is not a floor on *exploration*; it only bounds how far the
+# resolver may depart from the learned sigma, and on a cold start those two come
+# apart. An untrained network's flip-to-order rate is high because the network is
+# random, not because sigma is large, so the controller reads over-exploration and
+# turns sigma down at the one moment there is nothing yet to exploit. Measured on
+# `market-free-landgate-v10`: update 20 resolved exactly 0.125 -- the `1 / 8`
+# clamp hit dead on -- with `mean_abs_q` at 0.046, and the run went quiet.
+#
+# Flooring the *base* costs nothing in diagnostics. `noisy_actor_alpha` already
+# spreads the ladder 32x downward, so the near-greedy actor that gives
+# `trading_rate` an honest read comes from the ladder rather than from letting the
+# base collapse. A base under half the learned sigma buys nothing the ladder does
+# not already provide.
+noisy_sigma_scale_floor = 0.0
+
+# Noise strictly hurts a 186-way classification fit, so the clone phase's
+# cheapest answer is to drive sigma to zero -- and it runs *before* the TD loop,
+# so it could zero out exploration before a single TD step has seen it. Sigma is
+# also excluded from the clone optimizer's parameter group for the same reason;
+# this key only controls whether the clone forward is noisy at all.
+behavior_clone_noise = false
 
 # Demonstrations from stored league replays, pinned in the buffer and never
 # evicted. The manifest remains the reward-only control; named demo experiments
@@ -162,7 +457,36 @@ viability_min_orders_per_decision = 0.02
 # promoted or not; release is gated, the behaviour distribution is not. Snap the
 # lineage back to the released checkpoint after this many consecutive rejections
 # so a diverged trajectory is not carried forward forever. 0 disables the reset.
-resume_reset_after_rejections = 5
+#
+# 2, down from 5, because 5 never fires in time. Measured across v7, v8 and v9 the
+# run oscillates rather than diverging monotonically: it promotes, then produces
+# candidates at 1,335 / 975 / 3,877 against a released incumbent scoring ~17,000,
+# and sometimes recovers on its own before the limit is reached. That recovery is
+# what made 5 look adequate. It is not -- each rejected update in between is a
+# generation spent collecting from a policy the gate has already judged far worse
+# than one sitting released and unused, and the buffer fills with its behaviour.
+# Snapping back after two costs at most one salvageable update and bounds how far
+# the collection distribution can drift from something known good.
+resume_reset_after_rejections = 2
+
+# Self-play against this model's own recent checkpoints, mixed into `opponents`
+# at `self_play_ratio` once `self_play_after` batches have been collected. The
+# pool follows the lineage rather than the release, for the same reason the
+# rollout policy does: gating it on promotion made the mirror unreachable on a
+# run that promoted nothing in 33 updates.
+#
+# 0 disables it, and that is the manifest default: the bare manifest is the
+# control. `train_market_free.py` is where the mirror curriculum is turned on.
+self_play_after = 0
+self_play_pool = 5
+self_play_ratio = 0.3
+
+# The insolvency floor and its per-turn charge are deliberately *not* keys here.
+# They live beside `MONEY_SCALE` and `REJECTED_ORDER_PENALTY` in
+# `training/reward.py`, because the reward stream is part of the policy's
+# identity: `match_agent.toml` lists that file in `code_paths` so changing one of
+# those constants mints a new revision rather than silently re-labelling old
+# rollouts. A config key would put the same number outside that fingerprint.
 
 jobs = 8
 seed = 0

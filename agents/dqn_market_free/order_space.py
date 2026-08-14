@@ -199,11 +199,177 @@ def order_index(op: str, item: str | None, quantity: int) -> int | None:
     return ACTION_INDEX.get((op, item, nearest_quantity(int(quantity), ladder)))
 
 
+def _indices_by_item(op: str) -> dict[str | None, np.ndarray]:
+    """Action indices for one operation, grouped by item.
+
+    Built once at import so a feasibility mask costs a handful of numpy slice
+    writes rather than a 186-iteration Python loop. This runs on every turn of
+    every rollout episode.
+    """
+
+    groups: dict[str | None, list[int]] = {}
+    for index, order in enumerate(ACTIONS):
+        if order.op == op:
+            groups.setdefault(order.item, []).append(index)
+    return {item: np.asarray(rows, dtype=np.intp) for item, rows in groups.items()}
+
+
+_SELL_ROWS = _indices_by_item("SELL")
+_BUY_PRODUCT_ROWS = _indices_by_item("BUY_PRODUCT")
+_BUY_SEED_ROWS = _indices_by_item("BUY_SEED")
+_BUY_ANIMAL_ROWS = _indices_by_item("BUY_ANIMAL")
+_HIRE_ROWS = _indices_by_item("HIRE").get(None, np.empty(0, dtype=np.intp))
+_BUY_LAND_ROW = ACTION_INDEX[("BUY_LAND", None, 0)]
+NOOP_INDEX = 0
+
+#: `HIRE n` costs `sum(_fib(hires_today) .. _fib(hires_today + n - 1))` times the
+#: hand multiplier, because `_do_hire` charges per hand and increments
+#: `hires_today` between them. Prefix sums turn that into one subtraction:
+#: `_FIB_PREFIX[h + n] - _FIB_PREFIX[h]`.
+#:
+#: The simulator puts no ceiling on `hires_today` -- only affordability stops it
+#: -- so the table is sized well past `MAX_HANDS`. It does not need to cover
+#: every reachable value: `_fib(40)` is already 165 million, so a farm that far
+#: into a day cannot afford another hand under any money the game produces, and
+#: falling off the end leaves the rows masked, which is the right answer.
+_FIB_PREFIX = np.concatenate(
+    ([0.0], np.cumsum([float(donor._fib(index)) for index in range(64)]))
+)
+#: `_HIRE_ROWS` is built in `HIRE_QUANTITIES` order, so these line up positionally.
+_HIRE_HANDS = np.asarray(HIRE_QUANTITIES, dtype=np.intp)
+
+
+#: Score given to a masked action before an argmax, in both numpy and torch.
+#:
+#: Finite rather than -inf, and the same constant on both sides. Finite because
+#: a masked score can reach a multiply -- `-inf * 0.0` is nan, not zero, and one
+#: nan takes a whole minibatch down through the backward pass -- and because a
+#: cross-entropy whose target somehow landed on a masked class would return inf
+#: rather than a large, visible number. Shared because the numpy argmax and the
+#: torch argmax must break ties identically for identical weights, which is what
+#: the parity test between `policy.py` and `training/network.py` pins.
+#:
+#: -1e4 against Q values of single digits (`reward.MONEY_SCALE` sizes a season's
+#: return that way) leaves the ordering in no doubt.
+MASKED_SCORE = -1e4
+
+
+def feasible_actions(
+    obs: dict, farm: dict, private: dict, field: dict, config=None
+) -> np.ndarray:
+    """[ACTION_COUNT] bool: True where the simulator would commit at least one unit.
+
+    This is feasibility, not preference. Every rule below is read straight off
+    `_commit_unit`, `_do_hire` and `_do_buy_land` in the environment, so a False
+    here means the game would refuse the order outright -- never that the order
+    is unwise. Choosing among what remains is left entirely to the network, the
+    same way `order_is_structurally_possible` already removes orders the game can
+    never accept without expressing a view on the rest.
+
+    `BUY_LAND` was gated on the day and a cash reserve for one session and is
+    not any more, so the claim above is unqualified again. The measurement that
+    motivated it stands and is recorded in the roadmap: land-buying seats finish
+    far behind the rest because `LAND_PRICES` opens at 1,000 against a 3,000
+    stake, so the purchase is offered on turn 0 before any revenue exists. What
+    the gate could not show is that forbidding it *helps* -- under it the policy
+    stopped buying land entirely rather than buying it later. Revisit with that
+    evidence rather than from scratch.
+
+    It exists because roughly half the action space is unusable until the farm
+    produces something. Measured on a live run: SELL is 88 of the 186 actions,
+    the policy emitted an order on 84% of turns, and the simulator accepted 1% of
+    them -- it was selling goods it did not own, and could not stop, because
+    nothing it could sell would exist until it first bought seed.
+
+    An action counts as feasible when *one* unit would commit. `SELL WHEAT 45`
+    against a single wheat in the shed is feasible and fills partially, which is
+    exactly what the simulator does, so quantity never affects feasibility.
+
+    `field` is this turn's unit plan and is required. The environment applies
+    every DROP, PLACE and PICKUP *before* the market phase (`interpreter` calls
+    `_apply_unit_action` for both seats, then `_process_market`), so a hand
+    dropping a harvested melon this turn makes `SELL MELON` commit even though
+    the observation still shows an empty shed. Reading the raw shed alone would
+    forbid an order the game accepts -- the one direction this function must
+    never take.
+
+    Where the raw and post-field views disagree the permissive one wins:
+    `_post_field_storage` is a model of the simulator, not the simulator, so a
+    modelling error can only ever leave an extra action open -- which the game
+    then refuses exactly as it does today -- and never remove a real one.
+    """
+
+    mask = np.zeros(ACTION_COUNT, dtype=np.bool_)
+    # Doing nothing is always available, so the mask can never be empty and the
+    # argmax always has something to land on.
+    mask[NOOP_INDEX] = True
+
+    money = float(farm.get("money", 0) or 0)
+    capacity = int(donor._cfg(config, "shedCapacity", donor.SHED_CAPACITY))
+    raw_shed = private.get("shed", {}) or {}
+    post_shed, _ = donor._post_field_storage(private, field or {}, capacity)
+
+    def _held(item: str) -> int:
+        return max(int(raw_shed.get(item, 0) or 0), int(post_shed.get(item, 0) or 0))
+
+    occupancy = min(
+        sum(max(0, int(value or 0)) for value in raw_shed.values()),
+        sum(max(0, int(value or 0)) for value in post_shed.values()),
+    )
+    has_room = occupancy < capacity
+    inventory = (obs.get("market", {}) or {}).get("inventory", {}) or {}
+
+    for item, rows in _SELL_ROWS.items():
+        if _held(item) > 0:
+            mask[rows] = True
+
+    for item, rows in _BUY_PRODUCT_ROWS.items():
+        # Quoted at the post-buy inventory, which is what `_commit_unit` does --
+        # not the sale price the observation carries at current inventory.
+        stock = int(inventory.get(item, donor.MARKET_I0) or donor.MARKET_I0)
+        if has_room and money >= float(donor._price_at(item, stock - 1, obs)):
+            mask[rows] = True
+
+    for crop, rows in _BUY_SEED_ROWS.items():
+        if money >= float(donor.CROPS[crop]["seed"]):
+            mask[rows] = True
+
+    for animal, rows in _BUY_ANIMAL_ROWS.items():
+        if has_room and money >= float(donor.ANIMALS[animal]["cost"]):
+            mask[rows] = True
+
+    extra = max(0, len(farm.get("unlocked_quadrants", ["NW"]) or ["NW"]) - 1)
+    if extra < len(donor.LAND_PRICES) and money >= float(donor.LAND_PRICES[extra]):
+        mask[_BUY_LAND_ROW] = True
+
+    # Every hand in the order has to be affordable, not just the first.
+    #
+    # This is the one rule here that is stricter than `_do_hire`, which commits
+    # what it can and stops when the money runs out. It is still feasibility and
+    # not preference: `HIRE 13` against 700 coins partially commits as four
+    # hands, and `HIRE 4` is its own index on the same ladder, so no outcome the
+    # simulator would produce becomes unreachable -- only the mislabelled route
+    # to it does. Measured on `market-free-simple-v2`: hire cost is fibonacci in
+    # `hires_today`, so one `HIRE 13` is 609 coins against a 3,000 stake, and the
+    # policy that learned to emit it was bankrupt by turn four of 720 and spent
+    # the rest of the episode in a state where nothing but NOOP was feasible.
+    hire_mult = float(donor._cfg(config, "farmHandCostMult", 1))
+    hires_today = int(farm.get("hires_today", 0) or 0)
+    if hires_today + int(_HIRE_HANDS[-1]) < _FIB_PREFIX.shape[0]:
+        costs = hire_mult * (
+            _FIB_PREFIX[hires_today + _HIRE_HANDS] - _FIB_PREFIX[hires_today]
+        )
+        mask[_HIRE_ROWS] = money >= costs
+
+    return mask
+
+
 @dataclass(frozen=True, slots=True)
 class OrderDecision:
     state: np.ndarray  # float32 [STATE_DIM]
     order: Order
     chosen: int  # index into ACTIONS
+    mask: np.ndarray | None = None  # bool [ACTION_COUNT], feasibility at `state`
 
     def wire(self) -> list[list]:
         """The order list as the simulator wants it; empty on NOOP."""
@@ -216,8 +382,9 @@ def choose_order(
     network,
     epsilon: float = 0.0,
     rng: np.random.Generator | None = None,
+    mask: np.ndarray | None = None,
 ) -> OrderDecision:
-    """Greedy argmax over the action head, with epsilon-greedy exploration.
+    """Greedy argmax over the feasible action head, with epsilon-greedy exploration.
 
     `epsilon` is the probability that this turn emits a uniformly random *real*
     order. It absorbs what used to be two knobs: a per-turn exploration coin and
@@ -229,13 +396,24 @@ def choose_order(
     0.1, 0.02 and even 0.005 the agent finishes the season on 5, 185, 48 and 4
     coins from a 3,000 float while the donor finishes above 100,000. Random
     capital purchases are what does it -- BUY_LAND is 1,000-4,000 and BUY_ANIMAL
-    300-500 -- so the buffer fills with nothing but bankruptcy and the only
-    policy consistent with it is NOOP. Which order to emit when exploring is
-    still uniform, including state-invalid choices such as unaffordable ones.
+    300-500 -- so the buffer fills with nothing but bankruptcy.
+
+    `mask` restricts both paths to what the simulator would actually accept. It
+    matters most for the exploring one: without it roughly half of every random
+    draw was a sell from an empty shed, which is not exploration, it is a no-op
+    the agent then has to learn its way out of.
     """
 
+    if mask is None:
+        mask = np.ones(ACTION_COUNT, dtype=np.bool_)
+
     if epsilon > 0.0 and rng is not None and rng.random() < epsilon:
-        chosen = int(rng.integers(1, ACTION_COUNT))
+        # Explore over feasible *real* orders. NOOP is reachable by not
+        # exploring, and is the fallback when nothing else can be done.
+        options = np.flatnonzero(mask)
+        options = options[options != NOOP_INDEX]
+        chosen = int(rng.choice(options)) if options.size else NOOP_INDEX
     else:
-        chosen = int(np.argmax(np.asarray(network(state)).reshape(ACTION_COUNT)))
-    return OrderDecision(state, ACTIONS[chosen], chosen)
+        scores = np.asarray(network(state)).reshape(ACTION_COUNT)
+        chosen = int(np.argmax(np.where(mask, scores, MASKED_SCORE)))
+    return OrderDecision(state, ACTIONS[chosen], chosen, mask)

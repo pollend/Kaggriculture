@@ -33,7 +33,7 @@ import numpy as np
 
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
-from agents.dqn_market_free.order_space import ACTIONS, OrderDecision
+from agents.dqn_market_free.order_space import ACTION_COUNT, ACTIONS, OrderDecision
 from agents.dqn_market_free.training.reward import episode_rewards, potential
 
 if TYPE_CHECKING:
@@ -49,6 +49,14 @@ class EpisodeRecord:
     order_state: np.ndarray  # float32 [D, STATE_DIM]
     order_chosen: np.ndarray  # int16   [D]  index into ACTIONS
     order_step: np.ndarray  # int16   [D]  index into `reward` each decision is paid from
+    #: bool [D, ACTION_COUNT]. Which actions the simulator would have accepted at
+    #: each decision. Stored rather than recomputed from `order_state`: every
+    #: input is technically recoverable from the normalised features, but that
+    #: would tie the mask to the exact scaling of six columns in `market_state`,
+    #: which is source-frozen against the scorer -- and a drift there would
+    #: corrupt the Double-DQN target silently. It compresses to almost nothing
+    #: beside `order_state`.
+    order_mask: np.ndarray
 
     @property
     def steps(self) -> int:
@@ -92,6 +100,7 @@ EPISODE_ARRAY_FIELDS = (
     "order_state",
     "order_chosen",
     "order_step",
+    "order_mask",
 )
 
 
@@ -123,11 +132,26 @@ def load_episode_batch(path: str | Path) -> list[EpisodeRecord]:
         count = int(payload["episode_count"][0])
         records = []
         for index in range(count):
-            values = {name: payload[f"e{index}_{name}"].copy() for name in EPISODE_ARRAY_FIELDS}
+            try:
+                values = {
+                    name: payload[f"e{index}_{name}"].copy() for name in EPISODE_ARRAY_FIELDS
+                }
+            except KeyError as missing:
+                raise ValueError(
+                    f"{path}: episode {index} is missing {missing}, so it predates a "
+                    "schema change. Rollout artifacts do not outlive the session that "
+                    "wrote them -- start a new training instance rather than reading it."
+                ) from missing
             width = values["order_state"].shape[-1]
             if width != STATE_DIM:
                 raise ValueError(
                     f"{path}: episode {index} has a {width}-wide state, expected {STATE_DIM}"
+                )
+            actions = values["order_mask"].shape[-1]
+            if actions != ACTION_COUNT:
+                raise ValueError(
+                    f"{path}: episode {index} has a {actions}-wide action mask, "
+                    f"expected {ACTION_COUNT}"
                 )
             records.append(EpisodeRecord(**values))
         return records
@@ -172,7 +196,13 @@ class Recorder:
         self.money.append(float(money))
         self.potential.append(potential(farm, private, obs))
 
-    def finish(self, final_money: float, opponent_money: float, gamma: float) -> EpisodeRecord:
+    def finish(
+        self,
+        final_money: float,
+        opponent_money: float,
+        gamma: float,
+        mode: str = "shaped",
+    ) -> EpisodeRecord:
         steps = len(self.money)
         if steps == 0:
             raise ValueError("recorder captured no steps")
@@ -187,15 +217,24 @@ class Recorder:
                 emitted[step] = True
 
         shaped, raw, money = episode_rewards(
-            self.money, self.potential, final_money, opponent_money, gamma, emitted
+            self.money,
+            self.potential,
+            final_money,
+            opponent_money,
+            gamma,
+            emitted,
+            mode=mode,
         )
 
         count = len(self.decisions)
         order_state = np.zeros((count, STATE_DIM), dtype=np.float32)
         order_chosen = np.zeros(count, dtype=np.int16)
+        order_mask = np.ones((count, ACTION_COUNT), dtype=np.bool_)
         for index, decision in enumerate(self.decisions):
             order_state[index] = decision.state
             order_chosen[index] = decision.chosen
+            if decision.mask is not None:
+                order_mask[index] = decision.mask
 
         return EpisodeRecord(
             reward=shaped.astype(np.float32),
@@ -204,6 +243,7 @@ class Recorder:
             order_state=order_state,
             order_chosen=order_chosen,
             order_step=np.asarray(self.order_steps, dtype=np.int16),
+            order_mask=order_mask,
         )
 
 
@@ -235,12 +275,22 @@ def learner_spec(
     exploration_seed: int,
     trace_path: Path | str | None = None,
     policy_revision_id: str | None = None,
+    reward_mode: str = "shaped",
+    noise_cadence: str = "none",
+    sigma_scale: float = 1.0,
 ) -> str:
     """Address the exploring learner as an ordinary agent spec.
 
     The per-episode trace path and revision id are deliberately separable: the
     spec without them is the *policy identity*, and folding a per-episode trace
     into it would mint one agent revision per episode.
+
+    `reward_mode` is emitted only when it differs from the default, so leaving it
+    off keeps the spec string byte-identical to what a run recorded before it
+    existed and no revision churns. It sits in the identity spec rather than
+    beside it for the same reason `gamma` does: both are read only by
+    `Recorder.finish`, never by the policy, and a run that relabels its rewards
+    is worth telling apart from one that does not.
     """
 
     query: dict[str, Any] = {
@@ -249,6 +299,15 @@ def learner_spec(
         "gamma": f"{gamma:.6f}",
         "exploration_seed": str(int(exploration_seed)),
     }
+    # Emitted only on departure from the default, for the reason spelled out
+    # above: a run with NoisyNet off leaves every spec string byte-identical to
+    # what this agent recorded before it existed, so no revision churns.
+    if noise_cadence != "none":
+        query["noise_cadence"] = str(noise_cadence)
+    if sigma_scale != 1.0:
+        query["sigma_scale"] = f"{sigma_scale:.6f}"
+    if reward_mode != "shaped":
+        query["reward_mode"] = str(reward_mode)
     if trace_path is not None:
         query["trace_path"] = str(trace_path)
     if policy_revision_id is not None:
@@ -268,8 +327,11 @@ def collect_episode(
     pair_index: int = 0,
     policy_revision_id: str | None = None,
     config: dict[str, Any] | None = None,
+    reward_mode: str = "shaped",
+    noise_cadence: str = "none",
+    sigma_scale: float = 1.0,
 ) -> OrderRollout | None:
-    """Play one episode with an epsilon-greedy learner and record it."""
+    """Play one episode with an exploring learner and record it."""
 
     from kaggriculture_lab.episode_metrics import episode_metrics
     from sim.runner import OK_STATUSES, run_match
@@ -282,6 +344,9 @@ def collect_episode(
         exploration_seed=exploration_seed,
         trace_path=trace_path,
         policy_revision_id=policy_revision_id,
+        reward_mode=reward_mode,
+        noise_cadence=noise_cadence,
+        sigma_scale=sigma_scale,
     )
     seats = (spec, opponent_spec) if learner_seat == 0 else (opponent_spec, spec)
     result = run_match(seats, seed, config=config, analyzer=episode_metrics)
@@ -376,6 +441,30 @@ def actor_epsilons(base: float, actors: int, alpha: float = 4.0) -> list[float]:
     return [base ** (1.0 + (index / (actors - 1)) * alpha) for index in range(actors)]
 
 
+def actor_sigma_scales(actors: int, alpha: float = 32.0) -> list[float]:
+    """One NoisyNet sigma multiplier per actor, spread geometrically.
+
+    The exact analogue of `actor_epsilons`, and it exists for the same measured
+    reason rather than by analogy: one temperature for a whole batch fills the
+    buffer with near-copies of one trajectory, at 81% mean pairwise action
+    agreement between the sixteen episodes of a batch. That finding is about
+    behavioural diversity within a batch and is orthogonal to the exploration
+    *mechanism*, so a single sigma reproduces it exactly.
+
+    Actor `i` of `N` runs at `alpha ** (-i/(N-1))`: actor 0 plays the learned
+    sigma and the last actor is effectively greedy, so `trading_rate` and the
+    money diagnostics always have a clean read of what the policy actually does.
+    At alpha 32 and eight pairs that is 1.0 down to 0.031.
+
+    This is Ape-X's per-actor temperature trick transplanted, *not* principled
+    NoisyNet -- the paper has one sigma, learned, and no spread at all.
+    """
+
+    if actors <= 1:
+        return [1.0]
+    return [alpha ** (-(index / (actors - 1))) for index in range(actors)]
+
+
 def collect_batch(
     weights_path: Path,
     opponents: list[str],
@@ -387,6 +476,9 @@ def collect_batch(
     exploration_seed: int = 0,
     policy_revision_id: str | None = None,
     config: dict[str, Any] | None = None,
+    reward_mode: str = "shaped",
+    noise_cadence: str = "none",
+    sigma_scales: list[float] | None = None,
 ) -> list[OrderRollout]:
     """Play `len(seeds)` episodes, one opponent drawn per consecutive seed pair.
 
@@ -398,9 +490,11 @@ def collect_batch(
     `epsilons` is indexed by pair for the same reason the opponent is: both
     orientations of a seed must be played by the same policy at the same
     temperature, or the paired margin the league settles is a comparison between
-    two different agents.
+    two different agents. `sigma_scales` is indexed by pair for exactly that
+    reason too -- it is the same knob under a different exploration mechanism.
     """
 
+    scales = sigma_scales or [1.0]
     payloads = []
     for index, seed in enumerate(seeds):
         pair_index = index // 2
@@ -418,6 +512,9 @@ def collect_batch(
                 pair_index,
                 policy_revision_id,
                 config,
+                reward_mode,
+                noise_cadence,
+                scales[pair_index % len(scales)],
             )
         )
     if jobs <= 1:

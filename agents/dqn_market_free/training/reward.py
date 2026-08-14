@@ -15,6 +15,22 @@ Shaping of this form is policy-invariant as long as the terminal potential is
 forced to zero (Ng, Harada & Russell 1999), which `episode_rewards` does. It
 cannot change which policy is optimal -- only how quickly the network finds it --
 so `Phi` is free to price anything that is worth something, and it should.
+
+On top of that sits the episode's own outcome, the tanh of the final margin. It
+is paid twice: as a lump on the terminal step, and as a per-step annuity of
+`(1 - gamma) * outcome` on every step of the episode. The two sum to a flat
+`outcome` in Q at every timestep, so a state on a winning trajectory is valued
+above the same-looking state on a losing one no matter when in the season it was
+seen. Unlike the shaping, this is not policy-invariant -- that is the point.
+
+Two small per-turn charges sit alongside it, also not policy-invariant, for the
+two states the shaping cannot price because it prices everything at zero: an
+order the simulator refused, and a wallet with no runway left.
+
+`REWARD_MODES` selects whether the first two terms are present at all. The
+`outcome_only` mode drops the money delta and the shaping together, leaving the
+episode outcome and the two charges -- see the constant for what that buys and
+what it costs.
 """
 
 from __future__ import annotations
@@ -25,6 +41,7 @@ from typing import Any
 import numpy as np
 
 from agents.dqn_market_free import donor
+from agents.dqn_market_free.market_state import order_refused
 
 PRODUCTS: tuple[str, ...] = tuple(donor.PRODUCTS)
 
@@ -43,17 +60,71 @@ MONEY_SCALE = 20_000.0
 
 #: Coins of final margin at which the terminal term reaches tanh(1) = 0.76.
 #:
-#: Sized from the observed margin range, because the previous 20,000 with a hard
-#: clip was informationless: measured across 640 recorded episodes the margin ran
-#: from -21,681 to -210,076, so `clip(margin / 20_000, -1, 1)` returned exactly
-#: -1.0 on every one of them. A constant on the terminal reward shifts every Q
-#: value uniformly and can never change an argmax, so the one term tying training
-#: to what the promotion gate measures was contributing nothing.
+#: Sized to the *self-play* margin distribution, which is the one this term has
+#: to discriminate. Against the scripted field it never did: measured across 640
+#: recorded episodes the margin ran from -21,681 to -210,076, so the original
+#: 20,000 with a hard clip returned exactly -1.0 on every one of them, and 100,000
+#: only moved the saturation point -- by the last recorded generation every
+#: episode margin was about -128,000, giving a constant -0.86. A constant on the
+#: terminal reward shifts every Q value uniformly and can never change an argmax,
+#: so the one term tying training to what the promotion gate measures was
+#: contributing nothing either way.
 #:
-#: At 100,000 that same range maps to -0.21 .. -0.97, which discriminates, and a
-#: run that closes on the donor sees the term shrink toward zero and cross into
-#: positive as it should.
-TERMINAL_MARGIN_SCALE = 100_000.0
+#: Against its own mirror the margins are hundreds to low thousands, where
+#: `tanh(margin / 100_000)` is about 0.01 -- a vanishing term rather than a
+#: saturated one, which is no better. At 10,000 a 2,000-coin mirror margin maps
+#: to 0.20 and discriminates.
+#:
+#: The anchor games stay saturated at this scale, deliberately. Their job in the
+#: mix is the absolute money signal, which the per-step delta already carries;
+#: the margin term is there for the mirror.
+TERMINAL_MARGIN_SCALE = 10_000.0
+
+#: Multiplier on the per-step outcome annuity.
+#:
+#: The terminal margin term lands on one turn of about 720, and the buffer samples
+#: 24-turn windows, so only ~3% of transitions ever see it as a reward. The rest
+#: wait on a bootstrap chain up to 720 links deep to find out whether the episode
+#: they came from made money. Paying `(1 - gamma) * outcome` on every step as well
+#: as the terminal lump makes the outcome's contribution to Q flat at `outcome`
+#: for every t:
+#:
+#:     sum_{k>=t} gamma^(k-t) * (1-gamma) * outcome  +  gamma^(T-1-t) * outcome
+#:       = outcome * (1 - gamma^(T-t) + gamma^(T-1-t))  ~=  outcome
+#:
+#: Scaled by `(1 - gamma)` rather than the more obvious `1 / T`. An even
+#: `outcome / T` spread leaves Q at about 0.71 * outcome on the first turn decaying
+#: to nothing on the last, which is *less* late-game outcome signal than the
+#: terminal lump alone already provides. It also means the annuity vanishes exactly
+#: at gamma = 1, where an undiscounted lump already reaches every step at full
+#: weight and there is nothing to fix.
+OUTCOME_ANNUITY_WEIGHT = 1.0
+
+#: How `episode_rewards` builds the stream.
+#:
+#: ``shaped`` is the reward this file was written for: money delta, potential
+#: shaping, outcome, penalties.
+#:
+#: ``outcome_only`` drops the money delta *and* the potential shaping, leaving
+#: the outcome annuity plus the two penalties. The pair goes together -- `Phi`
+#: exists only to cancel the cash leg of a purchase (see `_land_value`), so
+#: dropping the delta and keeping `Phi` would price a buy at `+Phi` and a sale at
+#: `-Phi`, which is the wrong sign on both. Dropping `Phi` and keeping the delta
+#: is the opposite mistake: every purchase becomes a pure loss and every sale a
+#: pure gain, which is the churn this mode exists to stop.
+#:
+#: What it costs, stated plainly because the tests cannot: the immediate reward
+#: becomes identical for every action on a turn, so `REJECTED_ORDER_PENALTY` and
+#: `INSOLVENCY_PENALTY` are the *only* terms separating any two actions at the
+#: immediate-reward level. Everything else has to arrive through the bootstrap
+#: from one scalar per episode. And `tanh` saturates: measured margins against
+#: the scripted anchors run -26,000 to -134,000, which is a flat -1.0 at
+#: `TERMINAL_MARGIN_SCALE`, so those episodes carry a constant and only the
+#: self-play mirror games discriminate. The answer is to stop playing the
+#: saturated sources rather than to rescale them -- `market-free-mirror-v5` runs
+#: no scripted opponent and no demonstrations for exactly this reason; see
+#: `docs/dqn_market_free_roadmap.md`.
+REWARD_MODES: tuple[str, ...] = ("shaped", "outcome_only")
 
 
 def _price(prices: dict, item: str) -> float:
@@ -139,6 +210,32 @@ def potential(farm: dict, private: dict, obs: Any) -> float:
 #: policy-invariant, unlike the potential shaping, so it is kept small.
 REJECTED_ORDER_PENALTY = 0.001
 
+#: Coins below which the farm has no runway left.
+#:
+#: The cheapest thing worth buying is a seed, and the cheapest hand is one coin,
+#: so a farm under a couple of hundred coins is not choosing between actions --
+#: `feasible_actions` has already closed almost every column and left it NOOP.
+INSOLVENCY_FLOOR = 250.0
+
+#: Charged on every turn the farm spends below the floor.
+#:
+#: Bankruptcy is an *opportunity* cost: the money delta is bounded below by a
+#: wallet that cannot go negative, so spending the last of the stake reads as a
+#: one-off -0.15 at `MONEY_SCALE` and everything it forecloses arrives only as
+#: the absence of later fills. Recovering that through the bootstrap means
+#: propagating value back across up to 720 turns in 24-turn hops, through a
+#: buffer where nearly every state is the dead absorbing one -- measured on
+#: `market-free-simple-v2`, the policy went broke on turn four and then held
+#: 715 turns of NOOP, so that is what the network trained on.
+#:
+#: This charges for the state directly instead. At 0.002 a whole episode spent
+#: broke costs about -1.4, the same order as the outcome term, while a farm that
+#: dips below the floor for a few turns between a purchase and a sale pays almost
+#: nothing. Like `REJECTED_ORDER_PENALTY` and unlike the potential shaping, it is
+#: not policy-invariant -- it is meant to change which policy is optimal -- so it
+#: is kept small and states a floor rather than a preference about trades.
+INSOLVENCY_PENALTY = 0.002
+
 
 def episode_rewards(
     money: list[float],
@@ -148,6 +245,9 @@ def episode_rewards(
     gamma: float,
     emitted: Sequence[bool] | None = None,
     rejected_penalty: float = REJECTED_ORDER_PENALTY,
+    insolvency_floor: float = INSOLVENCY_FLOOR,
+    insolvency_penalty: float = INSOLVENCY_PENALTY,
+    mode: str = "shaped",
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Turn one episode's money and potential traces into a reward stream.
 
@@ -159,7 +259,19 @@ def episode_rewards(
     turn that emitted one and moved no money had it refused: every order the
     simulator accepts moves cash by at least a coin, since prices floor at 1 and
     quantities start at 1.
+
+    On top of the shaping sit three terms that are deliberately not
+    policy-invariant: the outcome margin, the refused-order charge, and the
+    insolvency charge. Each is documented at its constant.
+
+    `mode` selects whether the money delta and the potential shaping are in the
+    stream at all; see `REWARD_MODES`. `raw` is returned either way, so the
+    money-delta diagnostics an update logs mean the same thing in both modes and
+    `order_refused` keeps reading a real cash trace.
     """
+
+    if mode not in REWARD_MODES:
+        raise ValueError(f"unknown reward mode {mode!r}, expected one of {REWARD_MODES}")
 
     money_array = np.asarray([*money, final_money], dtype=np.float32)
     # The environment ends in an absorbing state. Forcing Phi(s_T)=0 is what
@@ -168,18 +280,36 @@ def episode_rewards(
     phi = np.asarray([*potentials, 0.0], dtype=np.float32)
 
     raw = (money_array[1:] - money_array[:-1]) / MONEY_SCALE
-    shaped = raw + gamma * phi[1:] - phi[:-1]
+    # Always computed: `order_refused` reads it to tell a refused order from an
+    # accepted one, and the update logs money diagnostics off it, so both have to
+    # keep working when the stream itself no longer carries the delta.
+    if mode == "outcome_only":
+        shaped = np.zeros_like(raw)
+    else:
+        shaped = raw + gamma * phi[1:] - phi[:-1]
     # tanh rather than a hard clip. Both bound the term to (-1, 1) so one blowout
     # episode cannot dominate a batch, but a clip is flat outside its range --
     # and every margin this agent has produced so far was outside it, which made
     # the term a constant. tanh keeps discriminating everywhere and still
     # compresses the tail.
-    shaped[-1] += float(np.tanh((final_money - opponent_money) / TERMINAL_MARGIN_SCALE))
+    outcome = float(np.tanh((final_money - opponent_money) / TERMINAL_MARGIN_SCALE))
+    shaped[-1] += outcome
+    # And again as an annuity on every step, so the outcome reaches the ~97% of
+    # sampled transitions that never contain the terminal turn.
+    shaped += np.float32(OUTCOME_ANNUITY_WEIGHT * (1.0 - gamma) * outcome)
 
     if emitted is not None and rejected_penalty:
         tried = np.zeros(raw.shape[0], dtype=bool)
         width = min(len(emitted), tried.shape[0])
         tried[:width] = np.asarray(emitted[:width], dtype=bool)
-        shaped[tried & (raw == 0.0)] -= float(rejected_penalty)
+        # `order_refused` lives in `market_state` because the state encodes the
+        # same fact -- a refusal streak the policy can see. One definition, so a
+        # feature saying "refused" and a reward charging for it cannot disagree.
+        shaped[order_refused(tried, raw)] -= float(rejected_penalty)
+
+    if insolvency_penalty:
+        # Read off the *resulting* wallet, so the turn that spends the last of
+        # the stake is the first one charged.
+        shaped[money_array[1:] < float(insolvency_floor)] -= float(insolvency_penalty)
 
     return shaped.astype(np.float32), raw.astype(np.float32), money_array
