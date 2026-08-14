@@ -47,11 +47,9 @@ from kaggriculture_lab.runner import ensure_session, run_generations
 # Edit these experiment constants. The runner intentionally accepts no flags.
 #
 # The run is unbounded: generations are created and played one at a time until
-# the process is interrupted. Exploration anneals over
-# `epsilon_decay_transitions` (2,000,000) at roughly 11,500 transitions a batch
-# and 20 batches a generation, so epsilon does not reach its floor until
-# generation ~9. Any fixed stop below that answers only that the policy had not
-# finished annealing, not whether it learns -- and a useful stopping point is a
+# the process is interrupted. There is no annealing schedule to wait out --
+# exploration is NoisyNet, and `noisy_order_rate_target` holds it at a measured
+# rate rather than decaying toward one -- so a useful stopping point is a
 # judgement about the metrics in the docstring above, not a number decided in
 # advance. Ctrl-C after a generation closes; committed work stays resumable.
 SYNC_ENVIRONMENT = True
@@ -247,13 +245,54 @@ SYNC_ENVIRONMENT = True
 # So `feasible_actions` is back to pure feasibility, the periodic burst is off,
 # and the burst machinery is repointed at the case it is actually good for. A NOOP
 # policy produces no learning signal at all, so bankruptcy is the better failure;
-# `noisy_idle_trading_rate` fires the burst on silence and stops as soon as
-# trading resumes.
-SESSION_ID = "market-free-idleburst-v12"
+# `noisy_actor_hot` forces it directly, on every batch.
+# `market-free-rare-v20` makes exploration *directed* for the first time.
+# Everything from v6 onward has been a way of asking NoisyNet for more or less of
+# the same undirected thing, and the probe that motivated this says the quantity
+# was never the problem. Over 23,008 states from
+# v18's own rollouts, against its live checkpoint: `BUY_LAND` sits at median rank
+# 33 of 104 feasible actions on a median Q gap of 0.031 -- inside what the
+# perturbation crosses routinely -- and the greedy policy picks it on 0.0000% of
+# states, while 55% of the argmax flips go to HIRE and BUY_SEED rows. That is the
+# head-only factorized noise picking near state-independently, exactly as the
+# `noisy_hot_order_rate` comment above predicts it would.
+#
+# The league agrees. Across v15-v18, 7,266 seats bought land 89 times, no seat
+# ever bought a *second* quadrant, and `hot_v1` had it affordable on 88% of turns
+# and bought none.
+#
+# So the lever is the correlation, not the magnitude. `rare_sigma_gain` widens
+# the head's own sigma row for an action this run has barely sampled --
+# `epsilon_out` is already per-output, so one entry moves one action and the other
+# 185 stay where the controller put them. Zero-mean, never in the TD target, and
+# bounded below at 1.0, so it can only add variance to a row.
+#
+# Not a bonus added to the Q scores, which was the first shape and the wrong one:
+# a deterministic tilt makes a rare row win *every* turn its gap is under the
+# coefficient rather than surfacing occasionally, which is a policy change rather
+# than exploration and is what the epsilon runs bankrupted on.
+#
+# On the four hot pairs, overlapping the two `noisy_actor_hot` rungs. v9's
+# finding that land is only ever bought at sigma <= 0.871 is about *global*
+# sigma -- every row widened into indiscriminate trading -- and does not transfer
+# to widening one row while the rest hold still.
+#
+# What it does not answer, and this is v15's finding rather than a caveat added
+# here: seats that bought land finished at a mean of 355 coins against 2,753 for
+# those that did not. Land is bought and then not farmed. Sampling the row more
+# often is how the Q function gets the evidence to price it at all -- the bonus is
+# generic over rare rows, not an opinion that land is good -- but if the mix
+# improves and money does not, the comment on `noisy_hot_scale_limit` above named
+# the next place to look before this run existed: the reward, or the mask.
+#
+# Same `MODEL_NAME` deliberately. The reward function is untouched, so v18's
+# batches are the same quantity this run's buffer wants, and `all_batches` is
+# scoped by `model_id`. Only the behaviour distribution moves.
+SESSION_ID = "market-free-rare-v20"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_league.toml")
 MANIFEST = Path("agents/dqn_market_free/agent.toml")
-MODEL_NAME = "coldstart_v1"
+MODEL_NAME = "falloff_v1"
 
 DONOR = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
 
@@ -270,26 +309,6 @@ FREE_CONFIG = {
     # rest are non-regression diagnostics.
     "benchmarks": list(BENCHMARKS),
     "episode_steps": 720,
-    # Only the margin against the opponent is paid, spread over every turn of the
-    # episode by the annuity. The money delta and the potential shaping are both
-    # out; see the session comment for the round-trip loop that made them
-    # unusable, and `reward.REWARD_MODES` for what dropping them costs.
-    #
-    "reward_mode": "outcome_only",
-    # Inert, and kept only to hold this session's identity. `outcome_baseline` was
-    # the documented lever for a saturated `tanh`; it never ran at anything but
-    # 0.0, and a single scalar could not have centred v4's *bimodal* outcome
-    # distribution anyway (+1.0 demonstrations, -1.0 anchor). Removing the two
-    # saturated sources was the fix, so the knob is gone from `reward.py` and no
-    # code reads this key.
-    #
-    # It stays because `ensure_session` digests `experiment.training_agents` and
-    # `market-free-noisy-v6` already has a stored manifest carrying this key:
-    # deleting it changes the digest and v6 stops resuming, which is what
-    # stranded `market-free-simple-v1` above. Delete it with the next session id,
-    # not before. `test_the_outcome_baseline_key_is_an_inert_digest_relic` pins
-    # both halves so this cannot quietly become a live setting again.
-    "outcome_baseline": 0.0,
     # One base opponent: seeded noise.
     #
     # This was `[]` -- pure mirror play, which `compose_opponents` expresses by
@@ -355,15 +374,6 @@ FREE_CONFIG = {
     # silently got none. Recorded here so the next attempt starts from the real
     # blocker: to clone the donor, its gate matches have to be persisted first.
     "demonstration_episodes": 0,
-    # Exploration is now the only thing putting unfamiliar states in the buffer,
-    # with neither demonstrations nor a scripted opponent left to do it.
-    #
-    # `_epsilon` anneals linearly in `total_transitions`, which is scoped by
-    # `model_id` and therefore inherited: v4 stands at 1,380,480, so on the old
-    # 2,000,000 schedule this run would resume at 0.063 and reach the 0.01 floor
-    # about three generations in. Doubling the horizon puts it back at 0.121 and
-    # keeps it above 0.05 for the rest of the run.
-    "epsilon_decay_transitions": 4_000_000,
     # NoisyNet takes over exploration, and epsilon is zeroed rather than deleted.
     #
     # Epsilon's explore branch draws uniformly over feasible actions with NOOP
@@ -406,60 +416,75 @@ FREE_CONFIG = {
     # comparison between the two controllers is at the same number. It is a
     # harder ask on this quantity than on the flip rate, which is the point.
     "noisy_order_rate_target": 0.05,
-    "noisy_flip_rate_target": 0.0,
-    # One burst round in five, collecting at four times the ordinary order rate.
+    # The rate the `noisy_actor_hot` rungs collect at, and the reason it moved
+    # 0.35 -> 0.12: at 0.35 it was inert. Measured on the curve update 110
+    # recorded, 0.35 resolves to 5.26 and is clipped to `noisy_hot_scale_limit`,
+    # so the *cap* was the operating point and this knob controlled nothing. A
+    # ceiling should be an emergency stop, not the setting.
     #
-    # Five because `rounds_per_generation` is 20 and `min_new_batches` is 20, so a
-    # generation is exactly one model update: at every-fifth, each update trains
-    # on four consolidation rounds per burst -- 20% of the batches collected, and
-    # rather less than 20% of the ring once the FIFO has churned. Every-other
-    # would put a burst in half the buffer permanently, which is the noise floor
-    # this schedule exists to avoid.
+    # 0.08 resolves to about 1.19 against a setpoint of 1.032, with the cap well
+    # clear of it. Sized off the per-sigma bankruptcy table this run produced,
+    # joining `metadata_json -> 'seeds'` to `actor_sigma_scales` by pair and then
+    # to `episode_players.seed`:
     #
-    # 0.10 against the 0.05 setpoint, expressed as a rate rather than a sigma
-    # multiplier because a multiplier is the wrong unit: the base it multiplies
-    # moves every update as the controller tracks the setpoint, and what a given
-    # scale buys moves with the network. `resolve_sigma_scale` reads it off the
-    # same `noisy_flip_to_order_curve` the setpoint uses, so the burst re-sizes
-    # itself as both drift.
+    #     sigma  0.44   0.52   1.03   1.33   1.41   2.00   4.00
+    #     broke  12%    18%    27%    52%    53%    36%    44%
+    #     money  3953   3891   3900   2594   2396   2567   2414
     #
-    # Down hard from v9's 0.35, which resolved to sigma 3.159 and was measured a
-    # failure on its own terms. Per-episode over 212 seats at that sigma: 49%
-    # bankrupt against 8-26% across the ordinary ladder, mean money 4,892 against
-    # 11-13k, and *zero* land purchases -- the thing the burst was built to find.
-    # The mechanism is the epsilon purchase pump restated: 97 of 186 actions spend
-    # money, so at that perturbation the wallet is gone in the first turns and
-    # `feasible_actions` offers nothing but NOOP for the remaining ~700.
+    # The knee is just above 1.0: below it a fifth to a quarter of episodes go
+    # broke and mean money sits near 3,900; from 1.33 up it is half of them and
+    # money falls by a third. 0.12 would have resolved to 1.435, inside that
+    # band. Bankruptcy in the hot rungs is accepted -- it is two of eight pairs
+    # and a bankrupt episode still carries a gradient -- but it should be the
+    # price of exploring, not the default outcome of it.
     #
-    # 0.10 log-interpolates to about 1.31 on the curve update 1362 recorded
-    # ({1.0: 0.0557, 2.0: 0.1702, 4.0: 0.4428, 8.0: 0.6401}) -- just above the
-    # ordinary ladder's top rung of 0.871, and below the 2.129 rung that already
-    # measured 29% bankrupt. A burst has to search, not detonate.
+    # Deliberately modest for a second reason: sigma is not the axis that
+    # escapes a local minimum here. `sigma_ratio_0` is still 6, so the head's
+    # noise is six times its learned weight magnitude and 39% of argmaxes flip
+    # already; `noisy_layers = "head"` perturbs through one shared `f_in` with
+    # `weight_sigma` near its constant initialisation, so which action gets
+    # boosted is close to state-independent. More of that is undirected variance,
+    # not search. `noisy_layers = "all"` is the lever for state-dependent
+    # exploration and is its own experiment.
+    "noisy_hot_order_rate": 0.08,
+    # Two of the eight pairs collect above the setpoint, at the burst base and at
+    # its geometric midpoint. The ladder is otherwise downward only, so nothing
+    # anywhere explores harder than the controller resolved and the behaviours
+    # that need a harder push than the setpoint are unreachable rather than rare
+    # -- the idle burst answers a policy that has already collapsed, not one that
+    # is merely never shown the option.
     #
-    # Kept rather than removed because the hypothesis is not fully dead: what v9
-    # showed is that *this* much noise destroys episodes, not that a burst just
-    # above the setpoint buys nothing. That is now the experiment.
-    # The periodic schedule is retired. Measured twice and never positive: at
-    # rate 0.20 it changed nothing over 560 seats, and flat at 0.35 (sigma 3.159)
-    # it put 49% of 212 seats bankrupt and found no new behaviour. The mechanism
-    # and its tests stay -- the idle trigger below reuses the same path, and a
-    # tested negative result is worth keeping.
-    "noisy_burst_every": 0,
-    # Burst when the policy has gone silent, and burst *hard*. A NOOP policy
-    # produces no learning signal at all, so bankruptcy is the better failure --
-    # it at least generates transitions with a gradient. The 49%-bankruptcy
-    # objection to sigma 3.159 was right on a healthy policy and is the point on
-    # an idle one, and it is self-limiting: one batch back above the floor ends
-    # it.
-    #
-    # 0.005 is well under `viability_min_orders_per_decision` (0.02), so this
-    # answers genuine silence rather than merely cautious trading.
-    "noisy_idle_trading_rate": 0.005,
-    "noisy_burst_order_rate": 0.35,
+    # Two rather than more because `priority_alpha` is 0.0: hot episodes are
+    # sampled uniformly beside the good ones, so this is a permanent noise floor
+    # in every minibatch and 25% of pairs is the most it should be worth. The
+    # remaining six still run 1.0 down to 0.031, so the near-greedy read survives
+    # -- and `cold_order_diagnostics` keeps the idle trigger reading the policy
+    # rather than the hot pairs.
+    "noisy_actor_hot": 2,
     # The hard stop the rate cannot express, because what a rate costs in sigma
     # depends on a curve that moves with the network. Without this, a steeper
     # curve reproduces the 3.159 event silently.
-    "noisy_burst_scale_limit": 4.0,
+    #
+    # 2.0 rather than 4.0, and that is v15's measurement rather than caution. At
+    # 4.0 the limit was hit dead on -- `noisy_hot_order_rate = 0.35` resolved past
+    # it on every update -- so the hot rungs played 4.0 and 1.414 against a 0.5
+    # setpoint, and the top rung detonated instead of searching. Over 1,424
+    # learner seats, the hottest quarter finished below 100 coins from a 3,000
+    # stake on 55% of seats (against 22% at the next rung down and 0% on the cold
+    # half), which reproduces v9's 49%-bankrupt result at sigma 3.159 exactly.
+    #
+    # And it bought nothing for it: 3 of those 356 seats ever bought land, against
+    # 6 of the 356 at the rung below, while the order mix at the top rung ran to
+    # `BUY_PRODUCT` 147 per seat -- market churn, not fields. Seats that did buy
+    # land finished at a mean of 355 coins against 2,753 for those that did not,
+    # so land is being bought and then not farmed.
+    #
+    # At 2.0 the rungs become 2.0 and 1.0 against the same setpoint: still the
+    # only episodes anywhere above it, but inside the band where v7 measured a
+    # flip-to-order rate of 0.19 rather than 0.54. If land purchases stay at ~1%
+    # of seats here too, the answer is not more sigma -- the reward or the mask
+    # is what makes an unfarmed field worth buying.
+    "noisy_hot_scale_limit": 2.0,
     # A floor under the resolved scale, because the implicit `1 / limit` clamp is
     # not one. On `landgate-v10`'s cold start the controller resolved exactly
     # 0.125 by update 20 -- the clamp, hit dead on -- with `mean_abs_q` at 0.046:
@@ -471,8 +496,22 @@ FREE_CONFIG = {
     # policy genuinely over-trades; it just cannot switch exploration off. The
     # 32x actor ladder still supplies the near-greedy read either way.
     "noisy_sigma_scale_floor": 0.5,
-    "epsilon_start": 0.0,
-    "epsilon_end": 0.0,
+    # Directed exploration, on for the first time here: the head's sigma row for
+    # an action this run has barely sampled is drawn up to 3x wider than the rest.
+    # The manifest defaults the gain to 0.0 and stays the undirected control.
+    #
+    # 1.0 and a 3.0 cap, against `sigma_ratio_0` around 6 on this family: an
+    # unvisited row is perturbed hard enough to surface in an argmax it currently
+    # loses by a median 0.031, and a row with a few hundred visits is back to
+    # roughly the sigma the controller resolved.
+    #
+    # Four of the eight pairs, from the hot end, so they overlap the two
+    # `noisy_actor_hot` rungs rather than sitting opposite them. The greedy half
+    # of the ladder carries neither, which is what keeps `cold_order_diagnostics`
+    # reading the policy and `mean_final_money` comparable across the change.
+    "rare_sigma_gain": 1.0,
+    "rare_sigma_cap": 3.0,
+    "rare_sigma_pairs": 4,
     # A resume restores the optimizer's learning rate from the checkpoint, so
     # this key was previously inert on every generation after the first. It is
     # now re-applied from config each update.

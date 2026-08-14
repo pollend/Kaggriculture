@@ -36,21 +36,25 @@ import torch
 from torch import nn
 
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_replay
-from agents.dqn_market_free.order_space import ACTION_COUNT, MASKED_SCORE, NOOP_INDEX
+from agents.dqn_market_free.order_space import (
+    ACTION_COUNT,
+    ACTION_INDEX,
+    MASKED_SCORE,
+    NOOP_INDEX,
+)
 from agents.dqn_market_free.policy import OrderQNetwork
 from agents.dqn_market_free.training import network as net_module
+from agents.dqn_market_free.training import rare
 from agents.dqn_market_free.training.clone import load_demonstrations
 from agents.dqn_market_free.training.collect import (
     LEARNER_ENTRY_POINT,
     EpisodeRecord,
     _single_threaded_workers,
-    actor_epsilons,
     actor_sigma_scales,
     collect_batch,
     load_episode_batch,
     save_episode_batch,
 )
-from agents.dqn_market_free.training.reward import REWARD_MODES
 from agents.dqn_market_free.training.replay import (
     DEFAULT_CAPACITY,
     DEFAULT_N_STEP,
@@ -86,7 +90,12 @@ from kaggriculture_lab.model_updates import (
 SELF_SPEC = "agents/dqn_market_free/main.py"
 LEARNER_MANIFEST = "agents/dqn_market_free/match_agent.toml"
 SOURCE_KIND = "free_market_rollout"
-_PROMOTION_RULES = {"significant", "point_estimate"}
+_PROMOTION_RULES = {"significant", "point_estimate", "always"}
+
+#: The row `rare.py` exists for, kept as a named batch column. Not special to the
+#: mechanism -- the widening knows nothing about land -- but it is the action whose
+#: absence was measurable across four sessions, so it is the one a run is read on.
+LAND_INDEX = ACTION_INDEX[("BUY_LAND", None, 0)]
 
 VIABILITY_DEFAULTS = {
     "viability_min_mean_money_ratio": 0.80,
@@ -155,9 +164,7 @@ def _self_play_pool(context, reader, limit: int) -> list[str]:
 
 def _learner_policy(
     weights_path: Path,
-    epsilon: float,
     gamma: float,
-    reward_mode: str = "shaped",
     sigma_scale: float = 1.0,
 ) -> EvaluationPolicy:
     """Identity of the exploring behaviour policy for one batch.
@@ -167,28 +174,16 @@ def _learner_policy(
     per rollout episode. What defines the policy is its weights and how much it
     explores, so the identity spec carries only those -- and stays resolvable.
 
-    Epsilon is bucketed to four decimals. It decays continuously, and it is now
-    a small absolute number rather than a rate scaled by a separate act rate, so
-    two decimals would collapse most of the schedule onto one revision.
-
-    `reward_mode` is omitted at its default so a run that never touched it keeps
-    the revision ids it already recorded, and appears once it is set so rollouts
-    scored two different ways cannot land under one identity.
-
-    `sigma_scale` follows the same rule, and belongs here for the same reason
-    epsilon does: it is how much the policy explores. Only the *base* is carried.
-    The per-actor spread around it is deliberately left out, exactly as the
-    per-actor epsilon spread is -- folding sixteen of them in would mint eight
+    `sigma_scale` is bucketed to four decimals and carried because it is how much
+    the policy explores. Only the *base* is: the per-actor spread around it is
+    deliberately left out, since folding sixteen of them in would mint eight
     revisions a batch, none with enough games to rate.
     """
 
     query: dict[str, Any] = {
         "weights": str(weights_path.resolve()),
-        "epsilon": round(epsilon, 4),
         "gamma": gamma,
     }
-    if reward_mode != "shaped":
-        query["reward_mode"] = reward_mode
     if sigma_scale != 1.0:
         query["sigma_scale"] = round(sigma_scale, 4)
     spec = f"{LEARNER_ENTRY_POINT}?" + urlencode(query)
@@ -418,27 +413,11 @@ def _behavior_clone_steps_per_update(config: dict[str, Any]) -> int:
     return int(config.get("behavior_clone_steps_per_update", default))
 
 
-def _reward_shape(config: dict[str, Any]) -> str:
-    """How this run scores an episode; see `training.reward.REWARD_MODES`.
-
-    Read in one place because the collector and the updater must agree: the
-    updater bootstraps across a buffer holding both live rollouts and cloned
-    demonstrations, and scoring the two differently would fit a Q function to
-    two reward functions at once.
-    """
-
-    mode = str(config.get("reward_mode", "shaped"))
-    if mode not in REWARD_MODES:
-        raise ValueError(f"unknown reward_mode {mode!r}, expected one of {REWARD_MODES}")
-    return mode
-
-
 @dataclass(frozen=True)
 class NoisySpec:
     """How this run explores in weight space; empty when NoisyNet is off.
 
-    Read in one place for the same reason `_reward_shape` is: the collector and
-    the updater must agree. They build the same network from different sides --
+    Read in one place because the collector and the updater must agree. They build the same network from different sides --
     the updater from `net_module.build`, the collector from a `weights.npz` the
     updater exported -- and a disagreement about `layers` surfaces as
     `from_numpy` raising in the middle of an update rather than as a config
@@ -450,13 +429,11 @@ class NoisySpec:
     sigma0: float
     cadence: str
     actor_alpha: float
-    burst_every: int
-    burst_order_rate: float
-    burst_scale_limit: float
+    actor_hot: int
+    hot_order_rate: float
+    hot_scale_limit: float
     scale_floor: float
-    idle_trading_rate: float
     clone_noise: bool
-    flip_rate_target: float
     order_rate_target: float
     scale_limit: float
 
@@ -470,85 +447,7 @@ class NoisySpec:
 
     @property
     def controlled(self) -> bool:
-        """Whether collection sigma is chosen from a measured curve at all."""
-
-        return self.enabled and (self.flip_rate_target > 0.0 or self.order_rate_target > 0.0)
-
-    def burst_round(self, batch_index: int, *, idle: bool = False) -> bool:
-        """Whether this round collects at the raised burst sigma.
-
-        Two triggers, and the second is the one that earns its keep. `idle` says
-        the policy is trading at or below `noisy_idle_trading_rate` -- doing
-        nothing. A NOOP policy generates no learning signal at all, so bankruptcy
-        is strictly the better failure: it at least produces transitions with a
-        gradient in them. Bursting there costs nothing, because the episodes it
-        replaces were worth nothing, and it stops by itself the moment trading
-        resumes.
-
-        That is the trigger the periodic schedule should have been. On a fixed
-        cadence the burst fires when the policy is *healthy*, which is exactly
-        when high sigma is pure damage: measured on `market-free-burst-v9` at
-        sigma 3.159, 49% of 212 seats bankrupt against 8-26% across the ordinary
-        ladder, and no behaviour discovered for it. Same machinery, right moment.
-
-        Rounds rather than actors, deliberately. The Ape-X ladder already spreads
-        sigma *within* a batch, but only downward -- actor 0 plays the setpoint
-        and the rest play less -- so no episode anywhere ever explores harder than
-        the controller resolved, and the rarest behaviours are the ones collection
-        is structurally blind to. Raising the whole ladder inside every batch
-        would fix that and charge for it continuously: `priority_alpha` is 0.0, so
-        high-sigma episodes are sampled uniformly beside the good ones, and a
-        permanent noise floor in every minibatch is the epsilon purchase pump with
-        a different name.
-
-        The burst is sized by a target *rate* rather than a multiplier, resolved
-        off the same measured curve the setpoint uses. A multiplier is the wrong
-        unit twice over: the base it multiplies moves every update as the
-        controller tracks the setpoint, and the rate a given scale buys is a
-        property of the current network, not a constant. Measured on `explore-v7`,
-        a scale of 8 put `flip_to_order` at 0.74 -- an order on three of every four
-        turns the policy would have sat out, which at 720 decisions bankrupts the
-        episode in the first turns and leaves ~700 turns of the dead NOOP state
-        that was 99% of `simple_v2`'s buffer. A burst has to search, not detonate.
-
-        Alternating instead concentrates the cost. A burst round fills the ring
-        with exploratory trajectories; the ordinary rounds that follow refill the
-        FIFO with on-policy data while `reservoir_fraction` keeps a sample of the
-        burst alive to learn from. Exploration and consolidation get their own
-        rounds instead of averaging into every batch.
-
-        `batch_index` counts this model's batches over its whole lineage, so the
-        phase survives restarts and session changes rather than resetting to a
-        burst on every relaunch.
-        """
-
-        if not self.enabled:
-            return False
-        if idle and self.idle_trading_rate > 0.0:
-            return True
-        return self.burst_every > 0 and batch_index % self.burst_every == 0
-
-    def burst_reason(self, batch_index: int, *, idle: bool = False) -> str | None:
-        """Which trigger fired, for the batch metadata.
-
-        A burst round is *meant* to look terrible on `mean_final_money`, so
-        without this the money series alternates between two regimes with nothing
-        in the row to say why -- and now with two different reasons behind it.
-        """
-
-        if not self.burst_round(batch_index, idle=idle):
-            return None
-        return "idle" if idle and self.idle_trading_rate > 0.0 else "schedule"
-
-    @property
-    def controls_on_orders(self) -> bool:
-        """Whether the flip-*to-order* rate is the controlled quantity.
-
-        Both targets live in the config so a run can record what the other one
-        would have said, but only one may drive sigma: they disagree by design on
-        a collapsed policy, which is the whole reason this property exists, and a
-        run that ran both would be unable to say which number moved it.
-        """
+        """Whether collection sigma is chosen from the measured curve at all."""
 
         return self.enabled and self.order_rate_target > 0.0
 
@@ -585,29 +484,17 @@ def _noisy(config: dict[str, Any]) -> NoisySpec:
         )
     if cadence not in _NOISE_CADENCES:
         raise ValueError(f"unknown noisy_cadence {cadence!r}, expected one of {_NOISE_CADENCES}")
-    burst_every = int(config.get("noisy_burst_every", 0))
-    burst_order_rate = float(config.get("noisy_burst_order_rate", 0.0))
+    hot_order_rate = float(config.get("noisy_hot_order_rate", 0.0))
     order_target = float(config.get("noisy_order_rate_target", 0.0))
-    idle_trading_rate = float(config.get("noisy_idle_trading_rate", 0.0))
-    # A burst is defined by the rate it collects at, not by a multiplier, so it
-    # has to have one -- and it has to be above the ordinary setpoint, or the
-    # "burst" round explores less than the rounds it interrupts and the two are
+    # The hot rungs are sized by the rate they collect at, not by a multiplier,
+    # and that rate has to be above the ordinary setpoint -- otherwise the "hot"
+    # pairs explore *less* than the ladder they sit on top of, and the two are
     # indistinguishable in `metrics_json` afterwards.
-    #
-    # Checked against either trigger. The idle escape is the one that matters now
-    # and it arms the same machinery, so a config that sets only the idle rate
-    # must still say how hard the burst is.
-    if burst_every > 0 or idle_trading_rate > 0.0:
-        if burst_order_rate <= 0.0:
+    if hot_order_rate > 0.0:
+        if order_target > 0.0 and hot_order_rate <= order_target:
             raise ValueError(
-                "a burst trigger is armed (noisy_burst_every or noisy_idle_trading_rate) "
-                "without noisy_burst_order_rate; a burst resolves its sigma from a target "
-                "rate, so there is nothing to resolve"
-            )
-        if order_target > 0.0 and burst_order_rate <= order_target:
-            raise ValueError(
-                f"noisy_burst_order_rate {burst_order_rate} is not above "
-                f"noisy_order_rate_target {order_target}, so the burst round would explore "
+                f"noisy_hot_order_rate {hot_order_rate} is not above "
+                f"noisy_order_rate_target {order_target}, so the hot rungs would explore "
                 "no harder than the ordinary ones"
             )
     return NoisySpec(
@@ -616,25 +503,29 @@ def _noisy(config: dict[str, Any]) -> NoisySpec:
         sigma0=float(config.get("noisy_sigma0", 0.5)),
         cadence=cadence,
         actor_alpha=float(config.get("noisy_actor_alpha", 32.0)),
-        burst_every=burst_every,
-        burst_order_rate=burst_order_rate,
+        # How many of the batch's seed pairs collect *above* the setpoint. 0 --
+        # the default -- is the one-sided ladder every run through v13 played,
+        # where no episode anywhere explores harder than the controller resolved.
+        # The hot rungs are sized off `noisy_hot_order_rate`, so a config that
+        # asks for them without a hot rate to resolve gets the one-sided ladder
+        # rather than a silent multiplier of its own.
+        actor_hot=int(config.get("noisy_actor_hot", 0)),
+        hot_order_rate=hot_order_rate,
         # Defaults to the ordinary limit, so a config that never names it behaves
         # exactly as it did. It exists because the ordinary limit is far too loose
-        # to bound a burst: at 8.0 it let `noisy_burst_order_rate = 0.35` resolve
+        # to bound the hot end: at 8.0 it let `noisy_hot_order_rate = 0.35` resolve
         # to 3.159 on v9's curve, which measured 49% of episodes bankrupt across
         # 212 seats and bought no land at all.
-        burst_scale_limit=float(
+        hot_scale_limit=float(
             config.get(
-                "noisy_burst_scale_limit",
+                "noisy_hot_scale_limit",
                 config.get("noisy_sigma_scale_limit", 8.0),
             )
         ),
         # 0.0 keeps the implicit `1 / noisy_sigma_scale_limit` clamp, so a config
         # that never names it is unchanged.
         scale_floor=float(config.get("noisy_sigma_scale_floor", 0.0)),
-        idle_trading_rate=idle_trading_rate,
         clone_noise=bool(config.get("behavior_clone_noise", False)),
-        flip_rate_target=float(config.get("noisy_flip_rate_target", 0.0)),
         order_rate_target=float(config.get("noisy_order_rate_target", 0.0)),
         scale_limit=float(config.get("noisy_sigma_scale_limit", 8.0)),
     )
@@ -662,7 +553,7 @@ def flip_rate_curve(
     the flip rate reads high while the agent trades nothing: `market-free-noisy-v6`
     measured 0.28-0.39 against a 0.05 target and had sigma divided by up to six for
     it, throttling all eight actors to `[0.33 .. 0.010]`. A controller cannot tell
-    those apart from one curve. See `NoisySpec.controls_on_orders`.
+    those apart from one curve, which is why the controller reads this one.
 
     Swept rather than measured once because one reading says whether exploration
     is still there while the curve says what it would take to put it back, which
@@ -789,37 +680,6 @@ def resolve_sigma_scale(
     return max(low, min(high, min(points, key=lambda item: abs(item[1] - target))[0]))
 
 
-def last_batch_trading_rate(reader, model_id: str) -> float | None:
-    """The most recent batch's `trading_rate`, or None when there is not one yet.
-
-    Crosses from one round to the next through the database for the same reason
-    `collection_sigma_scale` does: `collect` runs per round and the number it
-    needs was measured in a previous one.
-
-    `None` rather than 0.0 when nothing is recorded, and the distinction is
-    load-bearing: 0.0 *is* the idle reading, so defaulting to it would make a
-    cold start burst on its very first batch, before the policy has been given a
-    chance to trade at all.
-
-    Reads the share of decisions the simulator acted on, not the emitted order
-    count -- `HIRE 13` is one decision that expands to thirteen wire rows, so the
-    wire count reads as activity for a policy that acted once in a hundred turns.
-    """
-
-    row = reader.fetchone(
-        """
-        SELECT (metadata_json -> 'order_diagnostics' ->> 'trading_rate')::float
-        FROM training_batches
-        WHERE model_id = %s
-          AND metadata_json -> 'order_diagnostics' ->> 'trading_rate' IS NOT NULL
-        ORDER BY batch_seq DESC
-        LIMIT 1
-        """,
-        [model_id],
-    )
-    return None if row is None or row[0] is None else float(row[0])
-
-
 def collection_sigma_scale(
     reader,
     model_id: str,
@@ -828,9 +688,9 @@ def collection_sigma_scale(
     """The scale the last update's probe resolved, or 1.0.
 
     `key` selects which resolved scale to read: the ordinary setpoint, or
-    `noisy_burst_sigma_scale_target` for the burst rounds. Both are written by the
+    `noisy_hot_sigma_scale_target` for the hot rungs. Both are written by the
     same update off the same measured curve, so reading them separately keeps a
-    burst round's scale on the same footing as an ordinary one -- including the
+    hot rungs' scale on the same footing as the setpoint -- including the
     "a rejected update still measured a real curve" rule below, which applies to
     both or to neither.
 
@@ -858,7 +718,7 @@ def collection_sigma_scale(
     # `WHERE` predicate where PostgreSQL infers two different types for it. The
     # input is not user data -- it is one of two literals chosen in this module --
     # so it is rejected outright rather than escaped.
-    if key not in {"noisy_sigma_scale_target", "noisy_burst_sigma_scale_target"}:
+    if key not in {"noisy_sigma_scale_target", "noisy_hot_sigma_scale_target"}:
         raise ValueError(f"unknown collection sigma key {key!r}")
     row = reader.fetchone(
         f"""
@@ -945,22 +805,6 @@ def _reject_inert_network(network: OrderQNetwork) -> None:
             "no gradient outside its output bias, so the run cannot recover -- the "
             "hidden trunk collapsed after the cold start, which starts it random"
         )
-
-
-def _epsilon(config: dict[str, Any], transitions: int) -> float:
-    """Probability that a rollout turn emits a uniformly random real order.
-
-    This absorbed the old per-slot `act_rate`: only the product of the two ever
-    mattered, and keeping them apart meant the effective exploration rate was a
-    number nobody could read off the config.
-    """
-
-    fraction = min(
-        1.0, transitions / max(1, int(config.get("epsilon_decay_transitions", 2_000_000)))
-    )
-    start = float(config.get("epsilon_start", 0.18))
-    end = float(config.get("epsilon_end", 0.01))
-    return start + fraction * (end - start)
 
 
 def fill_buffer(buffer: ReplayBuffer, batches) -> int:
@@ -1060,9 +904,22 @@ class FreeMarketCollector:
         seed = int(config.get("seed", 0))
         rng = np.random.default_rng(seed + total_transitions)
         gamma = float(config.get("gamma", 0.999))
-        reward_mode = _reward_shape(config)
         noisy = _noisy(config)
         jobs = int(config.get("jobs", 1))
+
+        # Directed exploration. The counts live beside the behaviour policy and
+        # under the *model*, not the checkpoint: they describe what this trainer
+        # has sampled, which is a fact about the run rather than about any one set
+        # of weights, and a checkpoint-keyed file would reset the novelty of every
+        # action on each promotion.
+        rare_gain = float(config.get("rare_sigma_gain", 0.0))
+        rare_sigma_cap = float(config.get("rare_sigma_cap", rare_gain))
+        rare_decay = float(config.get("rare_sigma_decay", 0.9))
+        # Held to a minority of the pairs by default, counted from the hot end --
+        # the same end `noisy_actor_hot` counts from. See `collect_batch`.
+        rare_sigma_pairs = int(config.get("rare_sigma_pairs", max(1, episodes // 4)))
+        rare_path = Path(context.artifacts) / "rare_counts" / "visits.npz"
+        rare_counts = rare.load(rare_path) if rare_gain > 0.0 else None
 
         base = [str(item) for item in config.get("opponents", [])]
         if config.get("league_opponents", True):
@@ -1076,22 +933,21 @@ class FreeMarketCollector:
         sigma_base = (
             collection_sigma_scale(reader, context.model_id) if noisy.controlled else 1.0
         )
-        # The burst round's scale, resolved by the same update off the same curve
-        # against `noisy_burst_order_rate`. Read here rather than derived from
-        # `sigma_base` because a burst is a target rate, not a multiple of the
+        # The hot rungs' scale, resolved by the same update off the same curve
+        # against `noisy_hot_order_rate`. Read here rather than derived from
+        # `sigma_base` because the hot end is a target rate, not a multiple of the
         # setpoint: the setpoint moves every update as the controller tracks it,
         # and the scale a given rate costs moves with the network.
-        burst_base = (
+        hot_base = (
             collection_sigma_scale(
-                reader, context.model_id, "noisy_burst_sigma_scale_target"
+                reader, context.model_id, "noisy_hot_sigma_scale_target"
             )
-            if noisy.burst_every > 0
+            if noisy.actor_hot > 0
             else 1.0
         )
 
         written: list[str] = []
         for _ in range(count):
-            epsilon = _epsilon(config, total_transitions)
             batch_index = int(
                 reader.fetchone(
                     "SELECT count(*) FROM training_batches WHERE model_id = %s",
@@ -1139,94 +995,72 @@ class FreeMarketCollector:
                 for value in rng.integers(0, 2**31 - 1, size=episodes // 2)
                 for _ in range(2)
             ]
-            # One rate per seed pair, spread around the schedule's current value
-            # so a single batch carries both exploratory and near-greedy data.
-            # The *identity* policy keeps the base rate: folding sixteen actor
-            # epsilons into it would mint eight revisions a batch, none of them
-            # with enough games to rate.
-            epsilons = actor_epsilons(
-                epsilon,
-                episodes // 2,
-                float(config.get("epsilon_actor_alpha", 4.0)),
-            )
-            # The same per-actor spread under the other exploration mechanism,
-            # and indexed by pair for the same reason. The identity policy keeps
-            # the base scale, exactly as it keeps the base epsilon.
+            # One scale per seed pair, so a single batch carries both
+            # exploratory and near-greedy data. The *identity* policy keeps the
+            # base: folding sixteen per-actor scales into it would mint eight
+            # revisions a batch, none of them with enough games to rate.
             #
             # `sigma_base` is what the last probe resolved, so actor 0 plays at
             # the configured rate and the spread runs down from there. With the
             # controller off it is 1.0 and this list is byte for byte what it was
             # before the controller existed.
             #
-            # On a burst round the whole ladder is multiplied, so its *shape* --
-            # the Ape-X spread that keeps a near-greedy actor in every batch for
-            # the money diagnostics to read -- is preserved rather than replaced.
-            # The identity policy deliberately keeps the un-burst `sigma_base`,
-            # for the reason the epsilon spread above keeps the base rate: a burst
-            # is a collection setting, not a different policy, and folding it into
-            # the identity would mint a revision every `noisy_burst_every` rounds
-            # and fragment the self-play pool.
-            # Re-read every batch rather than once per round: the escape is meant
-            # to end the moment trading resumes, and a round is `batches_per_round`
-            # batches long. The previous batch is the freshest evidence there is.
-            recent_trading = last_batch_trading_rate(reader, context.model_id)
-            idle = (
-                noisy.idle_trading_rate > 0.0
-                and recent_trading is not None
-                and recent_trading <= noisy.idle_trading_rate
-            )
-            burst = noisy.burst_round(batch_index, idle=idle)
-            burst_reason = noisy.burst_reason(batch_index, idle=idle)
-            round_base = burst_base if burst else sigma_base
+            # The identity policy carries `sigma_base` only. The per-actor spread
+            # around it, hot rungs included, is deliberately left out: folding
+            # sixteen scales in would mint eight revisions a batch, none with
+            # enough games to rate.
+            #
+            # One ladder, always. The idle burst that used to rebase this flat on
+            # a silent policy was removed at v15 -- it and `noisy_actor_hot` were
+            # two mechanisms for one job, fighting over the same variable: the
+            # controller holds flip-to-order at `noisy_order_rate_target` while a
+            # burst jumped to `noisy_hot_order_rate`, and the hot rungs already
+            # put pairs above the setpoint on *every* batch rather than
+            # occasionally. The reward now says idling is bad directly
+            # (`IDLE_PENALTY`), so forcing it through the behaviour distribution as
+            # well was second-guessing the objective.
             if not noisy.enabled:
                 sigma_scales = None
-            elif burst:
-                # Flat, not spread, and this is the correction v8 measured. A
-                # burst that kept the 32x ladder was diluted by it: at a burst
-                # base of 1.892 against a setpoint of 0.822 only *two* of the
-                # eight rungs exceeded an ordinary round's hardest actor, so a
-                # burst round was really "two of eight episodes explore twice as
-                # hard" -- and at one round in five, ~5% of the run. Measured
-                # over 560 seats it moved nothing: the land rate was 4.6% on
-                # burst rounds against 4.9% on ordinary ones, and burst money
-                # came out *higher*, not lower.
-                #
-                # The ladder exists because one temperature per batch fills the
-                # buffer with near-copies of one trajectory -- 81% mean pairwise
-                # action agreement. That was measured under *epsilon*, where a
-                # shared rate really does produce near-copies. Under
-                # `noisy_cadence = "episode"` every episode draws its own
-                # perturbation, so eight episodes at one sigma are eight
-                # different policies and the finding does not carry over.
-                #
-                # What the ladder also provides -- a near-greedy actor whose
-                # `trading_rate` says what the policy actually does -- is
-                # supplied by the four ordinary rounds between every burst.
-                sigma_scales = [burst_base] * (episodes // 2)
             else:
+                hot_top = max(1.0, hot_base / sigma_base) if sigma_base > 0.0 else 1.0
                 sigma_scales = [
                     sigma_base * scale
-                    for scale in actor_sigma_scales(episodes // 2, noisy.actor_alpha)
+                    for scale in actor_sigma_scales(
+                        episodes // 2,
+                        noisy.actor_alpha,
+                        noisy.actor_hot,
+                        hot_top,
+                    )
                 ]
-            learner = _learner_policy(behavior_path, epsilon, gamma, reward_mode, sigma_base)
+            learner = _learner_policy(behavior_path, gamma, sigma_base)
             rollouts = collect_batch(
                 behavior_path,
                 opponents,
                 seeds,
-                epsilons,
                 gamma,
                 trace_root,
                 jobs,
                 exploration_seed=seed + total_transitions,
                 policy_revision_id=learner.revision_id,
                 config=episode_config,
-                reward_mode=reward_mode,
                 noise_cadence=noisy.collect_cadence,
                 sigma_scales=sigma_scales,
+                # Only once the counts exist. The first batch of a run has nothing
+                # to be rare *against* -- every row is equally unvisited, so the
+                # widening is uniform and buys no direction at all while still
+                # loosening 97 spending rows. It arrives on batch two.
+                rare_sigma_gain=rare_gain if rare_counts is not None else 0.0,
+                rare_sigma_cap=rare_sigma_cap,
+                rare_sigma_path=rare_path if rare_counts is not None else None,
+                rare_sigma_pairs=rare_sigma_pairs,
             )
             if not rollouts:
                 raise RuntimeError("every free-market rollout episode failed")
             records = [rollout.record for rollout in rollouts]
+
+            if rare_gain > 0.0:
+                rare_counts = rare.fold(rare_counts, rare.visit_counts(records), rare_decay)
+                rare.save(rare_path, *rare_counts)
 
             # Record each rollout as an ordinary league pairing. Without this
             # the episodes exist only inside a batch `.npz`: nothing lands in
@@ -1258,8 +1092,36 @@ class FreeMarketCollector:
             transitions = sum(record.decisions for record in records)
             orders_placed = sum(record.orders_placed for record in records)
             order_diagnostics = _records_diagnostics(records)
+            # The same diagnostics over the pairs that played at or below the
+            # setpoint. `noisy_actor_hot` pairs collect *above* it, and they trade
+            # more by construction, so the whole-batch `trading_rate` reads higher
+            # than the policy actually is -- which is the number an idle-escape
+            # triggers on. Without this the hot rungs would quietly disable the
+            # escape hatch that answers a collapsed policy.
+            #
+            # Selected on `pair_index` rather than by slicing the first `hot * 2`
+            # records off the front: a failed episode is dropped from `rollouts`,
+            # so position and pair stop agreeing exactly when something went wrong.
+            #
+            # `None` when there are no hot pairs, so an ordinary run records
+            # nothing new and `last_batch_trading_rate` falls through to the
+            # whole-batch rate.
+            cold_records = [
+                rollout.record for rollout in rollouts if rollout.pair_index >= noisy.actor_hot
+            ]
+            cold_diagnostics = (
+                _records_diagnostics(cold_records)
+                if noisy.actor_hot > 0 and cold_records
+                else None
+            )
             final_money = [float(record.money[-1]) for record in records]
             played = [rollout.opponent_spec for rollout in rollouts]
+            # Recorded whether or not the widening is on: the point of the columns is
+            # to compare a run that has it against the runs that did not.
+            batch_chosen, _ = rare.visit_counts(records)
+            land_episodes = sum(
+                1 for record in records if int(np.count_nonzero(record.order_chosen == LAND_INDEX))
+            )
             batch = writer.record(
                 source_kind=SOURCE_KIND,
                 source_id=source_id,
@@ -1270,36 +1132,21 @@ class FreeMarketCollector:
                     "episodes": len(records),
                     "transitions": transitions,
                     "turns": sum(record.steps for record in records),
-                    "epsilon": epsilon,
-                    "actor_epsilons": epsilons,
-                    # Beside epsilon on purpose: these are the same knob under
-                    # the other mechanism, and a batch has to say which one was
-                    # actually driving its behaviour distribution.
                     "noise_cadence": noisy.collect_cadence,
-                    # The base the last flip-rate probe resolved, and the spread
-                    # around it that the actors actually played. Recorded apart
-                    # so a batch says both what exploration was aimed at and what
-                    # each actor got, the way `epsilon`/`actor_epsilons` do.
-                    # The base this round actually aimed at, which on a burst round
-                    # is the burst's resolved scale rather than the setpoint. Named
-                    # `sigma_base` unchanged so the existing series stays readable;
-                    # `noisy_burst` beside it says which of the two it is.
-                    "sigma_base": round_base if noisy.enabled else None,
+                    # The base the last probe resolved, and the spread around it
+                    # that the actors actually played. Recorded apart so a batch
+                    # says both what exploration was aimed at and what each actor
+                    # got.
+                    # The setpoint the ladder hangs from. `actor_sigma_scales`
+                    # beside it is what each pair actually played, hot rungs
+                    # included.
+                    "sigma_base": sigma_base if noisy.enabled else None,
                     "actor_sigma_scales": sigma_scales,
-                    # Which phase of the burst schedule collected this batch.
-                    # Load-bearing for reading the run at all: a burst round is
-                    # *supposed* to look terrible on `mean_final_money`, so
-                    # without this flag the money series alternates between two
-                    # regimes with nothing in the row to say why, and the ordinary
-                    # rounds' progress is invisible under the average.
-                    "noisy_burst": burst if noisy.enabled else None,
-                    # Which trigger fired, and the trading rate that decided it.
-                    # A burst round is meant to look terrible on money, so
-                    # without these the series alternates between two regimes
-                    # with nothing in the row to say why -- and there are now two
-                    # different reasons it could be doing so.
-                    "noisy_burst_reason": burst_reason,
-                    "noisy_idle_trading_rate_seen": recent_trading,
+                    # How many of those rungs were above the setpoint. The scales
+                    # say it too, but only against a `sigma_base` in the same row;
+                    # this is the column a money series can be filtered on, and a
+                    # batch with hot pairs in it is bimodal on money by design.
+                    "noisy_actor_hot": noisy.actor_hot if noisy.enabled else None,
                     "seeds": seeds,
                     # The two numbers that separate this agent's failure modes
                     # from each other. All-zero orders is the NOOP collapse;
@@ -1309,6 +1156,23 @@ class FreeMarketCollector:
                     "orders_placed": orders_placed,
                     "orders_per_decision": orders_placed / max(1, transitions),
                     "order_diagnostics": order_diagnostics.as_dict(),
+                    "cold_order_diagnostics": (
+                        cold_diagnostics.as_dict() if cold_diagnostics is not None else None
+                    ),
+                    # What the widening was worth this batch and whether it moved
+                    # anything. Entropy is the gain-free reading -- a policy
+                    # pouring every turn into three rows reads low here whatever
+                    # its money curve says -- and `buy_land_rate` is the specific
+                    # row that motivated the mechanism, kept as a named column so
+                    # the question that started this is answerable in one query.
+                    "rare_sigma_gain": rare_gain if rare_gain > 0.0 else None,
+                    # Counted from the hot end, so these pairs overlap
+                    # `noisy_actor_hot` rather than sitting opposite it and the
+                    # clean arm is the greedy tail. A money series filters on both
+                    # columns together.
+                    "rare_sigma_pairs": rare_sigma_pairs if rare_gain > 0.0 else None,
+                    "selection_entropy": rare.selection_entropy(batch_chosen),
+                    "buy_land_rate": land_episodes / max(1, len(records)),
                     "mean_final_money": float(np.mean(final_money)),
                     "max_final_money": float(np.max(final_money)),
                     "solvent_episodes": int(sum(1 for value in final_money if value > 10_000)),
@@ -1341,7 +1205,6 @@ class FreeMarketUpdater:
         device = resolve_device(str(config.get("device", "auto")))
         torch.manual_seed(int(config.get("seed", 0)))
         gamma = float(config.get("gamma", 0.999))
-        reward_mode = _reward_shape(config)
         # Fallbacks come from `replay.py` rather than being restated here.
         # Restated, they went stale: this read `n_step=8` long after the manifest
         # moved to 24, so a config that dropped the key silently trained on a
@@ -1372,7 +1235,6 @@ class FreeMarketUpdater:
                 min_final_money=float(config.get("demonstration_min_money", 10_000.0)),
                 family_id=config.get("demonstration_family"),
                 gamma=gamma,
-                mode=reward_mode,
             )
             buffer.add(demos, pinned=True)
 
@@ -1633,37 +1495,31 @@ class FreeMarketUpdater:
         # action near-tied, so flips are cheap -- and divides sigma down at the
         # one moment it needs raising. Both curves are recorded either way, so a
         # run that switches targets can see what the other would have said.
-        if noisy.controls_on_orders:
-            sigma_scale_target = resolve_sigma_scale(
+        sigma_scale_target = (
+            resolve_sigma_scale(
                 order_curve or {},
                 noisy.order_rate_target,
                 noisy.scale_limit,
                 noisy.scale_floor,
             )
-        elif noisy.controlled:
-            sigma_scale_target = resolve_sigma_scale(
-                flip_curve or {},
-                noisy.flip_rate_target,
-                noisy.scale_limit,
-                noisy.scale_floor,
-            )
-        else:
-            sigma_scale_target = 1.0
+            if noisy.controlled
+            else 1.0
+        )
 
-        # The burst round's own scale, off the same curve. Resolved here for the
+        # The hot rungs' own scale, off the same curve. Resolved here for the
         # same reason the setpoint is -- this is where the network and the probe
         # are -- and stored separately so `collect` can pick per round without
         # re-deriving anything. 1.0 when there is no schedule, no curve, or no
-        # order target, which makes a burst round identical to an ordinary one
+        # order target, which makes the hot rungs identical to the setpoint
         # rather than silently enormous.
-        burst_scale_target = (
+        hot_scale_target = (
             resolve_sigma_scale(
                 order_curve or {},
-                noisy.burst_order_rate,
-                noisy.burst_scale_limit,
+                noisy.hot_order_rate,
+                noisy.hot_scale_limit,
                 noisy.scale_floor,
             )
-            if noisy.burst_every > 0 and noisy.burst_order_rate > 0.0
+            if noisy.actor_hot > 0 and noisy.hot_order_rate > 0.0
             else 1.0
         )
 
@@ -1787,9 +1643,33 @@ class FreeMarketUpdater:
         )
 
         head_to_head_ok = policy_improvement(head_to_head, promotion_rule)
-        promote = hard_viability_passed and head_to_head_ok and not degenerate_head_to_head
+        # `always` releases every update, and the whole arena above still runs.
+        #
+        # Nothing here ever gated *training*: `lineage_checkpoint` takes the
+        # newest checkpoint promoted or not, `_self_play_pool` deliberately does
+        # not filter on `promoted`, and every update writes a checkpoint row
+        # regardless -- so a rejection only ever withheld the release. What it
+        # gated was `export-active` and the head-to-head incumbent.
+        #
+        # `hard_viability`, the money floors, the activity floor, the head-to-head
+        # and the pilkwang benchmark are all still computed and recorded in
+        # `gate_json`; only their effect on this boolean is gone. Losing the
+        # measurement was never the point.
+        #
+        # Two guards above are *not* part of this and must keep raising:
+        # `_reject_inert_network` on an all-zero exported trunk, and
+        # `_reject_degenerate` on a zero-width interval. Both signal a harness or
+        # export fault rather than a weak candidate, and both fail silently in the
+        # other direction -- an inert export would release as a healthy policy.
+        promote = promotion_rule == "always" or (
+            hard_viability_passed and head_to_head_ok and not degenerate_head_to_head
+        )
         gate: dict[str, Any] = {
-            "kind": f"{promotion_rule}_incumbent_improvement_and_hard_viability",
+            "kind": (
+                "unconditional_release"
+                if promotion_rule == "always"
+                else f"{promotion_rule}_incumbent_improvement_and_hard_viability"
+            ),
             "policy_kinds": POLICY_KINDS,
             "promotion_rule": promotion_rule,
             "seed_start": seed_start,
@@ -1837,9 +1717,6 @@ class FreeMarketUpdater:
             "resumed_from_released": resumed is not None and resumed.released,
             "rejection_streak": rejection_streak,
             "lineage_reset": lineage_reset,
-            # Logged so a rating trend spanning a mode change is readable as two
-            # runs rather than one that inexplicably stepped.
-            "reward_mode": reward_mode,
             "episodes_in_buffer": len(buffer.episodes),
             "pinned_demonstrations": len(buffer.pinned),
             "demo_fraction": demo_fraction,
@@ -1899,23 +1776,13 @@ class FreeMarketUpdater:
                 else None
             ),
             "noisy_sigma_scale_target": sigma_scale_target,
-            # The scale a burst round will collect at, resolved off the same
+            # The scale the hot rungs will collect at, resolved off the same
             # curve. Recorded whether or not a schedule is running, so a run that
-            # turns bursts on can see beforehand what one would have played at --
-            # and, more usefully, so a run with bursts on can be checked against
+            # turns them on can see beforehand what they would have played at --
+            # and, more usefully, so a run with them on can be checked against
             # `noisy_flip_to_order_curve` for whether the target is still landing
             # where it was meant to as the network moves.
-            "noisy_burst_sigma_scale_target": burst_scale_target,
-            # Which curve actually moved sigma. Both are recorded, so a run that
-            # switches targets can read what the other one would have said, and
-            # this key is what stops that from being guesswork afterwards.
-            "noisy_sigma_control_signal": (
-                "flip_to_order"
-                if noisy.controls_on_orders
-                else "argmax_flip"
-                if noisy.controlled
-                else None
-            ),
+            "noisy_hot_sigma_scale_target": hot_scale_target,
             # Reads on the NOOP attractor, which the flip rate does not: a
             # collapsed policy sits on a flat plateau where flips are cheap and
             # plentiful but almost none of them buy anything.

@@ -45,7 +45,7 @@ from agents.dqn_market_free.order_space import (
     order_index,
 )
 from agents.dqn_market_free.training.collect import EpisodeRecord
-from agents.dqn_market_free.training.reward import episode_rewards, potential
+from agents.dqn_market_free.training.reward import episode_rewards
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,16 +140,13 @@ def record_from_replay(
     replay: dict[str, Any],
     seat: int,
     gamma: float = 0.999,
-    mode: str = "shaped",
 ) -> tuple[EpisodeRecord | None, CloneStats]:
     """Convert one seat of one replay into a trainable episode record.
 
-    Reward, shaping and the terminal margin bonus come from the same
-    `episode_rewards` a live rollout uses, so a cloned episode and a
-    self-collected one are the same kind of sample and can share a buffer. That
-    is why `mode` is threaded here too: a buffer holding demonstrations scored
-    one way and rollouts scored another would be bootstrapping across two
-    different reward functions.
+    The reward comes from the same `episode_rewards` a live rollout uses, so a
+    cloned episode and a self-collected one are the same kind of sample and can
+    share a buffer -- a buffer holding demonstrations scored one way and rollouts
+    scored another would be bootstrapping across two different reward functions.
     """
 
     steps = replay.get("steps") or []
@@ -157,7 +154,6 @@ def record_from_replay(
         return None, CloneStats()
 
     money: list[float] = []
-    phi: list[float] = []
     order_state = np.zeros((len(steps) - 1, STATE_DIM), dtype=np.float32)
     order_chosen = np.zeros(len(steps) - 1, dtype=np.int16)
     order_step = np.zeros(len(steps) - 1, dtype=np.int16)
@@ -184,7 +180,6 @@ def record_from_replay(
         private = obs.get("private") or {}
 
         money.append(float(farm.get("money", 0) or 0))
-        phi.append(potential(farm, private, obs))
         history.observe(obs, farm)
 
         orders = (current.get("action") or {}).get("market") or []
@@ -262,12 +257,10 @@ def record_from_replay(
     emitted = [bool(order_chosen[index]) for index in range(decisions)]
     shaped, raw, money_array = episode_rewards(
         money,
-        phi,
         final_money,
         opponent_money,
         gamma,
         emitted,
-        mode=mode,
     )
 
     record = EpisodeRecord(
@@ -311,7 +304,6 @@ def load_demonstrations(
     min_final_money: float = 10_000.0,
     family_id: str | None = None,
     gamma: float = 0.999,
-    mode: str = "shaped",
 ) -> tuple[list[EpisodeRecord], CloneStats]:
     """Pull the best stored episodes and convert the demonstrator's seat.
 
@@ -330,7 +322,7 @@ def load_demonstrations(
             replay = decode_replay(bytes(blob))
         except (OSError, ValueError):
             continue
-        record, stats = record_from_replay(replay, int(seat), gamma, mode=mode)
+        record, stats = record_from_replay(replay, int(seat), gamma)
         if record is None:
             continue
         records.append(record)

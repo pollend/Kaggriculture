@@ -8,6 +8,7 @@ read from the numpy module so they cannot be changed in one place only.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -68,7 +69,7 @@ class NoisyLinear(nn.Module):
     def reset_noise(
         self,
         generator: torch.Generator | None = None,
-        scale: float = 1.0,
+        scale: float | Sequence[float] | torch.Tensor = 1.0,
     ) -> None:
         """Draw a fresh epsilon pair, optionally scaled.
 
@@ -80,14 +81,22 @@ class NoisyLinear(nn.Module):
         bilinear in the two epsilons, so folding the factor into one of them
         scales the whole term by exactly `scale` -- and sigma stays the trained
         parameter it is, so a scaled forward cannot leak into the checkpoint or
-        compound across repeated calls. `match_agent` scales the loaded sigma in
-        place instead, which is safe only because it happens once at load.
+        compound across repeated calls.
+
+        A per-output vector is accepted as well, and applies only to a layer
+        whose width it matches: that is directed exploration, widening one
+        action's row rather than every action's. The numpy mirror in `policy.py`
+        takes the same argument under the same rule, which the parity test pins.
         """
 
         device = self.weight_mu.device
         self.epsilon_in = self._factorized(self.in_features, device, generator)
         out = self._factorized(self.out_features, device, generator)
-        self.epsilon_out = out if scale == 1.0 else out * float(scale)
+        if isinstance(scale, (int, float)):
+            self.epsilon_out = out if scale == 1.0 else out * float(scale)
+            return
+        factor = torch.as_tensor(scale, dtype=out.dtype, device=device)
+        self.epsilon_out = out * factor if factor.shape == out.shape else out
 
     def zero_noise(self) -> None:
         self.epsilon_in = torch.zeros(self.in_features, device=self.weight_mu.device)

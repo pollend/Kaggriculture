@@ -12,9 +12,9 @@ from types import SimpleNamespace
 from urllib.parse import urlencode
 
 import numpy as np
-from numpy.testing import assert_array_equal
 import pytest
 import torch
+from numpy.testing import assert_array_equal
 
 from agents.dqn_market_free import donor
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
@@ -726,6 +726,107 @@ def test_viability_gate_rejects_bankruptcy():
     assert not viability["checks"]["median_money"]
 
 
+def test_always_releases_what_the_other_rules_would_refuse():
+    """The change, as one assertion: the two blockers stop blocking.
+
+    `hard_viability` failing and the head-to-head not improving are exactly the
+    conditions that rejected every update of `market-free-noisy-v6`. Under
+    `always` a candidate failing both is still released, and both results are
+    still recorded -- the arena is measured, it just no longer decides.
+    """
+
+    from agents.dqn_market_free.training.updater import _PROMOTION_RULES
+
+    assert "always" in _PROMOTION_RULES
+
+    import inspect
+
+    from agents.dqn_market_scorer.training.updater import policy_improvement
+
+    # v10's real numbers: a candidate at 3,877 against an incumbent at 16,991.
+    losing = {
+        "errors": {},
+        "margin": -13_113.0,
+        "margin_ci": [-14_125.0, -12_102.0],
+    }
+    assert not policy_improvement(losing, "significant")
+    assert not policy_improvement(losing, "point_estimate")
+
+    # The measurement is untouched -- what changed is that `promote` no longer
+    # consults it. Asserted at the source because the expression lives inside a
+    # 900-line method with a live database and an arena behind it, and the thing
+    # worth pinning is that the `always` arm short-circuits the conjunction
+    # rather than being folded into it.
+    from agents.dqn_market_free.training import updater as updater_module
+
+    source = inspect.getsource(updater_module.FreeMarketUpdater.update)
+    assert 'promote = promotion_rule == "always" or (' in source
+    assert "hard_viability_passed and head_to_head_ok and not degenerate_head_to_head" in source
+    # And the arena still runs: these are computed whatever the rule says.
+    assert "hard_viability_passed = head_viability" in source
+    assert "head_to_head_ok = policy_improvement(" in source
+
+
+def test_an_unknown_promotion_rule_still_raises():
+    """A typo must not fall through to releasing everything.
+
+    `always` makes the failure mode asymmetric: a misspelling that resolved to a
+    permissive default would ship every checkpoint silently, where before it would
+    only have withheld them.
+    """
+
+    from agents.dqn_market_free.training.updater import _PROMOTION_RULES
+
+    assert _PROMOTION_RULES == {"significant", "point_estimate", "always"}
+    assert "alway" not in _PROMOTION_RULES
+    assert "" not in _PROMOTION_RULES
+
+
+def test_the_export_and_harness_guards_are_not_part_of_the_gate():
+    """Two guards must keep raising under `always`, and both fail silently.
+
+    `_reject_inert_network` catches an all-zero exported trunk -- a policy that
+    can only ever emit NOOP, and which under `always` would now be *released* as
+    a healthy checkpoint rather than merely rejected. It exists because a real
+    `to_numpy` bug produced exactly that.
+
+    `_reject_degenerate` catches a zero-width interval, which means a harness
+    fault -- a dropped `?weights=`, a missing checkpoint -- not a weak candidate.
+    Neither is a quality judgement, so neither is what was removed.
+    """
+
+    import numpy as np
+
+    from agents.dqn_market_free.policy import OrderQNetwork
+    from agents.dqn_market_free.training.updater import _reject_inert_network
+    from agents.dqn_market_scorer.training.updater import _reject_degenerate
+
+    inert = OrderQNetwork.zeros()
+    with pytest.raises(RuntimeError, match="all-zero hidden weights"):
+        _reject_inert_network(inert)
+
+    degenerate = {
+        "errors": {},
+        "pairs": 100,
+        "margin": 0.0,
+        "margin_ci": [0.0, 0.0],
+        "opponent": "agents/dqn_market_free/main.py",
+    }
+    with pytest.raises(RuntimeError):
+        _reject_degenerate(degenerate, "head-to-head")
+
+    # A real spread is not degenerate, so the guard is not simply always firing.
+    healthy = {
+        "errors": {},
+        "pairs": 100,
+        "margin": 900.0,
+        "margin_ci": [120.0, 1_680.0],
+        "opponent": "agents/dqn_market_free/main.py",
+    }
+    _reject_degenerate(healthy, "head-to-head")
+    assert np.isfinite(healthy["margin"])
+
+
 def test_viability_gate_rejects_a_noop_collapse():
     """The other attractor. A policy that trades nothing preserves its money.
 
@@ -1173,17 +1274,15 @@ def test_noise_explores_like_the_policy_not_like_a_coin():
     chosen = []
     for _ in range(trials):
         network.sample_noise(rng)
-        chosen.append(choose_order(state, network, epsilon=0.0, rng=rng).chosen)
+        chosen.append(choose_order(state, network).chosen)
 
     assert ruinous not in chosen, "weight noise must never reach a clearly-bad purchase"
 
-    # The same budget of epsilon-greedy exploration reaches it constantly, which
-    # is the contrast the change is for.
-    plain = OrderQNetwork.quiet_start(seed=0)
-    drawn = [
-        choose_order(state, plain, epsilon=1.0, rng=rng).chosen for _ in range(trials)
-    ]
-    assert ruinous in drawn
+    # The contrast this replaced: uniform exploration over the feasible actions
+    # reached the same purchase constantly, because 97 of the 186 actions spend
+    # money and the draw never consulted the network. That branch was removed at
+    # v13, so what is asserted here is the bound alone: the perturbation is
+    # scaled by the Q gap, and a purchase mu says is ruinous stays unreachable.
 
 
 def test_the_evaluation_path_never_draws_noise():
@@ -1251,6 +1350,95 @@ def test_actor_sigma_scales_span_exploring_and_greedy():
     # of what the policy actually does alongside the exploratory episodes.
     assert scales[-1] < 0.05
     assert actor_sigma_scales(1) == [1.0]
+
+
+def test_hot_rungs_put_a_minority_of_pairs_above_the_setpoint():
+    """The one-sided ladder's blind spot, closed on request.
+
+    Actor 0 plays the setpoint and everything else plays less, so no episode
+    anywhere explores harder than the controller resolved and the behaviours that
+    need a harder push are unreachable rather than merely rare. `hot` rungs run
+    above it, geometrically from `top` down to the setpoint.
+    """
+
+    scales = actor_sigma_scales(8, 32.0, hot=2, top=4.0)
+    assert len(scales) == 8
+    assert scales == sorted(scales, reverse=True)
+    # Exactly the asked-for count above the setpoint, and the hottest is `top`.
+    assert [scale for scale in scales if scale > 1.0] == pytest.approx([4.0, 2.0])
+    # The setpoint rung survives, so `sigma_base` is still played by somebody.
+    assert sum(1 for scale in scales if scale == pytest.approx(1.0)) == 1
+    # And so does the near-greedy tail the money diagnostics read.
+    assert scales[-1] < 0.05
+
+    # A minority of the batch, which is the whole reason this is affordable:
+    # `priority_alpha` is 0.0, so hot episodes are sampled uniformly beside the
+    # good ones and every extra rung is a permanent noise floor.
+    assert sum(1 for scale in scales if scale > 1.0) * 2 < len(scales)
+
+    # `hot = 0` is the ladder byte for byte, so a run that never names the knob
+    # is unchanged.
+    assert actor_sigma_scales(8, 32.0, hot=0, top=4.0) == actor_sigma_scales(8, 32.0)
+    # And so is a `top` that is not actually above the setpoint: there is nothing
+    # to spread into, and rungs *below* 1.0 at the hot end would invert the order.
+    assert actor_sigma_scales(8, 32.0, hot=2, top=1.0) == actor_sigma_scales(8, 32.0)
+    assert actor_sigma_scales(8, 32.0, hot=2, top=0.5) == actor_sigma_scales(8, 32.0)
+
+    # Degenerate widths must not divide by zero, and must leave a cold rung.
+    assert actor_sigma_scales(1, 32.0, hot=4, top=4.0) == [1.0]
+    assert actor_sigma_scales(2, 32.0, hot=9, top=4.0) == pytest.approx([4.0, 1.0])
+
+
+def test_the_hottest_rung_is_the_resolved_hot_base_and_nothing_wider():
+    """Hot rungs are sized off a target rate, not off a multiplier of their own.
+
+    A multiplier is the wrong unit twice over: the setpoint it multiplies moves
+    every update as the controller tracks the target, and the rate a given scale
+    buys is a property of the current network. Resolving the top off
+    `noisy_hot_order_rate` puts the hottest pair at a measured rate, and inherits
+    `noisy_hot_scale_limit` with it.
+
+    That ceiling is the load-bearing half. v15 ran it at 4.0, where the limit was
+    hit dead on: the hot rungs played 4.0 and 1.414 against a 0.5 setpoint, and
+    over 1,424 learner seats the hottest quarter finished below 100 coins on 55%
+    of them -- v9's 49%-bankrupt result at sigma 3.159, reproduced. Three of those
+    356 seats bought land, against six at the rung below. The top rung detonated
+    the episode rather than searching it.
+    """
+
+    from agents.dqn_market_free.training.collect import actor_sigma_scales
+    from agents.dqn_market_free.training.updater import resolve_sigma_scale
+
+    # v7's measured flip-to-order curve, so the sizing below is the real one.
+    order_curve = {
+        0.125: 0.00117,
+        0.25: 0.00818,
+        0.5: 0.02453,
+        1.0: 0.08879,
+        2.0: 0.19159,
+        4.0: 0.53621,
+        8.0: 0.73949,
+    }
+    limit = 2.0
+    setpoint = resolve_sigma_scale(order_curve, 0.05, 8.0)
+    hot_base = resolve_sigma_scale(order_curve, 0.35, limit)
+    assert hot_base > setpoint
+
+    top = max(1.0, hot_base / setpoint)
+    played = [
+        setpoint * scale for scale in actor_sigma_scales(8, 32.0, hot=2, top=top)
+    ]
+
+    assert max(played) == pytest.approx(hot_base)
+    # Capped by the hot limit rather than by the looser ordinary one, so neither
+    # the 3.159 event nor v15's 4.0 can come back through the ladder.
+    assert max(played) <= limit
+    # Still above the setpoint, or the hot rungs are not hot and the ladder is
+    # one-sided again with extra steps.
+    assert played[1] > setpoint
+    # The rest of the batch is unchanged: setpoint, then the 32x spread down.
+    assert played[2] == pytest.approx(setpoint)
+    assert played[-1] == pytest.approx(setpoint / 32.0)
 
 
 def test_the_flip_rate_rises_with_the_sigma_scale():
@@ -1371,205 +1559,6 @@ def test_resolve_sigma_scale_declines_to_answer_when_it_cannot():
     assert resolve_sigma_scale({0.25: 0.0, 1.0: 0.0, 4.0: 0.0}, 0.05) == 1.0
 
 
-def test_the_burst_fires_on_idleness_and_stops_when_trading_resumes():
-    """The trigger the periodic schedule should have been.
-
-    A NOOP policy produces no learning signal at all, so bankruptcy is strictly
-    the better failure -- it at least generates transitions with a gradient.
-    Bursting there costs nothing because the episodes it replaces were worth
-    nothing, and it ends by itself the moment trading resumes.
-
-    On a fixed cadence the same burst fires when the policy is *healthy*, which
-    is when high sigma is pure damage: `market-free-burst-v9` at sigma 3.159 put
-    49% of 212 seats bankrupt and discovered nothing for it.
-    """
-
-    from agents.dqn_market_free.training.updater import _noisy
-
-    noisy = _noisy(
-        {
-            "noisy": True,
-            "noisy_order_rate_target": 0.05,
-            "noisy_burst_every": 0,
-            "noisy_idle_trading_rate": 0.005,
-            "noisy_burst_order_rate": 0.35,
-        }
-    )
-
-    # Silent -> burst, whatever the batch index, because the schedule is off.
-    assert noisy.burst_round(0, idle=True)
-    assert noisy.burst_round(7, idle=True)
-    assert noisy.burst_reason(7, idle=True) == "idle"
-
-    # Trading -> no burst, ever. The periodic path is retired.
-    assert not any(noisy.burst_round(index) for index in range(20))
-    assert noisy.burst_reason(3) is None
-
-
-def test_the_idle_trigger_is_opt_in_and_independent_of_the_schedule():
-    """Two triggers, neither implying the other."""
-
-    from agents.dqn_market_free.training.updater import _noisy
-
-    # Schedule only: idleness must not arm anything.
-    scheduled = _noisy(
-        {
-            "noisy": True,
-            "noisy_order_rate_target": 0.05,
-            "noisy_burst_every": 5,
-            "noisy_burst_order_rate": 0.35,
-        }
-    )
-    assert scheduled.idle_trading_rate == 0.0
-    assert not scheduled.burst_round(3, idle=True)
-    assert scheduled.burst_round(5) and scheduled.burst_reason(5) == "schedule"
-
-    # Both armed: either fires, and the reason names the idle one first because
-    # it is the one that says the policy is in trouble.
-    both = _noisy(
-        {
-            "noisy": True,
-            "noisy_order_rate_target": 0.05,
-            "noisy_burst_every": 5,
-            "noisy_idle_trading_rate": 0.005,
-            "noisy_burst_order_rate": 0.35,
-        }
-    )
-    assert both.burst_reason(5, idle=True) == "idle"
-    assert both.burst_reason(5, idle=False) == "schedule"
-
-    # NoisyNet off disables both regardless.
-    off = _noisy(
-        {
-            "noisy": False,
-            "noisy_idle_trading_rate": 0.005,
-            "noisy_burst_order_rate": 0.35,
-        }
-    )
-    assert not off.burst_round(0, idle=True)
-    assert off.burst_reason(0, idle=True) is None
-
-    # An armed idle trigger still has to say how hard the burst is.
-    with pytest.raises(ValueError, match="noisy_burst_order_rate"):
-        _noisy({"noisy": True, "noisy_idle_trading_rate": 0.005})
-
-
-def test_a_missing_trading_rate_is_not_idleness():
-    """No prior batch must not read as silence.
-
-    0.0 *is* the idle reading, so defaulting a missing row to it would burst on
-    the very first batch of a cold start -- before the policy has been given a
-    chance to trade at all.
-    """
-
-    from agents.dqn_market_free.training.updater import last_batch_trading_rate
-
-    class Reader:
-        def __init__(self, row):
-            self.row = row
-
-        def fetchone(self, sql, _parameters):
-            assert "training_batches" in sql
-            assert "trading_rate" in sql
-            return self.row
-
-    assert last_batch_trading_rate(Reader(None), "m") is None
-    assert last_batch_trading_rate(Reader((None,)), "m") is None
-    assert last_batch_trading_rate(Reader((0.0,)), "m") == 0.0
-    assert last_batch_trading_rate(Reader((0.3,)), "m") == pytest.approx(0.3)
-
-
-def test_burst_rounds_alternate_with_ordinary_ones():
-    """Exploration bursts are scheduled by round, not mixed into every batch.
-
-    The Ape-X ladder spreads sigma only downward, so with the schedule off no
-    episode anywhere explores harder than the controller's setpoint. That is a
-    discovery ceiling: `explore-v7` brought BUY_LAND back from extinct but every
-    purchase landed on day 0, at a 304 median against 13,844 for the seats that
-    bought none, because the timed day-5 purchase is a rarer draw than the
-    setpoint reaches.
-    """
-
-    from agents.dqn_market_free.training.updater import _noisy
-
-    noisy = _noisy({"noisy": True, "noisy_burst_every": 5, "noisy_burst_order_rate": 0.2})
-
-    phase = [index for index in range(20) if noisy.burst_round(index)]
-    assert phase == [0, 5, 10, 15], "one round in five, and the phase is the batch index"
-
-    # `batch_index` counts this model's batches over the whole lineage, so the
-    # schedule does not restart at a burst on every relaunch.
-    assert noisy.burst_round(1290) == (1290 % 5 == 0)
-
-    # Off by default, and off means never rather than every round.
-    quiet = _noisy({"noisy": True})
-    assert not any(quiet.burst_round(index) for index in range(20))
-
-    # NoisyNet off disables the schedule regardless of what it says.
-    disabled = _noisy(
-        {"noisy": False, "noisy_burst_every": 5, "noisy_burst_order_rate": 0.2}
-    )
-    assert not any(disabled.burst_round(index) for index in range(20))
-
-
-def test_a_burst_round_is_flat_and_every_actor_outexplores_an_ordinary_one():
-    """v8's measurement, as an assertion.
-
-    v8 rebased the ladder on a burst round and kept its 32x spread, which diluted
-    the burst to nothing: at a burst base of 1.892 against a 0.822 setpoint only
-    two of the eight rungs beat an ordinary round's *hardest* actor. Over 560
-    seats the land rate came out 4.6% on burst rounds against 4.9% on ordinary
-    ones, and burst money was higher rather than lower.
-
-    So a burst round is flat. The ladder's justification -- one temperature per
-    batch fills the buffer with near-copies at 81% pairwise agreement -- was
-    measured under epsilon, and does not survive `noisy_cadence = "episode"`,
-    where every episode draws its own perturbation and eight episodes at one
-    sigma are eight different policies.
-    """
-
-    from agents.dqn_market_free.training.collect import actor_sigma_scales
-    from agents.dqn_market_free.training.updater import _noisy, resolve_sigma_scale
-
-    noisy = _noisy(
-        {
-            "noisy": True,
-            "noisy_order_rate_target": 0.05,
-            "noisy_burst_every": 5,
-            "noisy_burst_order_rate": 0.35,
-        }
-    )
-    # v7's measured flip-to-order curve, so the sizing below is the real one.
-    order_curve = {
-        0.125: 0.00117,
-        0.25: 0.00818,
-        0.5: 0.02453,
-        1.0: 0.08879,
-        2.0: 0.19159,
-        4.0: 0.53621,
-        8.0: 0.73949,
-    }
-    setpoint = resolve_sigma_scale(order_curve, noisy.order_rate_target, noisy.scale_limit)
-    burst_base = resolve_sigma_scale(order_curve, noisy.burst_order_rate, noisy.scale_limit)
-
-    actors = 8
-    ordinary = [setpoint * scale for scale in actor_sigma_scales(actors, noisy.actor_alpha)]
-    burst = [burst_base] * actors
-
-    assert len(set(burst)) == 1, "a burst round is flat"
-    # The property v8 lacked: *every* burst episode outexplores every ordinary
-    # one, rather than only the top two rungs of eight.
-    assert min(burst) > max(ordinary)
-    # Still short of the scales that detonate the episode: on this curve 4.0
-    # already puts an order on 54% of the turns the policy would sit out, which
-    # bankrupts it within the first few turns of 720.
-    assert burst_base < 4.0
-
-    # Ordinary rounds keep the spread, and with it the near-greedy actor whose
-    # `trading_rate` says what the policy actually does.
-    assert min(ordinary) < max(ordinary) / 10
-
-
 def test_the_sigma_floor_stops_the_controller_switching_exploration_off():
     """The `1 / limit` clamp is not a floor on exploration, and a cold start proved it.
 
@@ -1610,10 +1599,10 @@ def test_the_sigma_floor_stops_the_controller_switching_exploration_off():
     assert _noisy({"noisy": True}).scale_floor == 0.0
 
 
-def test_the_burst_scale_has_its_own_ceiling():
+def test_the_hot_rungs_have_their_own_ceiling():
     """`noisy_sigma_scale_limit` is far too loose to bound a burst.
 
-    At its default of 8.0, v9's `noisy_burst_order_rate = 0.35` resolved to 3.159
+    At its default of 8.0, v9's `noisy_hot_order_rate = 0.35` resolved to 3.159
     on the curve update 1362 recorded. Per-episode across 212 seats at that sigma:
     49% bankrupt against 8-26% on the ordinary ladder, mean money 4,892 against
     11-13k, and zero land purchases -- the thing the burst existed to find. A rate
@@ -1643,11 +1632,11 @@ def test_the_burst_scale_has_its_own_ceiling():
             "noisy": True,
             "noisy_order_rate_target": 0.05,
             "noisy_burst_every": 5,
-            "noisy_burst_order_rate": 0.10,
-            "noisy_burst_scale_limit": 1.5,
+            "noisy_hot_order_rate": 0.10,
+            "noisy_hot_scale_limit": 1.5,
         }
     )
-    assert noisy.burst_scale_limit == 1.5
+    assert noisy.hot_scale_limit == 1.5
     assert noisy.scale_limit == 8.0, "the ordinary controller keeps its own limit"
 
     # The ceiling binds even if the curve later flattens enough that the same
@@ -1655,39 +1644,11 @@ def test_the_burst_scale_has_its_own_ceiling():
     # into the 3.159 regime without any config change.
     flat = {1.0: 0.01, 2.0: 0.02, 4.0: 0.05, 8.0: 0.30}
     assert resolve_sigma_scale(flat, 0.10, noisy.scale_limit) > 4.0
-    assert resolve_sigma_scale(flat, 0.10, noisy.burst_scale_limit) == pytest.approx(1.5)
+    assert resolve_sigma_scale(flat, 0.10, noisy.hot_scale_limit) == pytest.approx(1.5)
 
     # Unset, it falls back to the ordinary limit, so older configs are unchanged.
     default = _noisy({"noisy": True, "noisy_sigma_scale_limit": 8.0})
-    assert default.burst_scale_limit == 8.0
-
-
-def test_a_burst_must_be_sized_and_must_exceed_the_setpoint():
-    """Both failures are silent afterwards, so they have to fail at config time.
-
-    A schedule with no target has nothing to resolve, and a target at or below
-    the setpoint is a quiet round wearing an explorer's name -- indistinguishable
-    from a real burst in `metrics_json` once the run is over.
-    """
-
-    from agents.dqn_market_free.training.updater import _noisy
-
-    with pytest.raises(ValueError, match="noisy_burst_order_rate"):
-        _noisy({"noisy": True, "noisy_burst_every": 5})
-
-    with pytest.raises(ValueError, match="not above"):
-        _noisy(
-            {
-                "noisy": True,
-                "noisy_order_rate_target": 0.05,
-                "noisy_burst_every": 5,
-                "noisy_burst_order_rate": 0.05,
-            }
-        )
-
-    # A rate with the schedule off is inert rather than an error: that is the
-    # default pairing, and rejecting it would make the knob undeletable.
-    assert _noisy({"noisy": True, "noisy_burst_order_rate": 0.2}).burst_every == 0
+    assert default.hot_scale_limit == 8.0
 
 
 def test_the_two_controllers_disagree_on_a_collapsed_policy():
@@ -1723,36 +1684,57 @@ def test_the_two_controllers_disagree_on_a_collapsed_policy():
     assert throttled == pytest.approx(0.25)
 
 
-def test_the_order_rate_controller_is_opt_in():
-    """`noisy_order_rate_target` unset must leave the flip-rate path untouched.
+def test_every_noisy_attribute_the_updater_reads_exists():
+    """A `noisy.X` that no longer exists is invisible until an update runs.
 
-    The manifest is still the epsilon-greedy control arm and older sessions
-    resume through this code, so the new signal may not change what a config that
-    never mentions it resolves to.
+    `_noisy` and the config resolve fine without it, and every unit test that
+    touches `NoisySpec` still passes -- the failure lives inside
+    `FreeMarketUpdater.update`, which no test exercises end to end because it
+    wants a database, an arena and a torch build.
+
+    That is not hypothetical. Removing the idle burst left one
+    `noisy.idle_trading_rate` behind at the sigma-resolution site, and the run
+    collected 42 batches while every single update died with `AttributeError` --
+    which looks from the outside like the mirror never playing, because with no
+    checkpoint written `_self_play_pool` stays empty and only the base opponent
+    is ever drawn.
+    """
+
+    import dataclasses
+    import re
+
+    from agents.dqn_market_free.training import updater as updater_module
+    from agents.dqn_market_free.training.updater import NoisySpec
+
+    source = Path(updater_module.__file__).read_text()
+    referenced = set(re.findall(r"noisy\.([a-z_][a-z_0-9]*)", source))
+    available = {field.name for field in dataclasses.fields(NoisySpec)}
+    available |= {name for name in dir(NoisySpec) if not name.startswith("_")}
+
+    missing = sorted(referenced - available)
+    assert not missing, f"updater reads NoisySpec attributes that do not exist: {missing}"
+
+
+def test_the_controller_reads_the_flip_to_order_rate():
+    """One controller, and it is aimed at the NOOP attractor.
+
+    There was a second until v13, targeting the argmax flip rate, and removing it
+    is what the test above measures the cost of: on a collapsed policy every
+    action is near-tied so flips are cheap, and that controller read a silent
+    policy as exploring and divided sigma down. `market-free-noisy-v6` measured
+    0.28-0.39 against a 0.05 setpoint and had every actor throttled to
+    `[0.33 .. 0.010]` for it.
     """
 
     from agents.dqn_market_free.training.updater import _noisy
 
-    base = {"noisy": True, "noisy_flip_rate_target": 0.05}
-
-    off = _noisy(base)
-    assert off.order_rate_target == 0.0
-    assert off.controlled
-    assert not off.controls_on_orders
-
-    on = _noisy({**base, "noisy_order_rate_target": 0.05})
+    on = _noisy({"noisy": True, "noisy_order_rate_target": 0.05})
     assert on.controlled
-    assert on.controls_on_orders
 
-    # Neither target set is not a controller aimed at zero, it is no controller.
-    silent = _noisy({"noisy": True})
-    assert not silent.controlled
-    assert not silent.controls_on_orders
-
-    # And NoisyNet off disables both regardless of what the setpoints say.
-    disabled = _noisy({"noisy": False, "noisy_order_rate_target": 0.05})
-    assert not disabled.controlled
-    assert not disabled.controls_on_orders
+    # No target is not a controller aimed at zero, it is no controller.
+    assert not _noisy({"noisy": True}).controlled
+    # And NoisyNet off disables it regardless of what the setpoint says.
+    assert not _noisy({"noisy": False, "noisy_order_rate_target": 0.05}).controlled
 
 
 def test_resolve_sigma_scale_survives_a_saturating_order_curve():
@@ -1812,17 +1794,13 @@ def test_the_resolved_scale_crosses_from_train_to_collect_through_the_database()
 
 
 def test_the_controller_is_off_unless_a_target_is_set():
-    """Off is the default, and off must leave collection byte-identical.
-
-    The manifest is the epsilon-greedy control arm, so this also pins that
-    turning the controller on in one config cannot leak into the other.
-    """
+    """Off is the default, and off must leave collection byte-identical."""
 
     from agents.dqn_market_free.training.updater import _noisy
 
     assert not _noisy({"noisy": True}).controlled
-    assert not _noisy({"noisy": False, "noisy_flip_rate_target": 0.05}).controlled
-    assert _noisy({"noisy": True, "noisy_flip_rate_target": 0.05}).controlled
+    assert not _noisy({"noisy": False, "noisy_order_rate_target": 0.05}).controlled
+    assert _noisy({"noisy": True, "noisy_order_rate_target": 0.05}).controlled
 
     # With the controller off the base is 1.0, so the ladder the actors play is
     # exactly what it was before the controller existed.
@@ -1895,44 +1873,6 @@ def test_saved_weights_reject_a_stale_schema_at_both_ends(tmp_path):
 # --------------------------------------------------------------------------
 # Exploration
 # --------------------------------------------------------------------------
-
-
-def test_epsilon_is_the_whole_exploration_rate():
-    """One knob, and its value is the measured trade rate.
-
-    It absorbed a separate per-slot `act_rate`: only the product of the two ever
-    mattered. Exploring on every turn is measurably fatal -- at per-turn rates of
-    1.0 down to 0.005 the episode ends on single- to triple-digit money against a
-    3,000 float -- so what this pins is that the configured number *is* the rate,
-    with no second factor hiding between it and the behaviour.
-    """
-
-    state = np.zeros(STATE_DIM, dtype=np.float32)
-    network = initial_network({})
-    rng = np.random.default_rng(0)
-    epsilon = 0.02
-    trials = 20_000
-    placed = sum(
-        choose_order(state, network, epsilon=epsilon, rng=rng).chosen != 0
-        for _ in range(trials)
-    )
-    observed = placed / trials
-    assert 0.5 * epsilon < observed < 2.0 * epsilon
-
-
-def test_exploration_emits_at_most_one_order_and_never_draws_noop():
-    state = np.zeros(STATE_DIM, dtype=np.float32)
-    rng = np.random.default_rng(1)
-    network = initial_network({})
-    for _ in range(200):
-        decision = choose_order(state, network, epsilon=1.0, rng=rng)
-        # An exploring turn always trades: NOOP is drawn by not exploring.
-        assert decision.chosen != 0
-        wire = decision.wire()
-        assert wire
-        # One action, but HIRE expands to one wire order per hand.
-        assert len({tuple(row) for row in wire}) == 1
-        assert len(wire) == 1 or decision.order.op == "HIRE"
 
 
 def test_greedy_choice_takes_the_argmax():
@@ -2531,8 +2471,11 @@ def test_cloned_history_block_matches_the_live_agent():
 
     recorder = Recorder()
     learner = MarketFreeAgent(
+        # A randomly initialized head, not `quiet_start`: this needs the agent to
+        # actually trade so the history block has something in it, and epsilon --
+        # which used to force that -- was removed at v13. A random head's argmax
+        # varies across states on its own.
         OrderQNetwork.random(seed=3),
-        epsilon=0.25,
         rng=np.random.default_rng(0),
         recorder=recorder,
     )
@@ -2914,113 +2857,27 @@ _EMPTY_PRIVATE = {"shed": {}, "seeds": {}, "inventories": []}
 _EMPTY_OBS = {"market": {"prices": {}}}
 
 
-def test_buy_land_is_shaped_to_roughly_neutral():
-    """The one capital purchase whose cost the shaping used to never return.
+def test_the_reward_ignores_the_money_trace_entirely():
+    """The stream exists to stop the market round-trip from paying anything.
 
-    Seeds and animals leave cash and enter `Phi` at the price paid, so they cost
-    about nothing on the turn they happen. Land did not, so 1,000-4,000 coins
-    read as permanent loss with the payoff dozens of turns away -- and the
-    cheapest response is to never leave the starting quadrant.
-    """
-
-    from agents.dqn_market_free.training.reward import MONEY_SCALE, potential
-
-    gamma = 0.999
-    before = potential(_bare_farm(["NW"]), _EMPTY_PRIVATE, _EMPTY_OBS)
-    after = potential(_bare_farm(["NW", "NE"]), _EMPTY_PRIVATE, _EMPTY_OBS)
-
-    unshaped = -donor.LAND_PRICES[0] / MONEY_SCALE
-    shaped = unshaped + gamma * after - before
-
-    assert unshaped < -0.04
-    # All that survives is the (1 - gamma) leak on the potential itself.
-    assert abs(shaped) < 0.001
-
-
-def test_potential_prices_land_at_what_was_paid_for_it():
-    from agents.dqn_market_free.training.reward import MONEY_SCALE, potential
-
-    for extra in range(4):
-        quadrants = ["NW", "NE", "SW", "SE"][: extra + 1]
-        value = potential(_bare_farm(quadrants), _EMPTY_PRIVATE, _EMPTY_OBS)
-        assert value == pytest.approx(sum(donor.LAND_PRICES[:extra]) / MONEY_SCALE)
-
-
-def test_shaping_telescopes_so_the_return_is_policy_invariant():
-    """Sum of the shaping terms is `-Phi(s_0)`, whatever `Phi` prices.
-
-    That identity is why `Phi` is free to carry land: shaping of this form
-    cannot change which policy is optimal, only how fast it is found. It holds
-    only because the terminal potential is forced to zero.
-    """
-
-    from agents.dqn_market_free.training.reward import MONEY_SCALE, episode_rewards
-
-    money = [3_000.0, 2_000.0, 2_500.0, 4_000.0]
-    potentials = [0.5, 1.4, 0.9, 0.2]
-
-    # Exact at gamma = 1.
-    shaped, raw, _ = episode_rewards(money, potentials, 9_000.0, 9_000.0, 1.0)
-    # The margin term is zero here, so shaped - raw is the shaping alone.
-    assert float((shaped - raw).sum()) == pytest.approx(-potentials[0], abs=1e-5)
-
-    # Below 1 it leaks (1 - gamma) * sum(Phi), which is the only reason the
-    # identity is approximate rather than exact.
-    shaped, raw, _ = episode_rewards(money, potentials, 9_000.0, 9_000.0, 0.999)
-    leak = 0.001 * sum(potentials[1:])
-    assert float((shaped - raw).sum()) == pytest.approx(-potentials[0] - leak, abs=1e-5)
-
-    assert float(raw.sum()) == pytest.approx((9_000.0 - 3_000.0) / MONEY_SCALE, abs=1e-6)
-
-
-def test_terminal_potential_is_forced_to_zero():
-    """Inventory held past the last turn scores nothing, so it must be worth nothing."""
-
-    from agents.dqn_market_free.training.reward import episode_rewards
-
-    hoarding = [1.0, 5.0]
-    liquidating = [1.0, 0.0]
-    money = [3_000.0, 3_000.0]
-
-    hoard, _, _ = episode_rewards(hoarding, [0.0, 0.0], 3_000.0, 3_000.0, 0.999)
-    # A big terminal stockpile must not be rewarded for existing.
-    stocked, _, _ = episode_rewards(money, hoarding, 3_000.0, 3_000.0, 0.999)
-    sold, _, _ = episode_rewards(money, liquidating, 3_000.0, 3_000.0, 0.999)
-    assert stocked.sum() < sold.sum()
-    assert np.isfinite(hoard).all()
-
-
-def test_outcome_only_ignores_the_money_trace_and_the_shaping():
-    """The mode exists to stop the market round-trip from paying anything.
-
-    Measured on `market-free-selfplay-v3`: 219 `BUY_PRODUCT` and 204 `SELL` per
-    episode, 94% of the sale volume in wheat and fertilizer -- exactly the two
-    goods `BUY_PRODUCT` can buy back. A round trip is cash-neutral by the
-    simulator's own quoting rule, so the only thing paying for it was `Phi`
-    marking the whole shed to a quote the agent had just moved. Dropping the
-    delta and the shaping together is what makes that unpayable.
+    Measured on `market-free-selfplay-v3`, the last run that paid the money delta
+    plus potential shaping: 219 `BUY_PRODUCT` and 204 `SELL` per episode, 94% of
+    the sale volume in wheat and fertilizer -- exactly the two goods
+    `BUY_PRODUCT` can buy back. A round trip is cash-neutral by the simulator's
+    own quoting rule, so the only thing paying for it was `Phi` marking the whole
+    shed to a quote the agent had just moved. Dropping the delta and the shaping
+    together is what makes that unpayable, and v13 removed the shaped arm outright
+    so there is no longer a mode that can pay it.
     """
 
     from agents.dqn_market_free.training.reward import episode_rewards
 
     quiet = [3_000.0] * 6
     churning = [3_000.0, 9_000.0, 1_000.0, 8_000.0, 2_000.0, 7_000.0]
-    flat = [0.0] * 6
-    swinging = [0.2, 5.0, 0.1, 4.0, 0.3, 6.0]
 
-    baseline, _, _ = episode_rewards(
-        quiet, flat, 3_000.0, 3_000.0, 0.999, mode="outcome_only"
-    )
-    churned, _, _ = episode_rewards(
-        churning, swinging, 3_000.0, 3_000.0, 0.999, mode="outcome_only"
-    )
+    baseline, _, _ = episode_rewards(quiet, 3_000.0, 3_000.0, 0.999)
+    churned, _, _ = episode_rewards(churning, 3_000.0, 3_000.0, 0.999)
     assert np.allclose(baseline, churned)
-
-    # And the same two traces are emphatically not equal under the shaped mode,
-    # or this test would pass against a no-op.
-    shaped_quiet, _, _ = episode_rewards(quiet, flat, 3_000.0, 3_000.0, 0.999)
-    shaped_churn, _, _ = episode_rewards(churning, swinging, 3_000.0, 3_000.0, 0.999)
-    assert not np.allclose(shaped_quiet, shaped_churn)
 
 
 def test_outcome_only_still_returns_the_money_delta_as_raw():
@@ -3034,7 +2891,7 @@ def test_outcome_only_still_returns_the_money_delta_as_raw():
 
     money = [3_000.0, 2_000.0, 2_500.0]
     _, raw, money_array = episode_rewards(
-        money, [0.0] * 3, 4_000.0, 3_000.0, 0.999, mode="outcome_only"
+        money, 4_000.0, 3_000.0, 0.999
     )
     assert float(raw.sum()) == pytest.approx((4_000.0 - 3_000.0) / MONEY_SCALE, abs=1e-6)
     assert money_array[-1] == pytest.approx(4_000.0)
@@ -3060,7 +2917,7 @@ def test_outcome_only_holds_q_flat_at_the_outcome():
     # penalty fires and the outcome is the only term in the stream.
     money = [3_000.0] * turns
     shaped, _, _ = episode_rewards(
-        money, [0.0] * turns, 5_000.0, 3_000.0, gamma, mode="outcome_only"
+        money, 5_000.0, 3_000.0, gamma
     )
 
     outcome = float(np.tanh(2_000.0 / TERMINAL_MARGIN_SCALE))
@@ -3089,10 +2946,10 @@ def test_outcome_only_keeps_both_penalties():
     money = [3_000.0, 3_000.0, 3_000.0]
     emitted = [False, True, False]
     charged, _, _ = episode_rewards(
-        money, [0.0] * 3, 3_000.0, 3_000.0, 0.999, emitted, mode="outcome_only"
+        money, 3_000.0, 3_000.0, 0.999, emitted
     )
     plain, _, _ = episode_rewards(
-        money, [0.0] * 3, 3_000.0, 3_000.0, 0.999, mode="outcome_only"
+        money, 3_000.0, 3_000.0, 0.999
     )
     assert float(plain[1] - charged[1]) == pytest.approx(REJECTED_ORDER_PENALTY, abs=1e-6)
 
@@ -3101,41 +2958,13 @@ def test_outcome_only_keeps_both_penalties():
     # opponent, so the outcome term is identical and the gap is the charge alone.
     broke = [3_000.0, 10.0, 3_000.0]
     starved, _, _ = episode_rewards(
-        broke, [0.0] * 3, 3_000.0, 3_000.0, 0.999, mode="outcome_only"
+        broke, 3_000.0, 3_000.0, 0.999
     )
     solvent, _, _ = episode_rewards(
-        money, [0.0] * 3, 3_000.0, 3_000.0, 0.999, mode="outcome_only"
+        money, 3_000.0, 3_000.0, 0.999
     )
     assert float(solvent[0] - starved[0]) == pytest.approx(INSOLVENCY_PENALTY, abs=1e-6)
     assert np.allclose(solvent[1:], starved[1:])
-
-
-def test_unknown_reward_mode_is_rejected():
-    """A typo in the manifest must not silently fall back to the old reward."""
-
-    from agents.dqn_market_free.training.reward import episode_rewards
-
-    with pytest.raises(ValueError, match="unknown reward mode"):
-        episode_rewards([3_000.0], [0.0], 3_000.0, 3_000.0, 0.999, mode="outcome")
-
-
-def test_shaped_mode_is_unchanged_by_the_new_parameters():
-    """The live run is on `shaped`; defaults must reproduce it exactly."""
-
-    from agents.dqn_market_free.training.reward import episode_rewards
-
-    money = [3_000.0, 2_000.0, 2_500.0, 4_000.0]
-    potentials = [0.5, 1.4, 0.9, 0.2]
-    emitted = [False, True, False, True]
-
-    explicit, raw_a, _ = episode_rewards(
-        money, potentials, 9_000.0, 4_000.0, 0.999, emitted, mode="shaped",
-    )
-    implicit, raw_b, _ = episode_rewards(
-        money, potentials, 9_000.0, 4_000.0, 0.999, emitted
-    )
-    assert np.allclose(explicit, implicit)
-    assert np.allclose(raw_a, raw_b)
 
 
 def test_reward_scale_keeps_a_full_season_in_the_huber_quadratic_zone():
@@ -3151,73 +2980,12 @@ def test_reward_scale_keeps_a_full_season_in_the_huber_quadratic_zone():
     # A donor-grade season: 3k float to ~76k, banked in even steps.
     turns = 719
     money = list(np.linspace(3_000.0, 76_000.0, turns))
-    shaped, _, _ = episode_rewards(money, [0.0] * turns, 76_000.0, 40_000.0, 0.999)
+    shaped, _, _ = episode_rewards(money, 76_000.0, 40_000.0, 0.999)
 
     assert 1.0 < float(shaped.sum()) < 10.0
     # Every turn, including the last, is inside the quadratic zone.
     assert float(np.abs(shaped).max()) < 1.0
     assert MONEY_SCALE >= 10_000.0
-
-
-def test_actor_epsilons_spread_a_batch_across_temperatures():
-    """One rate per batch means one policy at one temperature in the buffer.
-
-    Measured at a base of 0.014 with a single rate: 81% mean pairwise action
-    agreement between the sixteen episodes of a batch, and identical actions on
-    38% of turns. Spreading the rate is what puts exploratory and near-greedy
-    trajectories in the same buffer instead of in different generations.
-    """
-
-    from agents.dqn_market_free.training.collect import actor_epsilons
-
-    spread = actor_epsilons(0.18, 8, 4.0)
-    assert len(spread) == 8
-    # The first actor runs at the schedule's own rate; the rest are quieter.
-    assert spread[0] == pytest.approx(0.18)
-    assert spread == sorted(spread, reverse=True)
-    assert spread[-1] < 0.001
-    # Both ends present: something exploring, something effectively greedy.
-    assert sum(1 for value in spread if value > 0.01) >= 3
-    assert sum(1 for value in spread if value < 0.01) >= 3
-
-    # Degenerate widths must not divide by zero.
-    assert actor_epsilons(0.18, 1, 4.0) == [0.18]
-
-
-def test_paired_seats_explore_at_the_same_temperature():
-    """Both orientations of a seed must be one policy, or the margin is a fiction.
-
-    `collect_batch` indexes `epsilons` by pair for the same reason it indexes
-    the opponent by pair: the league settles a seat-balanced `paired_margin`
-    across the two orientations, and that number only means something if the
-    same agent played both.
-    """
-
-    from agents.dqn_market_free.training.collect import collect_batch
-
-    captured: list[tuple] = []
-
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(
-            "agents.dqn_market_free.training.collect._job",
-            lambda payload: captured.append(payload) or None,
-        )
-        collect_batch(
-            Path("weights.npz"),
-            ["opponent-a", "opponent-b"],
-            [11, 11, 22, 22, 33, 33],
-            [0.5, 0.05, 0.005],
-            0.999,
-            Path("traces"),
-            jobs=1,
-        )
-
-    # payload layout: (weights, opponent, seed, seat, epsilon, gamma, ...)
-    by_seed: dict[int, set] = {}
-    for payload in captured:
-        by_seed.setdefault(payload[2], set()).add(payload[4])
-    assert by_seed == {11: {0.5}, 22: {0.05}, 33: {0.005}}
-
 
 
 def test_terminal_margin_discriminates_across_the_self_play_range():
@@ -3244,7 +3012,7 @@ def test_terminal_margin_discriminates_across_the_self_play_range():
         # Both seats well clear of the insolvency floor, so this reads the
         # outcome term alone.
         own = 20_000.0
-        shaped, _, _ = episode_rewards([own, own], [0.0, 0.0], own, own - margin, 1.0)
+        shaped, _, _ = episode_rewards([own, own], own, own - margin, 1.0)
         return float(shaped[-1])
 
     mirror = [-4_000.0, -1_500.0, 500.0, 2_000.0, 6_000.0]
@@ -3286,7 +3054,7 @@ SEASON_MONEY = 5_000.0
 
 
 def _season(turns: int = 400) -> tuple[list[float], list[float]]:
-    return [SEASON_MONEY] * turns, [0.0] * turns
+    return [SEASON_MONEY] * turns
 
 
 def _outcome_gap(margin: float, gamma: float, turns: int = 400) -> np.ndarray:
@@ -3294,11 +3062,10 @@ def _outcome_gap(margin: float, gamma: float, turns: int = 400) -> np.ndarray:
 
     from agents.dqn_market_free.training.reward import episode_rewards
 
-    money, potentials = _season(turns)
-    played, _, _ = episode_rewards(
-        money, potentials, SEASON_MONEY, SEASON_MONEY - margin, gamma
+    money = _season(turns)
+    played, _, _ = episode_rewards(money, SEASON_MONEY, SEASON_MONEY - margin, gamma
     )
-    drew, _, _ = episode_rewards(money, potentials, SEASON_MONEY, SEASON_MONEY, gamma)
+    drew, _, _ = episode_rewards(money, SEASON_MONEY, SEASON_MONEY, gamma)
     return played - drew
 
 
@@ -3357,13 +3124,12 @@ def test_the_annuity_vanishes_at_gamma_one():
     )
 
     money = [3_000.0, 2_000.0, 2_500.0, 4_000.0]
-    potentials = [0.5, 1.4, 0.9, 0.2]
 
-    shaped, raw, _ = episode_rewards(money, potentials, 9_000.0, 3_000.0, 1.0)
+    shaped, _, _ = episode_rewards(money, 9_000.0, 3_000.0, 1.0)
 
     outcome = float(np.tanh(6_000.0 / TERMINAL_MARGIN_SCALE))
-    # The lump, and nothing else, on top of the shaping.
-    assert float((shaped - raw).sum()) == pytest.approx(-potentials[0] + outcome, abs=1e-5)
+    # At gamma = 1 the annuity is zero and the lump is the whole stream.
+    assert float(shaped.sum()) == pytest.approx(outcome, abs=1e-5)
 
 
 def test_a_losing_episode_is_charged_on_every_turn():
@@ -3384,7 +3150,7 @@ def test_the_annuity_keeps_a_full_season_in_the_huber_quadratic_zone():
 
     turns = 719
     money = list(np.linspace(3_000.0, 76_000.0, turns))
-    shaped, _, _ = episode_rewards(money, [0.0] * turns, 76_000.0, 40_000.0, 0.999)
+    shaped, _, _ = episode_rewards(money, 76_000.0, 40_000.0, 0.999)
 
     assert 1.0 < float(shaped.sum()) < 10.0
     assert float(np.abs(shaped).max()) < 1.0
@@ -3462,28 +3228,98 @@ def test_rejected_orders_are_charged_and_valid_ones_are_not():
     """
 
     from agents.dqn_market_free.training.reward import (
+        IDLE_PENALTY,
         REJECTED_ORDER_PENALTY,
         episode_rewards,
     )
 
     money = [3_000.0, 3_000.0, 2_880.0]
-    potentials = [0.0, 0.0, 0.0]
     # turn 0 emitted and moved nothing (refused); turn 1 emitted and paid;
     # turn 2 emitted nothing at all.
     emitted = [True, True, False]
 
-    shaped, raw, _ = episode_rewards(money, potentials, 2_880.0, 2_880.0, 1.0, emitted)
+    shaped, raw, _ = episode_rewards(money, 2_880.0, 2_880.0, 1.0, emitted)
 
     assert shaped[0] == pytest.approx(-REJECTED_ORDER_PENALTY)
-    # The accepted order keeps its own cost and takes no charge on top.
-    assert shaped[1] == pytest.approx(raw[1])
-    # A turn that emitted nothing is never charged, so NOOP stays above a
-    # refused order rather than below it.
-    assert shaped[2] > shaped[0]
+    # The accepted order takes no charge: the stream pays nothing for a trade,
+    # so an accepted turn sits at exactly zero.
+    assert shaped[1] == pytest.approx(0.0)
+    # A turn that emitted nothing pays the idle charge, scaled by how much season
+    # is left: turn 2 of a 3-turn trace is a third of the way from full rate to
+    # zero. The three still sit in the order the reward is meant to express.
+    assert shaped[2] == pytest.approx(-IDLE_PENALTY * (1 - 2 / 3))
+    assert shaped[1] > shaped[2] > shaped[0]
 
-    # Off by default for callers that cannot say what was emitted.
-    plain, _, _ = episode_rewards(money, potentials, 2_880.0, 2_880.0, 1.0)
-    assert plain[0] == pytest.approx(0.0)
+    # Off by default for callers that cannot say what was emitted -- neither
+    # charge can be attributed without it.
+    plain, _, _ = episode_rewards(money, 2_880.0, 2_880.0, 1.0)
+    assert np.allclose(plain, 0.0)
+
+
+def test_idling_is_charged_but_stays_cheaper_than_going_broke():
+    """The two collapses, priced against each other.
+
+    Idling has to be bad or the NOOP attractor is the objective's own optimum --
+    `market-free-noisy-v6` sat at exactly 3,000 money with `trading_rate` 0.0 for
+    twelve updates. It also has to stay *cheaper* than bankruptcy, or the reward
+    buys the other collapse instead.
+    """
+
+    from agents.dqn_market_free.training.reward import (
+        IDLE_PENALTY,
+        INSOLVENCY_PENALTY,
+        REJECTED_ORDER_PENALTY,
+        episode_rewards,
+    )
+
+    assert 0.0 < IDLE_PENALTY < REJECTED_ORDER_PENALTY < INSOLVENCY_PENALTY
+
+    turns = 720
+    idle, _, _ = episode_rewards(
+        [3_000.0] * turns, 3_000.0, 3_000.0, 1.0, [False] * turns
+    )
+    broke, _, _ = episode_rewards(
+        [10.0] * turns, 10.0, 10.0, 1.0, [False] * turns
+    )
+    # The charge decays linearly to zero at the deadline, so a fully idle season
+    # pays the *mean* rate -- half of `IDLE_PENALTY` -- not the full one.
+    assert float(idle.sum()) == pytest.approx(-turns * IDLE_PENALTY / 2, abs=1e-3)
+    assert float(broke.sum()) < float(idle.sum()), "bankruptcy must stay the worse one"
+
+    # And the whole point of the size: it must stay under the outcome term's own
+    # range, or trading yourself downward scores better than sitting still. At a
+    # flat 0.0005 the season cost 0.36 against a 3,000-to-1,898 outcome gap of
+    # 0.104, and `market-free-hot-v16` duly learned to trade on 73-99% of turns
+    # while mean money fell 3,542 to 1,898.
+    import math
+
+    from agents.dqn_market_free.training.reward import TERMINAL_MARGIN_SCALE
+
+    outcome_gap = math.tanh(3_000 / TERMINAL_MARGIN_SCALE) - math.tanh(
+        1_898 / TERMINAL_MARGIN_SCALE
+    )
+    assert turns * IDLE_PENALTY / 2 < outcome_gap
+
+
+def test_an_unobserved_turn_is_not_charged_for_silence():
+    """`emitted` can be shorter than the stream, and absence is not evidence.
+
+    The agent skips a malformed observation, so the trace can end early. A turn
+    the recorder never saw must not be billed for sitting out, or a truncated
+    episode is charged for the tail it never played.
+    """
+
+    from agents.dqn_market_free.training.reward import IDLE_PENALTY, episode_rewards
+
+    money = [3_000.0] * 4
+    shaped, _, _ = episode_rewards(money, 3_000.0, 3_000.0, 1.0, [False, False])
+
+    # Charged, and scaled by season position like any other idle turn.
+    assert shaped[0] == pytest.approx(-IDLE_PENALTY * (1 - 0 / 4))
+    assert shaped[1] == pytest.approx(-IDLE_PENALTY * (1 - 1 / 4))
+    # Never observed, so never billed for silence.
+    assert shaped[2] == pytest.approx(0.0)
+    assert shaped[3] == pytest.approx(0.0)
 
 
 def test_the_penalty_is_smaller_than_the_terminal_signal():
@@ -3517,9 +3353,9 @@ def test_every_turn_with_no_runway_is_charged():
 
     # Turn 0 spends down to the floor, turns 1 and 2 sit there, turn 3 recovers.
     money = [3_000.0, 100.0, 100.0, 100.0]
-    shaped, raw, _ = episode_rewards(money, [0.0] * 4, 900.0, 900.0, 1.0)
+    shaped, _, _ = episode_rewards(money, 900.0, 900.0, 1.0)
 
-    charged = raw - shaped
+    charged = -shaped
     assert charged[:3] == pytest.approx(INSOLVENCY_PENALTY, abs=1e-6)
     # The turn that climbs back over the floor is not charged.
     assert float(charged[3]) == pytest.approx(0.0, abs=1e-6)
@@ -3538,9 +3374,9 @@ def test_a_solvent_season_is_never_charged():
     )
 
     money = list(np.linspace(3_000.0, 40_000.0, 400))
-    shaped, raw, _ = episode_rewards(money, [0.0] * 400, 40_000.0, 40_000.0, 1.0)
+    shaped, _, _ = episode_rewards(money, 40_000.0, 40_000.0, 1.0)
 
-    assert float(np.abs(raw - shaped).max()) < INSOLVENCY_PENALTY
+    assert float(np.abs(shaped).max()) < INSOLVENCY_PENALTY
 
 
 def test_the_insolvency_charge_is_the_scale_of_the_outcome_not_of_a_fill():
@@ -3835,38 +3671,6 @@ def test_greedy_choice_skips_a_masked_peak():
     assert decision.chosen == allowed
 
 
-def test_exploration_only_draws_feasible_orders():
-    mask = np.zeros(ACTION_COUNT, dtype=np.bool_)
-    wanted = [0, order_index("BUY_SEED", "WHEAT", 6), order_index("HIRE", None, 3)]
-    mask[wanted] = True
-
-    rng = np.random.default_rng(0)
-    network = initial_network({})
-    state = np.zeros(STATE_DIM, dtype=np.float32)
-    drawn = {
-        choose_order(state, network, epsilon=1.0, rng=rng, mask=mask).chosen
-        for _ in range(300)
-    }
-    # Exploring never draws NOOP, and never draws anything infeasible.
-    assert drawn == {wanted[1], wanted[2]}
-
-
-def test_exploration_falls_back_to_noop_when_nothing_else_is_feasible():
-    """A farm with no money and an empty shed. Must not raise or divide by zero."""
-
-    broke = _mask(money=0.0)
-    assert int(broke.sum()) == 1
-    decision = choose_order(
-        np.zeros(STATE_DIM, dtype=np.float32),
-        initial_network({}),
-        epsilon=1.0,
-        rng=np.random.default_rng(0),
-        mask=broke,
-    )
-    assert decision.chosen == 0
-    assert decision.wire() == []
-
-
 def test_the_masked_choice_agrees_between_numpy_and_torch():
     """Decision-level parity, which only holds because both use MASKED_SCORE.
 
@@ -3938,7 +3742,7 @@ def test_the_recorded_mask_is_the_one_the_policy_acted_on():
 
     recorder = Recorder()
     agent = MarketFreeAgent(
-        initial_network({}), epsilon=1.0, rng=np.random.default_rng(0), recorder=recorder
+        initial_network({}), rng=np.random.default_rng(0), recorder=recorder
     )
     obs, farm, private = _fresh_market_free_state({"WHEAT": 4})
     for step in range(5):
@@ -3963,3 +3767,213 @@ def test_the_episode_artifact_round_trips_the_mask(tmp_path: Path):
 
     assert np.array_equal(restored.order_mask, record.order_mask)
     assert not restored.order_mask[:, 3].any()
+
+
+def test_a_per_action_scale_widens_only_that_action():
+    """The whole mechanism in one assertion.
+
+    Uniform sigma cannot express "try this row more often"; a per-output vector
+    on `epsilon_out` can, because that vector is already the per-action half of
+    the factored perturbation.
+    """
+
+    from agents.dqn_market_free.order_space import NOOP_INDEX
+
+    land = order_index("BUY_LAND", None, 0)
+    module = net_module.build(noisy="head", sigma0=0.5)
+    network = net_module.to_numpy(module)
+    scale = np.ones(ACTION_COUNT, dtype=np.float32)
+    scale[land] = 8.0
+
+    rng = np.random.default_rng(0)
+    state = rng.standard_normal(STATE_DIM).astype(np.float32)
+    quiet = np.asarray(network(state)).copy()
+
+    spread = np.zeros(ACTION_COUNT)
+    for _ in range(200):
+        network.sample_noise(rng, scale)
+        spread += np.abs(np.asarray(network(state)) - quiet)
+    spread /= 200
+
+    others = np.delete(spread, [land, NOOP_INDEX])
+    assert spread[land] > 4.0 * others.mean(), "the widened row is not actually wider"
+    assert others.std() / max(1e-9, others.mean()) < 0.5, "the other 185 rows moved too"
+
+
+def test_the_per_action_scale_agrees_between_numpy_and_torch():
+    """Parity, on the vector path as well as the scalar one.
+
+    The collector perturbs through `policy.py` and the flip-rate probe through
+    `training/network.py`. If the two read a per-action scale differently, the
+    controller measures an exploration rate no actor ever played.
+    """
+
+    land = order_index("BUY_LAND", None, 0)
+    module = net_module.build(noisy="head", sigma0=0.5)
+    network = net_module.to_numpy(module)
+    scale = np.ones(ACTION_COUNT, dtype=np.float32)
+    scale[land] = 6.0
+
+    state = np.random.default_rng(3).standard_normal(STATE_DIM).astype(np.float32)
+    epsilon_in = np.random.default_rng(4).standard_normal(128).astype(np.float32)
+    epsilon_out = np.random.default_rng(5).standard_normal(ACTION_COUNT).astype(np.float32)
+
+    head = [layer for layer in module.modules() if isinstance(layer, net_module.NoisyLinear)][-1]
+    head.epsilon_in = torch.from_numpy(epsilon_in)
+    head.epsilon_out = torch.from_numpy(epsilon_out * scale)
+    expected = module(torch.from_numpy(state)).detach().numpy()
+
+    network._noise = [None] * len(network.layers)
+    network._noise[-1] = (epsilon_in, epsilon_out * scale)
+    assert np.allclose(np.asarray(network(state)), expected, atol=1e-5)
+
+
+def test_a_scale_vector_skips_layers_it_does_not_fit():
+    """`noisy_layers = "all"` must not receive the 186-wide action vector."""
+
+    module = net_module.build(noisy="all", sigma0=0.5)
+    scale = np.full(ACTION_COUNT, 5.0, dtype=np.float32)
+    net_module.reset_noise(module, scale=scale)
+
+    layers = [layer for layer in module.modules() if isinstance(layer, net_module.NoisyLinear)]
+    hidden, head = layers[0], layers[-1]
+    assert hidden.out_features != ACTION_COUNT
+    assert float(hidden.epsilon_out.abs().max()) < 4.0, "the hidden layer took the action vector"
+    assert head.out_features == ACTION_COUNT
+
+
+def test_the_sigma_scale_is_never_below_one():
+    """It may only add variance to a row, never remove it."""
+
+    from agents.dqn_market_free.training import rare
+
+    chosen, opportunities = rare.visit_counts([_synthetic_record(200, 10.0, seed=6)])
+    scale = rare.sigma_scale_vector(chosen, opportunities, gain=1.0, cap=3.0)
+    assert scale.min() >= 1.0
+    assert scale.max() <= 3.0
+
+
+def test_the_widening_targets_the_rows_the_run_has_not_sampled():
+    from agents.dqn_market_free.order_space import NOOP_INDEX
+    from agents.dqn_market_free.training import rare
+
+    land = order_index("BUY_LAND", None, 0)
+    chosen = np.full(ACTION_COUNT, 500.0)
+    chosen[land] = 0.0
+    opportunities = np.ones(ACTION_COUNT)
+    never_feasible = order_index("SELL", "WHEAT", 45)
+    opportunities[never_feasible] = 0.0
+
+    scale = rare.sigma_scale_vector(chosen, opportunities, gain=1.0, cap=3.0)
+    assert scale[land] > scale[order_index("HIRE", None, 1)]
+    assert scale[NOOP_INDEX] == 1.0, "extra mass on the collapse attractor"
+    assert scale[never_feasible] == 1.0, (
+        "a row the mask always refuses would arrive at full width the moment it opens"
+    )
+
+
+def test_the_widening_decays_as_a_row_accumulates_visits():
+    """Self-annealing, which is why there is no schedule to tune."""
+
+    from agents.dqn_market_free.training import rare
+
+    land = order_index("BUY_LAND", None, 0)
+    opportunities = np.ones(ACTION_COUNT)
+    unsampled = np.full(ACTION_COUNT, 500.0)
+    unsampled[land] = 0.0
+    sampled = np.full(ACTION_COUNT, 500.0)
+
+    wide = rare.sigma_scale_vector(unsampled, opportunities, 1.0, 3.0)[land]
+    narrow = rare.sigma_scale_vector(sampled, opportunities, 1.0, 3.0)[land]
+    assert wide > narrow >= 1.0
+
+
+def test_the_visit_counts_age_toward_the_recent_window():
+    from agents.dqn_market_free.training import rare
+
+    early = _synthetic_record(40, 10.0, seed=1, chosen=order_index("HIRE", None, 1))
+    late = _synthetic_record(40, 10.0, seed=2, chosen=order_index("BUY_SEED", "WHEAT", 6))
+    counts = rare.fold(None, rare.visit_counts([early]), 0.5)
+    for _ in range(5):
+        counts = rare.fold(counts, rare.visit_counts([late]), 0.5)
+
+    hire = counts[0][order_index("HIRE", None, 1)]
+    seed = counts[0][order_index("BUY_SEED", "WHEAT", 6)]
+    assert seed > hire, "a stale round still dominates the counts"
+    assert hire > 0.0, "decay is not deletion"
+
+
+def test_the_rollout_spec_carries_the_gain_only_when_it_is_on(tmp_path: Path):
+    """Spec bytes are the policy identity; an always-on key churns revisions."""
+
+    from agents.dqn_market_free.training.collect import learner_spec
+
+    off = learner_spec(tmp_path / "w.npz", gamma=0.999, exploration_seed=3)
+    assert "rare_sigma" not in off
+
+    on = learner_spec(
+        tmp_path / "w.npz",
+        gamma=0.999,
+        exploration_seed=3,
+        rare_sigma_gain=1.0,
+        rare_sigma_cap=3.0,
+        rare_sigma_path=tmp_path / "visits.npz",
+    )
+    assert "rare_sigma_gain=1.000000" in on and "rare_sigma_cap=3.000000" in on
+
+
+def test_the_widening_rides_the_hot_end_of_the_ladder(monkeypatch, tmp_path: Path):
+    """The hot rungs already exist to find things; the greedy tail must stay clean.
+
+    `cold_order_diagnostics` triggers the idle escape off the near-greedy pairs,
+    and the money series is only comparable across this change while some pairs
+    collect what the run before it collected.
+    """
+
+    from agents.dqn_market_free.training import collect as collect_module
+
+    seen: list[tuple[float, float]] = []
+
+    def fake_job(payload):
+        seen.append((payload[11], payload[12]))
+        return None
+
+    monkeypatch.setattr(collect_module, "_job", fake_job)
+    collect_module.collect_batch(
+        tmp_path / "w.npz",
+        ["opponent"],
+        list(range(16)),
+        0.999,
+        tmp_path,
+        jobs=1,
+        sigma_scales=[1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015, 0.008],
+        rare_sigma_gain=1.0,
+        rare_sigma_cap=3.0,
+        rare_sigma_path=tmp_path / "visits.npz",
+        rare_sigma_pairs=3,
+    )
+
+    carried = {sigma: gain for sigma, gain in seen}
+    assert carried[1.0] == 1.0, "the hot end is the arm whose job is finding things"
+    assert carried[0.008] == 0.0, "the greedy tail must stay a clean read"
+    assert sum(1 for value in carried.values() if value > 0.0) == 3
+    assert all(value in (0.0, 1.0) for value in carried.values()), (
+        "the gain must not be scaled by the rung's own sigma"
+    )
+
+
+def test_the_counts_round_trip_and_a_stale_width_is_dropped(tmp_path: Path):
+    from agents.dqn_market_free.training import rare
+
+    chosen, opportunities = rare.visit_counts([_synthetic_record(40, 10.0, seed=4)])
+    path = tmp_path / "visits.npz"
+    rare.save(path, chosen, opportunities)
+    restored = rare.load(path)
+    assert restored is not None
+    assert_array_equal(restored[0], chosen)
+
+    assert rare.load(tmp_path / "absent.npz") is None
+    np.savez(tmp_path / "stale.npz", chosen=np.zeros(3), opportunities=np.zeros(3))
+    assert rare.load(tmp_path / "stale.npz") is None, (
+        "counts from a different action space would misattribute every widening"
+    )

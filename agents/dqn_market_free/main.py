@@ -61,16 +61,17 @@ class MarketFreeAgent:
         self,
         network: OrderQNetwork | None = None,
         *,
-        epsilon: float = 0.0,
         rng: np.random.Generator | None = None,
         recorder: Any | None = None,
         episode_steps: int = 720,
         turns_per_day: int = 24,
         noise_cadence: str = "none",
         noise_scale: float = 1.0,
+        action_noise_scale: np.ndarray | None = None,
     ):
         self.network = network
-        self.epsilon = float(epsilon)
+        # Kept for the noise cadence redraw; the epsilon explore branch it also
+        # served was retired at v13.
         self.rng = rng
         # Multiplier on the perturbation this actor plays at, applied to the
         # *draw* rather than to the checkpoint's sigma. Scaling sigma in place --
@@ -78,6 +79,19 @@ class MarketFreeAgent:
         # it happened exactly once at load; a second application squares it, and
         # nothing about the object says so.
         self.noise_scale = float(noise_scale)
+        # Directed exploration: a per-action multiplier folded into the same draw,
+        # so this actor plays `noise_scale` everywhere and `noise_scale * rare[a]`
+        # on the rows `training/rare.py` says it has barely sampled. Resolved to a
+        # vector once here rather than per turn.
+        #
+        # Collection-only, and structurally so: `agent()` below leaves the cadence
+        # at "none", and a network that never draws noise cannot be steered by
+        # scaling one. Nothing on the arena, gate or Kaggle paths can reach it.
+        self.action_noise_scale = (
+            None
+            if action_noise_scale is None
+            else self.noise_scale * np.asarray(action_noise_scale, dtype=np.float32)
+        )
         # How often a NoisyNet weight perturbation is redrawn: "none", or one of
         # "decision" / "day" / "episode". The default is what makes evaluation
         # determinism structural rather than a promise -- the arena, the
@@ -116,7 +130,10 @@ class MarketFreeAgent:
             or (self.noise_cadence == "day" and turns_per_day > 0 and step % turns_per_day == 0)
         )
         if due:
-            self.network.sample_noise(self.rng, self.noise_scale)
+            scale = (
+                self.noise_scale if self.action_noise_scale is None else self.action_noise_scale
+            )
+            self.network.sample_noise(self.rng, scale)
 
     def __call__(self, obs: Any, configuration: Any | None = None) -> dict[str, list]:
         farms = obs.get("farms", []) or []
@@ -178,7 +195,7 @@ class MarketFreeAgent:
             # nothing about which of the remaining orders is worth making.
             mask = feasible_actions(obs, farm, private, field, configuration)
             self._sample_noise(step, turns_per_day)
-            decision = choose_order(state, self.network, self.epsilon, self.rng, mask)
+            decision = choose_order(state, self.network, mask)
             orders = decision.wire()
             self.history.record_decision(decision.order)
             if self.recorder is not None:

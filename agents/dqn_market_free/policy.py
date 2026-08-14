@@ -85,7 +85,11 @@ class OrderQNetwork:
     def is_noisy(self) -> bool:
         return any(pair is not None for pair in self.sigma)
 
-    def sample_noise(self, rng: np.random.Generator, scale: float = 1.0) -> None:
+    def sample_noise(
+        self,
+        rng: np.random.Generator,
+        scale: float | np.ndarray = 1.0,
+    ) -> None:
         """Draw one factorized epsilon pair per noisy layer, held until replaced.
 
         Factorized rather than independent because the cost difference is three
@@ -97,15 +101,24 @@ class OrderQNetwork:
         `scale`; keeping it off `sigma` means it cannot compound across calls and
         cannot reach `save`. The torch mirror takes the same argument in the same
         place -- see `training/network.py`.
+
+        `scale` may also be a *vector*, one entry per output unit, which is how
+        directed exploration arrives: `epsilon_out` is already the per-output half
+        of the factored pair, so widening one entry widens exactly one action's
+        perturbation and nothing else. A vector applies only to layers whose
+        output width it matches -- the 186-wide head -- and every other noisy
+        layer draws unscaled, so the same vector is correct whether the run
+        perturbs the head alone or the whole trunk.
         """
 
-        factor = np.float32(scale)
+        factor = np.asarray(scale, dtype=np.float32)
         self._noise = [
             None
             if pair is None
             else (
                 _factorized(rng, weight.shape[0]),
-                _factorized(rng, weight.shape[1]) * factor,
+                _factorized(rng, weight.shape[1])
+                * (factor if factor.ndim == 0 or factor.shape == (weight.shape[1],) else 1.0),
             )
             for (weight, _bias), pair in zip(self.layers, self.sigma)
         ]

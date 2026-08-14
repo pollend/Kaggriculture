@@ -11,10 +11,10 @@ fully described by the state vector and a single integer. That is what makes a
 per-turn decision rate affordable: 720 decisions an episode costs less memory
 than the scorer's 60.
 
-Reward shaping, the potential function, and the terminal margin bonus live in
-`training/reward.py`. They started as the scorer's and are no longer: this agent
-decides land and cash reserves itself, so its potential has to price what the
-scorer's market layer handled in code.
+The reward stream and its scales live in `training/reward.py`. They started as
+the scorer's and are no longer: this agent decides land and cash reserves itself,
+so the scales had to differ from the ones the scorer's market layer handled in
+code.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ import numpy as np
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
 from agents.dqn_market_free.order_space import ACTION_COUNT, ACTIONS, OrderDecision
-from agents.dqn_market_free.training.reward import episode_rewards, potential
+from agents.dqn_market_free.training.reward import episode_rewards
 
 if TYPE_CHECKING:
     from sim.runner import MatchResult
@@ -162,13 +162,11 @@ class Recorder:
     """Accumulates one episode of decisions as the agent makes them."""
 
     money: list[float] = field(default_factory=list)
-    potential: list[float] = field(default_factory=list)
     order_steps: list[int] = field(default_factory=list)
     decisions: list[OrderDecision] = field(default_factory=list)
 
     def reset(self) -> None:
         self.money.clear()
-        self.potential.clear()
         self.order_steps.clear()
         self.decisions.clear()
 
@@ -194,14 +192,12 @@ class Recorder:
 
     def record_turn(self, *, money: float, obs: Any, farm: dict, private: dict) -> None:
         self.money.append(float(money))
-        self.potential.append(potential(farm, private, obs))
 
     def finish(
         self,
         final_money: float,
         opponent_money: float,
         gamma: float,
-        mode: str = "shaped",
     ) -> EpisodeRecord:
         steps = len(self.money)
         if steps == 0:
@@ -218,12 +214,10 @@ class Recorder:
 
         shaped, raw, money = episode_rewards(
             self.money,
-            self.potential,
             final_money,
             opponent_money,
             gamma,
             emitted,
-            mode=mode,
         )
 
         count = len(self.decisions)
@@ -270,14 +264,15 @@ class OrderRollout:
 def learner_spec(
     weights_path: Path | str,
     *,
-    epsilon: float,
     gamma: float,
     exploration_seed: int,
     trace_path: Path | str | None = None,
     policy_revision_id: str | None = None,
-    reward_mode: str = "shaped",
     noise_cadence: str = "none",
     sigma_scale: float = 1.0,
+    rare_sigma_gain: float = 0.0,
+    rare_sigma_cap: float = 0.0,
+    rare_sigma_path: Path | str | None = None,
 ) -> str:
     """Address the exploring learner as an ordinary agent spec.
 
@@ -285,17 +280,13 @@ def learner_spec(
     spec without them is the *policy identity*, and folding a per-episode trace
     into it would mint one agent revision per episode.
 
-    `reward_mode` is emitted only when it differs from the default, so leaving it
-    off keeps the spec string byte-identical to what a run recorded before it
-    existed and no revision churns. It sits in the identity spec rather than
-    beside it for the same reason `gamma` does: both are read only by
-    `Recorder.finish`, never by the policy, and a run that relabels its rewards
-    is worth telling apart from one that does not.
+    `gamma` sits in the identity spec although the policy never reads it -- only
+    `Recorder.finish` does -- because a run that relabels its rewards is worth
+    telling apart from one that does not.
     """
 
     query: dict[str, Any] = {
         "weights": str(weights_path),
-        "epsilon": f"{epsilon:.6f}",
         "gamma": f"{gamma:.6f}",
         "exploration_seed": str(int(exploration_seed)),
     }
@@ -306,8 +297,13 @@ def learner_spec(
         query["noise_cadence"] = str(noise_cadence)
     if sigma_scale != 1.0:
         query["sigma_scale"] = f"{sigma_scale:.6f}"
-    if reward_mode != "shaped":
-        query["reward_mode"] = str(reward_mode)
+    # Same rule, and it matters more here: the counts file is content-addressed
+    # per checkpoint, so emitting these unconditionally would mint a fresh policy
+    # identity every round even for a run that leaves the widening off.
+    if rare_sigma_gain > 0.0 and rare_sigma_path is not None:
+        query["rare_sigma_gain"] = f"{rare_sigma_gain:.6f}"
+        query["rare_sigma_cap"] = f"{rare_sigma_cap:.6f}"
+        query["rare_sigma_path"] = str(rare_sigma_path)
     if trace_path is not None:
         query["trace_path"] = str(trace_path)
     if policy_revision_id is not None:
@@ -320,16 +316,17 @@ def collect_episode(
     opponent_spec: str,
     seed: int,
     learner_seat: int,
-    epsilon: float,
     gamma: float,
     trace_dir: Path,
     exploration_seed: int,
     pair_index: int = 0,
     policy_revision_id: str | None = None,
     config: dict[str, Any] | None = None,
-    reward_mode: str = "shaped",
     noise_cadence: str = "none",
     sigma_scale: float = 1.0,
+    rare_sigma_gain: float = 0.0,
+    rare_sigma_cap: float = 0.0,
+    rare_sigma_path: Path | str | None = None,
 ) -> OrderRollout | None:
     """Play one episode with an exploring learner and record it."""
 
@@ -339,14 +336,15 @@ def collect_episode(
     trace_path = Path(trace_dir) / f"seed-{seed:010d}-seat-{learner_seat}.npz"
     spec = learner_spec(
         weights_path,
-        epsilon=epsilon,
         gamma=gamma,
         exploration_seed=exploration_seed,
         trace_path=trace_path,
         policy_revision_id=policy_revision_id,
-        reward_mode=reward_mode,
         noise_cadence=noise_cadence,
         sigma_scale=sigma_scale,
+        rare_sigma_gain=rare_sigma_gain,
+        rare_sigma_cap=rare_sigma_cap,
+        rare_sigma_path=rare_sigma_path,
     )
     seats = (spec, opponent_spec) if learner_seat == 0 else (opponent_spec, spec)
     result = run_match(seats, seed, config=config, analyzer=episode_metrics)
@@ -420,36 +418,20 @@ def _single_threaded_workers():
                 os.environ[name] = value
 
 
-def actor_epsilons(base: float, actors: int, alpha: float = 4.0) -> list[float]:
-    """One exploration rate per actor, spread geometrically around `base`.
-
-    A single epsilon for the whole batch means every episode is the same policy
-    at the same temperature, and the buffer fills with near-copies of one
-    trajectory. Measured on this agent at a base of 0.014: 81% mean pairwise
-    action agreement between the sixteen episodes of a batch, and on 38% of
-    turns all sixteen chose the identical action.
-
-    So spread it, as Ape-X does: actor `i` of `N` runs at
-    `base ** (1 + i/(N-1) * alpha)`. The low-index actors explore hard enough to
-    find something, the high-index ones are effectively greedy and show what the
-    policy actually does, and every batch contains both rather than alternating
-    between them as the schedule decays.
-    """
-
-    if actors <= 1:
-        return [base]
-    return [base ** (1.0 + (index / (actors - 1)) * alpha) for index in range(actors)]
-
-
-def actor_sigma_scales(actors: int, alpha: float = 32.0) -> list[float]:
+def actor_sigma_scales(
+    actors: int,
+    alpha: float = 32.0,
+    hot: int = 0,
+    top: float = 1.0,
+) -> list[float]:
     """One NoisyNet sigma multiplier per actor, spread geometrically.
 
-    The exact analogue of `actor_epsilons`, and it exists for the same measured
-    reason rather than by analogy: one temperature for a whole batch fills the
-    buffer with near-copies of one trajectory, at 81% mean pairwise action
-    agreement between the sixteen episodes of a batch. That finding is about
-    behavioural diversity within a batch and is orthogonal to the exploration
-    *mechanism*, so a single sigma reproduces it exactly.
+    One temperature for a whole batch fills the buffer with near-copies of one
+    trajectory. Measured on the epsilon spread this replaced: 81% mean pairwise
+    action agreement between the sixteen episodes of a batch, and on 38% of turns
+    all sixteen chose the identical action. The finding is about behavioural
+    diversity within a batch and is orthogonal to the exploration *mechanism*, so
+    a single sigma reproduces it exactly.
 
     Actor `i` of `N` runs at `alpha ** (-i/(N-1))`: actor 0 plays the learned
     sigma and the last actor is effectively greedy, so `trading_rate` and the
@@ -458,27 +440,51 @@ def actor_sigma_scales(actors: int, alpha: float = 32.0) -> list[float]:
 
     This is Ape-X's per-actor temperature trick transplanted, *not* principled
     NoisyNet -- the paper has one sigma, learned, and no spread at all.
+
+    `hot` rungs above the setpoint, if asked for. The spread above is downward
+    only: no episode anywhere ever explores harder than the controller resolved,
+    so the rarest behaviours are precisely the ones collection is structurally
+    blind to. `hot` actors run above 1.0 instead, geometrically from `top` down
+    to the setpoint, and the remaining `N - hot` run the ordinary ladder from 1.0
+    down to `1/alpha` -- so both the setpoint read and the near-greedy read
+    survive. At `N=8, hot=2, top=4, alpha=32`:
+    `[4.0, 2.0, 1.0, 0.5, 0.25, 0.125, 0.0625, 0.031]`.
+
+    `top` is a *ratio* against the setpoint rather than an absolute sigma,
+    because that is the unit the caller has: it divides the burst base the
+    controller resolved from a target order rate by the setpoint, so the hottest
+    rung plays exactly what an idle burst would and inherits the same measured
+    ceiling. `hot = 0` reproduces the ladder byte for byte.
     """
 
     if actors <= 1:
         return [1.0]
-    return [alpha ** (-(index / (actors - 1))) for index in range(actors)]
+    hot = max(0, min(hot, actors - 1))
+    if top <= 1.0:
+        hot = 0
+    above = [top ** ((hot - index) / hot) for index in range(hot)]
+    cold = actors - hot
+    if cold <= 1:
+        return above + [1.0]
+    return above + [alpha ** (-(index / (cold - 1))) for index in range(cold)]
 
 
 def collect_batch(
     weights_path: Path,
     opponents: list[str],
     seeds: list[int],
-    epsilons: list[float],
     gamma: float,
     trace_dir: Path,
     jobs: int,
     exploration_seed: int = 0,
     policy_revision_id: str | None = None,
     config: dict[str, Any] | None = None,
-    reward_mode: str = "shaped",
     noise_cadence: str = "none",
     sigma_scales: list[float] | None = None,
+    rare_sigma_gain: float = 0.0,
+    rare_sigma_cap: float = 0.0,
+    rare_sigma_path: Path | str | None = None,
+    rare_sigma_pairs: int = 0,
 ) -> list[OrderRollout]:
     """Play `len(seeds)` episodes, one opponent drawn per consecutive seed pair.
 
@@ -487,11 +493,30 @@ def collect_batch(
     opponent per pair rather than per episode is what lets the resulting pairing
     settle a seat-balanced margin.
 
-    `epsilons` is indexed by pair for the same reason the opponent is: both
+    `sigma_scales` is indexed by pair for the same reason the opponent is: both
     orientations of a seed must be played by the same policy at the same
     temperature, or the paired margin the league settles is a comparison between
-    two different agents. `sigma_scales` is indexed by pair for exactly that
-    reason too -- it is the same knob under a different exploration mechanism.
+    two different agents.
+
+    `rare_sigma_gain` goes to the first `rare_sigma_pairs` pairs -- the hot end,
+    the same end `noisy_actor_hot` counts from -- at full gain rather than one
+    scaled by the rung's own sigma.
+
+    The hot end because that is already the arm whose job is finding things, and
+    because the near-greedy tail has to stay a clean read of the policy:
+    `cold_order_diagnostics` triggers the idle escape off it, and the money series
+    is only comparable across this change if some pairs are collecting what v18
+    collected.
+
+    Worth being explicit about one piece of evidence that looks like it argues the
+    other way. `market-free-burst-v9` attributed every episode to its rung across
+    212 seats and found land bought only at sigma <= 0.871, never at 3.159, where
+    49% went bankrupt. That measured *global* sigma -- every row widened at once,
+    which is a policy shaken into noise, and it says nothing about widening one
+    action's row while the other 185 stay where the controller put them. The
+    failure it records is bankruptcy from indiscriminate trading, and this cannot
+    produce that: `rare.sigma_scale_vector` leaves NOOP and every well-sampled row
+    at exactly 1.0.
     """
 
     scales = sigma_scales or [1.0]
@@ -499,22 +524,25 @@ def collect_batch(
     for index, seed in enumerate(seeds):
         pair_index = index // 2
         opponent = opponents[pair_index % len(opponents)]
+        scale = scales[pair_index % len(scales)]
+        pair_gain = rare_sigma_gain if pair_index < max(0, rare_sigma_pairs) else 0.0
         payloads.append(
             (
                 weights_path,
                 opponent,
                 seed,
                 index % 2,
-                epsilons[pair_index % len(epsilons)],
                 gamma,
                 trace_dir,
                 exploration_seed + index,
                 pair_index,
                 policy_revision_id,
                 config,
-                reward_mode,
                 noise_cadence,
-                scales[pair_index % len(scales)],
+                scale,
+                pair_gain,
+                rare_sigma_cap,
+                rare_sigma_path,
             )
         )
     if jobs <= 1:

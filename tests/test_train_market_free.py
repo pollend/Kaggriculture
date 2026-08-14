@@ -8,8 +8,6 @@ for a generation before anyone notices.
 import tomllib
 from pathlib import Path
 
-import pytest
-
 import train_market_free
 from agents.dqn_market_free.training.updater import POLICY_KINDS
 from agents.dqn_market_scorer.training.benchmarks import promotion_benchmark
@@ -84,31 +82,24 @@ def test_policy_kinds_do_not_collide_with_the_scaffolded_learner():
     assert POLICY_KINDS["market_learner"] != SCORER_KINDS["market_learner"]
 
 
-def test_the_session_starts_a_fresh_model_lineage():
-    """Both names move together again, after six sessions where only one did.
+def test_the_session_moves_and_the_model_lineage_does_not():
+    """Only the session id moves at v20, and the pairing is the whole point.
 
-    v6 through v10 kept `outcome_v4` deliberately: `reward_mode` was unchanged so
-    the old batches were the same kind of sample, and `_self_play_pool` is scoped
-    by `model_id`, so a fresh name has an empty pool on batch 0 -- which, with no
-    base opponent to fall back on, is the "needs at least one opponent" error
-    rather than a slower start.
-
-    Neither holds now. The database was reset, so there is no buffer, lineage or
-    checkpoint to inherit and the name was pointing at nothing; and `opponents`
-    carries a seeded-noise base, so `compose_opponents` has something to mix
-    against and the cold start is survivable.
+    `ensure_session` digests the experiment manifest, so adding `rare_sigma_gain`
+    makes the previous session unresumable and a new id is forced.
+    `MODEL_NAME` stays because `all_batches` and `_self_play_pool` are scoped by
+    `model_id` and the reward function did not move: v18's batches are the same
+    kind of sample, so inheriting them is the buffer working as intended rather
+    than a leak between regimes. Only the behaviour distribution changed.
 
     The reward is still the thing that would *force* a new name, so it stays
     asserted here: reusing one across a reward change fits one Q function to two
     reward streams.
     """
 
-    assert train_market_free.SESSION_ID == "market-free-idleburst-v12"
-    assert train_market_free.MODEL_NAME == "coldstart_v1"
+    assert train_market_free.SESSION_ID == "market-free-rare-v20"
+    assert train_market_free.MODEL_NAME == "falloff_v1"
     assert train_market_free.MODEL_NAME not in train_market_free.SESSION_ID
-    # Inheriting the lineage is only safe while the reward is untouched. If this
-    # moves, the session needs a new model name as well.
-    assert train_market_free.FREE_CONFIG["reward_mode"] == "outcome_only"
 
 
 def test_the_runner_clones_nothing():
@@ -130,44 +121,26 @@ def test_the_runner_clones_nothing():
     assert "behavior_clone_steps_per_update" not in train_market_free.FREE_CONFIG
 
 
-def test_the_runner_pays_only_the_outcome():
-    """The reason this instance exists, asserted rather than left in a comment.
+def test_the_reward_pays_only_the_outcome():
+    """There is one reward stream and no mode to choose, which is the point.
 
     v3 paid the money delta plus potential shaping, and the shaping marked the
     whole shed to a quote the agent moved itself by buying. Measured over 300 of
     its episodes: 219 `BUY_PRODUCT` and 204 `SELL` per episode, wheat and
     fertilizer 94% of the sale volume -- the only two goods `BUY_PRODUCT` can buy
-    back -- against 13 wheat actually planted. The manifest stays the shaped
-    control, so the departure has to live here.
-    """
-
-    from agents.dqn_market_free.training.reward import REWARD_MODES
-
-    config = train_market_free.FREE_CONFIG
-    assert config["reward_mode"] == "outcome_only"
-    assert config["reward_mode"] in REWARD_MODES
-    # The manifest is the control and must not have drifted into the mode.
-    assert "reward_mode" not in _manifest()["models"][0]["config"]
-
-
-def test_the_outcome_baseline_key_is_an_inert_digest_relic():
-    """It is still in the config and nothing reads it -- both halves, or neither.
-
-    `ensure_session` digests `experiment.training_agents`, and the stored
-    manifest for `market-free-noisy-v6` carries this key, so deleting it makes
-    that session unresumable. It stays for that alone: the
-    reward no longer takes a baseline at all. Left unasserted this is exactly the
-    silent dead key `test_the_runner_clones_nothing` exists to forbid, so the
-    pairing is pinned -- if the parameter ever comes back, this fails and the
-    config has to say so deliberately.
+    back -- against 13 wheat actually planted. `outcome_only` switched it off at
+    v4 and v13 removed the shaped arm outright, so neither config can select it.
     """
 
     import inspect
 
-    from agents.dqn_market_free.training.reward import episode_rewards
+    from agents.dqn_market_free.training import reward as reward_module
 
-    assert train_market_free.FREE_CONFIG["outcome_baseline"] == 0.0
-    assert "outcome_baseline" not in inspect.signature(episode_rewards).parameters
+    assert not hasattr(reward_module, "REWARD_MODES")
+    assert not hasattr(reward_module, "potential")
+    assert "mode" not in inspect.signature(reward_module.episode_rewards).parameters
+    assert "reward_mode" not in train_market_free.FREE_CONFIG
+    assert "reward_mode" not in _manifest()["models"][0]["config"]
 
 
 def test_the_manifest_stays_the_no_self_play_control():
@@ -246,45 +219,6 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
             assert sum(spec.startswith("self-") for spec in opponents) == 2
 
 
-def test_exactly_one_exploration_mechanism_is_live():
-    """Epsilon and NoisyNet must never both be putting states in the buffer.
-
-    They are not additive. Epsilon's explore branch bypasses the network
-    entirely -- uniform over feasible actions with NOOP removed, so an exploring
-    turn is forced to place an order and 97 of the 186 actions spend money. That
-    is the overbuying the low-scoring half of a batch shows, and running it
-    alongside weight noise would keep manufacturing the exact failure the noise
-    was turned on to remove, while making the two contributions unattributable.
-
-    Zeroed rather than deleted: `epsilon` is part of the policy identity string,
-    so removing the key would rewrite every revision id in the family.
-    """
-
-    from agents.dqn_market_free.training.updater import _epsilon
-
-    manifest = _manifest()["models"][0]["config"]
-    config = {**manifest, **train_market_free.FREE_CONFIG}
-
-    assert config["noisy"] is True
-    assert config["epsilon_start"] == 0.0
-    assert config["epsilon_end"] == 0.0
-    assert _epsilon(config, 0) == 0.0
-    assert _epsilon(config, 3_000_000) == 0.0
-    assert "epsilon_start" in config, "the key stays, so revision ids do not churn"
-
-    # The manifest still carries a live epsilon schedule, which is only safe
-    # while it is *not* also noisy. Whichever way that key is set there, the two
-    # must not both be on: assert the pairing rather than either value, so
-    # flipping one without the other fails here instead of quietly doubling the
-    # exploration budget in whatever run picks the manifest up without overrides.
-    manifest_epsilon = _epsilon(manifest, 1_380_480)
-    assert not (manifest.get("noisy", False) and manifest_epsilon > 0.0), (
-        "the manifest has both exploration mechanisms live: `noisy` is on while "
-        f"epsilon still anneals to {manifest_epsilon:.3f}. Zero `epsilon_start`/"
-        "`epsilon_end` there, or turn `noisy` back off and keep it as the control."
-    )
-
-
 def test_the_runner_declares_the_noise_knobs_it_means_to_change():
     """A misspelled key is silent: `config.get` keeps the default either way."""
 
@@ -302,14 +236,11 @@ def test_the_runner_declares_the_noise_knobs_it_means_to_change():
         # uncontrolled run. v7 overrides both from `FREE_CONFIG`; that is safe
         # only because it also takes a new session id, since `ensure_session`
         # digests `experiment.training_agents`.
-        "noisy_flip_rate_target",
         "noisy_order_rate_target",
         "noisy_sigma_scale_limit",
-        "noisy_burst_every",
-        "noisy_burst_order_rate",
-        "noisy_burst_scale_limit",
+        "noisy_hot_order_rate",
+        "noisy_hot_scale_limit",
         "noisy_sigma_scale_floor",
-        "noisy_idle_trading_rate",
     ):
         assert key in manifest, f"{key} must be declared in the manifest to be readable"
 
@@ -328,121 +259,6 @@ def test_the_runner_declares_the_noise_knobs_it_means_to_change():
     # none of them errors.
     assert config["noisy_cadence"] == "episode"
     assert config["n_step"] == 24, "cadence must still cover the credit horizon"
-
-
-def test_exactly_one_sigma_controller_is_live():
-    """Two setpoints, one curve allowed to move sigma.
-
-    They disagree by construction on a collapsed policy -- that disagreement is
-    the entire reason `noisy_order_rate_target` exists -- so a run with both set
-    could not say afterwards which number moved sigma.
-
-    v6 controlled on the argmax flip rate and that is what broke it: the policy
-    collapsed onto NOOP, where every action is near-tied and flips are therefore
-    cheap and plentiful, so the rate read 0.28-0.39 against a 0.05 setpoint and
-    the controller divided sigma down to `[0.33 .. 0.010]` across the eight
-    actors. Exploration was throttled at the one moment it needed raising.
-    """
-
-    from agents.dqn_market_free.training.updater import _noisy
-
-    manifest = _manifest()["models"][0]["config"]
-    config = {**manifest, **train_market_free.FREE_CONFIG}
-
-    assert config["noisy_order_rate_target"] > 0.0
-    assert config["noisy_flip_rate_target"] == 0.0
-
-    noisy = _noisy(config)
-    assert noisy.controlled
-    assert noisy.controls_on_orders
-
-    # The manifest stays the uncontrolled epsilon-greedy arm, so whichever way
-    # this run sets the pair, picking the manifest up without overrides never
-    # silently inherits a controller aimed at the wrong quantity.
-    assert manifest["noisy_order_rate_target"] == 0.0
-    assert not _noisy(manifest).controls_on_orders
-
-
-def test_the_burst_answers_idleness_rather_than_a_schedule():
-    """The periodic schedule is retired; the trigger is silence.
-
-    It was measured twice and never came out positive. At `noisy_burst_order_rate
-    = 0.20` it changed nothing over 560 seats -- 4.6% of burst-round seats bought
-    land against 4.9% of ordinary ones. Flat at 0.35 (sigma 3.159) it put 49% of
-    212 seats bankrupt against 8-26% across the ordinary ladder, with zero land
-    purchases. On a fixed cadence the burst fires when the policy is *healthy*,
-    which is exactly when high sigma is pure damage.
-
-    Idleness inverts that. A NOOP policy produces no learning signal at all, so
-    bankruptcy is strictly the better failure -- it at least generates transitions
-    with a gradient. The episodes a burst replaces there were worth nothing, and
-    it stops by itself as soon as trading resumes, so the 49%-bankruptcy objection
-    is the point rather than the cost.
-    """
-
-    from agents.dqn_market_free.training.updater import _noisy
-
-    manifest = _manifest()["models"][0]["config"]
-    config = {**manifest, **train_market_free.FREE_CONFIG}
-    noisy = _noisy(config)
-
-    assert noisy.burst_every == 0, "the periodic schedule is retired, not retuned"
-    rounds = train_market_free.LeagueConfig.from_toml(
-        REPO_ROOT / train_market_free.LEAGUE_CONFIG
-    ).rounds_per_generation
-    assert not any(noisy.burst_round(index) for index in range(rounds))
-
-    # Silence arms it at any point in the generation.
-    assert noisy.idle_trading_rate > 0.0
-    assert all(noisy.burst_round(index, idle=True) for index in range(rounds))
-
-    # Below the gate's own activity floor, so the escape answers genuine silence
-    # rather than merely cautious trading.
-    assert noisy.idle_trading_rate < config["viability_min_orders_per_decision"]
-
-    # Sized as a rate against the ordinary setpoint, not as a sigma multiplier:
-    # the base a multiplier would scale moves every update as the controller
-    # tracks the setpoint, and what a given scale buys moves with the network.
-    assert noisy.burst_order_rate > noisy.order_rate_target
-    # Hard on purpose now. The cap still binds -- an unbounded burst is how 0.35
-    # reached 3.159 in the first place -- but it is set to permit that sigma,
-    # because on an idle policy that is the intent and not the accident.
-    assert noisy.burst_scale_limit <= noisy.scale_limit
-
-    # The manifest stays the no-burst control arm on both triggers.
-    assert manifest["noisy_burst_every"] == 0
-    assert manifest["noisy_idle_trading_rate"] == 0.0
-    assert _noisy(manifest).burst_every == 0
-    assert not _noisy(manifest).burst_round(0, idle=True)
-
-
-def test_the_lineage_snaps_back_before_it_drifts_far():
-    """Two rejections, not five.
-
-    Both training and collection follow the newest checkpoint on the lineage,
-    promoted or not, so a rejected update's policy is what collects the next
-    generation. Measured across v7, v8 and v9 the run oscillates rather than
-    diverging monotonically: it promotes, then produces candidates at 1,335 / 975
-    / 3,877 against a released incumbent scoring ~17,000, and sometimes recovers
-    on its own before a limit of 5 is reached. That recovery is what made 5 look
-    adequate -- but every rejected update in between is a generation collected
-    from a policy the gate has already judged far worse than one sitting released
-    and unused.
-
-    Asserted rather than left in a comment because the knob is only readable in
-    the manifest: `lineage_checkpoint` reads it through `config.get`, so a
-    misspelling silently restores the default.
-    """
-
-    from agents.dqn_market_free.training.updater import lineage_checkpoint  # noqa: F401
-
-    manifest = _manifest()["models"][0]["config"]
-    config = {**manifest, **train_market_free.FREE_CONFIG}
-
-    assert config["resume_reset_after_rejections"] == 2
-    assert config["resume_reset_after_rejections"] > 0, "0 disables the reset entirely"
-    # It lives in the manifest, not the runner, so every session inherits it.
-    assert "resume_reset_after_rejections" not in train_market_free.FREE_CONFIG
 
 
 def test_manifest_hard_gate_catches_both_collapses():
@@ -486,25 +302,6 @@ def test_manifest_declares_no_retired_knobs():
     assert retired.isdisjoint(config)
 
 
-def test_exploration_rate_is_a_single_small_knob():
-    """`epsilon` is now the whole trade rate; it used to be scaled by `act_rate`.
-
-    Exploring on every turn is measurably fatal, so the start value has to be the
-    small number rather than 1.0 with a 0.02 multiplier hidden behind it.
-    """
-
-    config = _manifest()["models"][0]["config"]
-    assert config["epsilon_start"] == 0.18
-    assert config["epsilon_end"] == 0.01
-    assert config["epsilon_start"] > config["epsilon_end"] > 0.0
-    # The ten-slot scheme's per-turn probability of acting randomly was
-    # `epsilon * (1 - (1 - act_rate)^10)` = 0.183 at its start, not the 0.02 that
-    # reading `act_rate` alone suggests. Setting the single knob to 0.02 explored
-    # an order of magnitude less than the scheme it replaced.
-    assert config["epsilon_start"] == pytest.approx(1.0 * (1 - (1 - 0.02) ** 10), abs=0.01)
-    assert config["epsilon_actor_alpha"] > 0.0
-
-
 def test_both_defences_against_an_all_bankruptcy_buffer_are_declared():
     """The demonstration share and the return weighting cover different cases.
 
@@ -528,11 +325,30 @@ def test_both_defences_against_an_all_bankruptcy_buffer_are_declared():
     assert 0.0 < config["priority_beta"] < 1.0
 
 
-def test_promotion_gate_stays_on_for_this_run():
-    """The runner must not quietly relax the manifest's release bar."""
+def test_every_update_is_the_release():
+    """The gate is off, and the knob it makes unreachable is set to say so.
 
-    assert _manifest()["models"][0]["config"]["promotion_rule"] == "significant"
+    Nothing here ever gated training -- `lineage_checkpoint` takes the newest
+    checkpoint promoted or not and `_self_play_pool` does not filter on
+    `promoted`, so a rejected candidate always went straight into the next
+    generation. What a rejection withheld was the release.
+
+    `resume_reset_after_rejections` has to be 0 as a consequence, not as a
+    preference: with every update promoting, `rejections_since_promotion` is
+    permanently 0 and the streak can never trip. Left at 2 it would read as a
+    live safety net that cannot fire.
+    """
+
+    config = _manifest()["models"][0]["config"]
+
+    assert config["promotion_rule"] == "always"
+    assert config["resume_reset_after_rejections"] == 0
+    # The rule lives in the manifest, so the runner cannot disagree with it.
     assert "promotion_rule" not in train_market_free.FREE_CONFIG
+
+    # The arena is still measured -- only its effect on the boolean is gone.
+    assert config["viability_min_orders_per_decision"] > 0.0
+    assert config["promotion_seeds"] > 0
 
 
 def test_runner_overrides_carry_no_inert_keys():

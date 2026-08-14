@@ -380,40 +380,31 @@ class OrderDecision:
 def choose_order(
     state: np.ndarray,
     network,
-    epsilon: float = 0.0,
-    rng: np.random.Generator | None = None,
     mask: np.ndarray | None = None,
 ) -> OrderDecision:
-    """Greedy argmax over the feasible action head, with epsilon-greedy exploration.
+    """Greedy argmax over the feasible action head.
 
-    `epsilon` is the probability that this turn emits a uniformly random *real*
-    order. It absorbs what used to be two knobs: a per-turn exploration coin and
-    a per-slot act rate, whose product was the only thing that mattered. Keeping
-    them separate made the effective rate a number nobody read off the config.
+    Exploration lives in the *weights*, not here. This took an `epsilon` and an
+    rng until v13, drawing a uniformly random real order on that fraction of
+    turns, and it was retired because the rate is the wrong thing to control: 97
+    of the 186 actions spend money, so every exploring turn was a forced purchase
+    chosen without reference to what the network believed anything was worth.
+    Measured at per-turn rates of 1.0, 0.1, 0.02 and even 0.005, the agent
+    finished the season on 5, 185, 48 and 4 coins from a 3,000 float while the
+    donor finished above 100,000. NoisyNet perturbs the weights instead, so the
+    argmax moves only among actions already near-tied in Q.
 
-    That effective rate has to stay small, and the reason is measured rather
-    than assumed. Exploring at every turn is fatal: at per-turn rates of 1.0,
-    0.1, 0.02 and even 0.005 the agent finishes the season on 5, 185, 48 and 4
-    coins from a 3,000 float while the donor finishes above 100,000. Random
-    capital purchases are what does it -- BUY_LAND is 1,000-4,000 and BUY_ANIMAL
-    300-500 -- so the buffer fills with nothing but bankruptcy.
+    Directed exploration does not appear here either, for the same reason. A
+    structurally rare action is reached by widening *its own* sigma row in the
+    head -- see `training/rare.py` -- which keeps the mechanism zero-mean and
+    keeps this function a plain argmax over whatever the network just said.
 
-    `mask` restricts both paths to what the simulator would actually accept. It
-    matters most for the exploring one: without it roughly half of every random
-    draw was a sell from an empty shed, which is not exploration, it is a no-op
-    the agent then has to learn its way out of.
+    `mask` restricts the argmax to what the simulator would actually accept.
     """
 
     if mask is None:
         mask = np.ones(ACTION_COUNT, dtype=np.bool_)
 
-    if epsilon > 0.0 and rng is not None and rng.random() < epsilon:
-        # Explore over feasible *real* orders. NOOP is reachable by not
-        # exploring, and is the fallback when nothing else can be done.
-        options = np.flatnonzero(mask)
-        options = options[options != NOOP_INDEX]
-        chosen = int(rng.choice(options)) if options.size else NOOP_INDEX
-    else:
-        scores = np.asarray(network(state)).reshape(ACTION_COUNT)
-        chosen = int(np.argmax(np.where(mask, scores, MASKED_SCORE)))
+    scores = np.asarray(network(state)).reshape(ACTION_COUNT)
+    chosen = int(np.argmax(np.where(mask, scores, MASKED_SCORE)))
     return OrderDecision(state, ACTIONS[chosen], chosen, mask)
