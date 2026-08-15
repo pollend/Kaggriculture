@@ -576,6 +576,31 @@ the wire order count: `HIRE 13` is one decision that expands to thirteen rows, s
 a wire-count floor reads 0.13 orders per decision for a policy that acted once in
 a hundred turns.
 
+**Which arena carries it, corrected after `market-free-population-v25`.** Making
+it unconditional was right; applying it to the *cold-start head-to-head* was not,
+and the two are separable. That match is against the quiet baseline, which offers
+no counterparty, so the floor measures nothing there. At cutoff 143 learner_01,
+learner_02 and learner_09 traded at 0.633, 0.332 and 0.398 against the benchmark
+and emitted 0, 210 and 0 orders against the baseline; five of ten slots had never
+released after 143 batches and `population_members` held one row for the whole
+run, so every graduation took the `restart` branch and the mature group stayed
+empty. The floor is now unconditional on the index-0 benchmark and conditional on
+a release for the head-to-head, falling back to requiring it when no benchmark is
+configured. The v6 shape is still caught: a pure-NOOP candidate reads 0.0 against
+pilkwang too. Do not re-merge the two arenas without re-reading this paragraph —
+the pattern above makes "unconditional everywhere" look like the safe direction,
+and on the head-to-head it is what blocked the first release.
+
+**And the degeneracy check alongside it, same run, same cause.**
+`degenerate_head_to_head` inferred the NOOP collapse from a zero-width paired
+margin. That inference is false: round-trip trades are cash-neutral against an
+unchanged market, so `learner_05` placed 16,686 orders over 35,950 decisions at
+cutoff 143 — a trading rate of 0.464 — and still finished every paired seed on
+exactly 3,000.0 against a baseline doing the same. It passed the ratchet at 987
+benchmark money and passed hard viability, and this check alone rejected it. It
+now reads the candidate's own `trading_rate` through `_collapsed_against_baseline`
+rather than the margin, and shares the activity floor's off switch.
+
 **A note on the reset hold, which nearly repeated the same mistake in reverse.**
 Holding the lineage on the release until a promotion is only safe when there *is*
 a release. With nothing promoted, `released()` is `None`, so the hold would return
@@ -670,7 +695,177 @@ GROUP BY 1, 2, 3 ORDER BY 1, 2, 3
 
 `episodes` has no `pairing_id`; the link is through `pairing_episodes.match_id`.
 
+## The lineage stopped moving, and `market-free-population-v23`
+
+`falloff_v1` did not diverge, collapse, or bankrupt itself. It sat still. Over
+batches 1100–1688 — 590 batches, roughly 30 updates — every series is flat:
+
+| 50-batch bucket | 1100 | 1200 | 1300 | 1400 | 1500 | 1600 | 1650 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| rollout `mean_final_money` | 4,997 | 5,745 | 6,872 | 5,074 | 6,527 | 5,559 | 4,498 |
+
+`mean_loss` held between 0.0014 and 0.0017 across updates 1321–1662 and
+`mean_abs_q` between 0.19 and 0.33. Benchmark money against pilkwang ran 0.9 to
+1,208 from a 3,000 stake, with two promotions in the last twelve updates each
+immediately followed by rejections.
+
+Every exploration change from v7 through v20 aimed at the *behaviour
+distribution* — the sigma setpoint, the periodic burst, the idle burst, the hot
+rungs, the rare-action widening. Only v7 helped. What had stopped moving was the
+trajectory, and a trajectory cannot be pushed out of its basin by the gradient
+that put it there.
+
+**Two learner groups replace the single ever-resuming lineage.** Ten named slots
+train in parallel under one declared model — the harness already namespaces them
+as `dqn_market_free.raw_order_q_v1@learner_00…09` and gives each its own
+lineage, artifacts and batches, so no harness change was needed. A slot whose
+plateau-driven learning rate decays past `lr_graduate_cut` is *ended* rather than
+nursed: its released checkpoint graduates into `population_members`, the mature
+group drops its lowest scorer to hold `mature_capacity = 30`, and the slot
+restarts from the best mature member with its learning rate back at zero and 10%
+of its weights redrawn.
+
+**The learning rate is the graduation clock, and the plateau is what drives it.**
+Warmup climbs linearly from zero to `learning_rate` over `lr_warmup_updates`;
+after that, `lr_plateau_patience` updates without a `lr_plateau_min_delta`
+relative improvement halve it. At 1e-4 down to a cut of 1e-5 that is four
+halvings, and at patience 4 that is at least sixteen stalled updates — sixteen
+generations here — before a slot can end. Against a run that took 57 consecutive
+rejections without anything ending, that is generous rather than trigger-happy.
+
+Progress is measured on a **windowed median of the slot's own benchmark money**,
+never on `mean_loss`. Loss is not a progress signal on this family and is not
+even the right sign — a policy reaching harder states has a *larger* TD residual
+— and a single arena draw is not a number here: `falloff_v1` measured 61 of them
+on one unchanged checkpoint and got everything from 0.93 to 427. A plateau
+detector reading single draws finds an improvement by luck every few updates and
+never decays, which would reproduce the stagnation inside the mechanism meant to
+end it. The plateau counter also does not run during warmup, where a slot is
+deliberately under-trained and its scores describe the ramp rather than the
+policy.
+
+**What graduates is the released checkpoint, never the candidate.** A mature
+member should be a policy the gate has already accepted, and a slot that decayed
+to its cut is by definition one whose recent candidates stopped clearing the bar.
+A slot that never released contributes nothing and simply restarts. Its score is
+the windowed ratchet reference the gate already computed for that incumbent, so
+membership costs no arena time — the same reason `_released_benchmark_money`
+reads a recorded measurement instead of replaying the incumbent.
+
+**The reseed is a whole reset, and that is the part with a scar.** "The lineage
+reset was half a reset" above records what happens otherwise: a restored 18k
+checkpoint trained immediately on ~400 episodes from the 357-coin policy just
+discarded, and the mirror kept playing it. So a reseed carries two watermarks for
+the *slot's whole life*, not for the one update that consumes it —
+`reseed_batch_floor` keeps pre-reseed batches out of the buffer, and
+`reseed_after_checkpoint_id` keeps pre-reseed checkpoints out of the self-play
+pool, which falls back to the mature group while the slot has none of its own.
+The optimizer state and step counters are dropped rather than restored.
+
+The perturbed weights are **materialized as an artifact** rather than redrawn on
+each side from a shared seed, so `collect` and `update` load identical bytes. Two
+code paths agreeing only as long as they keep agreeing is the class of drift the
+`to_numpy` silent-skip bug in this file already cost a debugging session to.
+
+**`resume_reset_after_rejections` goes to 0, and not out of caution.** The
+snapback and the population answer the same question differently, and leaving
+both on is actively harmful: the snapback restores the slot's own incumbent,
+whose score is exactly what the plateau detector is reading, so `lr_best_score`
+gets pinned by the mechanism meant to rescue the slot and the slot never reaches
+its cut.
+
+**The hot actor ladder is retired with it.** `noisy_actor_hot`,
+`noisy_hot_order_rate` and `noisy_hot_scale_limit` are gone and `_noisy` now
+raises on them rather than ignoring them; `cold_order_diagnostics`, which existed
+only to keep the idle trigger reading past them, goes too. Per-episode
+attribution refused them twice: on `burst-v9`, 212 seats at sigma 3.159 finished
+49% bankrupt against 8–26% on the ordinary ladder and bought *zero* land, with
+every land purchase in the run happening at sigma ≤ 0.871; on `falloff-v18` the
+hot rungs' land rate was 4.6% against the ordinary rungs' 4.9%. 97 of 186 actions
+spend money, so a widened policy is broke before a rare action is affordable.
+`rare_sigma_gain` widens single rows and stays — it is a different mechanism, and
+`rare.sigma_scale_vector` leaves NOOP and every well-sampled row at exactly 1.0.
+
+**The cost, stated plainly.** `_update_session_models` iterates the roster in one
+process and each slot collects its own `rounds_per_generation` batches, so a
+generation takes **ten times** what it did. `jobs` stays at 8 inside each
+collector because the slots run one after another, not beside each other.
+
+**And the concern this was built through.** `mean_abs_q` at 0.2 with `mean_loss`
+at 0.0015 is a Q head carrying almost no TD signal. A population fixes a *stuck*
+trajectory, not a flat one. If all ten slots decay to `lr_graduate_cut` with
+benchmark money still under 100, the binding constraint is the reward and the
+answer is Phase 3 below, not more slots.
+
+**The pass condition is narrow, and it is not "money goes up".** It is the mature
+group's *best* score strictly increasing across at least two graduations — the
+ratchet the single lineage could not produce.
+
+```sql
+SELECT declared_model_id, count(*) FILTER (WHERE retired_at IS NULL) AS live,
+       max(score) FILTER (WHERE retired_at IS NULL) AS best,
+       min(score) FILTER (WHERE retired_at IS NULL) AS worst
+FROM population_members GROUP BY 1
+```
+
+```sql
+SELECT model_id, cutoff_batch_seq,
+       metrics_json ->> 'lr'              AS lr,
+       metrics_json ->> 'lr_stage'        AS stage,
+       metrics_json ->> 'lr_score'        AS score,
+       metrics_json ->> 'lr_best_score'   AS best,
+       metrics_json ->> 'lr_stall_updates' AS stall,
+       metrics_json -> 'population' ->> 'action' AS action
+FROM model_updates ORDER BY started_at DESC LIMIT 30
+```
+
+Failure shapes to watch for, each with a different answer:
+
+- **`lr_stage` stuck at `warmup`** — the score read is wired to the wrong
+  benchmark index and `_settle_slot` is receiving `None` every update.
+- **Every slot graduating within a generation or two of each other** — the
+  plateau terms are too tight for the measurement noise, not evidence about the
+  policy. Raise `lr_plateau_patience` before touching anything else.
+- **`population.action = "restart"` on every graduation** — no slot is ever
+  releasing, so the mature group stays empty and ten slots are cold-starting in
+  parallel. That is a gate problem, not a population problem.
+- **Batches after a reseed still naming the graduated checkpoint in
+  `metadata_json ->> 'behavior_checkpoint_id'`** — the marker is not reaching
+  `collect`, and the reset is a third of a reset again.
+
 ## Phase 1 — promotion, if it is still blocked
+
+**Implemented as `promotion_rule = "benchmark_ratchet"`, and the shape it took was
+the opposite of the one below: the problem was not a gate too strict to release,
+it was a gate that had been switched off.** Under `promotion_rule = "always"`,
+`falloff_v1` released nine consecutive updates, three of them with
+`hard_viability.passed = false`. Its head-to-head win rate against its own
+predecessor read 0.29, 0.00, 0.16, 1.00, 0.00, 0.38, 0.59, 0.94 — each comparison
+locally honest, and the series meaningless, because the incumbent it measures
+against *is* the previous update. Against the fixed pilkwang benchmark the same
+run scored 2,979 → 54 → 20 → 1,146 → 18 → 359 → 1 → 11 → 107 → 96 → 146, win rate
+0.00 throughout, and `export-active` was pointing at the 107-coin checkpoint whose
+benchmark median was 1.
+
+The absolute floor sketched below is what the fix kept: the release decision now
+reads the candidate's own money in the index-0 benchmark series against
+`benchmark_release_min_money`, plus a `benchmark_money_ratchet` non-regression
+term against the incumbent's *recorded* score for the same opponent — no extra
+arena time, since that number is already in the incumbent's `gate_json`. The
+head-to-head stays computed and advisory. Two anti-stall mechanisms bound how long
+it can block: `promotion_ratchet_grace_after_rejections` stands the relative term
+down after a streak (never the floor), and `resume_reset_after_rejections = 2`
+snaps the lineage back to something known good.
+
+The money floors had the same drift — their reference is the incumbent's own seat,
+which at `falloff_v1@80` put the mean floor at 58 coins — and on a cold start the
+reference was the quiet baseline, which never trades and so keeps its full 3,000
+stake, making `0.80 ×` it a bar no trading policy clears.
+`viability_cold_start_reference_money` replaces it; `coldstart_v1@140` (candidate
+mean 1,633 / median 2,218, benchmark money 894) is the update that would have
+given that run its first incumbent instead of seven rejections and no escape.
+
+The premise as originally written, and the `outcome_v4` finding that settled it:
 
 **Settled, and the answer was no rule change.** `outcome_v4` promoted at
 `cutoff_batch_seq = 40` under the existing `significant` rule with

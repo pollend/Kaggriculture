@@ -12,6 +12,8 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from kaggriculture_lab import league_queries as lq
+
 PROTOCOL_VERSION = "2025-11-25"
 SUPPORTED_PROTOCOL_VERSIONS = (PROTOCOL_VERSION, "2025-06-18", "2025-03-26")
 
@@ -37,17 +39,6 @@ def _plain(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_plain(item) for item in value]
     return value
-
-
-def _rows(connection: Any, sql: str, parameters: list[Any] | None = None) -> list[dict[str, Any]]:
-    cursor = connection.execute(sql, parameters or [])
-    names = [item[0] for item in cursor.description]
-    return [_plain(dict(zip(names, row))) for row in cursor.fetchall()]
-
-
-def _row(connection: Any, sql: str, parameters: list[Any] | None = None) -> dict[str, Any] | None:
-    values = _rows(connection, sql, parameters)
-    return values[0] if values else None
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -318,196 +309,75 @@ class ProgressMCP:
         league = arguments.get("league")
         if league is not None and (not isinstance(league, str) or not league or len(league) > 100):
             raise ValueError("league must be a non-empty string of at most 100 characters")
-        conditions: list[str] = []
-        parameters: list[Any] = []
-        if status:
-            conditions.append("s.status = %s")
-            parameters.append(status)
-        if league:
-            conditions.append("s.league = %s")
-            parameters.append(league)
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        parameters.append(limit)
         with self.repository.connect() as connection:
-            sessions = _rows(
-                connection,
-                f"""
-                WITH generation_rollup AS (
-                    SELECT session_id, count(*) AS generations,
-                           max(generation_index) AS latest_generation_index
-                    FROM generations GROUP BY session_id
-                ), pairing_rollup AS (
-                    SELECT g.session_id, count(*) AS pairings,
-                           count(*) FILTER (WHERE lp.status = 'COMPLETE') AS completed_pairings
-                    FROM generations g JOIN league_pairings lp USING (generation_id)
-                    GROUP BY g.session_id
-                ), episode_rollup AS (
-                    SELECT g.session_id, count(DISTINCT pe.match_id) AS episodes,
-                           count(DISTINCT pe.match_id) FILTER (WHERE e.failed) AS failed_episodes
-                    FROM generations g JOIN league_pairings lp USING (generation_id)
-                    JOIN pairing_episodes pe USING (pairing_id)
-                    JOIN episodes e USING (match_id) GROUP BY g.session_id
-                ), latest_generation AS (
-                    SELECT session_id, generation_id,
-                           generation_index AS latest_generation_index, status,
-                           row_number() OVER (
-                               PARTITION BY session_id ORDER BY generation_index DESC
-                           ) AS position
-                    FROM generations
-                ), latest_leader AS (
-                    SELECT g.session_id, rs.revision_id,
-                           coalesce(af.name, ar.family_id, rs.revision_id) AS display_name,
-                           rs.rating - 2 * rs.deviation AS conservative,
-                           row_number() OVER (
-                               PARTITION BY g.session_id
-                               ORDER BY g.generation_index DESC,
-                                        (rs.rating - 2 * rs.deviation) DESC,
-                                        rs.revision_id
-                           ) AS position
-                    FROM generations g JOIN rating_snapshots rs USING (generation_id)
-                    LEFT JOIN agent_revisions ar USING (revision_id)
-                    LEFT JOIN agent_families af USING (family_id)
-                    WHERE NOT rs.is_frozen
-                )
-                SELECT s.session_id, s.league, s.name, s.status, s.seed, s.created_at,
-                       coalesce(gr.generations, 0) AS generations,
-                       lg.generation_id AS latest_generation_id,
-                       lg.latest_generation_index, lg.status AS latest_generation_status,
-                       coalesce(pr.pairings, 0) AS pairings,
-                       coalesce(pr.completed_pairings, 0) AS completed_pairings,
-                       coalesce(er.episodes, 0) AS episodes,
-                       coalesce(er.failed_episodes, 0) AS failed_episodes,
-                       ll.revision_id AS leader_revision_id,
-                       ll.display_name AS leader_name,
-                       ll.conservative AS leader_conservative
-                FROM training_sessions s
-                LEFT JOIN generation_rollup gr ON gr.session_id = s.session_id
-                LEFT JOIN latest_generation lg
-                       ON lg.session_id = s.session_id AND lg.position = 1
-                LEFT JOIN pairing_rollup pr ON pr.session_id = s.session_id
-                LEFT JOIN episode_rollup er ON er.session_id = s.session_id
-                LEFT JOIN latest_leader ll
-                       ON ll.session_id = s.session_id AND ll.position = 1
-                {where}
-                ORDER BY s.created_at DESC, s.session_id LIMIT %s
-                """,
-                parameters,
-            )
+            # Resolve the page first, then roll up only those sessions.
+            sessions = lq.sessions(connection, limit=limit, league=league, status=status)
+            session_ids = [str(row["session_id"]) for row in sessions]
+            rollups = {
+                str(row["session_id"]): row
+                for row in lq.session_rollups(connection, session_ids)
+            }
+            latest = {
+                str(row["session_id"]): row
+                for row in lq.session_latest_generations(connection, session_ids)
+            }
+            leaders = {
+                str(row["session_id"]): row
+                for row in lq.session_leaders(connection, session_ids)
+            }
+        listed = []
         for session in sessions:
-            total = int(session["pairings"] or 0)
-            complete = int(session["completed_pairings"] or 0)
-            session["pairing_completion_fraction"] = complete / total if total else None
-        return {"sessions": sessions, "count": len(sessions)}
+            session_id = str(session["session_id"])
+            rollup = rollups.get(session_id, {})
+            generation = latest.get(session_id, {})
+            leader = leaders.get(session_id, {})
+            total = int(rollup.get("pairings") or 0)
+            complete = int(rollup.get("completed_pairings") or 0)
+            listed.append({
+                "session_id": session_id,
+                "league": session["league"],
+                "name": session["name"],
+                "status": session["status"],
+                "seed": session["seed"],
+                "created_at": session["created_at"],
+                "generations": int(rollup.get("generations") or 0),
+                "latest_generation_id": generation.get("generation_id"),
+                "latest_generation_index": generation.get("generation_index"),
+                "latest_generation_status": generation.get("status"),
+                "pairings": total,
+                "completed_pairings": complete,
+                "failed_pairings": int(rollup.get("failed_pairings") or 0),
+                "episodes": int(rollup.get("episodes") or 0),
+                "failed_episodes": int(rollup.get("failed_episodes") or 0),
+                "completed_rounds": int(rollup.get("completed_rounds") or 0),
+                "leader_revision_id": leader.get("revision_id"),
+                "leader_name": leader.get("display_name"),
+                "leader_conservative": leader.get("conservative"),
+                "pairing_completion_fraction": complete / total if total else None,
+            })
+        return {"sessions": listed, "count": len(listed)}
 
     def _get_session_progress(self, arguments: dict[str, Any]) -> dict[str, Any]:
         session_id = _required_text(arguments, "session_id")
         generation_limit = _bounded_int(arguments, "generation_limit", 10, 100)
         leader_limit = _bounded_int(arguments, "leader_limit", 10, 50)
         with self.repository.connect() as connection:
-            session = _row(
-                connection,
-                """
-                SELECT session_id, league, name, status, seed, config_json, created_at
-                FROM training_sessions WHERE session_id = %s
-                """,
-                [session_id],
-            )
+            session = lq.session(connection, session_id)
             if session is None:
                 raise LookupError(f"session not found: {session_id}")
             session["config"] = _json_object(session.pop("config_json"))
-            generations = _rows(
-                connection,
-                """
-                WITH members AS (
-                    SELECT generation_id, count(*) AS members
-                    FROM generation_members GROUP BY generation_id
-                ), pairings AS (
-                    SELECT generation_id, count(*) AS pairings,
-                           count(*) FILTER (WHERE status = 'COMPLETE') AS completed_pairings,
-                           count(*) FILTER (WHERE status = 'ERROR') AS pairing_errors
-                    FROM league_pairings GROUP BY generation_id
-                ), episode_counts AS (
-                    SELECT lp.generation_id, count(DISTINCT pe.match_id) AS episodes,
-                           count(DISTINCT pe.match_id) FILTER (WHERE e.failed) AS failed_episodes,
-                           sum(e.wallclock) AS wallclock_seconds
-                    FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
-                    JOIN episodes e USING (match_id) GROUP BY lp.generation_id
-                ), rounds AS (
-                    SELECT generation_id,
-                           count(DISTINCT round_index) FILTER (
-                               WHERE scope = 'round' AND status = 'COMPLETE'
-                           ) AS completed_rounds,
-                           count(*) FILTER (WHERE status = 'ERROR') AS hook_errors
-                    FROM model_round_hooks GROUP BY generation_id
-                )
-                SELECT g.generation_id, g.generation_index, g.status, g.created_at,
-                       g.completed_at, coalesce(m.members, 0) AS members,
-                       coalesce(p.pairings, 0) AS pairings,
-                       coalesce(p.completed_pairings, 0) AS completed_pairings,
-                       coalesce(p.pairing_errors, 0) AS pairing_errors,
-                       coalesce(ec.episodes, 0) AS episodes,
-                       coalesce(ec.failed_episodes, 0) AS failed_episodes,
-                       coalesce(ec.wallclock_seconds, 0) AS wallclock_seconds,
-                       coalesce(r.completed_rounds, 0) AS completed_rounds,
-                       coalesce(r.hook_errors, 0) AS hook_errors
-                FROM generations g LEFT JOIN members m USING (generation_id)
-                LEFT JOIN pairings p USING (generation_id)
-                LEFT JOIN episode_counts ec USING (generation_id)
-                LEFT JOIN rounds r USING (generation_id)
-                WHERE g.session_id = %s ORDER BY g.generation_index DESC LIMIT %s
-                """,
-                [session_id, generation_limit],
+            generations = lq.session_generations(
+                connection, session_id, limit=generation_limit
             )
-            trend = _rows(
-                connection,
-                """
-                SELECT g.generation_id, g.generation_index,
-                       max(rs.rating - 2 * rs.deviation) AS champion_conservative,
-                       percentile_cont(0.5) WITHIN GROUP (
-                           ORDER BY rs.rating - 2 * rs.deviation
-                       ) AS median_conservative
-                FROM generations g JOIN rating_snapshots rs USING (generation_id)
-                WHERE g.session_id = %s AND NOT rs.is_frozen
-                GROUP BY g.generation_id, g.generation_index
-                ORDER BY g.generation_index
-                """,
-                [session_id],
-            )
+            trend = lq.rating_trend(connection, session_id)
             latest_generation_id = generations[0]["generation_id"] if generations else None
             leaders = []
             if latest_generation_id is not None:
-                leaders = self._generation_leaders(connection, str(latest_generation_id), leader_limit)
-            evaluations = _row(
-                connection,
-                """
-                SELECT count(*) AS evaluations,
-                       count(*) FILTER (WHERE ee.status = 'ERROR') AS errors,
-                       count(*) FILTER (
-                           WHERE ee.status = 'COMPLETE'
-                             AND coalesce(CAST(ee.result_json ->> 'should_reevaluate' AS BOOLEAN), false)
-                       ) AS reevaluation_requests
-                FROM episode_evaluations ee JOIN pairing_episodes pe USING (match_id)
-                JOIN league_pairings lp USING (pairing_id)
-                JOIN generations g USING (generation_id) WHERE g.session_id = %s
-                """,
-                [session_id],
-            ) or {"evaluations": 0, "errors": 0, "reevaluation_requests": 0}
-            models = _rows(
-                connection,
-                """
-                WITH session_models AS (
-                    SELECT DISTINCT model_id FROM model_round_hooks WHERE session_id = %s
-                ), batches AS (
-                    SELECT model_id, max(batch_seq) AS latest_batch_seq
-                    FROM training_batches GROUP BY model_id
+                leaders = lq.generation_leaderboard(
+                    connection, str(latest_generation_id), limit=leader_limit
                 )
-                SELECT tm.model_id, tm.active_checkpoint_id, tm.min_new_batches,
-                       tm.last_attempted_batch_seq, coalesce(b.latest_batch_seq, 0) AS latest_batch_seq
-                FROM session_models sm JOIN training_models tm USING (model_id)
-                LEFT JOIN batches b USING (model_id) ORDER BY tm.model_id
-                """,
-                [session_id],
-            )
+            evaluations = lq.evaluation_rollup(connection, session_id=session_id)
+            models = lq.session_models(connection, session_id)
         for generation in generations:
             pairings = int(generation["pairings"] or 0)
             complete = int(generation["completed_pairings"] or 0)
@@ -517,8 +387,11 @@ class ProgressMCP:
         rating_delta = None
         median_delta = None
         if len(trend) >= 2:
-            rating_delta = float(trend[-1]["champion_conservative"]) - float(trend[-2]["champion_conservative"])
-            median_delta = float(trend[-1]["median_conservative"]) - float(trend[-2]["median_conservative"])
+            last, previous = trend[-1], trend[-2]
+            if last["champion_conservative"] is not None and previous["champion_conservative"] is not None:
+                rating_delta = float(last["champion_conservative"]) - float(previous["champion_conservative"])
+            if last["median_conservative"] is not None and previous["median_conservative"] is not None:
+                median_delta = float(last["median_conservative"]) - float(previous["median_conservative"])
         totals = {
             "generations_returned": len(generations),
             "pairings": sum(int(row["pairings"] or 0) for row in generations),
@@ -540,128 +413,20 @@ class ProgressMCP:
             "models": models,
         }
 
-    def _generation_leaders(self, connection: Any, generation_id: str, limit: int) -> list[dict[str, Any]]:
-        return _rows(
-            connection,
-            """
-            WITH episode_rollup AS (
-                SELECT ep.strategy_id AS revision_id, count(*) AS episodes,
-                       avg(ep.final_money) AS mean_final_money,
-                       avg(ep.money_difference) AS mean_episode_margin,
-                       avg(ep.win) AS win_rate,
-                       avg(ep.productive_action_percentage) AS productive_action_fraction,
-                       avg(ep.final_shed_items + ep.final_carried_items) AS mean_unsold_items
-                FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
-                JOIN episode_players ep USING (match_id)
-                WHERE lp.generation_id = %s AND NOT ep.failed GROUP BY ep.strategy_id
-            )
-            SELECT rs.revision_id, ar.strategy_id,
-                   coalesce(af.name, ar.family_id, rs.revision_id) AS display_name,
-                   rs.rating, rs.deviation, rs.rating - 2 * rs.deviation AS conservative,
-                   rs.games AS rated_games, gs.games AS paired_games, gs.wins, gs.draws, gs.losses,
-                   gs.mean_margin, gs.median_margin, er.episodes, er.mean_final_money,
-                   er.mean_episode_margin, er.win_rate, er.productive_action_fraction,
-                   er.mean_unsold_items
-            FROM rating_snapshots rs
-            LEFT JOIN generation_stats gs USING (generation_id, revision_id)
-            LEFT JOIN agent_revisions ar USING (revision_id)
-            LEFT JOIN agent_families af USING (family_id)
-            LEFT JOIN episode_rollup er USING (revision_id)
-            WHERE rs.generation_id = %s AND NOT rs.is_frozen
-            ORDER BY conservative DESC, rs.revision_id LIMIT %s
-            """,
-            [generation_id, generation_id, limit],
-        )
-
     def _get_generation_progress(self, arguments: dict[str, Any]) -> dict[str, Any]:
         generation_id = _required_text(arguments, "generation_id")
         leader_limit = _bounded_int(arguments, "leader_limit", 10, 50)
         with self.repository.connect() as connection:
-            generation = _row(
-                connection,
-                """
-                SELECT g.generation_id, g.session_id, g.generation_index, g.status,
-                       g.model_checkpoint_id, g.created_at, g.completed_at,
-                       s.league, s.name AS session_name, s.config_json
-                FROM generations g JOIN training_sessions s USING (session_id)
-                WHERE g.generation_id = %s
-                """,
-                [generation_id],
-            )
+            generation = lq.generation(connection, generation_id)
             if generation is None:
                 raise LookupError(f"generation not found: {generation_id}")
             config = _json_object(generation.pop("config_json"))
-            work = _row(
-                connection,
-                """
-                SELECT
-                    (SELECT count(*) FROM generation_members WHERE generation_id = %s) AS members,
-                    (SELECT count(*) FROM league_pairings WHERE generation_id = %s) AS pairings,
-                    (SELECT count(*) FROM league_pairings WHERE generation_id = %s AND status = 'COMPLETE') AS completed_pairings,
-                    (SELECT count(*) FROM league_pairings WHERE generation_id = %s AND status = 'ERROR') AS pairing_errors,
-                    (SELECT count(DISTINCT pe.match_id) FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id) WHERE lp.generation_id = %s) AS episodes,
-                    (SELECT count(DISTINCT pe.match_id) FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id) JOIN episodes e USING (match_id) WHERE lp.generation_id = %s AND e.failed) AS failed_episodes,
-                    (SELECT coalesce(sum(e.wallclock), 0) FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id) JOIN episodes e USING (match_id) WHERE lp.generation_id = %s) AS wallclock_seconds,
-                    (SELECT count(*) FROM (
-                        SELECT round_index FROM model_round_hooks
-                        WHERE generation_id = %s AND scope = 'round'
-                        GROUP BY round_index HAVING bool_and(status = 'COMPLETE')
-                    )) AS completed_rounds
-                """,
-                [generation_id] * 8,
-            ) or {}
-            outcomes = _row(
-                connection,
-                """
-                SELECT count(*) FILTER (WHERE NOT failed) AS settled_pairings,
-                       avg(paired_margin) FILTER (WHERE NOT failed) AS mean_paired_margin,
-                       percentile_cont(0.5) WITHIN GROUP (ORDER BY paired_margin)
-                           FILTER (WHERE NOT failed) AS median_paired_margin,
-                       stddev_samp(paired_margin) FILTER (WHERE NOT failed) AS paired_margin_stddev,
-                       count(*) FILTER (WHERE failed) AS failed_pairing_results
-                FROM pairing_results pr JOIN league_pairings lp USING (pairing_id)
-                WHERE lp.generation_id = %s
-                """,
-                [generation_id],
-            ) or {}
-            seats = _rows(
-                connection,
-                """
-                SELECT ep.seat, count(*) AS episodes, avg(ep.final_money) AS mean_final_money,
-                       avg(ep.money_difference) AS mean_margin, avg(ep.win) AS win_rate
-                FROM league_pairings lp JOIN pairing_episodes pe USING (pairing_id)
-                JOIN episode_players ep USING (match_id)
-                WHERE lp.generation_id = %s AND NOT ep.failed
-                GROUP BY ep.seat ORDER BY ep.seat
-                """,
-                [generation_id],
-            )
-            hooks = _rows(
-                connection,
-                """
-                SELECT model_id, scope, status, count(*) AS hooks,
-                       min(round_index) AS first_round, max(round_index) AS last_round,
-                       sum(batches_recorded) AS batches_recorded
-                FROM model_round_hooks WHERE generation_id = %s
-                GROUP BY model_id, scope, status ORDER BY model_id, scope, status
-                """,
-                [generation_id],
-            )
-            evaluations = _rows(
-                connection,
-                """
-                SELECT ee.status, ee.evaluator_path, count(*) AS evaluations,
-                       count(*) FILTER (
-                           WHERE coalesce(CAST(ee.result_json ->> 'should_reevaluate' AS BOOLEAN), false)
-                       ) AS reevaluation_requests
-                FROM episode_evaluations ee JOIN pairing_episodes pe USING (match_id)
-                JOIN league_pairings lp USING (pairing_id)
-                WHERE lp.generation_id = %s GROUP BY ee.status, ee.evaluator_path
-                ORDER BY ee.status, ee.evaluator_path
-                """,
-                [generation_id],
-            )
-            leaders = self._generation_leaders(connection, generation_id, leader_limit)
+            work = lq.generation_work(connection, generation_id)
+            outcomes = lq.generation_outcomes(connection, generation_id)
+            seats = lq.seat_balance(connection, generation_id)
+            hooks = lq.generation_hook_rollup(connection, generation_id)
+            evaluations = lq.evaluation_rollup_by_evaluator(connection, generation_id)
+            leaders = lq.generation_leaderboard(connection, generation_id, limit=leader_limit)
         pairings = int(work.get("pairings") or 0)
         completed = int(work.get("completed_pairings") or 0)
         rounds_planned = int(config.get("rounds_per_generation", 0) or 0)
@@ -681,23 +446,7 @@ class ProgressMCP:
         model_id = _required_text(arguments, "model_id")
         limit = _bounded_int(arguments, "history_limit", 10, 50)
         with self.repository.connect() as connection:
-            model = _row(
-                connection,
-                """
-                SELECT tm.model_id, tm.family_id, tm.agent_type, tm.agent_name,
-                       tm.declared_model_id, tm.trainer_path, tm.min_new_batches,
-                       tm.config_json, tm.active_checkpoint_id, tm.last_attempted_batch_seq,
-                       coalesce(tb.latest_batch_seq, 0) AS latest_batch_seq,
-                       tm.created_at, tm.updated_at
-                FROM training_models tm
-                LEFT JOIN (
-                    SELECT model_id, max(batch_seq) AS latest_batch_seq
-                    FROM training_batches GROUP BY model_id
-                ) tb USING (model_id)
-                WHERE tm.model_id = %s
-                """,
-                [model_id],
-            )
+            model = lq.model(connection, model_id)
             if model is None:
                 raise LookupError(f"model not found: {model_id}")
             model["config"] = _json_object(model.pop("config_json"))
@@ -705,81 +454,26 @@ class ProgressMCP:
             model["update_eligible"] = model["new_batches"] >= int(model["min_new_batches"])
             active_checkpoint = None
             if model["active_checkpoint_id"]:
-                active_checkpoint = _row(
-                    connection,
-                    """
-                    SELECT checkpoint_id, update_id, parent_checkpoint_id,
-                           trainer_artifact_path, inference_artifact_path, artifact_sha256,
-                           dataset_sha256, metrics_json, gate_json, promoted, created_at
-                    FROM model_training_checkpoints WHERE checkpoint_id = %s
-                    """,
-                    [model["active_checkpoint_id"]],
-                )
+                active_checkpoint = lq.checkpoint(connection, str(model["active_checkpoint_id"]))
                 if active_checkpoint:
+                    active_checkpoint.pop("model_id", None)
                     active_checkpoint["metrics"] = _json_object(active_checkpoint.pop("metrics_json"))
                     active_checkpoint["gate"] = _json_object(active_checkpoint.pop("gate_json"))
-            batches = _rows(
-                connection,
-                """
-                SELECT batch_seq, batch_id, source_kind, source_id, sample_count,
-                       metadata_json, created_at FROM training_batches
-                WHERE model_id = %s ORDER BY batch_seq DESC LIMIT %s
-                """,
-                [model_id, limit],
-            )
+            batches = lq.model_batches(connection, model_id, limit=limit)
             for batch in batches:
                 batch["metadata"] = _json_object(batch.pop("metadata_json"))
-            updates = _rows(
-                connection,
-                """
-                SELECT update_id, parent_checkpoint_id, cutoff_batch_seq, new_batch_count,
-                       dataset_sha256, status, candidate_checkpoint_id, metrics_json,
-                       gate_json, error_text, started_at, completed_at
-                FROM model_updates WHERE model_id = %s
-                ORDER BY started_at DESC LIMIT %s
-                """,
-                [model_id, limit],
-            )
+            updates = lq.model_updates(connection, model_id, limit=limit)
             for update in updates:
                 update["metrics"] = _json_object(update.pop("metrics_json"))
                 update["gate"] = _json_object(update.pop("gate_json"))
-            checkpoints = _rows(
-                connection,
-                """
-                SELECT checkpoint_id, update_id, parent_checkpoint_id, promoted,
-                       metrics_json, gate_json, dataset_sha256, created_at
-                FROM model_training_checkpoints WHERE model_id = %s
-                ORDER BY created_at DESC LIMIT %s
-                """,
-                [model_id, limit],
-            )
+            checkpoints = lq.model_checkpoints(connection, model_id, limit=limit)
             for checkpoint in checkpoints:
                 checkpoint["metrics"] = _json_object(checkpoint.pop("metrics_json"))
                 checkpoint["gate"] = _json_object(checkpoint.pop("gate_json"))
-            evaluations = _rows(
-                connection,
-                """
-                SELECT me.evaluation_id, me.update_id, me.evaluation_kind,
-                       me.opponent_checkpoint_id, me.metrics_json, me.passed, me.created_at
-                FROM model_evaluations me WHERE me.model_id = %s
-                ORDER BY me.created_at DESC LIMIT %s
-                """,
-                [model_id, limit],
-            )
+            evaluations = lq.model_evaluations(connection, model_id, limit=limit)
             for evaluation in evaluations:
                 evaluation["metrics"] = _json_object(evaluation.pop("metrics_json"))
-            hook_status = _rows(
-                connection,
-                """
-                SELECT session_id, scope, status, count(*) AS hooks,
-                       max(generation_id) AS latest_generation_id,
-                       max(round_index) AS latest_round_index,
-                       sum(batches_recorded) AS batches_recorded
-                FROM model_round_hooks WHERE model_id = %s
-                GROUP BY session_id, scope, status ORDER BY session_id, scope, status
-                """,
-                [model_id],
-            )
+            hook_status = lq.model_hook_status(connection, model_id)
         return {
             "model": model,
             "active_checkpoint": active_checkpoint,

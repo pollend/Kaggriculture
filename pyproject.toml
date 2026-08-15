@@ -33,6 +33,9 @@ packages = ["kaggriculture_lab", "sim", "agents"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "kaggriculture_lab/schema.sql" = "kaggriculture_lab/schema.sql"
+# The dashboard reads these at runtime; without them the wheel ships a site with
+# no stylesheet and no client-side event handling.
+"kaggriculture_lab/dashboard/static" = "kaggriculture_lab/dashboard/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "sim"]

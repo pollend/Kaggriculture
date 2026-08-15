@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import threading
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import contextmanager
@@ -389,6 +390,13 @@ _THREAD_VARS = (
     "VECLIB_MAXIMUM_THREADS",
 )
 
+#: Reference count and saved values for the pin below. Module state rather than
+#: closure state because the thing being guarded -- `os.environ` -- is itself
+#: process-global, so the guard has to be too.
+_PIN_LOCK = threading.Lock()
+_pin_depth = 0
+_pin_saved: dict[str, str | None] = {}
+
 
 @contextmanager
 def _single_threaded_workers():
@@ -404,26 +412,43 @@ def _single_threaded_workers():
     inherit the environment at launch, and the variables have to be set before
     numpy is imported in the child -- which happens while the task is being
     unpickled, ahead of any initializer running.
+
+    Reference counted, because `os.environ` is process-global and this is now
+    entered from several threads at once. One learner per thread is how a
+    population run keeps a 32-core box busy, and the naive save/restore is a race
+    on exactly the variable it exists to control: the second thread in saves the
+    "1"s the first one wrote, and when *it* exits it restores them as though they
+    were the originals -- so the pin either leaks forever or, far worse, is torn
+    down while another thread is still spawning workers. That worker inherits an
+    unpinned environment, and the docstring above measures what that costs: ~350%
+    CPU per worker and a 16-episode batch taking 17 minutes.
+
+    The innermost enter pins and the outermost exit restores, so a single-threaded
+    caller sees byte-for-byte the previous behaviour.
     """
 
-    saved = {name: os.environ.get(name) for name in _THREAD_VARS}
-    os.environ.update({name: "1" for name in _THREAD_VARS})
+    global _pin_depth
+    with _PIN_LOCK:
+        if _pin_depth == 0:
+            _pin_saved.clear()
+            _pin_saved.update({name: os.environ.get(name) for name in _THREAD_VARS})
+            os.environ.update({name: "1" for name in _THREAD_VARS})
+        _pin_depth += 1
     try:
         yield
     finally:
-        for name, value in saved.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        with _PIN_LOCK:
+            _pin_depth -= 1
+            if _pin_depth == 0:
+                for name, value in _pin_saved.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+                _pin_saved.clear()
 
 
-def actor_sigma_scales(
-    actors: int,
-    alpha: float = 32.0,
-    hot: int = 0,
-    top: float = 1.0,
-) -> list[float]:
+def actor_sigma_scales(actors: int, alpha: float = 32.0) -> list[float]:
     """One NoisyNet sigma multiplier per actor, spread geometrically.
 
     One temperature for a whole batch fills the buffer with near-copies of one
@@ -441,32 +466,20 @@ def actor_sigma_scales(
     This is Ape-X's per-actor temperature trick transplanted, *not* principled
     NoisyNet -- the paper has one sigma, learned, and no spread at all.
 
-    `hot` rungs above the setpoint, if asked for. The spread above is downward
-    only: no episode anywhere ever explores harder than the controller resolved,
-    so the rarest behaviours are precisely the ones collection is structurally
-    blind to. `hot` actors run above 1.0 instead, geometrically from `top` down
-    to the setpoint, and the remaining `N - hot` run the ordinary ladder from 1.0
-    down to `1/alpha` -- so both the setpoint read and the near-greedy read
-    survive. At `N=8, hot=2, top=4, alpha=32`:
-    `[4.0, 2.0, 1.0, 0.5, 0.25, 0.125, 0.0625, 0.031]`.
-
-    `top` is a *ratio* against the setpoint rather than an absolute sigma,
-    because that is the unit the caller has: it divides the burst base the
-    controller resolved from a target order rate by the setpoint, so the hottest
-    rung plays exactly what an idle burst would and inherits the same measured
-    ceiling. `hot = 0` reproduces the ladder byte for byte.
+    The spread is downward only, and the two mechanisms that tried to put rungs
+    *above* the setpoint are both retired: the periodic idle burst at v15, and
+    `noisy_actor_hot` here. Per-episode attribution across `burst-v9` and
+    `falloff-v18` says the same thing twice -- every land purchase in the run
+    happened at sigma <= 0.871, 49% of seats went bankrupt at 3.159, and the hot
+    rungs' land rate (4.6%) was indistinguishable from the ordinary rungs' (4.9%).
+    Widening the whole policy does not reach rare behaviour, it bankrupts the
+    wallet before the behaviour becomes affordable. `rare.sigma_scale_vector`
+    widens single rows instead, which is a different mechanism and stays.
     """
 
     if actors <= 1:
         return [1.0]
-    hot = max(0, min(hot, actors - 1))
-    if top <= 1.0:
-        hot = 0
-    above = [top ** ((hot - index) / hot) for index in range(hot)]
-    cold = actors - hot
-    if cold <= 1:
-        return above + [1.0]
-    return above + [alpha ** (-(index / (cold - 1))) for index in range(cold)]
+    return [alpha ** (-(index / (actors - 1))) for index in range(actors)]
 
 
 def collect_batch(
@@ -498,15 +511,14 @@ def collect_batch(
     temperature, or the paired margin the league settles is a comparison between
     two different agents.
 
-    `rare_sigma_gain` goes to the first `rare_sigma_pairs` pairs -- the hot end,
-    the same end `noisy_actor_hot` counts from -- at full gain rather than one
-    scaled by the rung's own sigma.
+    `rare_sigma_gain` goes to the first `rare_sigma_pairs` pairs -- the widest
+    rungs of the ladder -- at full gain rather than one scaled by the rung's own
+    sigma.
 
-    The hot end because that is already the arm whose job is finding things, and
-    because the near-greedy tail has to stay a clean read of the policy:
-    `cold_order_diagnostics` triggers the idle escape off it, and the money series
-    is only comparable across this change if some pairs are collecting what v18
-    collected.
+    The widest end because that is already the arm whose job is finding things,
+    and because the near-greedy tail has to stay a clean read of the policy: the
+    money series is only comparable across this change if some pairs are
+    collecting what v18 collected.
 
     Worth being explicit about one piece of evidence that looks like it argues the
     other way. `market-free-burst-v9` attributed every episode to its rung across

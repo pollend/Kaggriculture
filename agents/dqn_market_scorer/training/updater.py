@@ -161,7 +161,7 @@ class LineageCheckpoint:
     reset: bool = False
 
 
-def rejections_since_promotion(reader, model_id: str) -> int:
+def rejections_since_promotion(reader, model_id: str, *, held: bool = False) -> int:
     """Consecutive rejections the lineage is currently carrying.
 
     A recorded `lineage_reset` ends the streak as surely as a promotion does, and
@@ -171,7 +171,36 @@ def rejections_since_promotion(reader, model_id: str) -> int:
     only ever grows, so a run that trips the limit once trips it on every update
     after -- which pins a released run to its incumbent forever, and puts a
     never-released one on a reinitialize-every-update treadmill.
+
+    `held` is the case that reading alone does not cover, and leaving it out
+    deadlocks the run. The cutoff above is right for the reset that *fires*; it is
+    wrong for every update where the reset is only being *held*, because a held
+    update writes `lineage_reset` too and so moves the cutoff onto itself. The
+    streak then reads 0 forever, and every guard downstream that scales with it --
+    `promotion_ratchet_grace_after_rejections` above all -- becomes structurally
+    unreachable. Measured on `market-free-rare-v20`: 55 consecutive held updates,
+    all reporting a streak of 0, `gradient_steps` pinned at 24,100 throughout,
+    zero promotions in seven and a half hours. The escape hatch for a frozen
+    ratchet cannot itself be frozen by the snapback.
+
+    While the hold is in force the lineage is back on the released checkpoint, so
+    those rejections are one trajectory's again and belong to one streak. Count
+    them from the last promotion and ignore the resets.
     """
+
+    if held:
+        row = reader.fetchone(
+            """
+            SELECT count(*) FROM model_updates
+            WHERE model_id = %s AND status = 'REJECTED' AND started_at > coalesce(
+                (SELECT max(started_at) FROM model_updates
+                 WHERE model_id = %s AND status = 'PROMOTED'),
+                '-infinity'::timestamp
+            )
+            """,
+            [model_id, model_id],
+        )
+        return 0 if row is None else int(row[0])
 
     row = reader.fetchone(
         """
@@ -295,7 +324,15 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
         return released()
 
     limit = int(getattr(context, "config", {}).get("resume_reset_after_rejections", 0))
-    streak = rejections_since_promotion(reader, context.model_id) if limit > 0 else 0
+    # `held` is resolved first because the streak is measured differently under it:
+    # a held update writes `lineage_reset`, so the ordinary query's cutoff lands on
+    # the held update itself and the streak reads 0 for as long as the hold lasts.
+    # See `rejections_since_promotion`.
+    fallback = released()
+    held = fallback is not None and reset_since_promotion(reader, context.model_id)
+    streak = (
+        rejections_since_promotion(reader, context.model_id, held=held) if limit > 0 else 0
+    )
     # A reset holds until something promotes, rather than lasting one update.
     #
     # It used to last exactly one. The reset zeroes the streak -- correctly, the
@@ -320,13 +357,19 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
     # next attempt trains from good weights on good data instead of from good
     # weights on the discarded policy's buffer.
     #
+    # That self-repair assumes the gate is *reachable*. When it is not, the hold is
+    # a fixed point: `market-free-rare-v20` held for 55 consecutive updates, each
+    # one resuming `9071d2ad` and training exactly 2,000 steps before the ratchet
+    # refused it, so `gradient_steps` never moved off 24,100. What made it a trap
+    # rather than a pause was the streak reading 0 throughout, which is now fixed
+    # in `rejections_since_promotion` -- the hold still holds, but the guards that
+    # scale with the streak can see it and stand the ratchet down.
+    #
     # Both conditions require a release, so `fallback` gates the whole branch.
     # With nothing promoted there is no snapback available -- only a wipe back to
     # `quiet_start`, which discards the run's entire training history and which a
     # cold start cannot survive at any useful limit. See the docstring for the
     # measurement and for the v3 hole this knowingly reinstates.
-    fallback = released()
-    held = fallback is not None and reset_since_promotion(reader, context.model_id)
     if limit > 0 and fallback is not None and (streak >= limit or held):
         return replace(fallback, rejection_streak=streak, reset=True)
     return LineageCheckpoint(

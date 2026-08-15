@@ -25,16 +25,36 @@ from sim.runner import MatchResult
 
 
 class ExperimentStore:
+    """One connection to the lab database, with the schema ensured on open.
+
+    `initialize=False` skips that bootstrap, and exists for the case where
+    several stores are opened at once against a database some earlier store has
+    already initialized. `_initialize_schema` executes the whole of `schema.sql`,
+    and running it concurrently from more than one connection deadlocks: two
+    transactions take the same objects' locks in different orders and PostgreSQL
+    kills one of them. Measured on `market-free-population-v25`, four learners
+    opening their own store to run their model update at the same time:
+
+        psycopg.errors.DeadlockDetected: deadlock detected
+        Process 154699 waits for ShareLock on relation 16444; blocked by 154301.
+        Process 154301 waits for RowExclusiveLock on relation 16429; blocked by 154699.
+
+    It is also just waste on a database that already has its schema, which is
+    every connection after the first.
+    """
+
     def __init__(
         self,
         database: str | DatabaseTarget,
+        *,
+        initialize: bool = True,
     ):
         self.target = (
             database
             if isinstance(database, DatabaseTarget)
             else DatabaseTarget(database)
         )
-        self.connection = connect_postgres(self.target)
+        self.connection = connect_postgres(self.target, initialize=initialize)
 
     def close(self) -> None:
         self.connection.close()

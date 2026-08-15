@@ -288,17 +288,126 @@ SYNC_ENVIRONMENT = True
 # Same `MODEL_NAME` deliberately. The reward function is untouched, so v18's
 # batches are the same quantity this run's buffer wants, and `all_batches` is
 # scoped by `model_id`. Only the behaviour distribution moves.
-SESSION_ID = "market-free-rare-v20"
+#
+# v21: stop tuning exploration. It was never the binding constraint, and v20
+# proved it twice over.
+#
+# v20 ran 61 generations and learned nothing after generation 11, for a reason
+# that had nothing to do with sigma. `resume_reset_after_rejections` fired at
+# batch 281 and `lineage_checkpoint` held the snapback -- correctly, that is what
+# it is for -- but every held update writes `lineage_reset`, and
+# `rejections_since_promotion` used to stop counting at the newest one. So the
+# streak read 0 on all 55 held updates, `promotion_ratchet_grace_after_rejections`
+# could never fire, and the run resumed `9071d2ad` and trained exactly 2,000
+# steps 55 times in a row: `gradient_steps` pinned at 24,100 for seven and a half
+# hours, 57 consecutive rejections, nothing cumulative. Both halves are fixed --
+# the streak counts through a held reset, and grace now drops the *floor* rather
+# than the ratchet, because the floor was the unreachable term (candidate
+# benchmark money 0.93-427 against a bar of 1,000, on a reference of 145.8 that
+# could not have cleared its own floor either).
+#
+# The exploration numbers over those same 55 updates say the rest of it:
+# `noisy_argmax_flip_rate` 0.24-0.46, `sigma_ratio_0` pinned around 3.5 at the
+# `rare_sigma_cap`, `noisy_flip_to_order_rate` 0.07-0.14 against a 0.05 setpoint.
+# The controller was live and above target throughout. There is nothing to turn
+# up.
+#
+# What was actually missing is an opponent worth beating. `opponents` was a
+# single seeded-noise agent, and the learner solved it at generation 6 -- paired
+# margin flat at ~5,900 and a win rate of exactly 1.000 for the following 55
+# generations -- while the gate measured it against pilkwang, which it had never
+# once played. The comment on `self_play_ratio` below already named this failure
+# from `train_dqn.py`; v20 reproduced it one level up. See `opponents` for what
+# replaces it and why it is three entries rather than the manifest's five.
+#
+# `market-free-population-v23` is where the roster arrives, and the model names
+# move with it for the first time since v10. They have to: `_self_play_pool`,
+# `lineage_checkpoint` and the slot state are all scoped by `model_id`, so ten
+# named slots are ten independent lineages and none of them may inherit v22's.
+#
+# What the stall looked like, since it is the whole reason for the change.
+# `falloff_v1` over batches 1100-1688, by 50-batch bucket:
+#
+#     money  4997 5179 5745 6227 6872 5983 5074 4861 6527 3906 5559 4498
+#
+# No trend in either direction across 590 batches. `mean_loss` 0.0014-0.0017 and
+# `mean_abs_q` 0.19-0.33 over the same span, both flat, and benchmark money
+# against pilkwang between 0.9 and 1,208 from a 3,000 stake. Two promotions in the
+# last twelve updates, each immediately followed by rejections. Every exploration
+# lever tried from v7 through v20 aimed at the behaviour distribution; the thing
+# that had stopped moving was the trajectory.
+# v25 rather than resuming v24 because `rounds_per_generation` changed, and that
+# is in the run manifest: `ensure_session` hashes the league config and refuses a
+# resume whose digest moved, which is the right guard -- a generation would mean
+# two different things inside one session's history.
+#
+# The learner slots do not restart. `training_models` is keyed on model id rather
+# than on session, so the LR clocks, lineage checkpoints and the batch watermark
+# all carry across, and the graduation clock keeps the updates it has already
+# banked. What resets is the generation counter and the session's own rollups.
+SESSION_ID = "market-free-population-v25"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_league.toml")
 MANIFEST = Path("agents/dqn_market_free/agent.toml")
-MODEL_NAME = "falloff_v1"
+
+# Ten concurrent learner slots under one declared model, which the harness
+# namespaces as `dqn_market_free.raw_order_q_v1@learner_00` and so on.
+#
+# The cost was wall clock and it was linear, because `run_round_hooks` and
+# `_update_session_models` both walked the roster one slot at a time in one
+# process. v23 measured what that costs: 77 minutes a generation, load average 9
+# on 32 cores, max concurrent model updates 1. `training_concurrency` below is the
+# fix -- the slots are independent lineages and there was never a reason to walk
+# them -- and `SESSION_ID` moves to v24 because `ensure_session` digests both the
+# league config and this file's `model_config`, so neither could change under a
+# resume. The ten `MODEL_NAME`s stay, so all ten lineages, their checkpoints and
+# v23's batches carry forward; only the session row is new.
+#
+# Ten rather than more for a second reason worth being honest about: `mean_abs_q`
+# at 0.2 with `mean_loss` at 0.0015 is a Q head carrying almost no TD signal, and
+# a population fixes a stuck trajectory rather than a flat one. If all ten slots
+# decay to `lr_graduate_cut` with benchmark money still under 100, the binding
+# constraint is the reward and the answer is Phase 3 of the roadmap, not more
+# slots.
+LEARNERS = 10
+MODEL_NAME = "learner_00"
+
+# How many learners run their round hooks and their update at once, and how wide
+# each one's rollout pool is. The product is the core budget, so these two belong
+# together.
+#
+# v23 ran the population at the default concurrency of 1, which is the right
+# default for one trainable model and badly wrong for ten. Measured over its first
+# three generations on a 32-core box: max concurrent model updates 1, load average
+# 9, and a generation taking 77 minutes made of 37 minutes of collection and 37 of
+# the promotion gate, both walked one learner at a time behind `jobs = 8`. Twenty
+# four cores idle throughout.
+#
+# The gate is the surprising half. An update averaged 222.6 seconds of which
+# `train_seconds` was 8.2 -- 96% of it is the arena, because `eval_seeds = 100`
+# against the benchmark plus `promotion_seeds = 100` against the incumbent, both
+# seat-swapped, is 400 episodes per learner per generation against collection's
+# 320. More than half the machine's episodes are evaluation, and none of them land
+# in the `episodes` table, so the dashboard reports 3,200 a generation while the
+# box actually ran 7,200.
+#
+# 4 x 8 = 32 exactly. Deliberately not oversubscribed: the pools are `spawn`, and
+# the comment on `_single_threaded_workers` records what unpinned BLAS workers
+# cost when they outnumber the cores. If a generation is still gate-bound after
+# this, the next lever is `eval_seeds`/`promotion_seeds` rather than more threads.
+CONCURRENCY = 4
+JOBS_PER_LEARNER = 8
 
 DONOR = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
 
-# The release objective, and now the only benchmark. `configurable_crop_surrogate`
-# was here as a non-regression diagnostic; it is dropped with the rest of it, so
-# that nothing this run measures is a policy it never plays.
+# The release objective, and still the only benchmark. Index 0 is what the ratchet
+# reads; adding a second here would only add non-regression diagnostics the gate
+# does not consult.
+#
+# The rule this list used to be justified by -- "nothing this run measures is a
+# policy it never plays" -- was the right rule and v20 broke it in the other
+# direction: the benchmark stayed correct and `opponents` stopped containing it.
+# Both sides agree again now that pilkwang is in the rollout mix below.
 BENCHMARKS = (DONOR,)
 
 # Overrides only. `register_training_agent` materializes `agent.toml`'s
@@ -309,6 +418,37 @@ FREE_CONFIG = {
     # rest are non-regression diagnostics.
     "benchmarks": list(BENCHMARKS),
     "episode_steps": 720,
+    # The floor grace falls back to, and 0.0 rather than the 750 default because
+    # this lineage is being deliberately unstuck. v20's 57 rejections all failed
+    # the absolute floor, and the best benchmark money it ever measured was 427,
+    # so any positive floor keeps the deadlock intact and the fix does nothing.
+    #
+    # Zero does not mean the gate stands down. `no_regression` stays on under
+    # grace and is what actually decides: the reference is the incumbent's own
+    # recorded 145.8, so a release still has to measure at or above 131. Eight of
+    # v20's 57 rejected updates already did. Hard viability -- the money ratios
+    # against the incumbent's seat and the `min_orders_per_decision` floor -- never
+    # stands down at all, and it passed on every one of those 57, so it is a real
+    # bar rather than a formality.
+    #
+    # Expect this to hold only until the first promotion. Once something releases,
+    # the ratchet reference moves up with it and the run is back on a rising bar.
+    # Restated here rather than left to the manifest because it is now half of a
+    # budget: `CONCURRENCY * JOBS_PER_LEARNER` is what lands on the cores, and the
+    # two numbers have to be read together to see that.
+    "jobs": JOBS_PER_LEARNER,
+    "benchmark_grace_min_money": 0.0,
+    # 400 was throwing away most of what collection paid for. One generation is
+    # 20 rounds x 1 batch x 16 episodes = 320 episodes into a 400-episode ring
+    # against 2,000 gradient steps, and v20 finished with
+    # `skipped_evicted_batches` at 1,212 of 1,361 -- 89% of every episode ever
+    # collected aged out of both segments before a gradient step opened it.
+    #
+    # 1200 is three generations of ingest, so a batch survives long enough to be
+    # sampled more than once and the n-step returns get drawn from something wider
+    # than the last twenty rounds. It costs memory linearly -- v20 reported
+    # `buffer_megabytes` at 332 for 400 episodes, so expect roughly 1 GB.
+    "buffer_episodes": 1200,
     # One base opponent: seeded noise.
     #
     # This was `[]` -- pure mirror play, which `compose_opponents` expresses by
@@ -335,7 +475,38 @@ FREE_CONFIG = {
     # tanh and carries gradient. It is also reproducible -- the built-in `random`
     # agent builds a fresh unseeded RNG per call, which is why this goes through
     # `kaggriculture_lab.opponents:make_seeded_random` instead.
-    "opponents": ["kaggriculture_lab.opponents:make_seeded_random?seed=7"],
+    #
+    # v21 tried widening this to three -- noise, `configurable_crop_surrogate` and
+    # pilkwang -- on the argument that the gate measures an opponent the run never
+    # plays, which is the shape `train_dqn.py` recorded at 17 rejections and v20
+    # reproduced at 57. It ran 15 rounds and 120 pairings before being reverted,
+    # and those 120 are why this is one entry again:
+    #
+    #     seeded noise    +6,241   win rate 1.000
+    #     mirror          -5,015   win rate 0.333
+    #     surrogate      -29,376   win rate 0.000
+    #     pilkwang      -134,558   win rate 0.000
+    #
+    # The surrogate was supposed to be the middle rung, on the reading that its 32k
+    # is close enough to the learner's 9-13k mirror scores for the tanh to still
+    # have slope. It is not: against the surrogate the learner scores 2-3k rather
+    # than 9-13k, so -29,376 through `tanh(margin / 10000)` is -0.995 with a slope
+    # near 0.01. Both new slots were walls, and together they took 22% of
+    # collection to deliver a constant.
+    #
+    # There is no mid-strength opponent in this repo. The paragraph above is right
+    # as written: noise is the only static entry carrying terminal gradient at this
+    # strength, and adding saturated ones does not change that.
+    #
+    # The deadlock those slots were meant to break is handled at the gate instead,
+    # by `benchmark_grace_min_money` above, which is the half of the fix v20's data
+    # actually pointed at. If the run stalls again with that hatch open, the
+    # binding constraint is `TERMINAL_MARGIN_SCALE` rather than the opponent list:
+    # no opponent finishing 30-140k above the learner can teach it anything through
+    # a tanh sized at 10,000.
+    "opponents": [
+        "kaggriculture_lab.opponents:make_seeded_random?seed=7"
+    ],
     # The league population is this same family, and `league_opponents` excludes
     # it by construction, so leaving this on would only re-add anchors.
     "league_opponents": False,
@@ -416,75 +587,6 @@ FREE_CONFIG = {
     # comparison between the two controllers is at the same number. It is a
     # harder ask on this quantity than on the flip rate, which is the point.
     "noisy_order_rate_target": 0.05,
-    # The rate the `noisy_actor_hot` rungs collect at, and the reason it moved
-    # 0.35 -> 0.12: at 0.35 it was inert. Measured on the curve update 110
-    # recorded, 0.35 resolves to 5.26 and is clipped to `noisy_hot_scale_limit`,
-    # so the *cap* was the operating point and this knob controlled nothing. A
-    # ceiling should be an emergency stop, not the setting.
-    #
-    # 0.08 resolves to about 1.19 against a setpoint of 1.032, with the cap well
-    # clear of it. Sized off the per-sigma bankruptcy table this run produced,
-    # joining `metadata_json -> 'seeds'` to `actor_sigma_scales` by pair and then
-    # to `episode_players.seed`:
-    #
-    #     sigma  0.44   0.52   1.03   1.33   1.41   2.00   4.00
-    #     broke  12%    18%    27%    52%    53%    36%    44%
-    #     money  3953   3891   3900   2594   2396   2567   2414
-    #
-    # The knee is just above 1.0: below it a fifth to a quarter of episodes go
-    # broke and mean money sits near 3,900; from 1.33 up it is half of them and
-    # money falls by a third. 0.12 would have resolved to 1.435, inside that
-    # band. Bankruptcy in the hot rungs is accepted -- it is two of eight pairs
-    # and a bankrupt episode still carries a gradient -- but it should be the
-    # price of exploring, not the default outcome of it.
-    #
-    # Deliberately modest for a second reason: sigma is not the axis that
-    # escapes a local minimum here. `sigma_ratio_0` is still 6, so the head's
-    # noise is six times its learned weight magnitude and 39% of argmaxes flip
-    # already; `noisy_layers = "head"` perturbs through one shared `f_in` with
-    # `weight_sigma` near its constant initialisation, so which action gets
-    # boosted is close to state-independent. More of that is undirected variance,
-    # not search. `noisy_layers = "all"` is the lever for state-dependent
-    # exploration and is its own experiment.
-    "noisy_hot_order_rate": 0.08,
-    # Two of the eight pairs collect above the setpoint, at the burst base and at
-    # its geometric midpoint. The ladder is otherwise downward only, so nothing
-    # anywhere explores harder than the controller resolved and the behaviours
-    # that need a harder push than the setpoint are unreachable rather than rare
-    # -- the idle burst answers a policy that has already collapsed, not one that
-    # is merely never shown the option.
-    #
-    # Two rather than more because `priority_alpha` is 0.0: hot episodes are
-    # sampled uniformly beside the good ones, so this is a permanent noise floor
-    # in every minibatch and 25% of pairs is the most it should be worth. The
-    # remaining six still run 1.0 down to 0.031, so the near-greedy read survives
-    # -- and `cold_order_diagnostics` keeps the idle trigger reading the policy
-    # rather than the hot pairs.
-    "noisy_actor_hot": 2,
-    # The hard stop the rate cannot express, because what a rate costs in sigma
-    # depends on a curve that moves with the network. Without this, a steeper
-    # curve reproduces the 3.159 event silently.
-    #
-    # 2.0 rather than 4.0, and that is v15's measurement rather than caution. At
-    # 4.0 the limit was hit dead on -- `noisy_hot_order_rate = 0.35` resolved past
-    # it on every update -- so the hot rungs played 4.0 and 1.414 against a 0.5
-    # setpoint, and the top rung detonated instead of searching. Over 1,424
-    # learner seats, the hottest quarter finished below 100 coins from a 3,000
-    # stake on 55% of seats (against 22% at the next rung down and 0% on the cold
-    # half), which reproduces v9's 49%-bankrupt result at sigma 3.159 exactly.
-    #
-    # And it bought nothing for it: 3 of those 356 seats ever bought land, against
-    # 6 of the 356 at the rung below, while the order mix at the top rung ran to
-    # `BUY_PRODUCT` 147 per seat -- market churn, not fields. Seats that did buy
-    # land finished at a mean of 355 coins against 2,753 for those that did not,
-    # so land is being bought and then not farmed.
-    #
-    # At 2.0 the rungs become 2.0 and 1.0 against the same setpoint: still the
-    # only episodes anywhere above it, but inside the band where v7 measured a
-    # flip-to-order rate of 0.19 rather than 0.54. If land purchases stay at ~1%
-    # of seats here too, the answer is not more sigma -- the reward or the mask
-    # is what makes an unfarmed field worth buying.
-    "noisy_hot_scale_limit": 2.0,
     # A floor under the resolved scale, because the implicit `1 / limit` clamp is
     # not one. On `landgate-v10`'s cold start the controller resolved exactly
     # 0.125 by update 20 -- the clamp, hit dead on -- with `mean_abs_q` at 0.046:
@@ -505,27 +607,62 @@ FREE_CONFIG = {
     # loses by a median 0.031, and a row with a few hundred visits is back to
     # roughly the sigma the controller resolved.
     #
-    # Four of the eight pairs, from the hot end, so they overlap the two
-    # `noisy_actor_hot` rungs rather than sitting opposite them. The greedy half
-    # of the ladder carries neither, which is what keeps `cold_order_diagnostics`
-    # reading the policy and `mean_final_money` comparable across the change.
+    # Four of the eight pairs, from the widest end of the ladder. The greedy half
+    # carries none of it, which is what keeps `mean_final_money` comparable
+    # across the change and keeps a clean read of what the policy actually does.
     "rare_sigma_gain": 1.0,
     "rare_sigma_cap": 3.0,
     "rare_sigma_pairs": 4,
     # A resume restores the optimizer's learning rate from the checkpoint, so
     # this key was previously inert on every generation after the first. It is
-    # now re-applied from config each update.
+    # now re-applied from config each update, and under the population it is the
+    # schedule's *peak* rather than a constant: a slot warms up to it from zero
+    # after a reseed and halves away from it on every plateau.
     "learning_rate": 1e-4,
+    # The slot schedule, declared here as well as in the manifest because this is
+    # the file that decides what the run is. Everything else about the population
+    # -- `mature_capacity`, the reseed perturbation, the plateau terms -- takes
+    # the manifest's value, so a change to any of those is a manifest change and
+    # shows up in `ensure_session`'s digest the same way.
+    #
+    # 1e-5 against a peak of 1e-4 needs `lr_decay_factor**d < 0.1`, which at the
+    # manifest's 0.25 is two decays. At `lr_plateau_patience = 4` that is eight
+    # stalled updates, plus three of warmup and one spent setting the baseline:
+    # twelve updates, and so twelve generations here, since `min_new_batches` and
+    # `rounds_per_generation` are both 10 and a generation is exactly one update.
+    # Against the measured stall that is still generous rather than trigger-happy:
+    # `falloff_v1` went 57 consecutive rejections without anything ending.
+    "lr_graduate_cut": 1e-5,
+    # Off, and this is the one interaction worth stating outright. The snapback
+    # and the population answer the same question differently, and leaving both on
+    # means a stalling slot is repeatedly restored to the incumbent whose score is
+    # exactly what the plateau detector reads -- so `lr_best_score` is pinned by
+    # the mechanism meant to rescue it and the slot never reaches its cut.
+    "resume_reset_after_rejections": 0,
 }
 
+# One entry per learner slot. `LeagueConfig.validate` requires exactly one
+# `primary` per agent type -- it is the name `_primary_training_model_id` resolves
+# for the surrogate-propose path -- so slot 0 carries it and the rest do not. The
+# choice is arbitrary between identical slots and deliberately not re-derived from
+# scores: a primary that moved as the population turned over would make every
+# query that resolves it non-reproducible.
+#
+# Distinct seeds, because that is the only thing separating the slots at the
+# start. `register_training_agent` overlays `model_config` onto the manifest and
+# then stamps `agent_type`/`name`/`seed`, so identical configs with one seed apart
+# is exactly the intended shape: ten independent searches of the same space, and
+# what diverges them afterwards is which mature member each one is reseeded from
+# and which weights the perturbation redrew.
 TRAINING_AGENTS = [
     {
         "type": "dqn_market_free",
-        "name": MODEL_NAME,
+        "name": f"learner_{index:02d}",
         "train": True,
-        "primary": True,
-        "model_config": FREE_CONFIG,
+        "primary": index == 0,
+        "model_config": {**FREE_CONFIG, "seed": 2718 + 1009 * index},
     }
+    for index in range(LEARNERS)
 ]
 
 MAIN_CONFIG = REPO_ROOT / "main.toml"
@@ -553,6 +690,7 @@ def _effective_config() -> LeagueConfig:
     return replace(
         base,
         training_agents=tuple(TrainingAgentSpec.from_dict(item) for item in TRAINING_AGENTS),
+        training_concurrency=CONCURRENCY,
     )
 
 

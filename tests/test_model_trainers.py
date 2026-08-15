@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,13 @@ CALLS: list[tuple[str, str, int]] = []
 RATING_COUNTS: list[int] = []
 #: Rounds whose hook should raise, consumed one failure per entry.
 FAIL_ROUNDS: set[int] = set()
+#: Rendezvous for the concurrency tests. Set to a `threading.Barrier` sized to the
+#: number of models expected to be in flight at once; a hook that reaches it and
+#: waits can only be released by its peers, so passing it *is* the proof they ran
+#: together rather than a guess from timing.
+BARRIER: threading.Barrier | None = None
+#: Model ids whose hook should raise, for error isolation under fan-out.
+FAIL_MODELS: set[str] = set()
 
 
 class RecordingTrainer:
@@ -66,19 +74,52 @@ class BatchOnlyTrainer:
         raise AssertionError("on_batch must not run during round hooks")
 
 
+class RendezvousTrainer:
+    """Waits for every peer to arrive, then records and returns.
+
+    The wait is the assertion. Run serially, the first hook blocks forever and the
+    barrier times out; the only way all of them get through is if they were in
+    flight at the same time.
+    """
+
+    def on_round(self, context, reader, writer) -> None:
+        if BARRIER is not None:
+            BARRIER.wait(timeout=60)
+        # After the rendezvous, so a query proves each thread has a working store
+        # of its own rather than sharing the caller's connection.
+        reader.fetchone("SELECT count(*) FROM training_models")
+        CALLS.append((context.model_id, context.scope, context.round_index))
+        if context.model_id in FAIL_MODELS:
+            raise RuntimeError(f"{context.model_id} exploded")
+        writer.record(
+            source_kind="unit",
+            source_id=f"{context.scope}-{context.round_index}",
+            sample_count=1,
+        )
+
+    def on_batch(self, context, reader):  # pragma: no cover - never reached here
+        raise AssertionError("on_batch must not run during round hooks")
+
+
 recording = RecordingTrainer()
 batch_only = BatchOnlyTrainer()
+rendezvous = RendezvousTrainer()
 
 
 @pytest.fixture(autouse=True)
 def _reset_recorders():
+    global BARRIER
     CALLS.clear()
     RATING_COUNTS.clear()
     FAIL_ROUNDS.clear()
+    FAIL_MODELS.clear()
+    BARRIER = None
     yield
     CALLS.clear()
     RATING_COUNTS.clear()
     FAIL_ROUNDS.clear()
+    FAIL_MODELS.clear()
+    BARRIER = None
 
 
 def _register(store: ExperimentStore, trainer: str, model_id: str = MODEL_ID) -> None:
@@ -107,6 +148,139 @@ def _fire(store: ExperimentStore, scope: str, round_index: int, **kwargs):
         family_ids=[FAMILY_ID],
         **kwargs,
     )
+
+
+def test_models_run_their_hooks_at_the_same_time(tmp_path: Path):
+    """The serial walk was the whole overhead on a population run.
+
+    Measured on `market-free-population-v23`, ten learners on a 32-core box: max
+    concurrent model updates 1, load average 9, 77 minutes a generation of which
+    96% was simulation nothing was waiting on. The models are independent
+    lineages, so there was never a reason to walk them.
+
+    A barrier rather than a stopwatch: every hook waits for its peers, so the call
+    only returns if they genuinely overlapped.
+    """
+
+    global BARRIER
+    models = [f"{MODEL_ID}.{index}" for index in range(3)]
+    with ExperimentStore(postgres_database(tmp_path, "concurrent")) as store:
+        for model in models:
+            _register(store, "tests.test_model_trainers:rendezvous", model_id=model)
+        BARRIER = threading.Barrier(len(models))
+
+        reports = _fire(store, "round", 0, concurrency=len(models))
+
+    # Order is by model, not by completion, so the two paths are indistinguishable
+    # from the return value.
+    assert [item.model_id for item in reports] == models
+    assert [item.status for item in reports] == ["complete"] * len(models)
+    assert sorted(call[0] for call in CALLS) == models
+
+
+def test_fan_out_workers_do_not_re_bootstrap_the_schema(tmp_path: Path):
+    """`market-free-population-v25` died on generation zero for this.
+
+    `ExperimentStore` ensures the schema on open, which is right for the first
+    connection and a deadlock for the fourth: `_initialize_schema` executes the
+    whole of `schema.sql`, and two of those running at once take the same objects'
+    locks in different orders.
+
+        psycopg.errors.DeadlockDetected: deadlock detected
+        Process 154699 waits for ShareLock on relation 16444; blocked by 154301.
+
+    Asserted on the flag rather than by racing stores, because the deadlock needs
+    a particular interleaving to show up -- the concurrency tests above open three
+    stores at once and got through it on luck.
+    """
+
+    global BARRIER
+    models = [f"{MODEL_ID}.{index}" for index in range(3)]
+    initialized: list[bool] = []
+    original = ExperimentStore.__init__
+
+    def recording_init(self, database, *, initialize=True):
+        initialized.append(initialize)
+        original(self, database, initialize=initialize)
+
+    with ExperimentStore(postgres_database(tmp_path, "bootstrap")) as store:
+        for model in models:
+            _register(store, "tests.test_model_trainers:rendezvous", model_id=model)
+        BARRIER = threading.Barrier(len(models))
+        ExperimentStore.__init__ = recording_init
+        try:
+            reports = _fire(store, "round", 0, concurrency=len(models))
+        finally:
+            ExperimentStore.__init__ = original
+
+    assert [item.status for item in reports] == ["complete"] * len(models)
+    # One store per model, none of them re-running the bootstrap.
+    assert initialized == [False] * len(models)
+
+
+def test_a_failing_model_does_not_take_its_peers_down_under_fan_out(tmp_path: Path):
+    """Error isolation is the one property the fan-out must not quietly drop.
+
+    One broken trainer being recorded and skipped rather than propagated is the
+    existing contract; running the models on threads gives an exception a second
+    way to escape, and `pool.map` re-raising the first failure would abort the rest
+    of the generation.
+    """
+
+    global BARRIER
+    models = [f"{MODEL_ID}.{index}" for index in range(3)]
+    with ExperimentStore(postgres_database(tmp_path, "isolation")) as store:
+        for model in models:
+            _register(store, "tests.test_model_trainers:rendezvous", model_id=model)
+        BARRIER = threading.Barrier(len(models))
+        FAIL_MODELS.add(models[1])
+
+        reports = _fire(store, "round", 0, concurrency=len(models))
+
+        statuses = {item.model_id: item.status for item in reports}
+        assert statuses == {
+            models[0]: "complete",
+            models[1]: "error",
+            models[2]: "complete",
+        }
+        # The ledger has to agree, because that is what a resume reads.
+        recorded = dict(
+            store.connection.execute(
+                "SELECT model_id, status FROM model_round_hooks WHERE round_index = 0"
+            ).fetchall()
+        )
+        assert recorded == {
+            models[0]: "COMPLETE",
+            models[1]: "ERROR",
+            models[2]: "COMPLETE",
+        }
+
+
+def test_concurrency_of_one_uses_the_callers_own_store(tmp_path: Path):
+    """The default path must not open connections it never used to.
+
+    A store is a connection, and a generation fires this once per round per model.
+    Silently doubling that on the single-model case would be a regression paid for
+    by every existing league.
+    """
+
+    with ExperimentStore(postgres_database(tmp_path, "serial")) as store:
+        _register(store, "tests.test_model_trainers:recording")
+        opened: list[object] = []
+        original = ExperimentStore.__init__
+
+        def counting_init(self, database):
+            opened.append(database)
+            original(self, database)
+
+        ExperimentStore.__init__ = counting_init
+        try:
+            reports = _fire(store, "round", 0)
+        finally:
+            ExperimentStore.__init__ = original
+
+    assert [item.status for item in reports] == ["complete"]
+    assert opened == []
 
 
 def test_hook_runs_once_and_is_not_reoffered(tmp_path: Path):

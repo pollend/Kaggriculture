@@ -5,6 +5,7 @@ manifest -- the kind that only shows up as a session that trains the wrong thing
 for a generation before anyone notices.
 """
 
+import os
 import tomllib
 from pathlib import Path
 
@@ -19,8 +20,15 @@ def _manifest() -> dict:
         return tomllib.load(stream)
 
 
-def test_effective_config_builds_a_single_learner_roster(tmp_path: Path, monkeypatch):
-    """One learner, trainer-only. The league schedules the clock, not a population."""
+def test_effective_config_builds_the_learner_roster(tmp_path: Path, monkeypatch):
+    """One trainable slot per learner, all trainer-only.
+
+    `population_size` stays 0 and `pairing_mode` stays `trainer_only`: the league
+    population is a *breeding* population settled by Glicko off pairings, and this
+    is not that. Each slot collects its own full-length episodes and the roster is
+    a roster of trainers, which the harness expresses as named instances of one
+    agent type rather than as league members.
+    """
 
     monkeypatch.setattr(train_market_free, "ARTIFACTS", tmp_path)
     config = train_market_free._effective_config()
@@ -29,8 +37,22 @@ def test_effective_config_builds_a_single_learner_roster(tmp_path: Path, monkeyp
     assert config.anchor_manifests == ()
     assert config.training_manifests == ("agents/dqn_market_free/agent.toml",)
     assert [(item.type, item.name, item.train) for item in config.training_agents] == [
-        ("dqn_market_free", train_market_free.MODEL_NAME, True),
+        ("dqn_market_free", f"learner_{index:02d}", True)
+        for index in range(train_market_free.LEARNERS)
     ]
+    # Exactly one primary, which `LeagueConfig.validate` requires and
+    # `_primary_training_model_id` resolves. Pinned to slot 0 rather than left to
+    # whichever slot is currently best: a primary that moved as the population
+    # turned over would make every query resolving it non-reproducible.
+    assert sum(item.primary for item in config.training_agents) == 1
+    assert config.training_agents[0].primary
+
+    # Distinct seeds are the only thing separating the slots at the start. Sharing
+    # one would make ten identical searches of the same space and the population
+    # would have nothing to select between.
+    seeds = [item.model_config["seed"] for item in config.training_agents]
+    assert len(set(seeds)) == train_market_free.LEARNERS
+
     assert config.pairing_mode == "trainer_only"
     assert config.population_size == 0
     assert config.episode_steps == 720
@@ -82,24 +104,117 @@ def test_policy_kinds_do_not_collide_with_the_scaffolded_learner():
     assert POLICY_KINDS["market_learner"] != SCORER_KINDS["market_learner"]
 
 
-def test_the_session_moves_and_the_model_lineage_does_not():
-    """Only the session id moves at v20, and the pairing is the whole point.
+def test_the_session_and_every_model_name_move_together():
+    """Both move at v23, which is the first time the names have moved since v10.
 
-    `ensure_session` digests the experiment manifest, so adding `rare_sigma_gain`
-    makes the previous session unresumable and a new id is forced.
-    `MODEL_NAME` stays because `all_batches` and `_self_play_pool` are scoped by
-    `model_id` and the reward function did not move: v18's batches are the same
-    kind of sample, so inheriting them is the buffer working as intended rather
-    than a leak between regimes. Only the behaviour distribution changed.
+    They have to. `all_batches`, `_self_play_pool`, `lineage_checkpoint`,
+    `training_models.active_checkpoint_id` and the slot state are every one of
+    them scoped by `model_id`, so ten named slots are ten independent lineages --
+    and any of them inheriting v22's single lineage would start the population
+    with nine cold slots and one carrying the stalled trajectory the population
+    exists to leave. The mature group would then be seeded from exactly that.
 
-    The reward is still the thing that would *force* a new name, so it stays
-    asserted here: reusing one across a reward change fits one Q function to two
-    reward streams.
+    The earlier rule this replaces still holds for the ordinary case: a name is
+    kept across a change that only moves the behaviour distribution, because v20's
+    batches are the same kind of sample and inheriting them is the buffer working
+    as intended. A reward change forces a new name; so does this.
     """
 
-    assert train_market_free.SESSION_ID == "market-free-rare-v20"
-    assert train_market_free.MODEL_NAME == "falloff_v1"
-    assert train_market_free.MODEL_NAME not in train_market_free.SESSION_ID
+    assert train_market_free.SESSION_ID == "market-free-population-v25"
+    names = [item["name"] for item in train_market_free.TRAINING_AGENTS]
+    assert names == [f"learner_{index:02d}" for index in range(train_market_free.LEARNERS)]
+    assert train_market_free.MODEL_NAME == names[0]
+    assert all(name not in train_market_free.SESSION_ID for name in names)
+
+
+def test_the_core_budget_is_concurrency_times_jobs():
+    """v23's overhead was idle cores, not simulation cost.
+
+    Ten learners on a 32-core box with `training_concurrency` at its default of 1:
+    max concurrent model updates 1, load average 9, 77 minutes a generation of
+    which 96% was arena nothing was waiting on. The two knobs multiply, because
+    each learner's rollouts and arena series spawn their own `jobs`-wide pool, so
+    they have to be read together or the budget is invisible.
+    """
+
+    config = train_market_free._effective_config()
+    assert config.training_concurrency == train_market_free.CONCURRENCY
+    assert train_market_free.FREE_CONFIG["jobs"] == train_market_free.JOBS_PER_LEARNER
+    # Not oversubscribed. The pools are `spawn` and unpinned BLAS workers that
+    # outnumber the cores are what `_single_threaded_workers` exists to prevent.
+    assert train_market_free.CONCURRENCY * train_market_free.JOBS_PER_LEARNER <= os.cpu_count()
+    # No point running more slots at once than there are slots.
+    assert train_market_free.CONCURRENCY <= train_market_free.LEARNERS
+
+
+def test_a_benchmark_the_run_never_plays_has_a_way_out_of_the_gate():
+    """The invariant `market-free-rare-v20` broke, stated so both fixes satisfy it.
+
+    v20 gated on pilkwang while `opponents` held one seeded-noise agent and
+    nothing else. The learner solved that opponent at generation 6 -- paired margin
+    flat near 5,900, win rate exactly 1.000 for the 55 generations after -- and
+    accumulated 57 consecutive rejections against a benchmark it had never played.
+    `train_dqn.py` recorded the same shape at 17 rejections before it.
+
+    Two ways to not be in that state, and either is enough. Play the benchmark, so
+    the rollouts and the gate measure the same distribution; or leave the gate an
+    escape, so a stalled ratchet cannot become a fixed point. v21 tried the first
+    and its own 120 pairings argued against it -- pilkwang at -134,558 and the
+    surrogate at -29,376 are both a saturated -1.0 through the tanh, so they cost
+    22% of collection and returned a constant. v22 takes the second.
+
+    What is not optional is that *one* of them holds. v20 had neither.
+    """
+
+    config = train_market_free.FREE_CONFIG
+    opponents = config["opponents"]
+
+    plays_the_benchmark = promotion_benchmark(config) in opponents
+    manifest = _manifest()["models"][0]["config"]
+    gate_has_an_exit = (
+        int(manifest["promotion_ratchet_grace_after_rejections"]) > 0
+        and config.get("benchmark_grace_min_money") is not None
+    )
+    assert plays_the_benchmark or gate_has_an_exit
+
+    # Either way, something in the mix has to carry terminal gradient, and seeded
+    # noise is the only static opponent that does at this strength.
+    assert any("make_seeded_random" in opponent for opponent in opponents)
+
+
+def test_the_stalled_lineage_is_given_a_reachable_grace_floor():
+    """0.0 rather than the 750 default, and the ratchet is what still binds.
+
+    v20's best benchmark measurement across 57 rejections was 427, so any positive
+    floor leaves the deadlock exactly where it was. What decides instead is
+    non-regression against the incumbent's recorded 145.815, which grace does not
+    drop -- and hard viability, which never stands down at all.
+    """
+
+    assert train_market_free.FREE_CONFIG["benchmark_grace_min_money"] == 0.0
+    manifest = _manifest()["models"][0]["config"]
+    assert manifest.get("benchmark_grace_min_money") is None
+    assert int(manifest["promotion_ratchet_grace_after_rejections"]) > 0
+
+
+def test_the_buffer_outlives_a_generation_of_ingest():
+    """v20 aged out 1,212 of 1,361 batches before a gradient step opened them.
+
+    20 rounds x 1 batch x 16 episodes is 320 episodes per generation into a
+    400-episode ring, so a batch was evicted about as fast as it arrived and 89% of
+    everything collection paid for was never sampled.
+    """
+
+    league = train_market_free.LeagueConfig.from_toml(
+        REPO_ROOT / train_market_free.LEAGUE_CONFIG
+    )
+    model = _manifest()["models"][0]["config"]
+    per_generation = (
+        league.rounds_per_generation
+        * int(model["batches_per_round"])
+        * int(model["episodes_per_batch"])
+    )
+    assert train_market_free.FREE_CONFIG["buffer_episodes"] >= 2 * per_generation
 
 
 def test_the_runner_clones_nothing():
@@ -181,6 +296,14 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
     `train_dqn.py` records the cost of having no static opponent at all: 17
     consecutive rejections, because promotion is gated on a benchmark the policy
     never plays. The noise slot is what keeps collection and the gate in contact.
+
+    v21 widens the base past noise alone, and what is pinned here is the part that
+    did not change: the *first* slot -- the one the mirror is composed around and
+    the only one guaranteed present at every batch index -- still has to be the
+    non-saturating opponent. v20 is why the wider base exists at all; it ran the
+    single-noise version to a 1.000 win rate by generation 6 and then learned
+    nothing for 55 generations. See `test_the_gate_benchmark_is_an_opponent_the_
+    run_actually_plays`.
     """
 
     from agents.dqn_market_scorer.training.updater import compose_opponents
@@ -188,13 +311,15 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
     config = train_market_free.FREE_CONFIG
     base = config["opponents"]
 
-    assert len(base) == 1
+    assert base, "an empty base cannot cold-start"
     assert base[0].startswith("kaggriculture_lab.opponents:make_seeded_random")
     # Reproducible: the built-in `random` agent builds a fresh unseeded RNG per
     # call, so two runs of the same seed diverge.
     assert "seed=" in base[0]
-    # No competitor may be the static opponent -- that is the saturating case.
-    assert not any("competitor_" in spec or "surrogate" in spec for spec in base)
+    # The saturating opponents earn their slots on state coverage, so they must
+    # stay a minority of the static base rather than becoming the anchor.
+    walls = [spec for spec in base if "competitor_" in spec or "surrogate" in spec]
+    assert len(walls) < len(base)
 
     assert config["league_opponents"] is False
     # Must be truthy. The updater reads `if self_play_after and batch_index >=
@@ -205,9 +330,9 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
     assert not any("surrogate" in spec for spec in config["benchmarks"])
 
     # Reproduce the updater's own branch. The mix must be non-empty at every
-    # batch index, before and after the mirror joins, and once it joins the ratio
-    # must resolve to two mirror slots against the single noise slot rather than
-    # rounding one of them away.
+    # batch index, before and after the mirror joins, and once it joins every
+    # static entry must survive rather than being rounded away -- a base slot that
+    # disappears is an opponent the run believes it is training against and is not.
     pool = [f"self-{index}" for index in range(config["self_play_pool"])]
     for batch_index, has_pool in ((0, False), (1, False), (20, True), (120, True)):
         opponents = list(base)
@@ -216,7 +341,12 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
         assert opponents, f"empty opponent mix at batch {batch_index}"
         if has_pool:
             assert opponents[0] == base[0]
-            assert sum(spec.startswith("self-") for spec in opponents) == 2
+            for spec in base:
+                assert spec in opponents, f"{spec} rounded out of the mix"
+            mirrored = sum(spec.startswith("self-") for spec in opponents)
+            # `self_play_ratio` is what this has to land on, and whole slots only
+            # approximate it -- three static entries at 0.65 give 6 of 9.
+            assert abs(mirrored / len(opponents) - config["self_play_ratio"]) < 0.05
 
 
 def test_the_runner_declares_the_noise_knobs_it_means_to_change():
@@ -238,8 +368,6 @@ def test_the_runner_declares_the_noise_knobs_it_means_to_change():
         # digests `experiment.training_agents`.
         "noisy_order_rate_target",
         "noisy_sigma_scale_limit",
-        "noisy_hot_order_rate",
-        "noisy_hot_scale_limit",
         "noisy_sigma_scale_floor",
     ):
         assert key in manifest, f"{key} must be declared in the manifest to be readable"
@@ -274,6 +402,10 @@ def test_manifest_hard_gate_catches_both_collapses():
     assert config["viability_min_median_money_ratio"] == 0.75
     assert config["viability_min_orders_per_decision"] == 0.02
     assert not any(key.startswith("viability_max_") for key in config)
+    # The money floors are ratios, so before a release they need something to be
+    # a ratio *of*. The quiet baseline is not usable there: it never trades, so
+    # it keeps the full stake and the floor becomes "lose nothing".
+    assert 0.0 < config["viability_cold_start_reference_money"] < 3_000.0
 
 
 def test_manifest_declares_no_retired_knobs():
@@ -325,28 +457,42 @@ def test_both_defences_against_an_all_bankruptcy_buffer_are_declared():
     assert 0.0 < config["priority_beta"] < 1.0
 
 
-def test_every_update_is_the_release():
-    """The gate is off, and the knob it makes unreachable is set to say so.
+def test_the_release_is_gated_on_a_fixed_benchmark():
+    """The release decision reads something that does not move with the candidate.
 
-    Nothing here ever gated training -- `lineage_checkpoint` takes the newest
-    checkpoint promoted or not and `_self_play_pool` does not filter on
-    `promoted`, so a rejected candidate always went straight into the next
-    generation. What a rejection withheld was the release.
+    Every other comparison in this gate is against the previous update, so a run
+    can walk itself down while each individual step reads as an improvement --
+    `falloff_v1` released nine of those in a row. The ratchet reads the
+    candidate's own money against the fixed benchmark instead.
 
-    `resume_reset_after_rejections` has to be 0 as a consequence, not as a
-    preference: with every update promoting, `rejections_since_promotion` is
-    permanently 0 and the streak can never trip. Left at 2 it would read as a
-    live safety net that cannot fire.
+    `resume_reset_after_rejections` is off under the population, and that is not
+    caution. The snapback and the population answer the same question -- this
+    trajectory has gone bad, restart it from something better -- and the snapback
+    answers it by restoring the slot's own incumbent, whose score is exactly what
+    the plateau detector reads. Leaving both on pins `lr_best_score` with the
+    mechanism meant to rescue the slot, and the slot never reaches its cut.
     """
 
     config = _manifest()["models"][0]["config"]
 
-    assert config["promotion_rule"] == "always"
+    assert config["promotion_rule"] == "benchmark_ratchet"
     assert config["resume_reset_after_rejections"] == 0
+    assert train_market_free.FREE_CONFIG["resume_reset_after_rejections"] == 0
+    assert config["lr_graduate_cut"] > 0.0, "the population must be the live escape route"
     # The rule lives in the manifest, so the runner cannot disagree with it.
     assert "promotion_rule" not in train_market_free.FREE_CONFIG
 
-    # The arena is still measured -- only its effect on the boolean is gone.
+    # Declared rather than left to `config.get`, which would keep the code
+    # default while the file says nothing -- the silent-key failure this file
+    # tests for elsewhere.
+    assert config["benchmark_release_min_money"] > config["benchmark_cold_start_min_money"] > 0.0
+    assert 0.0 < config["benchmark_money_ratchet"] < 1.0
+    # A relative bar that can never be released is how a gated run freezes.
+    assert config["promotion_ratchet_grace_after_rejections"] > 0
+    # Pinned, so this update's benchmark score and the incumbent's recorded one
+    # are the same hundred seeds.
+    assert config["benchmark_seed_stride"] == 0
+
     assert config["viability_min_orders_per_decision"] > 0.0
     assert config["promotion_seeds"] > 0
 

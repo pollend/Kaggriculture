@@ -11,6 +11,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
+import json
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
@@ -695,6 +698,17 @@ def _viability_result(
     }
 
 
+def _benchmark_result(mean_money: float) -> dict:
+    """A challenger benchmark series, carrying only what the ratchet reads."""
+
+    return {
+        "opponent": "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+        "pairs": 100,
+        "errors": {},
+        "a_money_mean": mean_money,
+    }
+
+
 def test_viability_gate_accepts_a_solvent_trading_policy():
     viability = _arena_viability(
         _viability_result(),
@@ -726,60 +740,250 @@ def test_viability_gate_rejects_bankruptcy():
     assert not viability["checks"]["median_money"]
 
 
-def test_always_releases_what_the_other_rules_would_refuse():
-    """The change, as one assertion: the two blockers stop blocking.
+def test_the_ratchet_refuses_the_decay_the_head_to_head_called_an_improvement():
+    """`falloff_v1`'s real series, as one test.
 
-    `hard_viability` failing and the head-to-head not improving are exactly the
-    conditions that rejected every update of `market-free-noisy-v6`. Under
-    `always` a candidate failing both is still released, and both results are
-    still recorded -- the arena is measured, it just no longer decides.
+    Its last update won the head-to-head 0.94 with a significant +2,347 margin
+    against the checkpoint before it, and scored 107 coins against the fixed
+    benchmark where its own predecessor scored 1,146. Both statements are true
+    because they measure against different things, and only one of them is a
+    reference that stays still.
     """
 
-    from agents.dqn_market_free.training.updater import _PROMOTION_RULES
+    from agents.dqn_market_free.training.updater import _benchmark_ratchet
 
-    assert "always" in _PROMOTION_RULES
+    config = {}
+    decay = _benchmark_ratchet(
+        _benchmark_result(107.49), 1_145.595, "2f013342ef149272d875893b", config, grace=False
+    )
+    assert not decay["passed"]
+    assert not decay["checks"]["min_money"]
+    assert not decay["checks"]["no_regression"]
+    assert decay["floor_name"] == "benchmark_release_min_money"
 
-    import inspect
-
+    # The same policy would have been released under the head-to-head rule.
     from agents.dqn_market_scorer.training.updater import policy_improvement
 
-    # v10's real numbers: a candidate at 3,877 against an incumbent at 16,991.
-    losing = {
-        "errors": {},
-        "margin": -13_113.0,
-        "margin_ci": [-14_125.0, -12_102.0],
+    winning = {"errors": {}, "margin": 2_346.61, "margin_ci": [2_038.38, 2_654.84]}
+    assert policy_improvement(winning, "significant")
+
+
+def test_the_ratchet_releases_a_cold_start_against_the_lower_floor():
+    """With nothing released there is no reference, so only the floor binds.
+
+    `None` is not "the ratchet passes" -- the absolute floor still decides, at
+    the cold-start value, which is what makes a first release reachable without
+    making it cheap.
+    """
+
+    from agents.dqn_market_free.training.updater import _benchmark_ratchet
+
+    cold = _benchmark_ratchet(_benchmark_result(2_978.68), None, None, {}, grace=False)
+    assert cold["passed"]
+    assert "no_regression" not in cold["checks"]
+    assert cold["floor_name"] == "benchmark_cold_start_min_money"
+
+    # 894 is `coldstart_v1@140`, the update that would have given that run its
+    # first incumbent. Above the cold-start floor, below the release floor.
+    foothold = _benchmark_ratchet(_benchmark_result(894.0), None, None, {}, grace=False)
+    assert foothold["passed"]
+    assert not _benchmark_ratchet(_benchmark_result(894.0), 1_000.0, "x", {}, grace=False)["passed"]
+
+
+def test_the_grace_drops_the_floor_but_never_the_ratchet():
+    """The bound on how long the gate can block, and which term pays for it.
+
+    `market-free-rare-v20` is why this is the floor rather than the ratchet. All
+    57 of its rejections failed `min_money` against a bar of 1,000 while measuring
+    between 0.93 and 427, so the term grace used to stand down was the one the run
+    was already clearing. Dropping the absolute bar and keeping the relative one
+    leaves a gate that a genuinely improving policy can pass and a decaying one
+    still cannot.
+    """
+
+    from agents.dqn_market_free.training.updater import _benchmark_ratchet
+
+    # v20's own numbers: candidate 215.5 against a recorded reference of 145.815.
+    # Under the release floor it is refused; under grace the ratchet alone decides
+    # and 215.5 clears `0.9 * 145.815`.
+    stalled = _benchmark_result(215.5)
+    blocked = _benchmark_ratchet(stalled, 145.815, "9071d2ad", {}, grace=False)
+    assert not blocked["passed"]
+    assert not blocked["checks"]["min_money"]
+    assert blocked["checks"]["no_regression"]
+
+    freed = _benchmark_ratchet(
+        stalled, 145.815, "9071d2ad", {"benchmark_grace_min_money": 0.0}, grace=True
+    )
+    assert freed["passed"]
+    assert freed["floor"] == 0.0
+    assert freed["floor_name"] == "benchmark_grace_min_money"
+
+    # The ratchet is what grace does not drop, so the decay it exists to catch is
+    # still refused with the floor at zero.
+    decaying = _benchmark_ratchet(
+        _benchmark_result(20.4), 145.815, "9071d2ad", {"benchmark_grace_min_money": 0.0}, grace=True
+    )
+    assert not decaying["passed"]
+    assert not decaying["checks"]["no_regression"]
+
+
+def test_the_ratchet_reference_is_a_median_not_a_lucky_draw():
+    """`falloff_v1` failed `no_regression` 57 times without having regressed.
+
+    Its 61 benchmark measurements ran 0.93 to 427 around a median of 36.7 while
+    the snapback held the policy on one checkpoint, so the series is noise, not a
+    trajectory -- `a_money_median` reads 2 against a mean of 32.6, so the policy is
+    bankrupt on most seeds and the mean rides on a few survivors. `9071d2ad`
+    stored 145.8, its own p75, and every later draw was ratcheted against that.
+
+    A window median cannot be set by one lucky draw, and one lucky draw cannot
+    clear it either.
+    """
+
+    from agents.dqn_market_free.training.updater import _benchmark_ratchet
+
+    config = {"benchmark_grace_min_money": 0.0}
+    # v20's ten most recent measurements, verbatim.
+    window = [21.5, 15.36, 112.9, 19.59, 4.12, 1.305, 94.18, 55.47, 5.56, 46.51]
+
+    single = _benchmark_ratchet(_benchmark_result(32.59), 145.815, "9071d2ad", config, grace=True)
+    assert single["reference_kind"] == "released_measurement"
+    assert not single["passed"]
+
+    windowed = _benchmark_ratchet(
+        _benchmark_result(32.59), 145.815, "9071d2ad", config, grace=True,
+        reference_samples=window,
+    )
+    assert windowed["reference_kind"] == "window_median"
+    assert windowed["reference_samples"] == len(window) + 1
+    # The stored draw stays readable beside the statistic that decided.
+    assert windowed["released_money"] == 145.815
+    assert windowed["reference_money"] == 21.5
+    assert windowed["passed"]
+
+    # A single outlier does not move a median, so it cannot re-aim the bar.
+    spiked = _benchmark_ratchet(
+        _benchmark_result(32.59), 145.815, "9071d2ad", config, grace=True,
+        reference_samples=[*window, 10_000.0],
+    )
+    assert spiked["passed"]
+
+    # Nor does the window make the ratchet toothless: a genuine collapse still
+    # fails against the same median.
+    collapsed = _benchmark_ratchet(
+        _benchmark_result(1.2), 145.815, "9071d2ad", config, grace=True,
+        reference_samples=window,
+    )
+    assert not collapsed["checks"]["no_regression"]
+
+
+def test_the_grace_floor_defaults_to_the_cold_start_bar():
+    """An unset `benchmark_grace_min_money` must not change any existing config."""
+
+    from agents.dqn_market_free.training.updater import _benchmark_ratchet
+
+    graced = _benchmark_ratchet(_benchmark_result(800.0), 500.0, "x", {}, grace=True)
+    assert graced["floor"] == 750.0
+    assert graced["floor_name"] == "benchmark_cold_start_min_money"
+    assert graced["passed"]
+
+    # 700 is under the cold-start bar, so grace alone does not release it.
+    assert not _benchmark_ratchet(_benchmark_result(700.0), 500.0, "x", {}, grace=True)["passed"]
+
+
+def test_an_unmeasured_benchmark_is_not_a_pass():
+    """Every way of not knowing has to fail closed."""
+
+    from agents.dqn_market_free.training.updater import _benchmark_ratchet
+
+    assert not _benchmark_ratchet(None, None, None, {}, grace=True)["passed"]
+    errored = {**_benchmark_result(5_000.0), "errors": {"3": "crashed"}}
+    assert not _benchmark_ratchet(errored, None, None, {}, grace=True)["passed"]
+
+
+def test_the_ratchet_reference_is_matched_on_the_opponent_not_the_slot():
+    """Reconfiguring benchmarks must reset the ratchet, not silently re-aim it.
+
+    Comparing this update's score against a *different* opponent's recorded
+    number is the one way this gate could be wrong without any of it looking
+    wrong, so the lookup matches the spec string and returns `None` -- no ratchet
+    term -- when it does not find it.
+    """
+
+    import json
+
+    from agents.dqn_market_free.training.updater import _released_benchmark_money
+
+    donor = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+    gate = {
+        "challenger_benchmarks": [
+            {"opponent": donor, "a_money_mean": 1_145.595, "errors": {}},
+        ]
     }
-    assert not policy_improvement(losing, "significant")
-    assert not policy_improvement(losing, "point_estimate")
 
-    # The measurement is untouched -- what changed is that `promote` no longer
-    # consults it. Asserted at the source because the expression lives inside a
-    # 900-line method with a live database and an arena behind it, and the thing
-    # worth pinning is that the `always` arm short-circuits the conjunction
-    # rather than being folded into it.
-    from agents.dqn_market_free.training import updater as updater_module
+    class _Reader:
+        def __init__(self, payload):
+            self.payload = payload
 
-    source = inspect.getsource(updater_module.FreeMarketUpdater.update)
-    assert 'promote = promotion_rule == "always" or (' in source
-    assert "hard_viability_passed and head_to_head_ok and not degenerate_head_to_head" in source
-    # And the arena still runs: these are computed whatever the rule says.
-    assert "hard_viability_passed = head_viability" in source
-    assert "head_to_head_ok = policy_improvement(" in source
+        def fetchone(self, sql, parameters):
+            assert "model_training_checkpoints" in sql
+            assert parameters == ["ckpt"]
+            return (self.payload,)
+
+    class _Active:
+        checkpoint_id = "ckpt"
+
+    money, source = _released_benchmark_money(_Reader(gate), _Active(), donor)
+    assert (money, source) == (1_145.595, "ckpt")
+    # Serialized the way psycopg hands back a json column that is not decoded.
+    money, _ = _released_benchmark_money(_Reader(json.dumps(gate)), _Active(), donor)
+    assert money == 1_145.595
+    # A different opponent, an errored series, and a cold start all mean "no
+    # reference", never "the reference passes".
+    assert _released_benchmark_money(_Reader(gate), _Active(), "agents/other.py") == (None, None)
+    assert _released_benchmark_money(_Reader(gate), None, donor) == (None, None)
+    errored = {"challenger_benchmarks": [{"opponent": donor, "a_money_mean": 9e9, "errors": {"1": "x"}}]}
+    assert _released_benchmark_money(_Reader(errored), _Active(), donor) == (None, None)
 
 
 def test_an_unknown_promotion_rule_still_raises():
-    """A typo must not fall through to releasing everything.
+    """A typo must not fall through to a permissive default.
 
-    `always` makes the failure mode asymmetric: a misspelling that resolved to a
-    permissive default would ship every checkpoint silently, where before it would
-    only have withheld them.
+    `always` is still in the set and still ships every checkpoint, so a
+    misspelling resolving to it would silently release everything.
     """
 
     from agents.dqn_market_free.training.updater import _PROMOTION_RULES
 
-    assert _PROMOTION_RULES == {"significant", "point_estimate", "always"}
+    assert _PROMOTION_RULES == {"significant", "point_estimate", "always", "benchmark_ratchet"}
     assert "alway" not in _PROMOTION_RULES
+    assert "benchmark-ratchet" not in _PROMOTION_RULES
+    assert "benchmark_rachet" not in _PROMOTION_RULES
     assert "" not in _PROMOTION_RULES
+
+
+def test_the_ratchet_rule_does_not_fall_through_to_the_head_to_head():
+    """`policy_improvement` treats any unknown rule as `significant`.
+
+    Passing `benchmark_ratchet` straight in would therefore mean the drifting
+    head-to-head test under a name that says otherwise. Asserted at the source
+    because the mapping lives inside a 900-line method with a live database and
+    an arena behind it.
+    """
+
+    import inspect
+
+    from agents.dqn_market_free.training import updater as updater_module
+
+    source = inspect.getsource(updater_module.FreeMarketUpdater.update)
+    assert 'head_reference_rule = (\n            "point_estimate" if promotion_rule ==' in source
+    assert "head_to_head_ok = policy_improvement(head_to_head, head_reference_rule)" in source
+    # The ratchet decides, and hard viability still has to pass with it.
+    assert 'promotion_rule == "benchmark_ratchet"' in source
+    assert 'and benchmark_ratchet["passed"]' in source
+    # The arena still runs whatever the rule says.
+    assert "hard_viability_passed = head_viability" in source
 
 
 def test_the_export_and_harness_guards_are_not_part_of_the_gate():
@@ -853,13 +1057,21 @@ def test_viability_gate_rejects_a_noop_collapse():
 
 
 def test_the_activity_floor_binds_without_a_release():
-    """The caller must not re-introduce the `active is not None` condition.
+    """A silent candidate must not become the incumbent, released or not.
 
     Two other guards in this family were written to fire "once released" and were
     silently inert on a run that had never released -- the lineage snapback, and
     the streak that feeds it. This is the third, and the one that decides what
     becomes the incumbent in the first place, so it is asserted at the call site
     rather than only on the helper.
+
+    The arena carrying it is the *benchmark*, not the head-to-head. On a cold
+    start the head-to-head opponent is the quiet baseline, which offers no
+    counterparty, so the floor measures nothing there -- see
+    `test_the_cold_start_head_to_head_does_not_require_activity`. A pure-NOOP
+    candidate reads 0.0 against the benchmark as well, so this call site is
+    where the v6 shape (`trading_rate: 0.0` beside `hard_viability.passed:
+    true`) is still caught.
     """
 
     import inspect
@@ -867,11 +1079,62 @@ def test_the_activity_floor_binds_without_a_release():
     from agents.dqn_market_free.training import updater as updater_module
 
     source = inspect.getsource(updater_module.FreeMarketUpdater.update)
-    assert "require_activity = True" in source, (
-        "the activity floor must bind on a cold start; a candidate that never "
-        "trades must never become the incumbent"
+    assert "_order_viability(result, config, require_activity=True)" in source, (
+        "the activity floor must bind on the benchmark arena unconditionally; a "
+        "candidate that never trades must never become the incumbent"
     )
-    assert "require_activity = active is not None" not in source
+
+
+def test_the_cold_start_head_to_head_does_not_require_activity():
+    """The floor cannot be read in a match that offers no counterparty.
+
+    `market-free-population-v25` at cutoff 143: learner_01, learner_02 and
+    learner_09 traded at 0.633, 0.332 and 0.398 against the benchmark and emitted
+    0, 210 and 0 orders against the quiet baseline. Five of ten slots had never
+    released after 143 batches and `population_members` held one row for the
+    whole run, so the mature group the population exists to build stayed empty.
+
+    Asserted at the call site because the condition is the whole point: it must
+    fall back to requiring activity when there is no benchmark arena to carry it.
+    """
+
+    import inspect
+
+    from agents.dqn_market_free.training import updater as updater_module
+
+    source = inspect.getsource(updater_module.FreeMarketUpdater.update)
+    assert "require_head_activity = active is not None or not challenger_benchmarks" in source
+    assert "require_activity=require_head_activity" in source
+
+
+def test_degeneracy_reads_activity_rather_than_the_margin():
+    """A zero margin is not a NOOP collapse, and v25 paid for the conflation.
+
+    `learner_05` at cutoff 143 placed 16,686 orders over 35,950 decisions -- a
+    trading rate of 0.464 -- into a head-to-head that still scored an identically
+    zero margin, both seats on exactly 3,000.0, because round-trip trades are
+    cash-neutral against an unchanged market. It passed the ratchet at 987
+    benchmark money and passed hard viability, and the degeneracy check alone
+    rejected it.
+    """
+
+    traded = _viability_result(decisions=100, orders=46, trading_decisions=46)
+    assert not updater_module._collapsed_against_baseline(traded, {})
+
+    # The collapse the check exists for is still a collapse.
+    silent = _viability_result(orders=0)
+    assert updater_module._collapsed_against_baseline(silent, {})
+
+    # A hire on one turn in a hundred is not activity, however many wire rows.
+    hires_once = _viability_result(
+        decisions=100, orders=HIRE_QUANTITIES[-1], trading_decisions=1
+    )
+    assert updater_module._collapsed_against_baseline(hires_once, {})
+
+    # Off with the rest of the activity floors, deliberately.
+    assert not updater_module._collapsed_against_baseline(
+        silent, {"viability_min_orders_per_decision": 0.0}
+    )
 
 
 def test_activity_floor_leaves_ordinary_trading_alone():
@@ -1002,6 +1265,89 @@ def test_self_play_pool_follows_the_lineage_not_the_release():
     assert seen and "promoted" not in seen[0]
 
 
+def test_a_held_reset_keeps_the_rejection_streak_growing(tmp_path: Path):
+    """The deadlock `market-free-rare-v20` sat in for 55 updates.
+
+    The snapback holds until a promotion, and every held update writes
+    `lineage_reset` -- so the ordinary streak query, which stops at the newest
+    reset, stopped at the held update itself and returned 0 forever. Everything
+    that scales with the streak went with it: `promotion_ratchet_grace_after_
+    rejections = 4` could not fire against a streak that never left zero, and the
+    run resumed the same checkpoint and trained the same 2,000 steps 55 times
+    while `gradient_steps` stayed on 24,100.
+
+    Under a hold the lineage is back on the release, so those rejections are one
+    trajectory's again and the streak counts from the last promotion.
+    """
+
+    from agents.dqn_market_scorer.training.updater import lineage_checkpoint
+
+    released_trainer = tmp_path / "released.pt"
+    released_trainer.write_bytes(b"trainer")
+    newer_trainer = tmp_path / "newer.pt"
+    newer_trainer.write_bytes(b"trainer")
+
+    asked: list[str] = []
+
+    class Reader:
+        def fetchone(self, sql, parameters):
+            asked.append(sql)
+            if "model_training_checkpoints" in sql:
+                return ("newer", str(newer_trainer), str(tmp_path / "newer.npz"))
+            if "status = 'REJECTED'" in sql:
+                # The held query ignores resets, so it sees all 57; the ordinary
+                # one stops at the most recent held update and sees none.
+                return (57,) if "lineage_reset" not in sql else (0,)
+            # `reset_since_promotion`: a reset is recorded with nothing promoted
+            # after it.
+            return (1,)
+
+    context = SimpleNamespace(
+        model_id="free.model",
+        config={"resume_reset_after_rejections": 2},
+        active_checkpoint=SimpleNamespace(
+            checkpoint_id="9071d2ad",
+            trainer_artifact_path=str(released_trainer),
+            inference_artifact_path=str(tmp_path / "released.npz"),
+        ),
+    )
+
+    resumed = lineage_checkpoint(context, Reader())
+
+    assert resumed.reset
+    assert resumed.released
+    assert resumed.checkpoint_id == "9071d2ad"
+    assert resumed.rejection_streak == 57
+    # The streak that reaches the gate is the held one, so the query that produced
+    # it must not have been cut off at a `lineage_reset`.
+    counted = [sql for sql in asked if "status = 'REJECTED'" in sql]
+    assert counted and "lineage_reset" not in counted[-1]
+
+
+def test_the_streak_still_stops_at_a_reset_that_is_not_being_held():
+    """The original reading, unchanged where it was right.
+
+    A reset that fires drops the diverged trajectory's debt, and counting past it
+    would charge the new trajectory for the old one's failures. That only stops
+    applying once the reset is being *held*, which is a different state.
+    """
+
+    from agents.dqn_market_scorer.training.updater import rejections_since_promotion
+
+    seen: list[str] = []
+
+    class Reader:
+        def fetchone(self, sql, parameters):
+            seen.append(sql)
+            return (3,)
+
+    assert rejections_since_promotion(Reader(), "free.model") == 3
+    assert "lineage_reset" in seen[-1]
+
+    assert rejections_since_promotion(Reader(), "free.model", held=True) == 3
+    assert "lineage_reset" not in seen[-1]
+
+
 def test_self_play_pool_skips_checkpoints_whose_weights_are_gone(tmp_path: Path):
     """A row surviving its artifact would fail every episode it is drawn for."""
 
@@ -1037,10 +1383,660 @@ def test_resume_reapplies_the_configured_learning_rates():
     _reset_learning_rates(optimizer, clone_optimizer, {"learning_rate": 2e-4})
     assert [group["lr"] for group in clone_optimizer.param_groups] == [2e-4]
 
+    # The slot schedule overrides the peak, and the clone rate keeps its ratio to
+    # it rather than staying at the configured constant -- a decaying slot has to
+    # decay both phases or the clone quietly dominates the fine-tuning after it.
+    _reset_learning_rates(
+        optimizer,
+        clone_optimizer,
+        {"learning_rate": 2e-4, "behavior_clone_learning_rate": 4e-4},
+        5e-5,
+    )
+    assert [group["lr"] for group in optimizer.param_groups] == [5e-5]
+    assert [group["lr"] for group in clone_optimizer.param_groups] == [1e-4]
+
 
 # --------------------------------------------------------------------------
-# Cold start
+# Population training
 # --------------------------------------------------------------------------
+
+
+_SLOT_CONFIG = {
+    "learning_rate": 1e-4,
+    "lr_graduate_cut": 1e-5,
+    "lr_warmup_updates": 3,
+    "lr_plateau_patience": 2,
+    "lr_plateau_min_delta": 0.05,
+    "lr_decay_factor": 0.5,
+    "lr_min_updates_before_graduation": 4,
+}
+
+
+def _run_slot(scores, config=None):
+    """Drive a slot through `scores`, returning one state per update."""
+
+    spec = updater_module._slot(config or _SLOT_CONFIG)
+    previous: dict = {}
+    history = []
+    for score in scores:
+        state = updater_module._slot_state(previous, spec)
+        state = updater_module._settle_slot(state, score, spec)
+        history.append((state, updater_module._graduates(state, spec)))
+        previous = state.as_metrics()
+    return history
+
+
+def test_the_slot_warms_up_from_zero_and_then_holds_the_peak():
+    """"Learning rate back to zero" is literal, and it is the first update.
+
+    The rounds between a graduation and the update that consumes it are collected
+    by the reseeded policy, so the slot's first update is fitting freshly
+    perturbed weights to a buffer it has only just started refilling. Training
+    that at full rate is the `landgate-v10` failure in miniature.
+    """
+
+    rates = [state.learning_rate for state, _ in _run_slot([100.0] * 6)]
+
+    assert rates[0] == 0.0
+    assert rates[:3] == pytest.approx([0.0, 1e-4 / 3, 2e-4 / 3])
+    assert rates[3:] == pytest.approx([1e-4] * 3), "warmup ends at the peak"
+
+
+def test_the_rate_decays_on_a_plateau_and_not_on_progress():
+    """Progress is measured on benchmark money, never on `mean_loss`.
+
+    Loss is not a progress signal on this family -- it sat at 0.0015 across 500
+    batches of a policy going nowhere -- and it is not even the right sign: a
+    policy that genuinely improves reaches harder states and its TD residual
+    rises. `lr_plateau_min_delta` is relative for the matching reason: benchmark
+    money spans three orders of magnitude across a run.
+    """
+
+    climbing = [state.learning_rate for state, _ in _run_slot([10.0 * 2**n for n in range(9)])]
+    assert climbing[-1] == pytest.approx(1e-4), "a rising score must never decay the rate"
+
+    # Three warmup updates, then the first steady one sets the baseline, then two
+    # stalls at `lr_plateau_patience = 2` halve it. The counter restarts on every
+    # decay, so the next halving costs another two.
+    stalled = _run_slot([10.0] * 11)
+    rates = [state.learning_rate for state, _ in stalled]
+    assert rates[3:6] == pytest.approx([1e-4] * 3)
+    assert rates[6:8] == pytest.approx([5e-5] * 2)
+    assert rates[8:10] == pytest.approx([2.5e-5] * 2)
+    assert rates[10] == pytest.approx(1.25e-5)
+
+    # A score inside the delta is a stall; one outside it is progress. Read off a
+    # state whose counter is at zero, so what moves is the delta and not the
+    # patience budget the previous line already spent.
+    spec = updater_module._slot(_SLOT_CONFIG)
+    rested = replace(stalled[-1][0], stall_updates=0, best_score=10.0)
+    assert updater_module._settle_slot(rested, 10.4, spec).stall_updates == 1
+    settled = updater_module._settle_slot(rested, 11.0, spec)
+    assert settled.stall_updates == 0 and settled.best_score == 11.0
+
+
+def test_a_slot_graduates_only_after_it_has_actually_trained():
+    """Warmup is below the cut too, and at update zero it is exactly zero.
+
+    Without the floor a reseeded slot graduates on its first update, reseeds
+    again, and the roster does nothing but churn -- ten learners each burning a
+    generation to produce nothing.
+    """
+
+    history = _run_slot([10.0] * 14)
+    graduated = [index for index, (_, ends) in enumerate(history) if ends]
+
+    assert graduated, "a slot that never improves must eventually end"
+    first = graduated[0]
+    assert first >= 4, "the lifetime floor holds through warmup and past it"
+    assert history[first][0].learning_rate > _SLOT_CONFIG["lr_graduate_cut"], (
+        "the cut is read off the rate the *next* update would use, or it is "
+        "always noticed one update late"
+    )
+    assert not any(ends for _, ends in history[:first])
+
+    # A rising score never graduates, however long the slot runs.
+    climbing = _run_slot([10.0 * 2**index for index in range(14)])
+    assert not any(ends for _, ends in climbing)
+
+
+def test_the_schedule_is_inert_without_a_graduation_cut():
+    """One key turns the whole mechanism on, and every older config is unchanged.
+
+    `lr_warmup_updates` and `lr_decay_factor` both carry non-trivial defaults, so
+    a config that never asked for a population would otherwise be silently warmed
+    up from zero and decayed afterwards.
+    """
+
+    rates = [
+        state.learning_rate
+        for state, _ in _run_slot([10.0] * 8, {"learning_rate": 1e-4})
+    ]
+
+    assert rates == pytest.approx([1e-4] * 8)
+    assert not any(ends for _, ends in _run_slot([10.0] * 8, {"learning_rate": 1e-4}))
+
+
+def test_a_cut_at_or_above_the_peak_is_refused():
+    """Otherwise every slot in the roster graduates before it trains, forever."""
+
+    with pytest.raises(ValueError, match="lr_graduate_cut"):
+        updater_module._slot({"learning_rate": 1e-4, "lr_graduate_cut": 1e-4})
+
+
+def test_the_slot_score_is_a_median_of_its_own_measurements():
+    """A single arena draw is not a number on this family.
+
+    `falloff_v1` measured its benchmark money 61 times without the policy
+    meaningfully moving -- the snapback held it on one checkpoint for 55 of them
+    -- and got everything from 0.93 to 427 around a median of 36.7. A plateau
+    detector reading single draws finds an "improvement" by luck every few
+    updates and the rate never decays, which is the stagnation this exists to end
+    reproduced by the thing meant to end it.
+    """
+
+    seen: list[list] = []
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            seen.append(list(parameters))
+            return [
+                (json.dumps({"challenger_benchmarks": [{"opponent": "pilkwang", "a_money_mean": value}]}),)
+                for value in (0.93, 36.0, 427.0, 12.0)
+            ]
+
+    score = updater_module._slot_score(Reader(), "free.model", "pilkwang", 40.0, 5, 120)
+
+    assert score == pytest.approx(36.0), "the median, not the latest draw"
+    # Bounded below by the slot's own reseed: measurements from before it describe
+    # a policy this slot no longer is, and an inherited high score would pin the
+    # plateau counter of a restarted slot.
+    assert seen[-1][1] == 120
+
+    # A window of one is the candidate itself, byte for byte the behaviour before
+    # the window existed.
+    assert updater_module._slot_score(Reader(), "free.model", "pilkwang", 40.0, 1, 0) == 40.0
+    # Nothing measured is not a stall, and `_settle_slot` must see it as such.
+    spec = updater_module._slot(_SLOT_CONFIG)
+    state = updater_module._slot_state({}, spec)
+    assert updater_module._settle_slot(state, None, spec) == state
+
+
+def test_the_reseed_perturbation_moves_a_fraction_and_keeps_the_shape():
+    """Weight-space dropout, not a layer, so numpy/torch parity is untouched."""
+
+    from agents.dqn_market_free.training import reseed
+
+    source = OrderQNetwork.quiet_start(seed=11)
+    # The output layer of a quiet start is all zeros, which makes the count of
+    # changed entries exactly the count of redrawn ones.
+    perturbed = reseed.perturb(source, rate=0.25, seed=3)
+
+    assert len(perturbed.layers) == len(source.layers)
+    for (weight, bias), (original, _) in zip(perturbed.layers, source.layers):
+        assert weight.shape == original.shape
+        assert weight.dtype == np.float32 and bias.dtype == np.float32
+
+    head, original_head = perturbed.layers[-1][0], source.layers[-1][0]
+    assert not original_head.any(), "the quiet start zeroes its head"
+    moved = np.count_nonzero(head) / head.size
+    assert 0.2 < moved < 0.3, "about a quarter of the head redrawn"
+    # At the layer's own init scale rather than at whatever a trained layer has
+    # drifted to, so a fresh entry is explorable instead of immediately dominated.
+    assert np.abs(head).max() <= 1.0 / np.sqrt(original_head.shape[0])
+
+    # The source is not mutated, and rate 0 is still a copy the caller owns.
+    assert not source.layers[-1][0].any()
+    untouched = reseed.perturb(source, rate=0.0, seed=3)
+    assert untouched is not source
+    assert_array_equal(untouched.layers[0][0], source.layers[0][0])
+
+    # Same seed, same perturbation: the collector and the updater load the same
+    # materialized artifact, but a run has to be reproducible from its config too.
+    assert_array_equal(
+        reseed.perturb(source, rate=0.25, seed=3).layers[0][0],
+        perturbed.layers[0][0],
+    )
+
+
+def test_the_reseed_restores_sigma_and_survives_the_inert_guard():
+    """Sigma anneals toward zero over a slot's life; a restart needs it back.
+
+    A slot inheriting a collapsed sigma restarts with no exploration budget at
+    all and can only ever rediscover what the mature member already knows -- and
+    the failure is silent, because nothing else in `metrics_json` moves.
+    """
+
+    from agents.dqn_market_free.training import reseed
+
+    module = net_module.build(noisy="head", sigma0=0.5)
+    source = net_module.to_numpy(module)
+    # Anneal it away, the way a trained slot does.
+    source.sigma[-1] = (
+        np.zeros_like(source.sigma[-1][0]),
+        np.zeros_like(source.sigma[-1][1]),
+    )
+    assert not source.sigma[-1][0].any()
+
+    restored = reseed.perturb(source, rate=0.1, seed=5, sigma_reset=0.5)
+    assert restored.sigma[-1][0].any()
+    bound = 1.0 / np.sqrt(source.layers[-1][0].shape[0])
+    assert restored.sigma[-1][0].max() == pytest.approx(0.5 * bound)
+
+    # Left alone when not asked for, and a deterministic layer stays deterministic
+    # -- `from_numpy` raises if a checkpoint carries sigma the module does not.
+    kept = reseed.perturb(source, rate=0.1, seed=5)
+    assert not kept.sigma[-1][0].any()
+    assert reseed.perturb(OrderQNetwork.quiet_start(seed=1), 0.1, sigma_reset=0.5).sigma == [
+        None,
+        None,
+        None,
+    ]
+
+    # A perturbed network must still clear the guard the exported candidate goes
+    # through. An all-zero trunk has no gradient outside its output bias, so a
+    # slot restarted onto one could never leave.
+    updater_module._reject_inert_network(restored)
+
+
+def test_graduation_enters_the_group_and_retires_the_worst(tmp_path: Path):
+    """Capacity is held by retiring, not deleting: a run stays answerable."""
+
+    statements: list[tuple[str, list]] = []
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            statements.append((sql, list(parameters)))
+            if sql.strip().startswith("UPDATE"):
+                return [("worst", 1.5)]
+            return [("member",)]
+
+    result = updater_module._graduate(
+        Reader(), "decl", "decl@learner_03", "ckpt-a", 145.8, 30
+    )
+
+    insert, cull = statements
+    assert "INSERT INTO population_members" in insert[0]
+    assert "RETURNING" in insert[0], (
+        "the trainer's only handle is the read view, whose fetchall wants rows"
+    )
+    assert insert[1][1:] == ["decl", "decl@learner_03", "ckpt-a", 145.8]
+
+    # The cull reads the live set *after* the insert, so a graduate that is itself
+    # the worst member is the one retired and the group cannot be made worse by
+    # admitting to it.
+    assert "retired_at = current_timestamp" in cull[0]
+    assert "OFFSET" in cull[0] and cull[1] == ["decl", 30]
+    assert result["retired"] == [{"member_id": "worst", "score": 1.5}]
+    assert result["score"] == 145.8
+
+
+def test_a_hoarder_cannot_outrank_a_trader_in_the_pool():
+    """The pool is culled `ORDER BY score DESC`, so money alone selects for idling.
+
+    The stake is 3,000 and a policy that never trades keeps it, while one that
+    trades for a season carries hundreds. Ranked on raw money the hoarder enters
+    at the top, is never culled, and becomes the reseed source for every slot.
+    """
+
+    config = {"population_activity_reference": 0.10}
+    hoarder = updater_module._population_score(2998.8, 0.0, config)
+    trader = updater_module._population_score(600.0, 0.32, config)
+
+    assert hoarder["money"] > trader["money"], "the premise: money favours the hoarder"
+    assert hoarder["score"] < trader["score"], "the ranking must not"
+    assert hoarder["score"] == 0.0
+    assert trader["score"] == 600.0, "at or above the reference there is no discount"
+
+
+def test_barely_clearing_the_activity_floor_does_not_buy_the_top_of_the_pool():
+    """`viability_min_orders_per_decision` is a binary at 0.02.
+
+    It separates "never acts" from "acts", not "trades" from "hoards", so a policy
+    that clears 0.021 while sitting on its stake passes hard viability. The pool
+    score is what has to stop it dominating from there.
+    """
+
+    config = {"population_activity_reference": 0.10}
+    barely = updater_module._population_score(3000.0, 0.021, config)
+    trading = updater_module._population_score(600.0, 0.32, config)
+
+    assert barely["activity_factor"] == pytest.approx(0.21)
+    assert barely["score"] == pytest.approx(630.0)
+    assert barely["score"] < trading["score"] * 1.1, (
+        "five times the money on a tenth of the activity should rank comparably, "
+        "not dominate"
+    )
+
+
+def test_the_discount_is_a_ramp_rather_than_a_second_threshold():
+    """Repeating the floor's shape would only move the same cliff."""
+
+    config = {"population_activity_reference": 0.10}
+    scores = [
+        updater_module._population_score(1000.0, rate, config)["score"]
+        for rate in (0.0, 0.025, 0.05, 0.075, 0.10, 0.5)
+    ]
+
+    assert scores == sorted(scores), "monotone in activity"
+    assert scores[:5] == pytest.approx([0.0, 250.0, 500.0, 750.0, 1000.0])
+    # No upper penalty: over-trading can only surface as lost money, which the
+    # money term already carries.
+    assert scores[-1] == scores[-2]
+
+
+def test_more_money_still_wins_at_equal_activity():
+    """The discount must not invert the objective it is protecting."""
+
+    config = {"population_activity_reference": 0.10}
+    rich = updater_module._population_score(900.0, 0.30, config)
+    poor = updater_module._population_score(300.0, 0.30, config)
+    assert rich["score"] > poor["score"]
+
+
+def test_an_unmeasured_activity_ranks_on_money_rather_than_at_zero():
+    """A missing measurement is not evidence of idleness.
+
+    Treating it as zero would retire every checkpoint written before the trading
+    rate was recorded, the first time the pool was culled.
+    """
+
+    scored = updater_module._population_score(500.0, None, {})
+    assert scored["score"] == 500.0
+    assert scored["scored_by"] == "money_unmeasured_activity"
+
+
+def test_the_discount_can_be_turned_off():
+    scored = updater_module._population_score(2998.8, 0.0, {"population_activity_reference": 0})
+    assert scored["score"] == 2998.8
+    assert scored["scored_by"] == "money"
+
+
+def test_a_missing_money_measurement_scores_zero_rather_than_raising():
+    assert updater_module._population_score(None, 0.5, {})["score"] == 0.0
+
+
+def test_the_released_trading_rate_is_read_not_re_simulated():
+    """Same route as `_released_benchmark_money`: one row, no arena time."""
+
+    gate = {
+        "hard_viability": {
+            "benchmarks": [{"trading_rate": 0.31, "passed": True}],
+            "head_to_head": {"trading_rate": 0.29},
+        }
+    }
+
+    class Reader:
+        def __init__(self):
+            self.queries = 0
+
+        def fetchone(self, sql, parameters):
+            self.queries += 1
+            assert "model_training_checkpoints" in sql
+            return (json.dumps(gate),)
+
+    class Active:
+        checkpoint_id = "ckpt-a"
+
+    reader = Reader()
+    assert updater_module._released_trading_rate(reader, Active(), "bench") == 0.31
+    assert reader.queries == 1
+
+    # No incumbent, and a payload that never recorded it, both read as "unknown".
+    assert updater_module._released_trading_rate(reader, None, "bench") is None
+
+
+def test_an_older_gate_payload_falls_back_through_the_benchmark_diagnostics():
+    gate = {
+        "challenger_benchmarks": [
+            {"opponent": "other", "order_diagnostics": {"trading_rate": 0.9}},
+            {"opponent": "bench", "order_diagnostics": {"trading_rate": 0.4}},
+        ]
+    }
+
+    class Reader:
+        def fetchone(self, sql, parameters):
+            return (json.dumps(gate),)
+
+    # Matched on the opponent spec, like the money, so a reconfigured benchmark
+    # drops the term instead of reading a different opponent's activity.
+    assert updater_module._released_trading_rate(Reader(), type("A", (), {"checkpoint_id": "c"})(), "bench") == 0.4
+    assert updater_module._released_trading_rate(Reader(), type("A", (), {"checkpoint_id": "c"})(), "missing") is None
+
+
+def test_the_mature_group_drops_members_whose_weights_are_gone(tmp_path: Path):
+    """Best first, and unusable rows filtered rather than raising."""
+
+    present = tmp_path / "present.npz"
+    present.write_bytes(b"weights")
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            return [
+                ("m1", "decl@a", "ckpt-1", 900.0, str(tmp_path / "gone.npz")),
+                ("m2", "decl@b", "ckpt-2", 400.0, str(present)),
+            ]
+
+    members = updater_module.mature_members(Reader(), "decl")
+
+    assert [member["checkpoint_id"] for member in members] == ["ckpt-2"]
+    assert members[0]["score"] == 400.0
+
+
+class _AgeReader:
+    """Answers the release-age query with a fixed count."""
+
+    def __init__(self, count):
+        self.count = count
+        self.queries = 0
+
+    def fetchone(self, sql, parameters):
+        self.queries += 1
+        assert "model_updates" in sql and "model_training_checkpoints" in sql
+        return None if self.count is None else (self.count,)
+
+
+def test_a_release_is_dated_by_the_updates_it_has_survived():
+    assert updater_module._release_age(_AgeReader(7), "decl@learner_00", "ckpt-a") == 7
+    assert updater_module._release_age(_AgeReader(0), "decl@learner_00", "ckpt-a") == 0
+
+
+def test_an_undatable_release_reads_as_unknown_not_as_zero():
+    """An unreadable history must never open the gate the lag exists to hold shut."""
+
+    assert updater_module._release_age(_AgeReader(None), "decl@learner_00", "ckpt-a") is None
+    # No checkpoint at all short-circuits without querying.
+    reader = _AgeReader(5)
+    assert updater_module._release_age(reader, "decl@learner_00", None) is None
+    assert reader.queries == 0
+
+
+def test_the_entry_lag_is_what_stops_the_roster_recycling_itself():
+    """A release copyable the moment it is promoted closes the loop.
+
+    Whichever slot released last would become the ancestor for whichever slot
+    reseeds next, and ten slots converge on clones of the current best -- a greedy
+    hill-climb, which is strictly worse than the single lineage the population
+    replaced. The eligibility rule below is the whole defence, so it is pinned
+    here rather than left to the call site.
+    """
+
+    entry_after = 4
+
+    def eligible(age, graduating):
+        return graduating or (age is not None and age >= entry_after)
+
+    # Fresh release, slot still training: held back.
+    assert not eligible(0, False)
+    assert not eligible(3, False)
+    # Survived the lag: admitted.
+    assert eligible(4, False)
+    assert eligible(11, False)
+    # Undatable: treated as not old enough.
+    assert not eligible(None, False)
+    # A graduating slot contributes whatever the age -- it is finishing anyway,
+    # and holding its release back would lose it entirely.
+    assert eligible(0, True)
+    assert eligible(None, True)
+
+
+def _members(*scores):
+    return [
+        {
+            "member_id": f"m{index}",
+            "model_id": f"decl@learner_{index:02d}",
+            "checkpoint_id": f"ckpt-{index}",
+            "score": score,
+            "inference_artifact_path": f"/tmp/ckpt-{index}.npz",
+        }
+        for index, score in enumerate(scores)
+    ]
+
+
+def test_a_reseed_draws_from_the_top_rather_than_the_single_best():
+    """Argmax over noisy estimates picks the luckiest estimate, not the best policy.
+
+    And it picks the same one every time, because the estimate is stored and
+    reused -- so ten slots become ten perturbations of one ancestor.
+    """
+
+    members = _members(900.0, 850.0, 800.0, 100.0, 50.0)
+    config = {"reseed_source_pool": 3}
+
+    drawn = {
+        updater_module._reseed_source(members, config, seed=7, reseed_index=index)[
+            "checkpoint_id"
+        ]
+        for index in range(40)
+    }
+
+    assert drawn <= {"ckpt-0", "ckpt-1", "ckpt-2"}, "never below the configured top"
+    assert len(drawn) > 1, "and not always the same one"
+
+
+def test_the_draw_is_reproducible():
+    """A restart has to be answerable afterwards, like every other seeded choice."""
+
+    members = _members(900.0, 850.0, 800.0)
+    config = {"reseed_source_pool": 3}
+    first = updater_module._reseed_source(members, config, seed=3, reseed_index=2)
+    again = updater_module._reseed_source(members, config, seed=3, reseed_index=2)
+    assert first["checkpoint_id"] == again["checkpoint_id"]
+
+    # Different slot seed, or a later reseed on the same slot, may draw differently.
+    others = {
+        updater_module._reseed_source(members, config, seed=seed, reseed_index=index)[
+            "checkpoint_id"
+        ]
+        for seed in range(6)
+        for index in range(6)
+    }
+    assert len(others) > 1
+
+
+def test_a_pool_of_one_reproduces_taking_the_best():
+    members = _members(900.0, 850.0, 800.0)
+    chosen = updater_module._reseed_source(members, {"reseed_source_pool": 1}, seed=1, reseed_index=0)
+    assert chosen["checkpoint_id"] == "ckpt-0"
+
+
+def test_the_draw_degrades_to_what_the_group_actually_holds():
+    """The pool is expected to hold very few members early on."""
+
+    single = updater_module._reseed_source(_members(500.0), {"reseed_source_pool": 3}, seed=1, reseed_index=0)
+    assert single["checkpoint_id"] == "ckpt-0"
+    assert updater_module._reseed_source([], {"reseed_source_pool": 3}, seed=1, reseed_index=0) is None
+
+
+def test_a_nonsense_pool_size_does_not_crash_the_restart():
+    members = _members(900.0, 100.0)
+    for size in (0, -5):
+        chosen = updater_module._reseed_source(members, {"reseed_source_pool": size}, seed=1, reseed_index=0)
+        assert chosen["checkpoint_id"] == "ckpt-0"
+
+
+def test_the_shortened_ladder_keeps_the_same_terminal_rate():
+    """`lr_decay_factor` 0.25 halves the ladder without moving where it ends.
+
+    0.25**2 and 0.5**4 are both 0.0625, so a slot still finishes at 6.25e-6 --
+    and `lr_plateau_patience` is untouched, so every decay is still four
+    consecutive non-improving updates rather than two.
+    """
+
+    peak, cut = 1e-4, 1e-5
+
+    def decays(factor):
+        steps = 0
+        while peak * factor**steps >= cut:
+            steps += 1
+        return steps
+
+    assert decays(0.5) == 4
+    assert decays(0.25) == 2
+    assert peak * 0.25**2 == pytest.approx(peak * 0.5**4)
+
+
+def test_the_self_play_pool_is_bounded_below_by_the_reseed(tmp_path: Path):
+    """A restarted slot must not mirror the trajectory it was restarted to leave.
+
+    `landgate-v10` is the record of skipping this: the reset restored an 18k
+    checkpoint, the mirror kept playing the discarded 357-coin policy, and the
+    next twenty batches were collected against it.
+    """
+
+    seen: list[tuple[str, list]] = []
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            seen.append((sql, list(parameters)))
+            return []
+
+    context = SimpleNamespace(model_id="free.model")
+    _self_play_pool(context, Reader(), 5)
+    assert "created_at > (" not in seen[-1][0], "no floor without a reseed"
+
+    _self_play_pool(context, Reader(), 5, "ckpt-reseed")
+    assert "created_at > (" in seen[-1][0]
+    assert seen[-1][1] == ["free.model", "ckpt-reseed", 5]
+
+
+def test_the_reseed_watermarks_are_held_for_the_slot_and_not_for_one_update():
+    """The other half of the reset, and the half `landgate-v10` forgot.
+
+    `fill_buffer` rebuilds from recent batches whatever weights were loaded, and
+    `_self_play_pool` takes the newest checkpoints whether promoted or not, so a
+    restored checkpoint trains immediately on episodes generated by the policy
+    just thrown away and mirrors it as well. Holding the two watermarks across
+    only the consuming update lets both come straight back one update later,
+    which is the shape that made the original reset a third of a reset.
+    """
+
+    spec = updater_module._slot(_SLOT_CONFIG)
+    marker = {
+        "reseed_pending": True,
+        "reseed_batch_floor": 1400,
+        "reseed_after_checkpoint_id": "ckpt-reseed",
+        "lr_reseed_index": 2,
+        # Deliberately healthy, to show the consuming update discards them.
+        "lr_updates_since_reseed": 40,
+        "lr_decay_steps": 3,
+        "lr_best_score": 900.0,
+        "lr_stall_updates": 1,
+    }
+
+    consuming = updater_module._slot_state(marker, spec)
+    assert consuming.updates_since_reseed == 0
+    assert consuming.decay_steps == 0 and consuming.stall_updates == 0
+    assert consuming.best_score is None, "an inherited score would pin the plateau"
+    assert consuming.reseed_index == 3
+    assert consuming.batch_floor == 1400
+    assert consuming.after_checkpoint_id == "ckpt-reseed"
+
+    # And the update after it, which carries no marker at all, keeps both.
+    following = updater_module._slot_state(consuming.as_metrics(), spec)
+    assert following.updates_since_reseed == 1
+    assert following.batch_floor == 1400
+    assert following.after_checkpoint_id == "ckpt-reseed"
 
 
 def test_cold_start_emits_nothing():
@@ -1352,93 +2348,28 @@ def test_actor_sigma_scales_span_exploring_and_greedy():
     assert actor_sigma_scales(1) == [1.0]
 
 
-def test_hot_rungs_put_a_minority_of_pairs_above_the_setpoint():
-    """The one-sided ladder's blind spot, closed on request.
+def test_the_ladder_never_explores_above_the_setpoint():
+    """Downward only, and the two mechanisms that broke that rule are retired.
 
-    Actor 0 plays the setpoint and everything else plays less, so no episode
-    anywhere explores harder than the controller resolved and the behaviours that
-    need a harder push are unreachable rather than merely rare. `hot` rungs run
-    above it, geometrically from `top` down to the setpoint.
+    The idle burst went at v15 and `noisy_actor_hot` went with the population.
+    Both were answers to the same complaint -- nothing anywhere explores harder
+    than the controller resolved -- and per-episode attribution refused both. On
+    `burst-v9`, 212 seats at sigma 3.159 finished 49% bankrupt against 8-26%
+    across the ordinary ladder and bought zero land; on `falloff-v18` the hot
+    rungs' land rate was 4.6% against the ordinary rungs' 4.9%.
+
+    97 of 186 actions spend money, so a widened policy is broke before a rare
+    action is affordable. Escaping a stuck trajectory is the population's job now.
     """
 
-    scales = actor_sigma_scales(8, 32.0, hot=2, top=4.0)
-    assert len(scales) == 8
-    assert scales == sorted(scales, reverse=True)
-    # Exactly the asked-for count above the setpoint, and the hottest is `top`.
-    assert [scale for scale in scales if scale > 1.0] == pytest.approx([4.0, 2.0])
-    # The setpoint rung survives, so `sigma_base` is still played by somebody.
-    assert sum(1 for scale in scales if scale == pytest.approx(1.0)) == 1
-    # And so does the near-greedy tail the money diagnostics read.
-    assert scales[-1] < 0.05
-
-    # A minority of the batch, which is the whole reason this is affordable:
-    # `priority_alpha` is 0.0, so hot episodes are sampled uniformly beside the
-    # good ones and every extra rung is a permanent noise floor.
-    assert sum(1 for scale in scales if scale > 1.0) * 2 < len(scales)
-
-    # `hot = 0` is the ladder byte for byte, so a run that never names the knob
-    # is unchanged.
-    assert actor_sigma_scales(8, 32.0, hot=0, top=4.0) == actor_sigma_scales(8, 32.0)
-    # And so is a `top` that is not actually above the setpoint: there is nothing
-    # to spread into, and rungs *below* 1.0 at the hot end would invert the order.
-    assert actor_sigma_scales(8, 32.0, hot=2, top=1.0) == actor_sigma_scales(8, 32.0)
-    assert actor_sigma_scales(8, 32.0, hot=2, top=0.5) == actor_sigma_scales(8, 32.0)
-
-    # Degenerate widths must not divide by zero, and must leave a cold rung.
-    assert actor_sigma_scales(1, 32.0, hot=4, top=4.0) == [1.0]
-    assert actor_sigma_scales(2, 32.0, hot=9, top=4.0) == pytest.approx([4.0, 1.0])
-
-
-def test_the_hottest_rung_is_the_resolved_hot_base_and_nothing_wider():
-    """Hot rungs are sized off a target rate, not off a multiplier of their own.
-
-    A multiplier is the wrong unit twice over: the setpoint it multiplies moves
-    every update as the controller tracks the target, and the rate a given scale
-    buys is a property of the current network. Resolving the top off
-    `noisy_hot_order_rate` puts the hottest pair at a measured rate, and inherits
-    `noisy_hot_scale_limit` with it.
-
-    That ceiling is the load-bearing half. v15 ran it at 4.0, where the limit was
-    hit dead on: the hot rungs played 4.0 and 1.414 against a 0.5 setpoint, and
-    over 1,424 learner seats the hottest quarter finished below 100 coins on 55%
-    of them -- v9's 49%-bankrupt result at sigma 3.159, reproduced. Three of those
-    356 seats bought land, against six at the rung below. The top rung detonated
-    the episode rather than searching it.
-    """
-
-    from agents.dqn_market_free.training.collect import actor_sigma_scales
-    from agents.dqn_market_free.training.updater import resolve_sigma_scale
-
-    # v7's measured flip-to-order curve, so the sizing below is the real one.
-    order_curve = {
-        0.125: 0.00117,
-        0.25: 0.00818,
-        0.5: 0.02453,
-        1.0: 0.08879,
-        2.0: 0.19159,
-        4.0: 0.53621,
-        8.0: 0.73949,
-    }
-    limit = 2.0
-    setpoint = resolve_sigma_scale(order_curve, 0.05, 8.0)
-    hot_base = resolve_sigma_scale(order_curve, 0.35, limit)
-    assert hot_base > setpoint
-
-    top = max(1.0, hot_base / setpoint)
-    played = [
-        setpoint * scale for scale in actor_sigma_scales(8, 32.0, hot=2, top=top)
-    ]
-
-    assert max(played) == pytest.approx(hot_base)
-    # Capped by the hot limit rather than by the looser ordinary one, so neither
-    # the 3.159 event nor v15's 4.0 can come back through the ladder.
-    assert max(played) <= limit
-    # Still above the setpoint, or the hot rungs are not hot and the ladder is
-    # one-sided again with extra steps.
-    assert played[1] > setpoint
-    # The rest of the batch is unchanged: setpoint, then the 32x spread down.
-    assert played[2] == pytest.approx(setpoint)
-    assert played[-1] == pytest.approx(setpoint / 32.0)
+    scales = actor_sigma_scales(8, 32.0)
+    assert max(scales) == pytest.approx(1.0)
+    assert not [scale for scale in scales if scale > 1.0]
+    # The retired keys are refused rather than ignored, because a config still
+    # carrying them was asking for something the ladder no longer does.
+    for key in ("noisy_actor_hot", "noisy_hot_order_rate", "noisy_hot_scale_limit"):
+        with pytest.raises(ValueError, match="retired"):
+            updater_module._noisy({"noisy": True, key: 2})
 
 
 def test_the_flip_rate_rises_with_the_sigma_scale():
@@ -1599,15 +2530,15 @@ def test_the_sigma_floor_stops_the_controller_switching_exploration_off():
     assert _noisy({"noisy": True}).scale_floor == 0.0
 
 
-def test_the_hot_rungs_have_their_own_ceiling():
-    """`noisy_sigma_scale_limit` is far too loose to bound a burst.
+def test_the_setpoint_ceiling_still_bounds_a_flattening_curve():
+    """`noisy_sigma_scale_limit` is the last stop, and it has to be.
 
-    At its default of 8.0, v9's `noisy_hot_order_rate = 0.35` resolved to 3.159
-    on the curve update 1362 recorded. Per-episode across 212 seats at that sigma:
-    49% bankrupt against 8-26% on the ordinary ladder, mean money 4,892 against
-    11-13k, and zero land purchases -- the thing the burst existed to find. A rate
-    target alone cannot express that bound, because what a rate costs in sigma
-    depends on a curve that moves with the network.
+    What a target rate costs in sigma depends on a curve that moves with the
+    network, so a curve that flattens asks for far more sigma at an unchanged
+    config. That is how v9 reached 3.159 and measured 49% of 212 seats bankrupt
+    against 8-26% on the ordinary ladder, with zero land purchases -- the thing
+    the widening existed to find. The limit is what stops a run drifting back into
+    that regime without anyone changing a setting.
     """
 
     from agents.dqn_market_free.training.updater import _noisy, resolve_sigma_scale
@@ -1622,33 +2553,21 @@ def test_the_hot_rungs_have_their_own_ceiling():
         4.0: 0.44277,
         8.0: 0.64006,
     }
-
-    # What v9 played, and what v10 plays instead.
     assert resolve_sigma_scale(curve, 0.35, 8.0) == pytest.approx(3.16, abs=0.02)
-    assert resolve_sigma_scale(curve, 0.10, 8.0) == pytest.approx(1.31, abs=0.02)
+    assert resolve_sigma_scale(curve, 0.05, 8.0) < 1.5
 
     noisy = _noisy(
         {
             "noisy": True,
             "noisy_order_rate_target": 0.05,
-            "noisy_burst_every": 5,
-            "noisy_hot_order_rate": 0.10,
-            "noisy_hot_scale_limit": 1.5,
+            "noisy_sigma_scale_limit": 1.5,
         }
     )
-    assert noisy.hot_scale_limit == 1.5
-    assert noisy.scale_limit == 8.0, "the ordinary controller keeps its own limit"
+    assert noisy.scale_limit == 1.5
 
-    # The ceiling binds even if the curve later flattens enough that the same
-    # target asks for far more sigma -- which is exactly how a run drifts back
-    # into the 3.159 regime without any config change.
     flat = {1.0: 0.01, 2.0: 0.02, 4.0: 0.05, 8.0: 0.30}
-    assert resolve_sigma_scale(flat, 0.10, noisy.scale_limit) > 4.0
-    assert resolve_sigma_scale(flat, 0.10, noisy.hot_scale_limit) == pytest.approx(1.5)
-
-    # Unset, it falls back to the ordinary limit, so older configs are unchanged.
-    default = _noisy({"noisy": True, "noisy_sigma_scale_limit": 8.0})
-    assert default.hot_scale_limit == 8.0
+    assert resolve_sigma_scale(flat, 0.10, 8.0) > 4.0
+    assert resolve_sigma_scale(flat, 0.10, noisy.scale_limit) == pytest.approx(1.5)
 
 
 def test_the_two_controllers_disagree_on_a_collapsed_policy():
@@ -3922,11 +4841,10 @@ def test_the_rollout_spec_carries_the_gain_only_when_it_is_on(tmp_path: Path):
     assert "rare_sigma_gain=1.000000" in on and "rare_sigma_cap=3.000000" in on
 
 
-def test_the_widening_rides_the_hot_end_of_the_ladder(monkeypatch, tmp_path: Path):
-    """The hot rungs already exist to find things; the greedy tail must stay clean.
+def test_the_widening_rides_the_widest_end_of_the_ladder(monkeypatch, tmp_path: Path):
+    """The widest rungs already exist to find things; the greedy tail stays clean.
 
-    `cold_order_diagnostics` triggers the idle escape off the near-greedy pairs,
-    and the money series is only comparable across this change while some pairs
+    The money series is only comparable across this change while some pairs
     collect what the run before it collected.
     """
 
@@ -3954,7 +4872,7 @@ def test_the_widening_rides_the_hot_end_of_the_ladder(monkeypatch, tmp_path: Pat
     )
 
     carried = {sigma: gain for sigma, gain in seen}
-    assert carried[1.0] == 1.0, "the hot end is the arm whose job is finding things"
+    assert carried[1.0] == 1.0, "the widest rung is the arm whose job is finding things"
     assert carried[0.008] == 0.0, "the greedy tail must stay a clean read"
     assert sum(1 for value in carried.values() if value > 0.0) == 3
     assert all(value in (0.0, 1.0) for value in carried.values()), (

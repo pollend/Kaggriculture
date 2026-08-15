@@ -13,7 +13,7 @@ import tomllib
 import traceback
 import uuid
 from collections.abc import Callable, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,6 +69,21 @@ class LeagueConfig:
     episode_steps: int = 720
     seed: int = 42
     jobs: int = 1
+    #: How many of this session's models run their hooks and updates at once.
+    #:
+    #: 1 is the historical behaviour: `run_round_hooks` and `_update_session_models`
+    #: walk the models one at a time. That is fine for one trainable model and
+    #: badly wrong for a population. Measured on `market-free-population-v23`, ten
+    #: learners on a 32-core box: max concurrent model updates 1, load average 9,
+    #: and a generation taking 77 minutes of which 37 was collection and 37 was the
+    #: promotion gate's arena series -- both serial, both using only `jobs` cores.
+    #: Actual gradient descent was 8.2 seconds per update.
+    #:
+    #: The real budget is `training_concurrency * jobs` against the core count,
+    #: because each model's rollouts and arena series spawn their own `jobs`-wide
+    #: process pool. Oversubscribing is not free: the pools are `spawn`, so the
+    #: cost of getting it wrong is paid in context switches on every episode.
+    training_concurrency: int = 1
     tau: float = 0.5
     candidate_pool: int = 2_000
     seed_session_id: str | None = None
@@ -114,6 +129,8 @@ class LeagueConfig:
             raise ValueError("episode_steps must be positive")
         if self.jobs < 0:
             raise ValueError("jobs must be zero (automatic) or positive")
+        if self.training_concurrency < 1:
+            raise ValueError("training_concurrency must be at least 1")
         seen: set[tuple[str, str]] = set()
         by_type: dict[str, list[TrainingAgentSpec]] = {}
         for instance in self.training_agents:
@@ -1039,6 +1056,7 @@ def run_generation(
                 model_ids,
                 artifacts,
                 update_models,
+                config.training_concurrency,
             )
             return generation_status(store, session_id)
         if status == "OPEN":
@@ -1096,8 +1114,28 @@ def run_generation(
                     round_index=round_index,
                     model_ids=model_ids,
                     artifacts=artifacts,
+                    concurrency=config.training_concurrency,
                 )
                 round_errors = [report for report in round_reports if report.status == "error"]
+                if on_progress is not None:
+                    # A round is the whole population's rollouts, so this is the
+                    # only line that says the previous one *ended*. Without it the
+                    # log is a series of "started" with minutes of silence between
+                    # them, which reads as a hang rather than as work.
+                    on_progress(
+                        {
+                            "event": "round_finished",
+                            "session_id": session_id,
+                            "generation_id": generation_id,
+                            "generation_index": generation_index,
+                            "round_index": round_index,
+                            "round_number": round_number,
+                            "round_count": len(rounds),
+                            "models": len(round_reports),
+                            "batches": sum(len(item.batches) for item in round_reports),
+                            "errors": [item.model_id for item in round_errors],
+                        }
+                    )
                 if config.pairing_mode == "trainer_only" and round_errors:
                     details = "; ".join(
                         f"{report.model_id}: {report.error}" for report in round_errors
@@ -1107,7 +1145,33 @@ def run_generation(
                         f"{details}"
                     )
                 if update_models:
-                    _update_session_models(store, model_ids, artifacts)
+                    # The update phase is the longer of the two silences: the
+                    # promotion gate simulates `eval_seeds` plus `promotion_seeds`
+                    # paired series per model, which measured 222 seconds a model
+                    # against 8 seconds of actual gradient descent. A log that goes
+                    # quiet for that long with no marker is indistinguishable from
+                    # a stall.
+                    if on_progress is not None:
+                        on_progress(
+                            {
+                                "event": "updates_started",
+                                "session_id": session_id,
+                                "generation_index": generation_index,
+                                "models": len(model_ids),
+                            }
+                        )
+                    _update_session_models(
+                        store, model_ids, artifacts, config.training_concurrency
+                    )
+                    if on_progress is not None:
+                        on_progress(
+                            {
+                                "event": "updates_finished",
+                                "session_id": session_id,
+                                "generation_index": generation_index,
+                                "models": len(model_ids),
+                            }
+                        )
         finally:
             if pool is not None:
                 pool.shutdown()
@@ -1120,6 +1184,7 @@ def run_generation(
             model_ids,
             artifacts,
             update_models,
+            config.training_concurrency,
         )
         store.connection.execute(
             """
@@ -1139,6 +1204,7 @@ def _close_generation_training(
     model_ids: Sequence[str],
     artifacts: str | Path,
     update_models: bool,
+    concurrency: int = 1,
 ) -> None:
     """Offer the closed generation to each declared model, then let it train.
 
@@ -1156,18 +1222,53 @@ def _close_generation_training(
         round_index=GENERATION_ROUND_INDEX,
         model_ids=model_ids,
         artifacts=artifacts,
+        concurrency=concurrency,
     )
     if update_models:
-        _update_session_models(store, model_ids, artifacts)
+        _update_session_models(store, model_ids, artifacts, concurrency)
 
 
 def _update_session_models(
     store: ExperimentStore,
     model_ids: Sequence[str],
     artifacts: str | Path,
+    concurrency: int = 1,
 ) -> None:
-    for model in session_training_models(store, model_ids=model_ids):
-        update_model_in_store(store, model[0], artifacts=artifacts)
+    """Offer every declared model its update, `concurrency` at a time.
+
+    This is the expensive half of a generation and the half that looked cheap.
+    An update's gradient descent is seconds; what surrounds it is the promotion
+    gate's arena series -- `eval_seeds` pairs against each benchmark and
+    `promotion_seeds` against the incumbent, both seat-swapped. Measured on
+    `market-free-population-v23`: 222.6 seconds per update of which 8.2 were
+    `train_seconds`, so 96% of it is simulation, and ten models of it walked one
+    at a time is 37 minutes a generation on a box with 24 idle cores.
+
+    One store per worker, for the reasons in `run_round_hooks` -- and here the
+    advisory lock matters more, because `update_model_in_store` takes
+    `advisory_lock("model", model_id)` and `pg_advisory_lock` is re-entrant within
+    a session. Sharing one connection would hand every model the same lock owner
+    and quietly disable the serialization.
+    """
+
+    models = session_training_models(store, model_ids=model_ids)
+    if concurrency <= 1 or len(models) <= 1:
+        for model in models:
+            update_model_in_store(store, model[0], artifacts=artifacts)
+        return
+
+    def isolated(model) -> None:
+        # `initialize=False`: the caller's store has already ensured the schema,
+        # and running that bootstrap from several connections at once deadlocks.
+        # See `ExperimentStore`.
+        with ExperimentStore(store.target, initialize=False) as own_store:
+            update_model_in_store(own_store, model[0], artifacts=artifacts)
+
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(models))) as pool:
+        # `list` rather than fire-and-forget: `map` is lazy and swallows nothing,
+        # so consuming it here is what re-raises a failed update in the caller's
+        # thread instead of at interpreter shutdown.
+        list(pool.map(isolated, models))
 
 
 def reevaluate_hooks(

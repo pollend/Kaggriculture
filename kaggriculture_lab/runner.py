@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import time
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
@@ -164,11 +165,50 @@ def run_generations(
         progress_label = f"{index}" if continuous else f"{index}/{generations}"
         print(f"[{session_id}] generation {progress_label} started", flush=True)
 
+        # Wall clock per phase, because the question this log has to answer is
+        # "is it moving", and a bare "started" cannot. A population generation is
+        # minutes of rollouts followed by minutes of promotion arenas, so silence
+        # is the normal state and only elapsed time distinguishes it from a stall.
+        started_at: dict[str, float] = {}
+
         def progress(event: dict[str, Any]) -> None:
-            if event.get("event") == "round_started":
+            kind = event.get("event")
+            if kind is None:
+                return
+            prefix = f"[{session_id}] generation g{int(event.get('generation_index', 0)):04d}"
+            now = time.monotonic()
+            if kind == "round_started":
+                started_at["round"] = now
                 print(
-                    f"[{session_id}] generation g{int(event['generation_index']):04d} "
-                    f"training round {event['round_number']}/{event['round_count']} started",
+                    f"{prefix} training round "
+                    f"{event['round_number']}/{event['round_count']} started",
+                    flush=True,
+                )
+            elif kind == "round_finished":
+                elapsed = now - started_at.get("round", now)
+                errors = event.get("errors") or []
+                detail = (
+                    f"{event['models']} models, {event['batches']} batches, {elapsed:.0f}s"
+                )
+                if errors:
+                    detail += f", ERRORS: {', '.join(errors)}"
+                print(
+                    f"{prefix} training round "
+                    f"{event['round_number']}/{event['round_count']} done ({detail})",
+                    flush=True,
+                )
+            elif kind == "updates_started":
+                started_at["updates"] = now
+                print(
+                    f"{prefix} model updates started "
+                    f"({event['models']} models; gate arenas are the slow part)",
+                    flush=True,
+                )
+            elif kind == "updates_finished":
+                elapsed = now - started_at.get("updates", now)
+                print(
+                    f"{prefix} model updates done "
+                    f"({event['models']} models, {elapsed:.0f}s)",
                     flush=True,
                 )
 
