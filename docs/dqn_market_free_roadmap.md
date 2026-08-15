@@ -833,6 +833,130 @@ Failure shapes to watch for, each with a different answer:
   `metadata_json ->> 'behavior_checkpoint_id'`** — the marker is not reaching
   `collect`, and the reset is a third of a reset again.
 
+## What `population-v25` measured, and `market-free-logmoney-v26`
+
+v25 ran 11 generations, 110 batches and 17,600 episodes with zero failures, and
+produced a policy worse than never trading.
+
+| | |
+| --- | --- |
+| benchmark money, 14 measured batches | 98 – 2,717 from a 3,000 stake |
+| pilkwang, same series | ~142,000 |
+| win rate | **0.000 at every batch** |
+| `trading_rate` | 0.00 → 0.78 |
+| `own_solvent_fraction` | 0.003 – 0.028 throughout |
+| promotions | 10 of 108 updates; 3 slots never released |
+
+It learned to act, and every action lost. The population question is **not**
+answered: `population.action` is `train` on all 109 updates, `_graduates` needs
+four LR halvings at patience 4 — sixteen stalled updates — and only eleven exist.
+The four `population_members` rows are the *contribution* path
+(`release_age >= population_entry_updates`), not graduations. What v25 settled is
+upstream of the roster.
+
+**Three causes, landed together because none is observable without the others.**
+
+**1. The outcome was a margin, and in the mirror the margin is zero.**
+`self_play_ratio` is 0.65 and `league_pairings.mean_margin` was exactly 0.000 in
+all eleven generations — both seats run the same policy off the same stake under
+the same frozen donor field. So two of every three rollouts carried no outcome
+term at all, and `IDLE_PENALTY` and `INSOLVENCY_PENALTY` were the entire
+objective. Their joint optimum is *emit an order every turn and stay a coin above
+the floor*, which is the measured policy exactly. `reward.py:145-150` records this
+same failure once already, at `IDLE_PENALTY = 0.0005`; it recurred because the
+term those charges were sized against is structurally absent in the mirror.
+
+**2. `tanh(margin / 10_000)` capped ambition at ~20k.** Against the bankrupt
+seeded-random opponent the margin is own money, and that tanh is 0.76 at 10k,
+0.96 at 20k, 0.999 at 40k. Every policy from the low twenties to pilkwang's 142k
+was reward-identical. `explore-v7` plateaued at 11–12k and `falloff-v18` at 5–6k,
+both sitting on the flat part. **The stall this document attributes to a stuck
+trajectory — and built a ten-slot population to escape — is also what a saturated
+objective looks like**, and the population had not begun to act when v25 produced
+the same shape from a cold start.
+
+**3. The gate judged the policy fifty times outside its training distribution.**
+`market_state.py` fed `opponent_money / 10_000` and `money / (money + opponent +
+1)` raw. Every training opponent holds 0–3,000, so those features lived in ~[0,
+0.3] and ~0.5 in every transition ever buffered; pilkwang, which appears in no
+rollout, finishes on 142,000 — 14.2 and 0.019. Measured rather than inferred: one
+unchanged `learner_04` checkpoint read `trading_rate` 0.805 against pilkwang and
+0.055 against its own incumbent **in the same update**. Own money was already
+`log1p(money)/10` one line above; the asymmetry was the tell.
+
+**What v26 changes.**
+
+- **`OUTCOME_LOG_SCALE = 5.0` replaces `TERMINAL_MARGIN_SCALE`.** The outcome is
+  `tanh(log((final + 1) / (stake + 1)) / 5)`, with the stake read off `money[0]`
+  rather than declared. Scale-free, so there is no saturation point to place, and
+  opponent-independent, so the mirror, the scripted opponent and the benchmark all
+  score the same way — the bimodal-by-source target variance diagnosed under
+  `outcome_v4` has no mechanism left. tanh(1) is a 167× season, 500,000 coins,
+  deliberately well past pilkwang so beating the benchmark is a point on the slope.
+
+      final money  3,000   6,000   12,000   40,000   142,000   500,000
+      outcome       0.00    0.14     0.27     0.48      0.65      0.77
+
+  It is also the number the gate already promotes on. Training on margin while
+  gating on `benchmark_release_min_money` is the mismatch that put the old
+  constant in an impossible position to begin with.
+
+  **The cost, stated because it is the thing to watch.** The bottom tightened: a
+  3,000-to-1,898 slide now scores −0.091 against a fully idle season's −0.072, so
+  idling still beats churning but by 0.019 rather than 0.080. Break-even is 2,092
+  coins. If `trading_rate` climbs while money falls, re-read this ratio before
+  touching `IDLE_PENALTY`.
+
+- **`priority_alpha` 0.0 → 0.7**, its documented intended value and the one
+  `priority_beta`'s measurements were taken at. `demo_fraction` is conditional on a
+  demonstrator and there is none, so until this moved, *nothing* was putting
+  solvent transitions in a batch — a uniform draw over a buffer that is 99.7%
+  insolvent teaches the only policy consistent with it.
+
+- **`market_state` puts opponent wealth on the same log scale as our own**, and
+  takes the wealth share as a ratio of logs. That moves 0.89 → 0.38 across the
+  whole range the old form spent between 0.9997 and 0.019. The lagged money deltas
+  are clipped to [-1, 1], both legs symmetrically; the own leg has never left that
+  range on any recorded run, so the clip is inert there today. `MARKET_STATE_DIM`
+  is unchanged at 238 and the numpy/torch parity test is untouched.
+
+- **New model names (`logmoney_00…09`) and a new session.** `all_batches`,
+  `_self_play_pool`, `lineage_checkpoint` and the slot LR state are all scoped by
+  `model_id`, and a shaped return is not comparable across `OUTCOME_LOG_SCALE` —
+  every v25 episode is mislabelled and every v25 checkpoint was fitted to the old
+  labels. Renaming severs all four at once. The roster stays at ten; it is now ten
+  independent reads on a reward change.
+
+**The pass condition is narrow, and it is not "money goes up".** It is
+**benchmark money above the 3,000 idle baseline on a majority of slots**, which no
+session in this family has ever produced — every one of them has been beaten by
+never trading. `own_solvent_fraction` above 0.2 is the same statement read off the
+rollouts instead of the arena.
+
+Failure shapes, each with a different answer:
+
+- **`trading_rate` climbing while benchmark money falls** — cause 1 recurring
+  under a reward that no longer permits it, which would mean the charges are now
+  too large relative to the tightened bottom. Re-read `OUTCOME_LOG_SCALE`'s
+  break-even, not `IDLE_PENALTY`.
+- **Benchmark money flat at 3,000 with `trading_rate` 0.0** — the NOOP attractor,
+  and the absolute outcome makes idling score exactly 0.0 rather than positive.
+  That is `viability_min_orders_per_decision`'s case, not the reward's.
+- **The two arenas still disagreeing on `trading_rate`** — the state fix did not
+  reach far enough, and the remaining OOD feature is own money's *linear* leg at
+  `market_state.py:517`, deliberately left alone here because this agent has never
+  been rich enough for it to bite.
+- **`mean_abs_q` climbing past the reward bound** — priority replay concentrating
+  the draw too hard. `priority_beta` is the dial, and 0.7/0.5 is the pair the
+  effective-sample-size measurement was taken at.
+
+If all of it holds and benchmark money still sits under the stake, the reward is
+no longer the binding constraint and the next lever is the one already written up
+under **Out of scope, worth recording**: pilkwang as a *training* opponent so its
+seats persist and become clonable, plus a DQfD large-margin term on
+`_behavior_clone_step`. It was deferred from v26 deliberately — landing it
+alongside three objective changes would have confounded all four.
+
 ## Phase 1 — promotion, if it is still blocked
 
 **Implemented as `promotion_rule = "benchmark_ratchet"`, and the shape it took was

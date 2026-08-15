@@ -11,16 +11,16 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import multiprocessing
 import os
 import sys
 from collections.abc import Iterable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
 from sim import registry
 from sim.metrics import Summary, render, summarize
 from sim.runner import MatchResult, run_match
+from sim.workers import discard_pool, worker_pool
 
 
 def _job(args: tuple[tuple[str, str], int, dict[str, Any]]) -> MatchResult:
@@ -46,10 +46,19 @@ def play_series(
     if jobs == 1:
         outcomes = [_job(task) for task in tasks]
     else:
-        with ProcessPoolExecutor(
-            max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
-        ) as pool:
-            outcomes = list(pool.map(_job, tasks, chunksize=1))
+        # Borrowed from the shared free-list and returned, not spawned here,
+        # because a promotion gate is two series back to back (eval seeds, then
+        # head-to-head) once per model per update, and spawning eight interpreters
+        # for each of them cost more than the ~150 episodes they play. The pin the
+        # workers need is taken inside `worker_pool`, so this call site does not
+        # have to hold one.
+        with worker_pool(jobs) as pool:
+            try:
+                outcomes = list(pool.map(_job, tasks, chunksize=1))
+            except BrokenProcessPool:
+                discard_pool(pool)
+                with worker_pool(jobs) as retry:
+                    outcomes = list(retry.map(_job, tasks, chunksize=1))
 
     return {seed: (outcomes[2 * i], outcomes[2 * i + 1]) for i, seed in enumerate(seeds)}
 

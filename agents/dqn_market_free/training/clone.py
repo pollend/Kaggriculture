@@ -140,6 +140,7 @@ def record_from_replay(
     replay: dict[str, Any],
     seat: int,
     gamma: float = 0.999,
+    opponent_weight: float = 0.0,
 ) -> tuple[EpisodeRecord | None, CloneStats]:
     """Convert one seat of one replay into a trainable episode record.
 
@@ -147,6 +148,13 @@ def record_from_replay(
     cloned episode and a self-collected one are the same kind of sample and can
     share a buffer -- a buffer holding demonstrations scored one way and rollouts
     scored another would be bootstrapping across two different reward functions.
+
+    `opponent_weight` is the one part of that the caller has to supply, because
+    the mirror gate is a fact about who played and a replay's seat specs are
+    where that lives here. It defaults to 0.0 rather than to `OPPONENT_WEIGHT`
+    for the same reason `match_agent` does: a demonstration whose provenance is
+    unknown is scored the absolute way, which is the only labelling that is
+    correct regardless of who the other seat was.
     """
 
     steps = replay.get("steps") or []
@@ -261,6 +269,7 @@ def record_from_replay(
         opponent_money,
         gamma,
         emitted,
+        opponent_weight=opponent_weight,
     )
 
     record = EpisodeRecord(

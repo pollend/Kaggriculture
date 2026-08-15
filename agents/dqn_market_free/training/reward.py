@@ -5,11 +5,12 @@ which is where this started: the scorer's market layer decides land and cash
 reserves in code, so sharing the constants would have meant changing the
 scorer's reward to fix this one.
 
-The reward is the episode's own outcome, the tanh of the final margin. It is
-paid twice: as a lump on the terminal step, and as a per-step annuity of
-`(1 - gamma) * outcome` on every step. The two sum to a flat `outcome` in Q at
-every timestep, so a state on a winning trajectory is valued above the
-same-looking state on a losing one no matter when in the season it was seen.
+The reward is the episode's own outcome, the tanh of the log growth on its own
+stake. It is paid twice: as a lump on the terminal step, and as a per-step
+annuity of `(1 - gamma) * outcome` on every step. The two sum to a flat
+`outcome` in Q at every timestep, so a state on a winning trajectory is valued
+above the same-looking state on a losing one no matter when in the season it was
+seen.
 
 Three small per-turn charges sit alongside it: an order the simulator refused, a
 turn that emitted nothing at all, and a wallet with no runway left. None is
@@ -19,6 +20,12 @@ only terms that separate two actions at the immediate-reward level.
 They are ordered deliberately: an accepted order pays nothing, NOOP pays
 `IDLE_PENALTY`, and a refused order pays the larger `REJECTED_ORDER_PENALTY`. So
 trading beats sitting out, and sitting out beats emitting junk.
+
+There is a second, opponent-relative leg of the same shape, landed inert at
+`OPPONENT_WEIGHT = 0.0`. Its constant carries the argument for why the shared
+market does *not* imply training on the margin -- the opponent's effect on us is
+already inside our own purse, and only the reverse direction is missing -- and
+the measurement that says the reverse direction is worth nothing yet.
 
 The money delta and potential-based shaping were removed at v13, having been
 switched off since v4. `Phi` existed only to cancel the cash leg of a purchase,
@@ -51,27 +58,139 @@ from agents.dqn_market_free.market_state import order_refused
 #: DQN answer and is wrong here: the magnitude of a fill *is* the signal.
 MONEY_SCALE = 20_000.0
 
-#: Coins of final margin at which the terminal term reaches tanh(1) = 0.76.
+#: Natural-log units of growth at which the outcome term reaches tanh(1) = 0.76.
 #:
-#: Sized to the *self-play* margin distribution, which is the one this term has
-#: to discriminate. Against the scripted field it never did: measured across 640
-#: recorded episodes the margin ran from -21,681 to -210,076, so the original
-#: 20,000 with a hard clip returned exactly -1.0 on every one of them, and 100,000
-#: only moved the saturation point -- by the last recorded generation every
-#: episode margin was about -128,000, giving a constant -0.86. A constant on the
-#: terminal reward shifts every Q value uniformly and can never change an argmax,
-#: so the one term tying training to what the promotion gate measures was
-#: contributing nothing either way.
+#: The outcome is the season's growth on **its own stake**, not the margin
+#: against the opponent, and dropping the opponent is what lets one constant do
+#: the job two could not.
 #:
-#: Against its own mirror the margins are hundreds to low thousands, where
-#: `tanh(margin / 100_000)` is about 0.01 -- a vanishing term rather than a
-#: saturated one, which is no better. At 10,000 a 2,000-coin mirror margin maps
-#: to 0.20 and discriminates.
+#: `tanh(margin / S)` had to discriminate two distributions at once and no `S`
+#: does. Against the mirror the margins are hundreds -- both seats run the same
+#: policy under the same frozen donor field -- so a large `S` vanishes; against a
+#: scripted field they are tens or hundreds of thousands, so a small one
+#: saturates. `market-free-population-v25` ran at `S = 10_000` with
+#: `self_play_ratio = 0.65` and measured the consequence in both directions at
+#: once: `league_pairings.mean_margin` was exactly 0.000 in all eleven
+#: generations, so two of every three rollouts carried *no outcome term at all*
+#: and the only live rewards in them were `IDLE_PENALTY` and
+#: `INSOLVENCY_PENALTY` -- whose joint optimum is to emit an order every turn and
+#: stay a coin above the floor. The policy learned exactly that: `trading_rate`
+#: 0.00 to 0.78 while benchmark money fell to 98 from a 3,000 stake.
 #:
-#: The anchor games stay saturated at this scale, deliberately. Their job in the
-#: mix is the absolute money signal, which the per-step delta already carries;
-#: the margin term is there for the mirror.
-TERMINAL_MARGIN_SCALE = 10_000.0
+#: The remaining third, against a bankrupt scripted opponent, has margin equal to
+#: its own money -- and there `tanh(m / 10_000)` is 0.76 at 10k, 0.96 at 20k and
+#: 0.999 at 40k. pilkwang finishes a season on about 142,000. Every policy from
+#: 20k upward was therefore reward-identical, which is where this family has
+#: stopped twice: `explore-v7` plateaued at 11-12k and `falloff-v18` at 5-6k,
+#: both sitting on the flat part of the curve. The roadmap read that plateau as a
+#: stuck trajectory and built a ten-slot population for it; a saturated objective
+#: explains the same series without one.
+#:
+#: A log ratio is scale-free, so it does not have a saturation point to place:
+#:
+#:     final money  3,000   6,000   12,000   40,000   142,000   500,000
+#:     outcome       0.00    0.14     0.27     0.48      0.65      0.77
+#:
+#: Monotone from the stake to the benchmark, with the steepest region exactly
+#: where this agent lives. It is also *opponent-independent*, so the mirror, the
+#: scripted opponent and the benchmark all score the same way and the
+#: bimodal-by-source target variance diagnosed under `outcome_v4` -- half of every
+#: minibatch labelled a flat +1.0 or -1.0 on states the network cannot tell apart
+#: -- has no mechanism left to recur.
+#:
+#: And it is the number the promotion gate already reads. `benchmark_ratchet`
+#: promotes on the candidate's own money against `benchmark_release_min_money`;
+#: training on margin while gating on money is the mismatch that put
+#: `TERMINAL_MARGIN_SCALE` in an impossible position to begin with.
+#:
+#: At 5.0 the tanh(1) = 0.76 point is a 167x season, or 500,000 coins from the
+#: 3,000 stake -- deliberately well past pilkwang's ~142,000, so beating the
+#: benchmark is a point on the slope rather than the end of it. Sized on the
+#: headroom rather than on any measurement, because every previous value of this
+#: constant was sized on the distribution the run happened to be producing at the
+#: time and was saturated by the next one that improved.
+#:
+#: The cost is at the bottom, and it is the number to watch. Trading a 3,000
+#: stake down to 1,898 now scores -0.091 against a fully idle season's -0.072
+#: (see `IDLE_PENALTY`), so idling still beats churning, but by 0.019 rather than
+#: by the 0.080 a scale of 3.0 would have given. The break-even is 2,092 coins:
+#: lose more than about a third of the stake and a whole season of silence would
+#: have scored better. That is the intended bar and it is deliberately not
+#: tighter -- but if `trading_rate` climbs while money falls, this ratio is the
+#: first thing to re-read, not `IDLE_PENALTY`.
+OUTCOME_LOG_SCALE = 5.0
+
+#: Weight on the opponent-relative leg of the outcome. **Held at 0.0.**
+#:
+#: The mechanism is landed inert, the same way `priority_alpha` was: the leg, its
+#: caller gate and its mirror detection are all in place and a test asserts the
+#: stream is bit-identical to the absolute one, so if this constant is ever moved
+#: the only thing that changes is the number.
+#:
+#: It is 0.0 rather than 0.1 because the argument for a relative term is weaker
+#: than it looks, and the reason is worth stating precisely, since "the market is
+#: shared, so train on the margin" is the intuition that produced
+#: `TERMINAL_MARGIN_SCALE` and every failure `OUTCOME_LOG_SCALE` records.
+#:
+#: **The opponent's effect on us is already in our own money.** One market object
+#: is shared by both seats and every unit either sells depresses the price for
+#: both. When the opponent gluts wheat, our revenue falls -- and the absolute
+#: outcome sees that in full, because it reads our purse after the fact. Playing
+#: against a productive opponent is already a harder episode that scores lower.
+#: Nothing needs to be added for the policy to care.
+#:
+#: What absolute money cannot see is the mirror image: *our* effect on *them*.
+#: Dumping sixty strawberries at a loss to crash the quote before their two
+#: hundred reach the market reads as a pure loss to us and a large gain to a
+#: margin. That -- denial -- is the entire content of the relative term, and it is
+#: the only thing it buys.
+#:
+#: Denial is out of reach for this agent and measurably absent from the runs. On
+#: `episode_players` for `league:market-free-logmoney-v26:g0011`:
+#:
+#:                        mean     sd    mean/sd
+#:     own final money   2,715  1,176      2.31
+#:     money difference    535  1,868      0.29
+#:
+#: with `corr(final_money, opponent_money) = 0.006`. Two readings, and they point
+#: the same way. First, at that correlation neither seat is moving the market
+#: enough to register in the other's outcome, so the coupling denial exploits is
+#: not yet operating. Second, a difference is a control variate and a control
+#: variate only pays when the subtracted term correlates with the kept one: at
+#: 0.006 nothing cancels, `Var(own - opp)` is very nearly `Var(own) + Var(opp)`,
+#: and the per-episode signal-to-noise ratio falls by a factor of eight. That is
+#: `OUTCOME_LOG_SCALE`'s failure quantified from the other side -- the margin was
+#: not merely mis-scaled, it was a noisier measurement of a smaller quantity.
+#:
+#: And the strategy needs inventory to dump. This family finishes a season on
+#: 1,928 coins from a 3,000 stake and plants about thirteen wheat; the $1 floor is
+#: absorbing, so gluting caps out early even when it is affordable. A term that
+#: costs variance now to reward a behaviour the policy cannot yet perform is the
+#: trade this file exists to refuse.
+#:
+#: Turn it on when the agent produces at scale and the correlation above departs
+#: from zero -- that is the measurement that says the coupling has started to
+#: matter. 0.1 is the value to try, sized as a tiebreaker rather than a driver: it
+#: spans +/-0.1 against the absolute leg's +/-1.0, so two policies finishing on
+#: equal money are separated by what they did to the opponent while a policy
+#: finishing on more money is not overturned. Watch `mean_abs_q` against the
+#: reward bound; if it climbs past it, halve this rather than re-reading
+#: `OUTCOME_LOG_SCALE`.
+#:
+#: A log ratio against the opponent's purse rather than a difference, and at the
+#: same `OUTCOME_LOG_SCALE`, so the two legs cannot drift apart in shape. Scale-
+#: free is the property `tanh(margin / S)` lacked and the reason no `S` served
+#: both the mirror's hundreds and the scripted field's hundred thousands. It is
+#: also exactly 0 at parity, which makes the mirror's degenerate case harmless
+#: rather than merely small.
+#:
+#: The mirror is gated off at the caller regardless of this value, because there
+#: the leg is noise by construction: the opponent is a recent checkpoint of the
+#: same slot, so its purse carries this policy's own variance and nothing else.
+#: `market-free-population-v25` is what that gate is for -- at
+#: `self_play_ratio = 0.65` two of every three rollouts would otherwise carry a
+#: zero-mean term worth only what it adds in noise.
+OPPONENT_WEIGHT = 0.0
 
 #: Multiplier on the per-step outcome annuity.
 #:
@@ -142,16 +261,23 @@ REJECTED_ORDER_PENALTY = 0.001
 #:
 #: The size is set against the *outcome term's* range, not against the other
 #: charges, and getting that wrong is what the previous value did. At 0.0005 flat
-#: a fully idle season cost 0.36 while `tanh(margin / TERMINAL_MARGIN_SCALE)` only
-#: spans 0.19 to 0.29 between 1,898 and 3,000 coins -- so trading yourself *down*
-#: to 1,898 scored 0.257 better than sitting on 3,000, and the policy correctly
-#: learned to trade on 73-99% of turns and lose money. Measured on
+#: a fully idle season cost 0.36 while the old `tanh(margin / 10_000)` only
+#: spanned 0.19 to 0.29 between 1,898 and 3,000 coins -- so trading yourself
+#: *down* to 1,898 scored 0.257 better than sitting on 3,000, and the policy
+#: correctly learned to trade on 73-99% of turns and lose money. Measured on
 #: `market-free-hot-v16`: mean money fell 3,542 to 1,898 while `mean_abs_q` rose
 #: 0.034 to 0.133 -- a Q function converging cleanly on a bad objective.
 #:
-#: At 0.0002 with the falloff the season total is 0.072, comfortably under the
-#: 0.104 outcome gap that mistake turned on, so losing money to stay busy is never
-#: worth it. The per-turn ordering still holds at every point in the season:
+#: At 0.0002 with the falloff the season total is 0.072. Under the absolute
+#: outcome the same 3,000-to-1,898 slide costs 0.091, so the ordering still
+#: holds -- narrowly, and `OUTCOME_LOG_SCALE` states the break-even exactly --
+#: but it now holds for the stronger reason: the outcome is no longer zero in the
+#: mirror, so this charge is not the only term with an opinion
+#: there. `market-free-population-v25` is what that
+#: correction is for: at `self_play_ratio = 0.65` against a margin of exactly
+#: 0.000, two of every three rollouts had nothing in the stream *but* this charge
+#: and the insolvency one, and the policy went to `trading_rate` 0.78 on 98 coins.
+#: The per-turn ordering still holds at every point in the season:
 #:
 #:     accepted order    0
 #:     NOOP             -0.0002 decaying to 0
@@ -196,6 +322,7 @@ def episode_rewards(
     opponent_money: float,
     gamma: float,
     emitted: Sequence[bool] | None = None,
+    opponent_weight: float = OPPONENT_WEIGHT,
     rejected_penalty: float = REJECTED_ORDER_PENALTY,
     idle_penalty: float = IDLE_PENALTY,
     insolvency_floor: float = INSOLVENCY_FLOOR,
@@ -207,8 +334,9 @@ def episode_rewards(
     read out of stored replays, so a cloned episode and a self-collected one are
     the same kind of sample and can sit in one buffer -- and cannot drift apart.
 
-    The stream is the terminal margin, spread as an annuity, minus the refusal
-    and insolvency charges. It took a `mode` and a potential trace until v13: the
+    The stream is the season's log growth on its own stake, spread as an
+    annuity, minus the refusal and insolvency charges. It took a `mode` and a
+    potential trace until v13: the
     `shaped` arm paid the money delta plus potential-based shaping, and it was
     retired because the shaping marked the whole shed to a quote the agent moved
     itself by buying. Measured over 300 episodes of the last run that used it:
@@ -221,9 +349,24 @@ def episode_rewards(
     simulator accepts moves cash by at least a coin, since prices floor at 1 and
     quantities start at 1.
 
-    All three terms are deliberately not policy-invariant: the outcome margin,
+    All three terms are deliberately not policy-invariant: the outcome growth,
     the refused-order charge, and the insolvency charge. Each is documented at
     its constant.
+
+    `opponent_money` is read only through `opponent_weight`, which defaults to
+    `OPPONENT_WEIGHT` and is 0.0 there -- so today it is not read at all, and the
+    stream is bit-identical to the absolute-only one this replaced. The outcome
+    became absolute at `OUTCOME_LOG_SCALE` and that is still the trunk; the
+    relative leg is a tiebreaker whose argument and measurements live at its
+    constant.
+
+    `opponent_weight` is a parameter rather than a straight read of the constant
+    because the mirror has to be gated off and only the caller knows who played:
+    `collect_episode` passes 0.0 against this agent's own entry point. Defaulting
+    it to the constant means the two callers -- `training/collect.py` on a live
+    rollout and `training/clone.py` on a stored replay -- cannot diverge by
+    forgetting it, only by disagreeing on the gate, which is one decision in one
+    place each.
 
     `raw` -- the money delta -- is returned although the stream no longer carries
     it, so the money diagnostics an update logs keep meaning what they meant and
@@ -237,12 +380,33 @@ def episode_rewards(
     # `order_refused` reads it to tell a refused order from an accepted one, and
     # the update logs its money diagnostics off it.
     shaped = np.zeros_like(raw)
-    # tanh rather than a hard clip. Both bound the term to (-1, 1) so one blowout
-    # episode cannot dominate a batch, but a clip is flat outside its range --
-    # and every margin this agent has produced so far was outside it, which made
-    # the term a constant. tanh keeps discriminating everywhere and still
-    # compresses the tail.
-    outcome = float(np.tanh((final_money - opponent_money) / TERMINAL_MARGIN_SCALE))
+    # The stake is read off the trace rather than declared as a constant, so a
+    # `startingMoney` override moves the reference with it. Anything else would
+    # score a season against a float it never had -- the same class of drift
+    # `market_state` avoids by normalising prices against the *effective* base.
+    stake = max(0.0, float(money_array[0]))
+    # tanh of a log ratio rather than of a linear one. Both bound the term to
+    # (-1, 1) so one blowout episode cannot dominate a batch, but the linear form
+    # has to pick a coin scale, and no scale separates the mirror's hundreds from
+    # the benchmark's hundred thousands. The ratio is scale-free: doubling the
+    # stake is the same reward wherever it happens, and doing nothing is exactly
+    # 0.0. See `OUTCOME_LOG_SCALE`.
+    outcome = float(
+        np.tanh(np.log((max(0.0, final_money) + 1.0) / (stake + 1.0)) / OUTCOME_LOG_SCALE)
+    )
+    if opponent_weight:
+        # The same shape against the opponent's purse instead of the stake, so
+        # the two legs share `OUTCOME_LOG_SCALE` and cannot drift apart. Folded
+        # into `outcome` before it is paid rather than added to `shaped`
+        # separately: the terminal lump and the annuity below are what make the
+        # contribution to Q flat across the season, and a second term paid any
+        # other way would not have that property.
+        outcome += float(opponent_weight) * float(
+            np.tanh(
+                np.log((max(0.0, final_money) + 1.0) / (max(0.0, opponent_money) + 1.0))
+                / OUTCOME_LOG_SCALE
+            )
+        )
     shaped[-1] += outcome
     # And again as an annuity on every step, so the outcome reaches the ~97% of
     # sampled transitions that never contain the terminal turn.

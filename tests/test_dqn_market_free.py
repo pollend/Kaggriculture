@@ -3826,7 +3826,7 @@ def test_outcome_only_holds_q_flat_at_the_outcome():
     """
 
     from agents.dqn_market_free.training.reward import (
-        TERMINAL_MARGIN_SCALE,
+        OUTCOME_LOG_SCALE,
         episode_rewards,
     )
 
@@ -3839,7 +3839,7 @@ def test_outcome_only_holds_q_flat_at_the_outcome():
         money, 5_000.0, 3_000.0, gamma
     )
 
-    outcome = float(np.tanh(2_000.0 / TERMINAL_MARGIN_SCALE))
+    outcome = float(np.tanh(np.log(5_001.0 / 3_001.0) / OUTCOME_LOG_SCALE))
     discounted = float(sum(gamma**t * shaped[t] for t in range(turns)))
     assert discounted == pytest.approx(outcome, rel=0.01)
 
@@ -3901,56 +3901,185 @@ def test_reward_scale_keeps_a_full_season_in_the_huber_quadratic_zone():
     money = list(np.linspace(3_000.0, 76_000.0, turns))
     shaped, _, _ = episode_rewards(money, 76_000.0, 40_000.0, 0.999)
 
-    assert 1.0 < float(shaped.sum()) < 10.0
+    # Bounded by 2 rather than by 10 now, and structurally rather than by
+    # calibration: the outcome is a tanh, the annuity re-pays it once across the
+    # season, and nothing else in the stream is season-scaled. The old lower
+    # bound of 1.0 was read off `tanh(margin / 10_000)` saturating on a 36,000
+    # margin, which is exactly the flat region `OUTCOME_LOG_SCALE` removed.
+    assert 0.5 < float(shaped.sum()) < 10.0
     # Every turn, including the last, is inside the quadratic zone.
     assert float(np.abs(shaped).max()) < 1.0
     assert MONEY_SCALE >= 10_000.0
 
 
-def test_terminal_margin_discriminates_across_the_self_play_range():
-    """The scale has to fit the margins the mix actually produces.
+def test_outcome_discriminates_from_the_stake_to_the_benchmark():
+    """One scale has to cover bankruptcy, the stake, and pilkwang.
 
-    Two ways this term has already been informationless. A hard clip at 20,000
-    returned exactly -1.0 on all 640 recorded episodes, whose margins ran from
-    -21,681 to -210,076. Widening to 100,000 only moved the saturation point: by
-    the last recorded generation every margin was about -128,000 and the term was
-    a constant -0.86. A constant on the terminal reward shifts every Q value
-    uniformly and can never change an argmax.
+    Three ways this term has already been informationless, all of them the same
+    mistake -- a coin scale sized to whichever distribution the run was producing
+    at the time. A hard clip at 20,000 returned exactly -1.0 on all 640 recorded
+    episodes, whose margins ran from -21,681 to -210,076. Widening to 100,000
+    only moved the saturation point: by the last recorded generation every margin
+    was about -128,000 and the term was a constant -0.86. Narrowing to 10,000 for
+    the self-play mirror then saturated the other end -- `tanh(m / 10_000)` is
+    0.96 at 20,000 and 0.999 at 40,000, so every policy above the low twenties was
+    reward-identical, and this family plateaued at 11-12k and 5-6k under it.
 
-    The mix is now mostly self-play, where both seats hold a 3,000 stake and the
-    margins are hundreds to low thousands. That is the range the scale is sized
-    for, and the range this test pins.
+    A log ratio has no saturation point to place. This pins that it discriminates
+    across the whole reachable range at once: broke, the 3,000 stake, pilkwang's
+    ~142,000, and the 500,000 headroom `OUTCOME_LOG_SCALE` is sized on.
     """
 
-    from agents.dqn_market_free.training.reward import (
-        TERMINAL_MARGIN_SCALE,
-        episode_rewards,
-    )
+    from agents.dqn_market_free.training.reward import episode_rewards
 
-    def terminal(margin: float) -> float:
-        # Both seats well clear of the insolvency floor, so this reads the
-        # outcome term alone.
-        own = 20_000.0
-        shaped, _, _ = episode_rewards([own, own], own, own - margin, 1.0)
+    stake = 3_000.0
+
+    def terminal(final: float) -> float:
+        # Well clear of the insolvency floor for the recorded turns, so this
+        # reads the outcome term alone. gamma = 1.0 zeroes the annuity.
+        shaped, _, _ = episode_rewards([stake, stake], final, 0.0, 1.0)
         return float(shaped[-1])
 
-    mirror = [-4_000.0, -1_500.0, 500.0, 2_000.0, 6_000.0]
-    values = [terminal(margin) for margin in mirror]
+    ladder = [0.0, 600.0, stake, 12_000.0, 40_000.0, 142_000.0, 500_000.0]
+    values = [terminal(final) for final in ladder]
 
     # Strictly ordered, and none of them crushed against the bound.
     assert values == sorted(values)
-    assert min(values) > -0.99 and max(values) < 0.99
-    assert max(values) - min(values) > 0.9
-    # A win and a loss must land on opposite sides of parity, not merely differ.
-    assert terminal(-1_500.0) < 0.0 < terminal(500.0)
+    assert max(values) < 0.99
+    # Every adjacent pair genuinely separated -- the failure being pinned here is
+    # a flat region, not a wrong constant. The tightest step is 40k -> 142k.
+    assert min(b - a for a, b in zip(values, values[1:])) > 0.1
+    # Doing nothing is exactly parity: the stake is the reference.
+    assert terminal(stake) == pytest.approx(0.0)
+    # Beating the benchmark is a point on the slope, not the end of it.
+    assert terminal(500_000.0) - terminal(142_000.0) > 0.1
 
     # Bounded either side, so one blowout episode cannot dominate a batch.
     # tanh is open on (-1, 1) mathematically; float32 saturates at the bound.
-    assert -1.0 <= terminal(-10_000_000.0) <= -0.99
-    assert 0.99 <= terminal(10_000_000.0) <= 1.0
-    # Symmetric about parity.
-    assert terminal(0.0) == pytest.approx(0.0)
-    assert terminal(TERMINAL_MARGIN_SCALE) == pytest.approx(-terminal(-TERMINAL_MARGIN_SCALE))
+    assert -1.0 <= terminal(0.0) < 0.0
+    assert 0.0 < terminal(1e12) <= 1.0
+
+
+def test_outcome_does_not_read_the_opponent():
+    """The mirror is 65% of rollouts and its margin is exactly zero.
+
+    `market-free-population-v25` ran `self_play_ratio = 0.65` with a margin-based
+    outcome and `league_pairings.mean_margin` was 0.000 in all eleven
+    generations -- both seats are the same policy off the same stake under the
+    same frozen donor field. So two of every three rollouts carried no outcome
+    term at all, leaving `IDLE_PENALTY` and `INSOLVENCY_PENALTY` as the whole
+    objective, whose joint optimum is to emit an order every turn and stay a coin
+    above the floor. The measured policy did exactly that: `trading_rate` 0.00 to
+    0.78 while benchmark money fell to 98.
+
+    An absolute outcome cannot have that failure mode, and this is what says so.
+
+    The opponent-relative leg landed beside it does not reintroduce it, because
+    `OPPONENT_WEIGHT` is 0.0: this reads the default and is therefore also the
+    regression that says the leg is inert.
+    """
+
+    from agents.dqn_market_free.training.reward import OPPONENT_WEIGHT, episode_rewards
+
+    assert OPPONENT_WEIGHT == 0.0
+
+    money = [3_000.0] * 50
+    mirror, _, _ = episode_rewards(money, 12_000.0, 12_000.0, 0.999)
+    scripted, _, _ = episode_rewards(money, 12_000.0, 142_000.0, 0.999)
+    bankrupt, _, _ = episode_rewards(money, 12_000.0, 0.0, 0.999)
+
+    assert float(mirror.sum()) == pytest.approx(float(scripted.sum()))
+    assert float(mirror.sum()) == pytest.approx(float(bankrupt.sum()))
+    # And it is not zero, which is the whole point -- a mirror episode that grew
+    # the stake fourfold is rewarded for it.
+    assert float(mirror.sum()) > 0.2
+
+
+def test_the_opponent_leg_is_landed_inert_and_changes_nothing_until_it_is_moved():
+    """`OPPONENT_WEIGHT` is 0.0 and the stream is bit-identical without it.
+
+    The mechanism is in the tree so that turning it on is a one-number change,
+    which is only worth anything if the number being 0.0 is provably the same as
+    the parameter not existing. `priority_alpha` was landed under exactly this
+    rule, and it is the reason the uniform draw it replaced could be trusted as a
+    baseline.
+
+    Bit-identical rather than approximately equal: `episode_rewards` returns
+    float32 and the whole point is that no arithmetic happened.
+    """
+
+    from agents.dqn_market_free.training.reward import episode_rewards
+
+    money = [3_000.0, 2_400.0, 5_100.0, 900.0, 4_000.0] * 8
+    emitted = [bool(index % 3) for index in range(len(money))]
+
+    explicit, _, _ = episode_rewards(
+        money, 12_000.0, 142_000.0, 0.999, emitted, opponent_weight=0.0
+    )
+    default, _, _ = episode_rewards(money, 12_000.0, 142_000.0, 0.999, emitted)
+
+    assert np.array_equal(default, explicit)
+
+
+def test_the_opponent_leg_reads_a_log_ratio_of_the_two_purses():
+    """Poorer opponent scores higher, richer scores lower, parity is exactly zero.
+
+    Parity being *exactly* zero is the property that matters and the reason this
+    is a log ratio rather than a difference. It is what makes the mirror's
+    degenerate case harmless on its own terms rather than merely small, so the
+    caller's gate is a second line of defence and not the only one.
+    """
+
+    from agents.dqn_market_free.training.reward import episode_rewards
+
+    money = [3_000.0] * 50
+    weight = 0.1
+
+    def terminal(opponent: float) -> float:
+        # gamma = 1.0 zeroes the annuity, so this is the outcome alone -- which
+        # is also what the outcome contributes to Q at every timestep.
+        shaped, _, _ = episode_rewards(
+            money, 12_000.0, opponent, 1.0, opponent_weight=weight
+        )
+        return float(shaped[-1])
+
+    absolute, _, _ = episode_rewards(money, 12_000.0, 12_000.0, 1.0)
+    baseline = float(absolute[-1])
+
+    # Parity: the ratio is 1, its log is 0, so the leg contributes nothing at all.
+    assert terminal(12_000.0) == pytest.approx(baseline)
+    assert terminal(0.0) > baseline
+    assert terminal(142_000.0) < baseline
+    # Bounded by the weight, which is what makes it a tiebreaker rather than a
+    # driver: it cannot overturn the absolute leg's ordering by more than 0.1.
+    assert abs(terminal(0.0) - baseline) <= weight
+    assert abs(terminal(142_000.0) - baseline) <= weight
+
+
+def test_the_opponent_leg_keeps_the_annuity_flat_across_the_season():
+    """Folded into `outcome` before it is paid, so Q stays flat at the total.
+
+    The terminal lump plus the `(1 - gamma)` annuity is what makes the outcome's
+    contribution to Q the same at every timestep. A second term paid any other
+    way would break that, and the whole reason the leg is added to `outcome`
+    rather than to `shaped` is to make breaking it impossible.
+    """
+
+    from agents.dqn_market_free.training.reward import episode_rewards
+
+    gamma = 0.999
+    money = [3_000.0] * 400
+    shaped, _, _ = episode_rewards(money, 40_000.0, 4_000.0, gamma, opponent_weight=0.1)
+
+    # Strip the charges: no turn emitted, so no refusal, and every recorded purse
+    # is well clear of the insolvency floor. `emitted` is None, so no idle charge.
+    turns = len(shaped)
+    annuity = float(shaped[0])
+    assert annuity == pytest.approx(float(shaped[turns // 2]))
+    # The lump is the rest of it, and the two sum to the outcome twice over --
+    # once through the annuity's whole stream and once on the terminal turn.
+    outcome = annuity / (1.0 - gamma)
+    assert float(shaped[-1]) == pytest.approx(annuity + outcome)
 
 
 # --------------------------------------------------------------------------
@@ -3964,11 +4093,17 @@ def test_terminal_margin_discriminates_across_the_self_play_range():
 # --------------------------------------------------------------------------
 
 
-#: Own money, held flat, for the annuity tests below.
+#: Own money, held flat, for the annuity tests below. Also the stake, since
+#: `episode_rewards` reads the reference off `money[0]`, so an episode finishing
+#: here is exactly parity and the comparison below is against a clean zero.
 #:
-#: The margin in these tests is always moved by varying the *opponent's* money and
-#: never one's own, so `raw` is bit-identical between the two calls being compared
-#: and the difference is the outcome terms alone.
+#: These tests used to move the margin by varying the *opponent's* money and
+#: never one's own, so `raw` stayed bit-identical between the two calls. The
+#: outcome is absolute now, so the final money is what has to move -- and the
+#: property still holds for a better reason: `raw` has not been part of `shaped`
+#: since v13, and with `emitted` unset and both finals well clear of
+#: `INSOLVENCY_FLOOR` no per-turn charge fires either. The outcome terms are the
+#: only difference between the two streams.
 SEASON_MONEY = 5_000.0
 
 
@@ -3976,28 +4111,39 @@ def _season(turns: int = 400) -> tuple[list[float], list[float]]:
     return [SEASON_MONEY] * turns
 
 
-def _outcome_gap(margin: float, gamma: float, turns: int = 400) -> np.ndarray:
-    """Per-step reward of an episode won by `margin`, minus the same one drawn."""
+def _season_outcome_from(stake: float, final: float) -> float:
+    """The outcome term an episode finishing on `final` from `stake` earns."""
+
+    from agents.dqn_market_free.training.reward import OUTCOME_LOG_SCALE
+
+    return float(np.tanh(np.log((final + 1.0) / (stake + 1.0)) / OUTCOME_LOG_SCALE))
+
+
+def _season_outcome(final: float) -> float:
+    """The same, for an episode played off `SEASON_MONEY`."""
+
+    return _season_outcome_from(SEASON_MONEY, final)
+
+
+def _outcome_gap(final: float, gamma: float, turns: int = 400) -> np.ndarray:
+    """Per-step reward of an episode finishing on `final`, minus one at parity."""
 
     from agents.dqn_market_free.training.reward import episode_rewards
 
     money = _season(turns)
-    played, _, _ = episode_rewards(money, SEASON_MONEY, SEASON_MONEY - margin, gamma
-    )
-    drew, _, _ = episode_rewards(money, SEASON_MONEY, SEASON_MONEY, gamma)
+    played, _, _ = episode_rewards(money, final, 0.0, gamma)
+    drew, _, _ = episode_rewards(money, SEASON_MONEY, 0.0, gamma)
     return played - drew
 
 
 def test_the_outcome_reaches_every_decision_not_just_the_last():
     """Every step of a winning episode must score above the same step at parity."""
 
-    from agents.dqn_market_free.training.reward import TERMINAL_MARGIN_SCALE
-
     gamma = 0.999
-    margin = 60_000.0
+    final = 60_000.0
 
-    outcome = float(np.tanh(margin / TERMINAL_MARGIN_SCALE))
-    gap = _outcome_gap(margin, gamma)
+    outcome = _season_outcome(final)
+    gap = _outcome_gap(final, gamma)
 
     # Not one turn in three hundred, but all of them.
     assert bool((gap > 0.0).all())
@@ -4015,14 +4161,12 @@ def test_the_outcome_contributes_a_flat_offset_to_the_return():
     and ~0 at the last turn -- less late-game signal than the lump gave on its own.
     """
 
-    from agents.dqn_market_free.training.reward import TERMINAL_MARGIN_SCALE
-
     gamma = 0.999
     turns = 400
 
-    for margin in (60_000.0, -120_000.0):
-        outcome = float(np.tanh(margin / TERMINAL_MARGIN_SCALE))
-        gap = _outcome_gap(margin, gamma, turns)
+    for final in (60_000.0, 500.0):
+        outcome = _season_outcome(final)
+        gap = _outcome_gap(final, gamma, turns)
         # Beginning, middle, and the final turn all see the same offset.
         for start in (0, turns // 2, turns - 1):
             weights = gamma ** np.arange(turns - start, dtype=np.float64)
@@ -4038,7 +4182,7 @@ def test_the_annuity_vanishes_at_gamma_one():
     """
 
     from agents.dqn_market_free.training.reward import (
-        TERMINAL_MARGIN_SCALE,
+        OUTCOME_LOG_SCALE,
         episode_rewards,
     )
 
@@ -4046,7 +4190,7 @@ def test_the_annuity_vanishes_at_gamma_one():
 
     shaped, _, _ = episode_rewards(money, 9_000.0, 3_000.0, 1.0)
 
-    outcome = float(np.tanh(6_000.0 / TERMINAL_MARGIN_SCALE))
+    outcome = float(np.tanh(np.log(9_001.0 / 3_001.0) / OUTCOME_LOG_SCALE))
     # At gamma = 1 the annuity is zero and the lump is the whole stream.
     assert float(shaped.sum()) == pytest.approx(outcome, abs=1e-5)
 
@@ -4054,7 +4198,7 @@ def test_the_annuity_vanishes_at_gamma_one():
 def test_a_losing_episode_is_charged_on_every_turn():
     """The annuity is signed, so it is a penalty as readily as a bonus."""
 
-    assert bool((_outcome_gap(-125_000.0, 0.999) < 0.0).all())
+    assert bool((_outcome_gap(500.0, 0.999) < 0.0).all())
 
 
 def test_the_annuity_keeps_a_full_season_in_the_huber_quadratic_zone():
@@ -4071,8 +4215,12 @@ def test_the_annuity_keeps_a_full_season_in_the_huber_quadratic_zone():
     money = list(np.linspace(3_000.0, 76_000.0, turns))
     shaped, _, _ = episode_rewards(money, 76_000.0, 40_000.0, 0.999)
 
-    assert 1.0 < float(shaped.sum()) < 10.0
+    assert 0.5 < float(shaped.sum()) < 10.0
     assert float(np.abs(shaped).max()) < 1.0
+    # The annuity's share of that is `(1 - gamma) * turns` of one outcome, which
+    # is what the docstring's 0.72 bound refers to.
+    outcome = _season_outcome_from(3_000.0, 76_000.0)
+    assert float(shaped.sum()) == pytest.approx(outcome * (1.0 + (1.0 - 0.999) * turns), rel=1e-3)
 
 
 def test_activity_is_counted_by_effect_not_by_emission():
@@ -4157,7 +4305,11 @@ def test_rejected_orders_are_charged_and_valid_ones_are_not():
     # turn 2 emitted nothing at all.
     emitted = [True, True, False]
 
-    shaped, raw, _ = episode_rewards(money, 2_880.0, 2_880.0, 1.0, emitted)
+    # Finishing on the stake, so the outcome term is exactly zero and the three
+    # charges are the whole stream. It used to be enough to draw level with the
+    # opponent; the outcome is absolute now, so it is the *stake* that has to be
+    # matched. gamma = 1.0 keeps the annuity out of it either way.
+    shaped, raw, _ = episode_rewards(money, 3_000.0, 2_880.0, 1.0, emitted)
 
     assert shaped[0] == pytest.approx(-REJECTED_ORDER_PENALTY)
     # The accepted order takes no charge: the stream pays nothing for a trade,
@@ -4171,7 +4323,7 @@ def test_rejected_orders_are_charged_and_valid_ones_are_not():
 
     # Off by default for callers that cannot say what was emitted -- neither
     # charge can be attributed without it.
-    plain, _, _ = episode_rewards(money, 2_880.0, 2_880.0, 1.0)
+    plain, _, _ = episode_rewards(money, 3_000.0, 2_880.0, 1.0)
     assert np.allclose(plain, 0.0)
 
 
@@ -4210,13 +4362,16 @@ def test_idling_is_charged_but_stays_cheaper_than_going_broke():
     # flat 0.0005 the season cost 0.36 against a 3,000-to-1,898 outcome gap of
     # 0.104, and `market-free-hot-v16` duly learned to trade on 73-99% of turns
     # while mean money fell 3,542 to 1,898.
+    #
+    # The absolute outcome tightened this rather than loosening it -- 0.091
+    # against the old 0.104 -- because `OUTCOME_LOG_SCALE` is sized on 500,000 of
+    # headroom instead of on the distribution of the day. That is the trade taken
+    # knowingly, and this is the assertion that says how much slack is left.
     import math
 
-    from agents.dqn_market_free.training.reward import TERMINAL_MARGIN_SCALE
+    from agents.dqn_market_free.training.reward import OUTCOME_LOG_SCALE
 
-    outcome_gap = math.tanh(3_000 / TERMINAL_MARGIN_SCALE) - math.tanh(
-        1_898 / TERMINAL_MARGIN_SCALE
-    )
+    outcome_gap = -math.tanh(math.log(1_899.0 / 3_001.0) / OUTCOME_LOG_SCALE)
     assert turns * IDLE_PENALTY / 2 < outcome_gap
 
 
@@ -4271,13 +4426,19 @@ def test_every_turn_with_no_runway_is_charged():
     )
 
     # Turn 0 spends down to the floor, turns 1 and 2 sit there, turn 3 recovers.
+    # Recovering all the way to the stake, so the outcome term is zero and the
+    # insolvency charge is the whole stream.
     money = [3_000.0, 100.0, 100.0, 100.0]
-    shaped, _, _ = episode_rewards(money, 900.0, 900.0, 1.0)
+    shaped, _, _ = episode_rewards(money, 3_000.0, 900.0, 1.0)
 
     charged = -shaped
     assert charged[:3] == pytest.approx(INSOLVENCY_PENALTY, abs=1e-6)
     # The turn that climbs back over the floor is not charged.
     assert float(charged[3]) == pytest.approx(0.0, abs=1e-6)
+    # And it is the resulting wallet that is read, not the opponent's: the same
+    # trace scores identically however rich the other seat got.
+    rich, _, _ = episode_rewards(money, 3_000.0, 142_000.0, 1.0)
+    assert np.allclose(rich, shaped)
 
     # The charge reads the resulting wallet, so the turn that spends the last of
     # the stake is the first one billed rather than the one after it.
@@ -4295,7 +4456,11 @@ def test_a_solvent_season_is_never_charged():
     money = list(np.linspace(3_000.0, 40_000.0, 400))
     shaped, _, _ = episode_rewards(money, 40_000.0, 40_000.0, 1.0)
 
-    assert float(np.abs(shaped).max()) < INSOLVENCY_PENALTY
+    # gamma = 1.0, so the annuity is zero and the last step carries the outcome
+    # lump alone. Every other step must be untouched -- that is the charge being
+    # absent, which is what this pins.
+    assert float(np.abs(shaped[:-1]).max()) < INSOLVENCY_PENALTY
+    assert float(shaped[-1]) == pytest.approx(_season_outcome_from(3_000.0, 40_000.0))
 
 
 def test_the_insolvency_charge_is_the_scale_of_the_outcome_not_of_a_fill():
@@ -4839,6 +5004,81 @@ def test_the_rollout_spec_carries_the_gain_only_when_it_is_on(tmp_path: Path):
         rare_sigma_path=tmp_path / "visits.npz",
     )
     assert "rare_sigma_gain=1.000000" in on and "rare_sigma_cap=3.000000" in on
+
+
+def test_the_rollout_spec_carries_the_opponent_weight_only_when_it_is_on(tmp_path: Path):
+    """Same rule as the gain, and it is what keeps the leg free while it is inert.
+
+    At `OPPONENT_WEIGHT = 0.0` every episode passes 0.0, so every spec string is
+    byte-identical to what this agent emitted before the parameter existed and no
+    revision churns on landing the mechanism.
+    """
+
+    from agents.dqn_market_free.training.collect import learner_spec
+
+    off = learner_spec(tmp_path / "w.npz", gamma=0.999, exploration_seed=3)
+    assert "opponent_weight" not in off
+
+    on = learner_spec(
+        tmp_path / "w.npz", gamma=0.999, exploration_seed=3, opponent_weight=0.1
+    )
+    assert "opponent_weight=0.100000" in on
+
+
+def test_the_opponent_weight_stays_out_of_the_policy_identity(tmp_path: Path):
+    """It is per-opponent, and the identity spec must be per-policy.
+
+    Folding it in would mint two revisions for one set of weights -- one for the
+    mirror and one for everything else -- splitting `rating_snapshots` and the
+    self-play pool down the middle. `_learner_policy` is what the identity is
+    actually built from, so this pins that it never grew the key.
+    """
+
+    from urllib.parse import parse_qs, urlsplit
+
+    from agents.dqn_market_free.training.updater import _learner_policy
+
+    weights = tmp_path / "w.npz"
+    policy = _learner_policy(weights, 0.999)
+
+    # Parsed rather than substring-matched: the weights path is in the spec and
+    # can contain anything, including this key's own name.
+    query = parse_qs(urlsplit(policy.agent_spec).query)
+    assert "opponent_weight" not in query
+
+
+def test_the_mirror_is_gated_out_of_the_opponent_leg(monkeypatch, tmp_path: Path):
+    """A self-play opponent scores absolutely; a scripted one carries the weight.
+
+    Against a recent checkpoint of the same slot the relative leg is noise by
+    construction -- the opponent's purse carries this policy's own variance and
+    nothing else. `market-free-population-v25` is the run that measured what
+    happens without this: at `self_play_ratio = 0.65`, two of every three
+    rollouts would carry a zero-mean term worth only what it adds in noise.
+    """
+
+    from agents.dqn_market_free.training import collect as collect_module
+
+    monkeypatch.setattr(collect_module, "OPPONENT_WEIGHT", 0.1)
+
+    seen: list[str] = []
+
+    def fake_learner_spec(_weights, **kwargs):
+        seen.append(f"{kwargs['opponent_weight']:.6f}")
+        # Stop before `run_match`: the gate is decided by the time the spec is
+        # built, which is the whole of what this reads.
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(collect_module, "learner_spec", fake_learner_spec)
+
+    mirror = f"{collect_module.SELF_SPEC}?weights={tmp_path / 'ckpt.npz'}"
+    for opponent in (mirror, "agents/competitor_pilkwang/main.py"):
+        with pytest.raises(RuntimeError):
+            collect_module.collect_episode(
+                tmp_path / "w.npz", opponent, 7, 0, 0.999, tmp_path, 0
+            )
+
+    assert seen == ["0.000000", "0.100000"]
 
 
 def test_the_widening_rides_the_widest_end_of_the_ladder(monkeypatch, tmp_path: Path):

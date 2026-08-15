@@ -345,13 +345,44 @@ SYNC_ENVIRONMENT = True
 # than on session, so the LR clocks, lineage checkpoints and the batch watermark
 # all carry across, and the graduation clock keeps the updates it has already
 # banked. What resets is the generation counter and the session's own rollups.
-SESSION_ID = "market-free-population-v25"
+#
+# v26: the reward changed, so this time the slots *do* restart, and the model
+# names move with them for the first time since v23. That is the whole reason
+# they move -- `training_models` being keyed on model id is exactly what would
+# otherwise carry v25's checkpoints, its batches and its `_self_play_pool` into a
+# run whose returns mean something different. A shaped return is not comparable
+# across `OUTCOME_LOG_SCALE`, so every stored episode is the wrong quantity and
+# every checkpoint was fitted to it.
+#
+# What v25 measured, and it is unambiguous. Eleven generations, 110 batches,
+# 17,600 episodes, zero failures, and a policy worse than never trading: win rate
+# 0.000 against pilkwang at every one of fourteen measured batches, benchmark
+# money 98-2,717 from a 3,000 stake against pilkwang's ~142,000, `trading_rate`
+# climbing 0.00 to 0.78 while money fell, and `own_solvent_fraction` between
+# 0.003 and 0.028 throughout. It learned to act and every action lost.
+#
+# Three causes, landed together because none is observable without the others:
+# the outcome term was a margin while the gate promotes on absolute money and was
+# structurally *zero* in the 65% of rollouts played against the mirror
+# (`training/reward.py`, `OUTCOME_LOG_SCALE`); `priority_alpha` was 0.0, so a
+# uniform draw over a buffer that is 99.7% insolvent taught the only policy
+# consistent with it (`agent.toml`); and the two opponent-wealth features were
+# raw coin scales, so the promotion benchmark was judged fifty times outside the
+# training distribution (`market_state.py`).
+#
+# This is the branch `LEARNERS` below already named: "if all ten slots decay with
+# benchmark money still under 100, the binding constraint is the reward". They
+# did not get that far -- `population.action` was `train` on all 109 updates and
+# no slot has reached `lr_graduate_cut` -- but the benchmark money was there from
+# the first generation, so the population question is deferred rather than
+# answered. The roster stays; it is now ten independent reads on a reward change.
+SESSION_ID = "market-free-logmoney-v26"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_league.toml")
 MANIFEST = Path("agents/dqn_market_free/agent.toml")
 
 # Ten concurrent learner slots under one declared model, which the harness
-# namespaces as `dqn_market_free.raw_order_q_v1@learner_00` and so on.
+# namespaces as `dqn_market_free.raw_order_q_v1@logmoney_00` and so on.
 #
 # The cost was wall clock and it was linear, because `run_round_hooks` and
 # `_update_session_models` both walked the roster one slot at a time in one
@@ -370,7 +401,13 @@ MANIFEST = Path("agents/dqn_market_free/agent.toml")
 # constraint is the reward and the answer is Phase 3 of the roadmap, not more
 # slots.
 LEARNERS = 10
-MODEL_NAME = "learner_00"
+# `logmoney_` rather than `learner_` so the ten slots are ten fresh lineages.
+# `_self_play_pool`, `lineage_checkpoint`, `all_batches` and the slot LR state are
+# all scoped by `model_id`, and every one of them would otherwise hand v25's
+# old-objective checkpoints and episodes to a run whose shaped return is a
+# different quantity. Renaming is the only thing that severs all four at once.
+SLOT_PREFIX = "logmoney"
+MODEL_NAME = f"{SLOT_PREFIX}_00"
 
 # How many learners run their round hooks and their update at once, and how wide
 # each one's rollout pool is. The product is the core budget, so these two belong
@@ -657,7 +694,7 @@ FREE_CONFIG = {
 TRAINING_AGENTS = [
     {
         "type": "dqn_market_free",
-        "name": f"learner_{index:02d}",
+        "name": f"{SLOT_PREFIX}_{index:02d}",
         "train": True,
         "primary": index == 0,
         "model_config": {**FREE_CONFIG, "seed": 2718 + 1009 * index},

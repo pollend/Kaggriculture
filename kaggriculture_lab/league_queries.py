@@ -582,7 +582,7 @@ def generation_outcomes(connection: Any, generation_id: str) -> dict[str, Any]:
 def margin_histogram(
     connection: Any, generation_id: str, *, buckets: int = 21
 ) -> list[dict[str, Any]]:
-    """Settled pairing margins, pre-binned.
+    """Settled pairing margins, pre-binned by size.
 
     Binned in SQL rather than in the renderer: `width_bucket` is what the database
     is for, and it keeps the chart primitive from growing a statistics layer.
@@ -591,23 +591,32 @@ def margin_histogram(
     is a fair "no edge" reference. `episode_players.money_difference` would count
     each pairing twice, once from each side, and carry the seat advantage with it
     -- which shows up as a bimodal shape that is an artefact, not a finding.
+
+    Bins `abs(margin)`, folding the two orientations of the same edge size into
+    one bucket: a 4,000 win and a 4,000 loss are one finding about how decisive
+    the pairings are, and splitting them halves every bar for no gain. Which way
+    the edge ran is read off the mean/min/max cards, not off this shape.
+
+    The low bound is a fixed 0 rather than `min(margin)`, so bucket 1 is always
+    the level pairings instead of sliding whenever the closest pairing changes.
+    Flooring the high bound keeps a generation whose margins are all identical
+    -- all draws, most often -- rendering one honest bar rather than nothing.
     """
     return rows(
         connection,
         """
         WITH settled AS (
-            SELECT pr.paired_margin AS margin
+            SELECT abs(pr.paired_margin) AS margin
             FROM league_pairings lp JOIN pairing_results pr USING (pairing_id)
             WHERE lp.generation_id = %s AND NOT pr.failed AND pr.paired_margin IS NOT NULL
         ), bounds AS (
-            SELECT min(margin) AS low, max(margin) AS high FROM settled
+            SELECT greatest(max(margin), 1.0) AS high FROM settled
         )
-        SELECT width_bucket(s.margin, b.low, b.high + 1e-9, %s) AS bucket,
+        SELECT width_bucket(s.margin, 0, b.high + 1e-9, %s) AS bucket,
                count(*) AS episodes,
                min(s.margin) AS low, max(s.margin) AS high,
                avg(s.margin) AS centre
         FROM settled s CROSS JOIN bounds b
-        WHERE b.high > b.low
         GROUP BY bucket ORDER BY bucket
         """,
         [generation_id, buckets],

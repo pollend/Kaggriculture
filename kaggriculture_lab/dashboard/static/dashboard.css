@@ -19,7 +19,7 @@ th a{color:inherit;white-space:nowrap}th a[aria-current="true"]{color:var(--acce
 padding:7px 11px;border-radius:8px;background:var(--panel)}form.filters{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin:0 0 16px}
 label{font-size:12px;color:var(--muted)}select{display:block;margin-top:4px;background:#0e1828;color:var(--ink);border:1px solid var(--line);padding:7px;border-radius:7px}
 pre{white-space:pre-wrap;word-break:break-word;background:#0a111d;border:1px solid var(--line);padding:12px;border-radius:8px;max-height:420px;overflow:auto}
-details{margin:8px 0}.pager{display:flex;justify-content:space-between;margin-top:16px}.chart{width:100%;height:auto;min-width:500px}.chart.small{min-width:0}.sparkline{vertical-align:middle}.empty{text-align:center;padding:42px;color:var(--muted)}
+details{margin:8px 0}.pager{display:flex;justify-content:space-between;margin-top:16px}.chart{width:100%;height:auto;min-width:500px}.chart.small{min-width:0}.chart text{font-size:11px}.sparkline{vertical-align:middle}.empty{text-align:center;padding:42px;color:var(--muted)}
 .error{max-width:700px;margin:70px auto;padding:28px;background:var(--panel);border:1px solid var(--line);border-radius:14px}
 .versus{color:var(--muted);font-size:12px;font-weight:700;margin:8px 0;text-transform:uppercase}
 .players{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin:14px 0}.player{overflow:visible}

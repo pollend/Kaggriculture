@@ -110,11 +110,18 @@ demo_fraction = 0.25
 # reservoir segment. A rank is invariant to all of it and bounded by
 # construction, so one blowout episode cannot take the batch.
 #
-# Held at 0.0 for now: the mechanism is landed inert so the uniform draw is
-# provably unchanged before the behaviour changes. 0.7 is the intended value --
-# Schaul et al.'s rank-based alpha, and note their proportional value is 0.6 and
-# the two are not interchangeable.
-priority_alpha = 0.0
+# Switched on at `market-free-logmoney-v26`, having been landed inert so the
+# uniform draw was provably unchanged first. 0.7 is Schaul et al.'s rank-based
+# alpha -- note their proportional value is 0.6 and the two are not
+# interchangeable -- and it is the value `priority_beta`'s measurements below
+# were taken at, so the pair stays calibrated.
+#
+# It goes on now because the other half of the argument above finally resolved.
+# `demo_fraction` is conditional on a demonstrator and there is none, so until
+# this exponent moved, *nothing* was putting solvent transitions in a batch:
+# `market-free-population-v25` held `own_solvent_fraction` between 0.003 and
+# 0.028 for its entire eleven generations while drawing uniformly over it.
+priority_alpha = 0.7
 
 # Importance-sampling exponent, fixed. There is no anneal schedule and that is
 # deliberate. An anneal is state: it has to key off `gradient_steps`, and

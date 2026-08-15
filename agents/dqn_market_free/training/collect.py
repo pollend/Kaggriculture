@@ -19,12 +19,8 @@ code.
 
 from __future__ import annotations
 
-import multiprocessing
-import os
-import threading
 import traceback
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import contextmanager
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,7 +31,8 @@ import numpy as np
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
 from agents.dqn_market_free.order_space import ACTION_COUNT, ACTIONS, OrderDecision
-from agents.dqn_market_free.training.reward import episode_rewards
+from agents.dqn_market_free.training.reward import OPPONENT_WEIGHT, episode_rewards
+from sim.workers import discard_pool, single_threaded_workers, worker_pool
 
 if TYPE_CHECKING:
     from sim.runner import MatchResult
@@ -199,6 +196,7 @@ class Recorder:
         final_money: float,
         opponent_money: float,
         gamma: float,
+        opponent_weight: float = OPPONENT_WEIGHT,
     ) -> EpisodeRecord:
         steps = len(self.money)
         if steps == 0:
@@ -219,6 +217,7 @@ class Recorder:
             opponent_money,
             gamma,
             emitted,
+            opponent_weight=opponent_weight,
         )
 
         count = len(self.decisions)
@@ -244,6 +243,14 @@ class Recorder:
 
 #: Spec target of the training-only wrapper in `match_agent.py`.
 LEARNER_ENTRY_POINT = "agents.dqn_market_free.match_agent:make_agent"
+
+#: Spec target of this agent's ordinary inference entry point.
+#:
+#: Here rather than in `training/updater`, where it used to live, because the
+#: mirror gate on the opponent-relative reward leg has to read it and `updater`
+#: already imports this module. Re-exported there under the same name, so nothing
+#: that referred to `updater.SELF_SPEC` has to move.
+SELF_SPEC = "agents/dqn_market_free/main.py"
 
 
 @dataclass(frozen=True)
@@ -274,6 +281,7 @@ def learner_spec(
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
     rare_sigma_path: Path | str | None = None,
+    opponent_weight: float = 0.0,
 ) -> str:
     """Address the exploring learner as an ordinary agent spec.
 
@@ -284,6 +292,15 @@ def learner_spec(
     `gamma` sits in the identity spec although the policy never reads it -- only
     `Recorder.finish` does -- because a run that relabels its rewards is worth
     telling apart from one that does not.
+
+    `opponent_weight` is the other reward-labelling parameter and is treated the
+    *opposite* way, for the reason that separates the two: gamma is one number
+    for a whole run, and this one is per-opponent, since the mirror is gated off.
+    Folding a per-episode value into the identity would mint two revisions for
+    one set of weights and split both `rating_snapshots` and the self-play pool
+    down the middle. So it travels on the played spec beside `trace_path`, and
+    `_learner_policy` in `training/updater` -- which is what the identity is
+    actually built from -- does not carry it.
     """
 
     query: dict[str, Any] = {
@@ -305,6 +322,13 @@ def learner_spec(
         query["rare_sigma_gain"] = f"{rare_sigma_gain:.6f}"
         query["rare_sigma_cap"] = f"{rare_sigma_cap:.6f}"
         query["rare_sigma_path"] = str(rare_sigma_path)
+    # Same "departure from the default" rule as the noise knobs above, and it
+    # matters for the same reason plus one more: at `OPPONENT_WEIGHT = 0.0` this
+    # is 0.0 on every episode, so a run with the relative leg switched off emits
+    # spec strings byte-identical to what this agent recorded before the
+    # parameter existed and churns no revisions at all.
+    if opponent_weight:
+        query["opponent_weight"] = f"{opponent_weight:.6f}"
     if trace_path is not None:
         query["trace_path"] = str(trace_path)
     if policy_revision_id is not None:
@@ -335,10 +359,21 @@ def collect_episode(
     from sim.runner import OK_STATUSES, run_match
 
     trace_path = Path(trace_dir) / f"seed-{seed:010d}-seat-{learner_seat}.npz"
+    # The mirror gate on the reward's opponent-relative leg. This is the only
+    # place that holds both the opponent's spec and a route to `Recorder.finish`,
+    # which runs in the match subprocess and cannot see who it played.
+    #
+    # A mirror is anything addressed at this agent's own inference entry point --
+    # `_weights_spec` in `training/updater` builds every self-play opponent as
+    # `SELF_SPEC?weights=...`, so the prefix is the test. Against a recent
+    # checkpoint of the same slot the relative leg is noise by construction: the
+    # opponent's purse carries this policy's own variance and nothing else.
+    opponent_weight = 0.0 if opponent_spec.startswith(SELF_SPEC) else OPPONENT_WEIGHT
     spec = learner_spec(
         weights_path,
         gamma=gamma,
         exploration_seed=exploration_seed,
+        opponent_weight=opponent_weight,
         trace_path=trace_path,
         policy_revision_id=policy_revision_id,
         noise_cadence=noise_cadence,
@@ -381,71 +416,11 @@ def _job(args: tuple) -> OrderRollout | None:
         return None
 
 
-#: Thread-count variables every BLAS backend numpy might be linked against reads.
-_THREAD_VARS = (
-    "OMP_NUM_THREADS",
-    "MKL_NUM_THREADS",
-    "OPENBLAS_NUM_THREADS",
-    "NUMEXPR_NUM_THREADS",
-    "VECLIB_MAXIMUM_THREADS",
-)
-
-#: Reference count and saved values for the pin below. Module state rather than
-#: closure state because the thing being guarded -- `os.environ` -- is itself
-#: process-global, so the guard has to be too.
-_PIN_LOCK = threading.Lock()
-_pin_depth = 0
-_pin_saved: dict[str, str | None] = {}
-
-
-@contextmanager
-def _single_threaded_workers():
-    """Pin spawned rollout workers to one BLAS thread each.
-
-    Parallelism here is across episodes, not inside one. Left alone, every
-    worker's BLAS opens a thread pool sized to the whole machine, so `jobs`
-    workers ask for `jobs * cores` threads: measured at ~350% CPU per worker,
-    eight workers wanting ~29 cores of a 32-core box, and a 16-episode batch
-    taking 17 minutes against an ideal of well under one.
-
-    Set in the parent rather than in an initializer because `spawn` children
-    inherit the environment at launch, and the variables have to be set before
-    numpy is imported in the child -- which happens while the task is being
-    unpickled, ahead of any initializer running.
-
-    Reference counted, because `os.environ` is process-global and this is now
-    entered from several threads at once. One learner per thread is how a
-    population run keeps a 32-core box busy, and the naive save/restore is a race
-    on exactly the variable it exists to control: the second thread in saves the
-    "1"s the first one wrote, and when *it* exits it restores them as though they
-    were the originals -- so the pin either leaks forever or, far worse, is torn
-    down while another thread is still spawning workers. That worker inherits an
-    unpinned environment, and the docstring above measures what that costs: ~350%
-    CPU per worker and a 16-episode batch taking 17 minutes.
-
-    The innermost enter pins and the outermost exit restores, so a single-threaded
-    caller sees byte-for-byte the previous behaviour.
-    """
-
-    global _pin_depth
-    with _PIN_LOCK:
-        if _pin_depth == 0:
-            _pin_saved.clear()
-            _pin_saved.update({name: os.environ.get(name) for name in _THREAD_VARS})
-            os.environ.update({name: "1" for name in _THREAD_VARS})
-        _pin_depth += 1
-    try:
-        yield
-    finally:
-        with _PIN_LOCK:
-            _pin_depth -= 1
-            if _pin_depth == 0:
-                for name, value in _pin_saved.items():
-                    if value is None:
-                        os.environ.pop(name, None)
-                    else:
-                        os.environ[name] = value
-                _pin_saved.clear()
+#: The BLAS pin and the rollout pool both moved to `sim.workers`, because the
+#: promotion gate's arena pays exactly the same two costs on exactly the same
+#: episodes. Re-exported under the old names: `training.updater` imports the pin
+#: from here to wrap `play_series`.
+_single_threaded_workers = single_threaded_workers
 
 
 def actor_sigma_scales(actors: int, alpha: float = 32.0) -> list[float]:
@@ -559,7 +534,14 @@ def collect_batch(
         )
     if jobs <= 1:
         return [rollout for rollout in (_job(payload) for payload in payloads) if rollout]
-    context = multiprocessing.get_context("spawn")
-    with _single_threaded_workers():
-        with ProcessPoolExecutor(max_workers=jobs, mp_context=context) as pool:
+    with _single_threaded_workers(), worker_pool(jobs) as pool:
+        try:
             return [rollout for rollout in pool.map(_job, payloads) if rollout]
+        except BrokenProcessPool:
+            # A worker died hard (OOM kill, segfault in a BLAS backend). The
+            # pool is unusable for good, so drop it rather than returning it to
+            # the free-list, and replay the batch once on a fresh one. A second
+            # failure is the caller's to see.
+            discard_pool(pool)
+            with worker_pool(jobs) as retry:
+                return [rollout for rollout in retry.map(_job, payloads) if rollout]

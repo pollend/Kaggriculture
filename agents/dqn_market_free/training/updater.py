@@ -49,6 +49,7 @@ from agents.dqn_market_free.training import rare, reseed
 from agents.dqn_market_free.training.clone import load_demonstrations
 from agents.dqn_market_free.training.collect import (
     LEARNER_ENTRY_POINT,
+    SELF_SPEC,
     EpisodeRecord,
     _single_threaded_workers,
     actor_sigma_scales,
@@ -88,7 +89,11 @@ from kaggriculture_lab.model_updates import (
     ModelUpdateResult,
 )
 
-SELF_SPEC = "agents/dqn_market_free/main.py"
+# `SELF_SPEC` is imported above rather than defined here. It moved to
+# `training.collect` so the reward's mirror gate could read it without importing
+# this module back, and it stays reachable as `updater.SELF_SPEC` for everything
+# that already referred to it there -- the same re-export
+# `_single_threaded_workers` got when it moved to `sim.workers`.
 LEARNER_MANIFEST = "agents/dqn_market_free/match_agent.toml"
 SOURCE_KIND = "free_market_rollout"
 _PROMOTION_RULES = {"significant", "point_estimate", "always", "benchmark_ratchet"}

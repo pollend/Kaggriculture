@@ -190,6 +190,55 @@ def town_demand_per_day(obs, item: str) -> float:
 # --- supply projection -------------------------------------------------------
 
 
+#: Which product each livestock animal yields, inverted from the per-item test
+#: the projection used to run once per item.
+_PRODUCT_FOR_ANIMAL = {"GOOSE": "EGG", "COW": "MILK", "SHEEP": "WOOL"}
+
+
+def projected_supply_map(
+    farm: dict, day: int, horizons: tuple[int, ...]
+) -> dict[int, dict[str, int]]:
+    """Every product's projected supply for one farm, in a single pass.
+
+    A tile feeds at most one product, so asking per (item, horizon) rescanned the
+    whole 10x10 board to read one crop off each tile and discard the other 99
+    answers. The feature vector wants nine products across two horizons for both
+    farms, which was 36 board scans -- 3,600 tile visits -- per decision, against
+    the 200 the two boards actually contain. Measured at 51,768 calls and 0.54s
+    of a ~2.9s episode, the single largest cost in the agent.
+    """
+
+    totals: dict[int, dict[str, int]] = {horizon: {} for horizon in horizons}
+    for row in farm.get("tiles", []) or []:
+        for tile in row:
+            if not isinstance(tile, dict):
+                continue
+            crop = tile.get("crop")
+            if tile.get("kind") == "PLANT" and crop in donor.CROPS:
+                rule = donor.CROPS[crop]
+                planted = tile.get("planted_day")
+                planted_day = day if planted is None else int(planted)
+                age = day - planted_day
+                held = int(tile.get("yield_units", 0) or 0)
+                ripe = held > 0 and age >= rule["first"]
+                for horizon, bucket in totals.items():
+                    if ripe:
+                        bucket[crop] = bucket.get(crop, 0) + held
+                    elif age + horizon >= rule["ripe"]:
+                        bucket[crop] = bucket.get(crop, 0) + max(
+                            1, min(rule["max_yield"], held + horizon)
+                        )
+            animal = tile.get("animal")
+            product = _PRODUCT_FOR_ANIMAL.get(str(animal))
+            if product is not None:
+                held = int(tile.get("yield_units", 0) or 0)
+                rule = donor.ANIMALS.get(str(animal), {"max_held": 4})
+                for horizon, bucket in totals.items():
+                    grown = min(2 * horizon, int(rule["max_held"])) if horizon > 0 else 0
+                    bucket[product] = bucket.get(product, 0) + held + grown
+    return totals
+
+
 def projected_supply(farm: dict, item: str, day: int, horizon: int) -> int:
     """Units of `item` this farm's tiles will hold `horizon` days from now.
 
@@ -197,31 +246,11 @@ def projected_supply(farm: dict, item: str, day: int, horizon: int) -> int:
     and opponent supply are measured the same way and can be compared. The donor
     version reads only the *other* seat's tiles, which is why it cannot be called
     for both; `test_projected_supply_matches_donor` pins this one against it on
-    an opponent farm.
+    an opponent farm -- and so, through this wrapper, pins `projected_supply_map`
+    that the feature vector actually calls.
     """
 
-    animal_for = {"EGG": "GOOSE", "MILK": "COW", "WOOL": "SHEEP"}
-    total = 0
-    for row in farm.get("tiles", []) or []:
-        for tile in row:
-            if not isinstance(tile, dict):
-                continue
-            if item in donor.CROPS and tile.get("kind") == "PLANT" and tile.get("crop") == item:
-                rule = donor.CROPS[item]
-                planted = tile.get("planted_day")
-                planted_day = day if planted is None else int(planted)
-                age = day - planted_day
-                held = int(tile.get("yield_units", 0) or 0)
-                if held > 0 and age >= rule["first"]:
-                    total += held
-                elif age + horizon >= rule["ripe"]:
-                    total += max(1, min(rule["max_yield"], held + horizon))
-            elif item in animal_for and tile.get("animal") == animal_for[item]:
-                total += int(tile.get("yield_units", 0) or 0)
-                if horizon > 0:
-                    rule = donor.ANIMALS.get(str(tile.get("animal")), {"max_held": 4})
-                    total += min(2 * horizon, int(rule["max_held"]))
-    return total
+    return projected_supply_map(farm, day, (horizon,))[horizon].get(item, 0)
 
 
 # --- cross-turn history ------------------------------------------------------
@@ -350,9 +379,25 @@ class MarketHistory:
             values += [
                 (new_inventory[item] - old_inventory[item]) / 1000.0 for item in PRODUCTS
             ]
+            # Clipped, because a coin-scaled delta is unbounded by construction
+            # and the opponent's leg is where that bites. See the wealth block in
+            # `market_features`: the training opponents hold 0-3,000 and the
+            # promotion benchmark holds ~142,000, so an unclipped opponent delta
+            # is a feature the network only ever meets at evaluation time.
+            #
+            # Both legs, symmetrically. This agent's own delta has never left
+            # [-1, 1] on any recorded run -- it is a 3,000-coin float over a
+            # `lag`-turn window -- so the clip is inert there today and stops it
+            # becoming the same problem in reverse if the policy ever gets rich.
             values += [
-                (self._money[-1] - self._money[0]) / 10_000.0,
-                (self._opponent_money[-1] - self._opponent_money[0]) / 10_000.0,
+                float(np.clip((self._money[-1] - self._money[0]) / 10_000.0, -1.0, 1.0)),
+                float(
+                    np.clip(
+                        (self._opponent_money[-1] - self._opponent_money[0]) / 10_000.0,
+                        -1.0,
+                        1.0,
+                    )
+                ),
             ]
 
         last = self.last_op or "NOOP"
@@ -486,8 +531,33 @@ def market_state_features(
         max(0, episode_steps - step) / max(1, episode_steps),
         float(np.log1p(max(0.0, money))) / 10.0,
         money / 10_000.0,
-        opponent_money / 10_000.0,
-        money / (money + opponent_money + 1.0),
+        # The opponent's wealth on the same log scale as our own two lines above,
+        # and the share taken on logs as well.
+        #
+        # These read raw until `market-free-logmoney-v26`, and that is where the
+        # gate and the buffer stopped describing the same policy. Every training
+        # opponent holds 0-3,000 -- the mirror runs this same policy off a 3,000
+        # stake, and the scripted one bankrupts -- so `opponent_money / 10_000`
+        # lived in about [0, 0.3] and the share sat near 0.5 in every transition
+        # the network ever trained on. pilkwang, which is the promotion
+        # benchmark and appears in no rollout, finishes on about 142,000: 14.2
+        # and 0.019. Fifty times outside the buffer, on two of the eight wealth
+        # features, at exactly the moment the run is being judged.
+        #
+        # `market-free-population-v25` measured the consequence rather than
+        # inferring it. One unchanged `learner_04` checkpoint read a
+        # `trading_rate` of 0.805 against pilkwang and 0.055 against its own
+        # incumbent in the same update -- the same weights, two behaviours,
+        # because one arena is in distribution and the other is not.
+        #
+        # log1p compresses that 47x gap to 1.5x and is the treatment `money`
+        # already had one line up; the asymmetry was the tell. The share is a
+        # ratio of the same logs, which keeps it monotone in relative wealth and
+        # bounded well away from 0 and 1 -- it moves 0.89 to 0.38 across the
+        # whole range the old form spent between 0.9997 and 0.019.
+        float(np.log1p(max(0.0, opponent_money))) / 10.0,
+        float(np.log1p(max(0.0, money)))
+        / (float(np.log1p(max(0.0, money))) + float(np.log1p(max(0.0, opponent_money))) + 1.0),
     ]
     values += [int(seeds.get(item, 0) or 0) / 10.0 for item in CROPS]
     values += [int(shed.get(item, 0) or 0) / 50.0 for item in PRODUCTS]
@@ -572,15 +642,19 @@ def market_state_features(
     # The opponent's harvested stock is private, but their tiles are not, and a
     # ripening field is a price move that has not happened yet.
     opponent_farms = [other for index, other in enumerate(farms) if index != player]
+    opponent_scans = [
+        projected_supply_map(other, day, OPPONENT_HORIZONS) for other in opponent_farms
+    ]
     opponent_supply = {
         horizon: {
-            item: sum(projected_supply(other, item, day, horizon) for other in opponent_farms)
+            item: sum(scan[horizon].get(item, 0) for scan in opponent_scans)
             for item in PRODUCTS
         }
         for horizon in OPPONENT_HORIZONS
     }
+    own_scan = projected_supply_map(farm, day, OWN_HORIZONS)
     own_supply = {
-        horizon: {item: projected_supply(farm, item, day, horizon) for item in PRODUCTS}
+        horizon: {item: own_scan[horizon].get(item, 0) for item in PRODUCTS}
         for horizon in OWN_HORIZONS
     }
     for horizon in OPPONENT_HORIZONS:

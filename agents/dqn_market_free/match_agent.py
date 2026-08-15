@@ -33,6 +33,12 @@ class MatchPolicyAgent:
         self.policy_revision_id = str(config.get("policy_revision_id", "free-market-learner"))
         self.trace_path = Path(str(config["trace_path"])) if config.get("trace_path") else None
         self.gamma = float(config.get("gamma", 0.999))
+        # Absent unless the caller gated it on, which `collect_episode` does only
+        # against a non-mirror opponent. Defaulting to 0.0 rather than to
+        # `OPPONENT_WEIGHT` on purpose: a spec that says nothing about the
+        # relative leg is a spec written before it existed, and it must label its
+        # rewards the way it did then.
+        self.opponent_weight = float(config.get("opponent_weight", 0.0))
         self.recorder = Recorder() if self.trace_path is not None else None
         seed = int(config.get("exploration_seed", 0))
         network = OrderQNetwork.load(str(config["weights"]))
@@ -83,6 +89,7 @@ class MatchPolicyAgent:
             float(farms[seat].get("money", 0.0)),
             float(farms[1 - seat].get("money", 0.0)),
             self.gamma,
+            self.opponent_weight,
         )
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)
         save_episode_batch([record], self.trace_path)

@@ -37,7 +37,7 @@ def test_effective_config_builds_the_learner_roster(tmp_path: Path, monkeypatch)
     assert config.anchor_manifests == ()
     assert config.training_manifests == ("agents/dqn_market_free/agent.toml",)
     assert [(item.type, item.name, item.train) for item in config.training_agents] == [
-        ("dqn_market_free", f"learner_{index:02d}", True)
+        ("dqn_market_free", f"{train_market_free.SLOT_PREFIX}_{index:02d}", True)
         for index in range(train_market_free.LEARNERS)
     ]
     # Exactly one primary, which `LeagueConfig.validate` requires and
@@ -105,7 +105,7 @@ def test_policy_kinds_do_not_collide_with_the_scaffolded_learner():
 
 
 def test_the_session_and_every_model_name_move_together():
-    """Both move at v23, which is the first time the names have moved since v10.
+    """They moved at v23 for the roster, and again at v26 for the reward.
 
     They have to. `all_batches`, `_self_play_pool`, `lineage_checkpoint`,
     `training_models.active_checkpoint_id` and the slot state are every one of
@@ -114,17 +114,28 @@ def test_the_session_and_every_model_name_move_together():
     with nine cold slots and one carrying the stalled trajectory the population
     exists to leave. The mature group would then be seeded from exactly that.
 
+    v26 is the other trigger, and the stronger one. `OUTCOME_LOG_SCALE` replaced
+    a margin-based outcome with an absolute one, so a shaped return is not the
+    same quantity it was: every v25 episode in the buffer is mislabelled and
+    every v25 checkpoint was fitted to the old labels. Renaming is what severs
+    all four scopes at once.
+
     The earlier rule this replaces still holds for the ordinary case: a name is
     kept across a change that only moves the behaviour distribution, because v20's
     batches are the same kind of sample and inheriting them is the buffer working
-    as intended. A reward change forces a new name; so does this.
+    as intended. A reward change forces a new name; so does the roster.
     """
 
-    assert train_market_free.SESSION_ID == "market-free-population-v25"
+    assert train_market_free.SESSION_ID == "market-free-logmoney-v26"
     names = [item["name"] for item in train_market_free.TRAINING_AGENTS]
-    assert names == [f"learner_{index:02d}" for index in range(train_market_free.LEARNERS)]
+    assert names == [
+        f"{train_market_free.SLOT_PREFIX}_{index:02d}"
+        for index in range(train_market_free.LEARNERS)
+    ]
     assert train_market_free.MODEL_NAME == names[0]
     assert all(name not in train_market_free.SESSION_ID for name in names)
+    # And they are not v25's, which is the whole point of the change.
+    assert not any(name.startswith("learner_") for name in names)
 
 
 def test_the_core_budget_is_concurrency_times_jobs():
@@ -284,14 +295,19 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
     collection needs at least one opponent" on batch 0 -- which is exactly how
     `market-free-noisy-v6` died on its first round.
 
-    The other failure is what the empty base was avoiding. Under `outcome_only`
-    the whole reward is `tanh(margin / TERMINAL_MARGIN_SCALE)` plus two ~0.002
+    The other failure is what the empty base was avoiding, and v26 removed the
+    mechanism behind it. The reward was `tanh(margin / 10_000)` plus two ~0.002
     charges, and every scripted *competitor* finishes far enough above a learner
     at ~0 to saturate it: pilkwang 139k, lucifer19 157k, tetsutani 156k,
-    kaitofukami 159k, `configurable_crop_surrogate` 32k, against a scale of
-    10,000. A constant on every terminal reward cannot change an argmax. Seeded
-    noise is the one static opponent that finishes in the learner's own range, so
-    the margin against it stays inside the linear part of the tanh.
+    kaitofukami 159k, `configurable_crop_surrogate` 32k. A constant on every
+    terminal reward cannot change an argmax, so seeded noise was the one static
+    opponent finishing in the learner's own range.
+
+    The outcome is absolute now (`OUTCOME_LOG_SCALE`) and does not read the
+    opponent at all, so no opponent can saturate it and this half of the argument
+    has expired. The first-slot rule is kept on the *other* two grounds, which
+    have not: an empty base cannot cold-start, and the noise slot is what keeps
+    collection in contact with a gate the policy would otherwise never play.
 
     `train_dqn.py` records the cost of having no static opponent at all: 17
     consecutive rejections, because promotion is gated on a benchmark the policy

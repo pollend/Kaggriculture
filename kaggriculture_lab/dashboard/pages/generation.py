@@ -33,8 +33,9 @@ def _margin_histogram(buckets: list[dict[str, Any]]) -> str:
     """Where the margins actually fall, rather than only their mean.
 
     Six summary numbers cannot tell a steady edge from two blowouts around a pile
-    of draws, and those are different findings. The bars diverge around zero
-    because `paired_margin` is seat-cancelled, so zero is a real "no edge" line.
+    of draws, and those are different findings. The axis is margin *size*: wins
+    and losses of the same size share a bar, so the leftmost bar is the pairings
+    that finished effectively level.
     """
     if not buckets:
         return ""
@@ -54,8 +55,8 @@ def _margin_histogram(buckets: list[dict[str, Any]]) -> str:
     )
     return (
         f'<div class="panel"><h3>Margin distribution</h3>{chart}'
-        '<p class="muted">Settled pairings by seat-cancelled margin. Bars left of the '
-        'centre are pairings the first revision lost.</p></div>'
+        '<p class="muted">Settled pairings binned by seat-cancelled margin size, both '
+        'directions folded together. The cards above say which way the edge ran.</p></div>'
     )
 
 

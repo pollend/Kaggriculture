@@ -232,6 +232,49 @@ def test_outcomes_read_the_seat_cancelled_margin(connection):
     assert int(outcomes["drawn"]) == 0
 
 
+def _settle(connection, pairing_id: str, generation_id: str, margin: float) -> None:
+    """One more settled pairing, so a test can shape the margin distribution."""
+    connection.execute(
+        "INSERT INTO league_pairings VALUES (%s, %s, 0, 'population', 9, 'r0', 'r1', 'COMPLETE')",
+        [pairing_id, generation_id],
+    )
+    connection.execute(
+        "INSERT INTO pairing_results VALUES (%s, %s, 1, false, 1, '{}')",
+        [pairing_id, margin],
+    )
+
+
+def test_margin_histogram_folds_mirrored_margins(connection):
+    """A 400 win and a 400 loss are the same edge size, so they share a bar."""
+    for index, margin in enumerate((400, -400, 100, -100)):
+        _settle(connection, f"p{index}", "g", margin)
+
+    buckets = lq.margin_histogram(connection, "g")
+    assert all(float(bucket["centre"]) >= 0 for bucket in buckets)
+    assert {round(float(bucket["centre"])): int(bucket["episodes"]) for bucket in buckets} == {
+        100: 2,
+        200: 1,  # the seeded pairing
+        400: 2,
+    }
+    # Nothing dropped and nothing counted twice: five settled pairings, five bars' worth.
+    assert sum(int(bucket["episodes"]) for bucket in buckets) == 5
+
+
+def test_margin_histogram_survives_a_generation_of_draws(connection):
+    """Every margin identical used to collapse the bounds and return no rows at all."""
+    connection.execute(
+        "INSERT INTO generations (generation_id, session_id, generation_index, status, created_at)"
+        " VALUES ('gz', 's', 1, 'RUNNING', now())"
+    )
+    _settle(connection, "z0", "gz", 0)
+    _settle(connection, "z1", "gz", 0)
+
+    buckets = lq.margin_histogram(connection, "gz")
+    assert len(buckets) == 1
+    assert float(buckets[0]["centre"]) == 0
+    assert int(buckets[0]["episodes"]) == 2
+
+
 def test_pairing_filter_values_come_back_split_and_sorted(connection):
     values = lq.pairing_filter_values(connection, "g")
     assert values == {"status": ["COMPLETE", "FAILED"], "kind": ["population"]}

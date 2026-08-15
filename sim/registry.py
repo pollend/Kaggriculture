@@ -100,6 +100,16 @@ def _import_file(path: Path, config: dict[str, Any] | None = None) -> Any:
     submission-shaped module reads KAGG_AGENT_CONFIG at import and keeps the
     result in module state, so two specs that differ only in query string are
     two different agents. Keying on the path alone let them share one entry.
+
+    The `sys.modules` entry is registered for the duration of the exec -- some
+    module bodies look themselves up while initialising -- and dropped again
+    afterwards. It must not persist: a learner spec carries a per-episode
+    `trace_path`, so every episode is a fresh identity, and a retained entry
+    pins that episode's module globals forever. `agents/dqn_market_free/main.py`
+    keeps its `OrderQNetwork` in `_AGENT`, which makes each retained entry
+    roughly half a megabyte of weights that nothing will ever read again. The
+    caller's reference to the returned module (and the agent callable's
+    `__globals__`) keeps it alive exactly as long as it is in use.
     """
     identity = (str(path.resolve()), json.dumps(config or {}, sort_keys=True))
     module_name = f"_kagg_agent_{path.stem}_{abs(hash(identity))}"
@@ -108,7 +118,10 @@ def _import_file(path: Path, config: dict[str, Any] | None = None) -> Any:
         raise ValueError(f"cannot import agent file: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
     return module
 
 

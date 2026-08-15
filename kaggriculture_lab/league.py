@@ -607,6 +607,7 @@ def _run_hook(
     evaluator_path: str | None,
     *,
     force: bool = False,
+    replay: dict[str, Any] | None = None,
 ) -> None:
     if not evaluator_path:
         return
@@ -648,7 +649,8 @@ def _run_hook(
         return
     try:
         result = evaluator(
-            context, EpisodeReader(store.connection, context.match_id, context.seat)
+            context,
+            EpisodeReader(store.connection, context.match_id, context.seat, replay),
         )
         store.connection.execute(
             "DELETE FROM episode_evaluations WHERE evaluation_id = %s", [evaluation_id]
@@ -807,6 +809,9 @@ def _store_orientation_result(
                 seat=seat,
             ),
             revision.episode_evaluator,
+            # Already in hand, and just written: reading it back would gunzip
+            # and re-parse several megabytes of JSON once per seat.
+            replay=result.replay,
         )
 
 
