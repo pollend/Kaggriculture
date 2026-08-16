@@ -117,6 +117,12 @@ CREATE TABLE IF NOT EXISTS population_members (
     -- A single arena series is a draw and not a number here: `falloff_v1`
     -- measured 61 of them on one unchanged checkpoint, running 0.93 to 427.
     score DOUBLE PRECISION NOT NULL,
+    -- The strategy fingerprint the group's reserved berths are keyed on: crops
+    -- planted, quadrants bought, the undiscounted money both were measured with,
+    -- and the archive cell they bin to. Nullable, and NULL is not zero -- a
+    -- member graduated before this existed has no fingerprint, and filing it into
+    -- a cell on that basis would hand a reserved berth to an unmeasured row.
+    behavior_json JSONB,
     graduated_at TIMESTAMP DEFAULT current_timestamp,
     retired_at TIMESTAMP,
     retired_reason VARCHAR

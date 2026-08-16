@@ -59,9 +59,18 @@ buffer_episodes = 400
 reservoir_fraction = 0.35
 warmup_episodes = 16
 
-# One in-game day. The credit this has to carry is a crop cycle -- 48 to 96
-# turns from BUY_SEED to the harvest that pays for it -- so the previous 8, a
-# third of a day, walked that credit back at a crawl.
+# One in-game day. The credit this has to carry is a crop cycle, and
+# `CROPS[crop]["first_yield_day"]` at `turnsPerDay = 24` makes that 48 turns for
+# WHEAT and CARROT, 192 for TOMATO, and 240 for MELON and STRAWBERRY -- to the
+# first *legal* harvest, before the shed and the sale that turn it into coins.
+# BUY_SEED is also processed after the turn's field actions, so the seed is not
+# plantable until `t + 1`.
+#
+# This window closes none of that on its own: `planting.py` optimises for melon,
+# which is ten bootstraps out, not the two to four an earlier version of this
+# comment claimed. What it does is stop the previous 8 -- a third of a day --
+# walking the credit back at a crawl. The purchase turn gets its signal from
+# `LOT_POTENTIAL_WEIGHT` instead, which pays on the turn itself.
 n_step = 24
 
 # The season is a hard 720-turn deadline, not an infinite horizon: stock held
@@ -147,7 +156,29 @@ priority_beta = 0.5
 # The bootstrap is a max over the 186-wide action head, not over an expanded
 # candidate grid, so there is nothing left to chunk and a wide batch is cheap.
 batch_size = 256
-gradient_steps_per_batch = 100
+# 100 -> 400 at v34, on the throughput measurement rather than on any theory about
+# the optimiser.
+#
+# At 100 this was `min_new_batches` x 100 = 1,000 gradient steps per update, one
+# update per generation. Against a buffer holding ~1,100 episodes of ~720
+# decisions -- about 790k transitions -- 1,000 steps of `batch_size` 256 replays
+# each transition **0.32 times per generation**. Ordinary DQN runs a replay ratio
+# between 1 and 8; this was at a third of the bottom of that range, so most of
+# every episode the machine paid to simulate was never learned from twice.
+#
+# It is close to free, which is the other half of the argument. `train_seconds` is
+# 18-32 s of a ~1,900 s generation -- 1.6% of the wall clock -- and the arena is
+# 96% of an update (see `eval_seeds`). Quadrupling the steps costs about 90
+# seconds a generation, roughly +5%, and buys 4x the learning per episode
+# collected. Nothing else in this file has that ratio.
+#
+# 400 rather than 800 because 0.32 is the only replay ratio this agent has ever
+# run at: 1.3 is the low end of normal and 2.6 would be the largest untested jump
+# available. The failure to watch for is buffer over-fitting, which shows as
+# `mean_abs_q` climbing while `mean_loss` falls and the promote rate drops -- all
+# three are already in `model_updates.metrics_json`. If it appears, 200 is the
+# fallback rather than a revert to 100.
+gradient_steps_per_batch = 400
 learning_rate = 0.0001
 weight_decay = 0.0
 target_sync = 2000
@@ -207,6 +238,52 @@ lr_plateau_patience = 4
 # delta is either inside the noise at the top of that range or unreachable at the
 # bottom of it.
 lr_plateau_min_delta = 0.05
+
+# How fast the plateau detector's high-water mark leaks back toward the level.
+#
+# A plain maximum latches. `best_score` is set by the single luckiest draw the
+# slot ever took, every later update has to clear it by `lr_plateau_min_delta` on
+# top, and on a signal that moves tens of percent between updates that is
+# unreachable by anything but another outlier. Measured on `logmoney-v26`:
+# `logmoney_07` pinned it at 4,208.69, a draw it never repeated, scored 2,992 to
+# 4,103 for the rest of its life and was graduated and reseeded down to 828 --
+# while its rollout money climbed 4,673 to 5,646 across the same updates.
+# `logmoney_02` the same, 3,497 to 332.
+#
+# Sized against the patience budget rather than picked: the largest excess cleared
+# before the `lr_plateau_patience`-th stall spends it is
+# `1 / ((1 + min_delta) * (1 - decay)**(patience - 1))`, which at 0.08 is 22% at
+# patience 4 and 71% at patience 8. The stranding outlier was 20%.
+#
+# Safe at that size because `_settle_slot` floors the leak at the current score, so
+# a slot genuinely flat at L keeps `best == L` however fast this decays and still
+# stalls, still decays, still graduates. Only excess above the current level leaks.
+# 0.0 restores the latch exactly.
+lr_best_decay = 0.08
+
+# Which measurement the plateau detector reads: "rollout" or "benchmark".
+#
+# "rollout" is `own_mean_final_money`, the mean over the whole 1,200-episode ring
+# the update just trained on. "benchmark" is the windowed median arena money this
+# used to read, and is what `population_members.score` and the promotion gate still
+# read -- this key changes what ends a slot, not what releases one.
+#
+# Measured over `logmoney-v26` batches 200-360, all ten slots, 160 consecutive
+# update pairs, as mean absolute update-to-update change:
+#
+#     own_mean_final_money    11.7%
+#     benchmark arena money   48.2%
+#
+# Four times noisier, on a number three irreversible decisions were riding on. It
+# is not a precision problem more seeds fix on their own: 48.2% is what the
+# eleven-wide median *already* reads, because adjacent windows share ten of eleven
+# samples and the arena's tail survives the smoothing.
+#
+# The two are different quantities -- the rollout mean is measured against the
+# training opponent mix at collection sigma, the arena against the pinned benchmark
+# greedily -- so `metrics_json.lr_score_signal` records which one each point is.
+lr_score_signal = "rollout"
+
 # Quartering rather than halving, which shortens the ladder without weakening any
 # rung of it. The cut is reached when `peak * factor**decays < lr_graduate_cut`:
 # at 0.5 that is `0.5^d < 0.1`, so four decays; at 0.25 it is two. The terminal
@@ -245,14 +322,94 @@ lr_min_updates_before_graduation = 10
 # just an enormous one: a whole decay cycle, and only if the slot died. This is
 # the same idea sized to something a healthy slot can reach.
 #
-# 4, a third of the twelve-update cycle. What it tests is survival: a policy has
-# to hold its slot through a meaningful stretch of continued training without
-# being beaten. A slot promoting on every update is improving fast, its current
-# best is a moving target, and it contributes nothing until it settles.
+# 2, and this used to be 4 on the reasoning that it was "a third of the
+# twelve-update cycle". That justification does not survive contact with a
+# measured cycle. The eleven graduations in `logmoney-v26` ran 11, 13, 16, 18, 18,
+# 20, 24, 25, 29, 31 and 34 updates -- a median of 20, with two slots never
+# graduating at all in 38 -- so the proportional rule argues for a *longer* gate,
+# not this one. The number is set from the survival histogram instead.
+#
+# All 128 releases that run made, by how long they stood before a newer candidate
+# of their own slot beat them:
+#
+#     stood >= 1 update    128
+#     stood >= 2            57
+#     stood >= 3            38
+#     stood >= 4            29
+#
+# 71 of 128, 55%, were superseded within a single update. That is the churn
+# population this gate exists to exclude, and it is entirely excluded at 2. Going
+# to 3 keeps 38 instead of 57 -- a third less yield for no additional protection
+# that the histogram can show.
+#
+# The gate was also the binding constraint on the group's size rather than one
+# input among several: 27 of the 32 distinct members that run produced entered at
+# release_age exactly 4, so the group was a direct readout of this number.
+#
+# What it tests is survival: a policy has to hold its slot through a stretch of
+# continued training without being beaten. A slot promoting on every update is
+# improving fast, its current best is a moving target, and it contributes nothing
+# until it settles.
+#
+# The age gate does not have to carry the quality question as well, which is what
+# makes a short one safe. `_graduate` inserts and then culls `ORDER BY score DESC
+# OFFSET mature_capacity` in the same call, so a premature entrant that is bad is
+# the row retired by its own insertion.
+#
+# Must be at least 1. Zero is entry-on-promotion, and that closes a loop:
+# whichever slot released most recently becomes the ancestor for whichever slot
+# reseeds next, and the roster converges on clones of the current best -- a greedy
+# hill-climb running ten copies, strictly worse than the single lineage the
+# population replaced. `_slot` refuses it.
 #
 # A graduating slot contributes regardless of age -- it is finishing anyway, and
-# holding its release back would lose it entirely.
-population_entry_updates = 4
+# holding its release back would lose it entirely. A warm-starting slot
+# contributes nothing regardless of age; see `population_warm_start`.
+population_entry_updates = 2
+
+
+# Adopt the mature group on a slot that has never been reseeded, instead of
+# leaving it on the cold start it was created with.
+#
+# A cold start is the right initialisation only when there is nothing to start
+# from. `declared_model_id` carries no session suffix, so the group outlives the
+# session that filled it, and a fresh roster begins beside checkpoints of policies
+# that already work. A slot starting from noise there is not searching a different
+# basin -- it is re-deriving what the group already holds, from noise, for the
+# whole decay cycle before `_graduates` gives it its first ancestor.
+#
+# `market-free-streak-v27` is the measurement. Five updates in, ten cold-started
+# slots scored 1,071-1,392 rollout money against a group whose worst usable member
+# was 1,861 and whose best was 6,270 -- and they were getting worse, 3,000 at
+# update zero down to 720 at update four. A generation of compute spent
+# re-learning the floor of what was already on disk.
+#
+# Fires at most once per reseed lineage and needs no flag of its own to record
+# that: the marker it writes advances `lr_reseed_index`, and the predicate is
+# `lr_reseed_index == 0`. So it is self-cancelling, it survives a process restart
+# because the state is the update row rather than memory, and it is inert on the
+# first run of a new declared model, where the group is empty and a cold start is
+# the only option there is.
+#
+# It is not a graduation. `lr_warmup_updates` and
+# `lr_min_updates_before_graduation` are deliberately not consulted: those floors
+# stop warmup noise from ending a slot that has not had a chance to train, which
+# is a claim about evidence. This reads no score and makes no such claim, and
+# every update spent waiting the floor out is an update spent training the
+# initialisation being corrected.
+#
+# This is permanent behaviour, not a one-time migration. A later session's slots
+# will also warm-start on their first update, from whatever the group holds then.
+# A genuinely cold control arm needs this set to false, deliberately.
+population_warm_start = true
+
+# A floor on how long a slot trains before it may warm-start, counted the way
+# `lr_min_updates_before_graduation` counts. 0 is the honest default: if the cold
+# start was the wrong initialisation then it was wrong from update one, and the
+# batches collected before the warm start are discarded by `reseed_batch_floor`
+# either way. Raise it only to hold a roster together for a fixed stretch before
+# letting the group in.
+population_warm_start_min_updates = 0
 
 # How many of the mature group's best a restarting slot draws its ancestor from,
 # uniformly. 1 reproduces the old behaviour of always taking the single best.
@@ -271,6 +428,37 @@ population_entry_updates = 4
 # group is small is just uniform sampling with extra steps.
 reseed_source_pool = 3
 
+# How many entries one originating slot may hold in the list a restart draws from.
+#
+# The group is `mature_capacity` *checkpoints*, not that many policies. A slot
+# that is genuinely ahead promotes repeatedly and occupies the top of the ranking
+# several times over, so ranking on score alone silently shrinks the population
+# the draw sees.
+#
+# Measured rather than hypothesised. Of the thirty live members at
+# `market-free-streak-v27`, ten lineages produced all of them and `logmoney_04`
+# alone held ranks 0, 1, 5, 6 and 9 -- so two of the top three were one policy's
+# own history, and `reseed_source_pool = 3` handed that lineage two thirds of
+# every restart. A population of ten read as a population of about four, which is
+# the failure `reseed_source_pool` is itself written to prevent, one level down.
+#
+# 1, meaning the best surviving checkpoint of each lineage and nothing else. That
+# makes the candidate list a list of *policies*, which is what the top-k argument
+# above assumes it is drawing from.
+#
+# The cap costs rank and never costs quality: the entry dropped is always one its
+# own lineage already beat. What it does give up is that a lineage better than
+# every other by more than one rung cannot supply two slots' ancestry at once.
+# That is the trade. A second perturbation of an ancestor the roster already holds
+# is the cheapest thing the roster can hold, and diversity is the entire reason
+# there is a population.
+#
+# Tuned to the run in front of it: ten lineages for ten slots, so at 1 every slot
+# can be given a different ancestor with none left over. A roster with more slots
+# than the group has lineages wraps onto the best entries instead, and a group
+# that consolidates onto few lineages may want this at 2.
+reseed_source_lineage_cap = 1
+
 # How many graduated checkpoints the mature group holds. Past this the lowest
 # scorer is retired -- a membership change, never a delete, so a run stays
 # answerable afterwards about what it dropped and at what score.
@@ -280,6 +468,81 @@ reseed_source_pool = 3
 # comparable on this family: `falloff_v1` measured 61 of them on one unchanged
 # checkpoint and got everything from 0.93 to 427.
 mature_capacity = 30
+
+# How many of those berths are held for *behaviour* instead of for score, which
+# turns the mature group from a ranking into a small quality-diversity archive.
+#
+# Carved out of `mature_capacity`, not added to it: 24 berths still go to the top
+# of the score ranking exactly as before, and 6 are held for the best-scoring
+# member of each behaviour cell. The group's size, and so its disk and its mirror
+# opponent cost, is unchanged.
+#
+# It exists because one scalar cannot hold a population apart, and the run says so
+# plainly. `logmoney-v26` by generation, distinct crops planted per seat against
+# the seat rate of `BUY_LAND`:
+#
+#     gen        0     4     9    12    15    20    30    38
+#     crops   3.31  3.66  2.32  1.37  1.29  1.85  1.82  1.89
+#     land     1.4% 18.5%  3.1%  0.3%  0.3%  0.4%  1.6%  1.7%
+#     money  8,726   454 1,669 2,460 3,365 3,054 4,061 3,916
+#
+# Money *rises* through the collapse, so this is not a failure the promotion gate
+# can catch and not one `_population_score`'s activity discount can catch either.
+# A wheat monoculture genuinely is the best thing the ranking has found; ranking is
+# simply the wrong instrument for keeping an alternative alive long enough to beat
+# it. The same schedule kills land in all three of v25, v26 and v27.
+#
+# Cells are `(distinct crops capped at 3) x (quadrants per episode capped at 2)`,
+# and `(1, 0)` -- monoculture, no expansion -- is deliberately not reserved. That
+# is the attractor, the score bucket is already full of it, and a berth spent
+# there is a berth spent on what twenty-four others already hold.
+#
+# 6 against 8 reservable cells, so the archive is slightly oversubscribed and the
+# cells compete on score rather than each drawing a free berth.
+#
+# 0 restores the old cull exactly -- `_graduate`'s two `EXCEPT` clauses collapse to
+# the `OFFSET mature_capacity` it used to run -- which is the retirement path if
+# the reserve turns out to be preserving losers rather than options.
+mature_reserved_capacity = 6
+
+# The money floor a member clears before it may occupy a reserved cell, and the
+# whole safety argument for reserving any.
+#
+# Diversity is not self-justifying here: across every session on this family, seats
+# that bought land finish on a median of 7 coins against 3,000 for seats that did
+# not, because `LAND_PRICES` opens at 1,000 against a 3,000 stake and the purchase
+# the policy can reach is the one on day 0. An unfloored cell would hold those
+# bankrupts permanently and reseed the roster from them, which is worse than the
+# collapse it is trying to prevent.
+#
+# Reads the *undiscounted* benchmark money rather than `score`. The activity
+# discount is a ranking device; applying it here would ask a diversified policy to
+# clear a bar that has already been bent against it once.
+#
+# 1,500 is not a new number: it is `viability_cold_start_reference_money`, which
+# this agent already uses to mean "traded for a season and did not die".
+mature_reserved_min_money = 1500.0
+
+# How often a restart draws its ancestor from the reserved cells instead of from
+# the top of the score ranking.
+#
+# The ranked draw can only ever return variations on what the ranking currently
+# rewards, so on its own the archive would fill up and never be read. This is the
+# read. At 0.25 a slot restarts from an archived behaviour on one reseed in four,
+# and from the score bucket otherwise -- so the roster keeps climbing the hill it
+# is on while spending a quarter of its restarts somewhere else.
+#
+# The whole-roster warm start does not roll for it. Ten slots choosing
+# independently would collide, so there the highest `round(share * slots)` ordinals
+# take the reserve by arithmetic and the rest index the score list, which is the
+# same coordination argument `reseed_source_pool`'s spread already makes.
+#
+# `reseed_source_lineage_cap` applies inside the reserve as well as outside it: a
+# reserve holding three checkpoints of one lineage is the same failure one level
+# down, which is the failure that comment was written about.
+#
+# 0.0 skips the bucket entirely and reproduces the pre-archive draw exactly.
+reseed_source_explorer_share = 0.25
 
 # The one-shot weight-space dropout applied when a slot is seeded from the best
 # mature member. Without it the restart lands inside the basin that member is
@@ -479,7 +742,60 @@ behavior_clone_noise = false
 # Nothing here reaches the TD target, and the multiplier is bounded below at 1.0,
 # so this can only ever add variance to a row and never quietly remove it.
 rare_sigma_gain = 0.0
+
+# The clamp on the multiplier. Read it as a ceiling on the rarest rows rather than
+# as a safety bound -- the safety is `rare_sigma_gain`'s floor at 1.0 and the plain
+# argmax, not this.
+#
+# Measured on `landrate-v30`, 1,133,396 folded selections at gain 0.5: at 3.0 the
+# only rows touching the clamp were `BUY_LAND` and `BUY_ANIMAL SHEEP 4`, and every
+# crop row sat strictly inside it -- `WHEAT` and `CARROT` at exactly 1.000,
+# `MELON`/`TOMATO`/`STRAWBERRY` at 1.74/1.63/1.87, unchanged whether the cap is 3.0
+# or 10.0. So raising it moves the two rarest actions and nothing else, and it is
+# not a lever on the crop distribution however much it looks like one.
+#
+# 3.0 here because the manifest is the `rare_sigma_gain = 0.0` control and the cap
+# is inert at that gain. The runner sets its own.
 rare_sigma_cap = 3.0
+
+# Which novelty statistic the widening reads: "count" or "rate".
+#
+# "count" is `sqrt(log(1 + T) / (1 + n_a))`, the plain UCB shape on raw selection
+# counts, and is what every run through `market-free-archive-v28` played. "rate" is
+# `log(reference / rate_a)`, where `rate_a` is the share of the turns a row was
+# *feasible* on that it was actually chosen and `reference` is that ratio taken
+# over the whole action space -- the rate every row would show under evenly spread
+# attention.
+#
+# The count arm has a measured blind spot, and it is the one that matters on this
+# family. Folded over `logmoney-v26`'s ten slots, 1,150,400 selections, at gain 1.0:
+#
+#     row                    chosen    feasible   count x   rate x (gain 0.5)
+#     BUY_SEED WHEAT q1      44,610     937,244     1.018     1.000
+#     BUY_SEED CARROT q4      4,878     920,251     1.053     1.400
+#     BUY_SEED MELON q1       1,917     882,780     1.085     1.846
+#     BUY_SEED TOMATO q1        768     895,215     1.135     2.310
+#     BUY_LAND                   61     734,763     1.474     3.000
+#
+# `log1p(1,150,400)` is 13.96, so the count arm's numerator is nearly constant and
+# its entire spread lives in `1 + n_a`. A row feasible on 883,000 turns and chosen
+# on 1,917 of them earns 1.085, which is indistinguishable from no widening. One
+# row of 186 reached the cap; only NOOP sat at exactly 1.0.
+#
+# The count arm can see "never tried". It cannot see "tried, then abandoned" --
+# which is the failure this run actually has. Crop diversity per seat falls 3.66 to
+# 1.29 and locks onto wheat while MELON keeps a five-figure historical count that
+# holds its novelty near zero permanently. MELON is not rare, it is *declined*, and
+# by raw count those are the same number.
+#
+# Log-ratio rather than a square root because the compared quantity spans four
+# orders of magnitude and the run length must not enter: `chosen` grows without
+# bound as a session runs, so the count arm's calibration drifts across a run while
+# a ratio of two rates over the same window does not.
+#
+# The manifest keeps "count" so this file still describes what v28 and everything
+# before it played, and so the rate arm has a control to be read against.
+rare_sigma_novelty = "count"
 
 # How many seed pairs carry it, counted from the widest end of the ladder, at
 # full gain rather than one scaled by the rung's own sigma.
@@ -555,20 +871,40 @@ promotion_rule = "benchmark_ratchet"
 # `degenerate_head_to_head` check. Both are threshold tests against the
 # incumbent's own seat. 100 paired seeds sizes the significance test this
 # promotion rule stopped running.
-eval_seeds = 50
-# `eval_seeds` can be cut for a different reason: the ratchet does not read one
-# draw. `_benchmark_reference_window` takes a median over eleven updates, and
-# `_slot_score` does the same for the graduation clock, so the variance reduction
-# that matters happens *across* updates rather than within one. That module's own
-# comment records a 100-seed series swinging 0.93 to 427 on an unmoving policy --
-# within-draw precision was never what made this estimator usable.
 #
-# Changed here rather than on a clean run because the ratchet term is currently
-# inactive on nine of ten slots: with no released incumbent there is no
-# `reference`, so `no_regression` is absent from every rejection so far. The one
-# slot that has promoted reset its window at that promotion. There is very little
-# mixed-width history for the median to inherit.
-promotion_seeds = 25
+# **Half of that cut is now reversed, on measurement.** The argument below was
+# that the variance reduction happens *across* updates through the eleven-wide
+# median, not within one draw. It does not: `logmoney-v26` batches 200-360 put the
+# windowed median's own mean absolute update-to-update change at 48.2%, against
+# 11.7% for the rollout mean the same updates computed. Adjacent windows share ten
+# of eleven samples, so the arena's heavy tail survives the smoothing and the
+# median is not buying what it was assumed to.
+#
+# The graduation clock no longer reads this at all -- see `lr_score_signal` -- so
+# what is left riding on the arena is the release decision, where the thresholds
+# are `benchmark_money_ratchet` 0.9 and `viability_min_mean_money_ratio` 0.8, both
+# well inside a 48% band. `logmoney_04` was rejected on four consecutive updates
+# while its benchmark money went 5,022 to 6,742.
+#
+# The cost is real and is the reason this is 100/50 rather than back at 100/100:
+# ten slots at ~130 s of arena over `CONCURRENCY = 4` is ~325 s of a ~3,400 s
+# generation, so doubling the seed count is about +10% wall-clock.
+eval_seeds = 100
+# `promotion_seeds` stays cut hardest, for the reason above it: under
+# `benchmark_ratchet` the significance test 100 paired seeds paid for is computed
+# and never consulted by `promote`. 50 is sized for the money floors in
+# `hard_viability` and the zero-width `degenerate_head_to_head` check, which are
+# threshold tests against the incumbent's own seat rather than a paired test.
+#
+# 50 -> 30 at v34. `eval_seeds` above deliberately stays at 100: the measurement
+# recorded there says the arena is the noisy signal and cutting it is what the
+# reversal was for. This one is different in kind, not in degree -- the paired
+# significance test 50 seeds pays for is still computed and still never consulted
+# by `promote`, so the seeds are buying a number nothing reads. What survives is
+# threshold tests against the incumbent's own seat, which do not need a paired
+# design. 30 keeps the money floors sized and drops 40 episodes per model per
+# update, about 13% of the arena, without touching the series the ratchet reads.
+promotion_seeds = 30
 promotion_seed_base = 1000000
 promotion_seed_stride = 10000
 # Pins the benchmark seed window while the head-to-head window keeps rotating.
@@ -636,14 +972,16 @@ benchmark_money_ratchet = 0.9
 #
 # What it gives up: a lineage decaying slowly and uniformly drags its own window
 # down and the ratchet follows rather than catches. Bounded by the absolute floor,
-# which only stands down under grace, and by hard viability, which never does.
+# which only stands down under grace, and by hard viability, whose cold-start
+# reference now stands down under a grace of its own --
+# `viability_grace_after_rejections`. Its incumbent-seat reference still never does.
 benchmark_reference_window = 11
 # After this many consecutive rejections the *absolute floor* stands down to
-# `benchmark_grace_min_money` and the relative ratchet alone decides. Hard
-# viability never stands down. This is the bound on how long the gate can block --
-# `market-free-simple-v2` ran 33 updates promoting none, `market-free-rare-v20` 57,
-# and a bar that cannot be reached is the failure mode `always` was introduced to
-# escape.
+# `benchmark_grace_min_money` and the relative ratchet alone decides. This is the
+# bound on how long *this* gate can block, and only this one: hard viability fails
+# independently and has its own hatch below. `market-free-simple-v2` ran 33 updates
+# promoting none, `market-free-rare-v20` 57, and a bar that cannot be reached is the
+# failure mode `always` was introduced to escape.
 #
 # It used to drop the relative term and keep the floor, and v20 is why it no
 # longer does: all 57 of those rejections failed on the floor, with the candidate
@@ -718,6 +1056,37 @@ population_activity_reference = 0.10
 # with nothing released could not snap its lineage back either. 1500 puts the
 # floors at 1,200 mean / 1,125 median: survivable, and still fatal to bankruptcy.
 viability_cold_start_reference_money = 1500.0
+# And the hatch for when 1500 is still not survivable, counted on the same
+# consecutive-rejection streak the ratchet's grace reads. It moves the reference
+# above and nothing else: both ratios still bind, the activity floor is untouched,
+# and it applies *only* while nothing has been released. From the first release
+# onward the reference is a real opponent's seat in the same paired series and never
+# stands down -- that comparison is what stops a lineage walking itself down.
+#
+# It exists because the two gates fail independently and the ratchet's hatch does
+# not help a slot this one is holding. Measured over every session in the lab
+# database: 35 updates across 20 distinct never-released slots were rejected with
+# `benchmark_ratchet` passing and `median_money` the only failing check, and 19 of
+# those 35 were already in ratchet grace when it happened -- the hatch was open on
+# the gate that was passing. `market-free-rarerate-v29@rarerate_03` is the shape:
+# ratchet passing from seq 30, `a_money_median` climbing 348 -> 910 -> 940 into a
+# fixed 1,125, `mean_money` clearing 1,200 the whole way, five updates and no
+# release. Converging on a synthetic bar from below is not the decay this gate
+# exists to catch.
+#
+# 4 to match `promotion_ratchet_grace_after_rejections`: the point is that both
+# hatches open together, since the run cannot tell in advance which gate is the one
+# holding it. 0 turns it off, which is what every config predating the key reads as.
+viability_grace_after_rejections = 4
+# The cold-start reference once viability grace is in force. Unset means
+# `benchmark_cold_start_min_money`, the same foothold the ratchet measures a first
+# release against -- 600 here, so the floors land at 480 mean / 450 median. That
+# admits rarerate_03's 940 and still refuses its own 348 twenty batches earlier.
+#
+# Set it explicitly to hold the two apart: this reference and that floor mean the
+# same thing only as long as a first release and a survivable season are the same
+# bar, and nothing enforces that.
+# viability_grace_cold_start_reference_money = 750.0
 
 # Both training and collection follow the newest checkpoint on the lineage,
 # promoted or not; release is gated, the behaviour distribution is not. Snap the
@@ -750,7 +1119,16 @@ viability_cold_start_reference_money = 1500.0
 # the incumbent whose score is exactly what the plateau detector is reading, which
 # pins `lr_best_score` and stops the slot ever reaching its cut. One escape route,
 # and the deeper one wins.
-resume_reset_after_rejections = 0
+#
+# **Back on at v27, because that coupling no longer exists.** It ran entirely
+# through the plateau detector reading the incumbent's arena score;
+# `lr_score_signal = "rollout"` moved the detector onto the ring the slot just
+# trained on, which a snapback moves rather than pins. The two escape routes are
+# now genuinely different: `lr_best_decay` unsticks a detector misreading a slot
+# that is still improving, the population ends one that has genuinely stopped, and
+# this one covers the case neither does -- a slot that has diverged and has
+# nothing of its own left to climb.
+resume_reset_after_rejections = 2
 
 # Self-play against this model's own recent checkpoints, mixed into `opponents`
 # at `self_play_ratio` once `self_play_after` batches have been collected. The

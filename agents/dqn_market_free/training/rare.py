@@ -98,13 +98,101 @@ def fold(
     return previous[0] * scale + chosen, previous[1] * scale + opportunities
 
 
+#: Which statistic `sigma_scale_vector` reads. See its docstring.
+NOVELTY_KINDS = ("count", "rate")
+
+
+def _count_novelty(chosen: np.ndarray, opportunities: np.ndarray) -> np.ndarray:
+    """`sqrt(log(1 + T) / (1 + n_a))` -- the plain UCB shape, on raw selections.
+
+    What every run through `market-free-archive-v28` played, kept so those runs
+    stay reproducible and so the rate arm below has a control to be read against.
+
+    Its blind spot is measured and is the reason `"rate"` exists. Folded over
+    `logmoney-v26`'s ten slots, 1,150,400 selections:
+
+        row                     chosen   feasible   sigma_x at gain 1.0
+        BUY_SEED WHEAT q1       44,610    937,244   1.018
+        BUY_SEED MELON q1        1,917    882,780   1.085
+        BUY_LAND                    61    734,763   1.474
+
+    `log1p(1,150,400)` is 13.96, so the numerator is nearly constant and the whole
+    spread lives in `1 + n_a`. A row feasible on 883,000 turns and chosen on 1,917
+    of them reads as *moderately visited*, and the multiplier it earns -- 1.085 --
+    is indistinguishable from no widening at all. Only one row of 186 reached the
+    3.0 cap, and only NOOP sat at exactly 1.0.
+
+    The statistic can see "never tried". It cannot see "tried, then abandoned",
+    which is the failure `logmoney-v26` actually exhibits: crop diversity per seat
+    falls 3.66 to 1.29 and locks onto wheat while MELON keeps a five-figure
+    historical count that keeps its novelty near zero forever.
+    """
+
+    total = float(np.sum(chosen))
+    return np.sqrt(np.log1p(total) / (1.0 + chosen))
+
+
+def _rate_novelty(chosen: np.ndarray, opportunities: np.ndarray) -> np.ndarray:
+    """`log(reference_rate / rate_a)` -- how far under uniform attention a row sits.
+
+    `rate_a` is the share of the turns a row was *feasible* on which it was
+    actually chosen, and `reference` is that same ratio taken over the whole
+    action space, so it is the rate every row would show if attention were spread
+    evenly across what the mask offered. The novelty is the log of the shortfall,
+    floored at zero: a row at or above the reference earns nothing.
+
+    Log-ratio rather than the UCB square root because the quantity being compared
+    spans four orders of magnitude and the run length must not enter. `chosen`
+    grows without bound as a session runs and `_count_novelty`'s numerator grows
+    with it, so that shape's calibration drifts across a run; a ratio of two rates
+    measured over the same window does not.
+
+    The floor on `rate_a` is one hypothetical selection over the row's own
+    opportunities rather than a fixed epsilon, so a feasible row that was never
+    once chosen is treated as having been chosen exactly once -- which is the
+    largest claim the data supports and needs no constant to tune.
+
+    Same numbers as `_count_novelty`'s docstring, at gain 0.5 and cap 3.0:
+
+        row                       rate    reference   sigma_x
+        BUY_SEED WHEAT q1     0.047597     0.007712   1.000
+        BUY_SEED MELON q1     0.002172     0.007712   1.634
+        BUY_LAND              0.000083     0.007712   3.000
+
+    Which is the ordering the mechanism was always supposed to produce: the crop
+    the policy abandoned is widened, the crop it is overfitted to is not.
+    """
+
+    opportunity = np.maximum(opportunities, 1.0)
+    total_opportunity = float(np.sum(opportunity))
+    reference = float(np.sum(chosen)) / total_opportunity if total_opportunity > 0.0 else 0.0
+    if reference <= 0.0:
+        # Nothing has been selected yet, so nothing has been *avoided* yet either.
+        # The first round has no evidence to widen on and says so.
+        return np.zeros_like(chosen)
+    rate = np.maximum(chosen / opportunity, 1.0 / opportunity)
+    return np.maximum(np.log(reference / rate), 0.0)
+
+
+_NOVELTY = {"count": _count_novelty, "rate": _rate_novelty}
+
+
 def sigma_scale_vector(
     chosen: np.ndarray,
     opportunities: np.ndarray,
     gain: float,
     cap: float,
+    novelty: str = "count",
 ) -> np.ndarray:
     """Per-action multiplier on the head's noise draw: `1 + gain * novelty`.
+
+    `novelty` selects the statistic: `"count"` is the raw-selection UCB shape every
+    run through v28 played, `"rate"` is the opportunity-normalised log shortfall.
+    They answer different questions -- "how little has this been sampled" against
+    "how far under its share of attention does this sit" -- and only the second can
+    see a row the policy tried and then abandoned. Each function's own docstring
+    carries the measurement. The two are not calibrated alike, so `rare_sigma_gain`
+    has to move with this key.
 
     Returned as a multiplier on `epsilon_out`, which is already the per-output
     half of the factored perturbation, so entry `a` widens exactly action `a`'s
@@ -121,9 +209,8 @@ def sigma_scale_vector(
     perturbation happens to favour it, and the argmax stays a plain argmax over
     what the network said.
 
-    `novelty = sqrt(log(1 + total) / (1 + n_a))` -- the UCB shape, so a row
-    decays out of the widening as it accumulates visits and the whole thing anneals
-    itself without a schedule to tune.
+    Either statistic anneals itself: a row decays out of the widening as it
+    accumulates selections, so there is no schedule to tune.
 
     Pinned to exactly 1.0 in two places, both of which would otherwise widen a
     row to no purpose:
@@ -138,9 +225,9 @@ def sigma_scale_vector(
     would arrive at full width rather than at the novelty it has actually earned.
     """
 
-    total = float(np.sum(chosen))
-    novelty = np.sqrt(np.log1p(total) / (1.0 + chosen))
-    scale = 1.0 + float(gain) * novelty
+    if novelty not in _NOVELTY:
+        raise ValueError(f"rare_sigma_novelty must be one of {list(NOVELTY_KINDS)}: {novelty}")
+    scale = 1.0 + float(gain) * _NOVELTY[novelty](chosen, opportunities)
     scale = np.clip(scale, 1.0, max(1.0, float(cap)))
     scale[NOOP_INDEX] = 1.0
     scale[opportunities <= 0.0] = 1.0

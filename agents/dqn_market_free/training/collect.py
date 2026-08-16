@@ -31,11 +31,23 @@ import numpy as np
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
 from agents.dqn_market_free.order_space import ACTION_COUNT, ACTIONS, OrderDecision
+from agents.dqn_market_free import lots
 from agents.dqn_market_free.training.reward import OPPONENT_WEIGHT, episode_rewards
-from sim.workers import discard_pool, single_threaded_workers, worker_pool
+from sim.workers import (
+    MAP_TIMEOUT_SECONDS,
+    discard_pool,
+    single_threaded_workers,
+    worker_pool,
+)
 
 if TYPE_CHECKING:
     from sim.runner import MatchResult
+
+#: Fallback only, for the land potential's day when an observation carries none.
+#: The live value comes off `configuration.turnsPerDay` in `main.py`; this is the
+#: simulator's default and matches `donor.TOTAL_DAYS * 24 == 720` episode steps.
+_TURNS_PER_DAY = 24
+
 
 @dataclass
 class EpisodeRecord:
@@ -160,11 +172,34 @@ class Recorder:
     """Accumulates one episode of decisions as the agent makes them."""
 
     money: list[float] = field(default_factory=list)
+    # The land potential's two inputs, indexed exactly like `money` because the
+    # reward stream is built from that list and `order_step` is a compacted index
+    # into it. Kept as parallel lists rather than folded into one tuple list so a
+    # trace that goes missing fails at `episode_rewards`' length check rather
+    # than silently pairing a quadrant count with the wrong day.
+    quadrants: list[int] = field(default_factory=list)
+    days: list[int] = field(default_factory=list)
+    # The lot potential's three inputs, indexed the same way again. Counts rather
+    # than dicts, over `lots.CROP_ITEMS` and `lots.STOCK_ITEMS`, so an episode
+    # carries 720 x 19 small integers instead of 720 dictionaries.
+    #
+    # `standing` is the one that is not in `private`: a seed leaving the seed bag
+    # for a tile has not stopped being committed cost, and without the tile count
+    # `PHI` would fall on the turn the agent plants -- charging for the action the
+    # term exists to make cheaper.
+    seeds: list[list[int]] = field(default_factory=list)
+    standing: list[list[int]] = field(default_factory=list)
+    stock: list[list[int]] = field(default_factory=list)
     order_steps: list[int] = field(default_factory=list)
     decisions: list[OrderDecision] = field(default_factory=list)
 
     def reset(self) -> None:
         self.money.clear()
+        self.quadrants.clear()
+        self.days.clear()
+        self.seeds.clear()
+        self.standing.clear()
+        self.stock.clear()
         self.order_steps.clear()
         self.decisions.clear()
 
@@ -190,6 +225,18 @@ class Recorder:
 
     def record_turn(self, *, money: float, obs: Any, farm: dict, private: dict) -> None:
         self.money.append(float(money))
+        # Both already on hand and previously discarded. `unlocked_quadrants`
+        # defaults to what a fresh farm carries, so a malformed observation
+        # contributes no land potential rather than a spurious one, and the day
+        # falls back to this turn's own index the way `market_state` does -- a
+        # missing day must not read as "the whole season is still ahead".
+        self.quadrants.append(len(farm.get("unlocked_quadrants", []) or ["NW"]))
+        held_seeds, held_stock = lots.holdings(private)
+        self.seeds.append(held_seeds)
+        self.standing.append(lots.standing_plants(farm))
+        self.stock.append(held_stock)
+        turn = len(self.money) - 1
+        self.days.append(int(obs.get("day", turn // _TURNS_PER_DAY) or 0))
 
     def finish(
         self,
@@ -218,6 +265,11 @@ class Recorder:
             gamma,
             emitted,
             opponent_weight=opponent_weight,
+            quadrants=self.quadrants,
+            days=self.days,
+            seeds=self.seeds,
+            standing=self.standing,
+            stock=self.stock,
         )
 
         count = len(self.decisions)
@@ -280,6 +332,7 @@ def learner_spec(
     sigma_scale: float = 1.0,
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
+    rare_sigma_novelty: str = "count",
     rare_sigma_path: Path | str | None = None,
     opponent_weight: float = 0.0,
 ) -> str:
@@ -322,6 +375,11 @@ def learner_spec(
         query["rare_sigma_gain"] = f"{rare_sigma_gain:.6f}"
         query["rare_sigma_cap"] = f"{rare_sigma_cap:.6f}"
         query["rare_sigma_path"] = str(rare_sigma_path)
+        # Same departure-from-the-default rule as the keys above: `"count"` is
+        # what every spec before this key meant, so a run on that arm still emits
+        # byte-identical spec strings and churns no revisions.
+        if rare_sigma_novelty != "count":
+            query["rare_sigma_novelty"] = str(rare_sigma_novelty)
     # Same "departure from the default" rule as the noise knobs above, and it
     # matters for the same reason plus one more: at `OPPONENT_WEIGHT = 0.0` this
     # is 0.0 on every episode, so a run with the relative leg switched off emits
@@ -351,6 +409,7 @@ def collect_episode(
     sigma_scale: float = 1.0,
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
+    rare_sigma_novelty: str = "count",
     rare_sigma_path: Path | str | None = None,
 ) -> OrderRollout | None:
     """Play one episode with an exploring learner and record it."""
@@ -380,6 +439,7 @@ def collect_episode(
         sigma_scale=sigma_scale,
         rare_sigma_gain=rare_sigma_gain,
         rare_sigma_cap=rare_sigma_cap,
+        rare_sigma_novelty=rare_sigma_novelty,
         rare_sigma_path=rare_sigma_path,
     )
     seats = (spec, opponent_spec) if learner_seat == 0 else (opponent_spec, spec)
@@ -471,6 +531,7 @@ def collect_batch(
     sigma_scales: list[float] | None = None,
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
+    rare_sigma_novelty: str = "count",
     rare_sigma_path: Path | str | None = None,
     rare_sigma_pairs: int = 0,
 ) -> list[OrderRollout]:
@@ -529,6 +590,7 @@ def collect_batch(
                 scale,
                 pair_gain,
                 rare_sigma_cap,
+                rare_sigma_novelty,
                 rare_sigma_path,
             )
         )
@@ -536,7 +598,16 @@ def collect_batch(
         return [rollout for rollout in (_job(payload) for payload in payloads) if rollout]
     with _single_threaded_workers(), worker_pool(jobs) as pool:
         try:
-            return [rollout for rollout in pool.map(_job, payloads) if rollout]
+            return [
+                rollout
+                for rollout in pool.map(_job, payloads, timeout=MAP_TIMEOUT_SECONDS)
+                if rollout
+            ]
+        except TimeoutError:
+            # Same reason as the arena's: a stalled pool that goes back on the
+            # free-list hands the next caller the same wedged workers.
+            discard_pool(pool)
+            raise
         except BrokenProcessPool:
             # A worker died hard (OOM kill, segfault in a BLAS backend). The
             # pool is unusable for good, so drop it rather than returning it to
@@ -544,4 +615,8 @@ def collect_batch(
             # failure is the caller's to see.
             discard_pool(pool)
             with worker_pool(jobs) as retry:
-                return [rollout for rollout in retry.map(_job, payloads) if rollout]
+                return [
+                    rollout
+                    for rollout in retry.map(_job, payloads, timeout=MAP_TIMEOUT_SECONDS)
+                    if rollout
+                ]

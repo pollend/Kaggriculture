@@ -193,7 +193,10 @@ class MarketFreeAgent:
             # Feasibility only: orders the simulator would refuse outright are
             # withheld from both the argmax and the exploring draw. It decides
             # nothing about which of the remaining orders is worth making.
-            mask = feasible_actions(obs, farm, private, field, configuration)
+            # `roles` is this turn's effective plan, and the land gate reads it
+            # for the seed and hand tests. Passed rather than recomputed: it is
+            # the same map the field actions were built from.
+            mask = feasible_actions(obs, farm, private, field, configuration, roles=roles)
             self._sample_noise(step, turns_per_day)
             decision = choose_order(state, self.network, mask)
             orders = decision.wire()

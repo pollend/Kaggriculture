@@ -44,6 +44,7 @@ from agents.dqn_market_free.order_space import (
     feasible_actions,
     order_index,
 )
+from agents.dqn_market_free import lots
 from agents.dqn_market_free.training.collect import EpisodeRecord
 from agents.dqn_market_free.training.reward import episode_rewards
 
@@ -162,6 +163,11 @@ def record_from_replay(
         return None, CloneStats()
 
     money: list[float] = []
+    quadrants: list[int] = []
+    days: list[int] = []
+    seeds: list[list[int]] = []
+    standing: list[list[int]] = []
+    stock: list[list[int]] = []
     order_state = np.zeros((len(steps) - 1, STATE_DIM), dtype=np.float32)
     order_chosen = np.zeros(len(steps) - 1, dtype=np.int16)
     order_step = np.zeros(len(steps) - 1, dtype=np.int16)
@@ -188,6 +194,19 @@ def record_from_replay(
         private = obs.get("private") or {}
 
         money.append(float(farm.get("money", 0) or 0))
+        # The land potential's two inputs, appended in lockstep with `money` so a
+        # cloned episode and a self-collected one carry the same trace on the
+        # same index. `collect.Recorder.record_turn` is the other half of this.
+        quadrants.append(len(farm.get("unlocked_quadrants", []) or ["NW"]))
+        days.append(int(obs.get("day", 0) or 0))
+        # And the lot potential's three, from the same observation, for the same
+        # reason: a demonstration and a rollout have to score the same quantity.
+        # `standing` comes off `farm["tiles"]` rather than `private`, which is
+        # what makes it recoverable from a stored replay at all.
+        held_seeds, held_stock = lots.holdings(private)
+        seeds.append(held_seeds)
+        standing.append(lots.standing_plants(farm))
+        stock.append(held_stock)
         history.observe(obs, farm)
 
         orders = (current.get("action") or {}).get("market") or []
@@ -216,7 +235,7 @@ def record_from_replay(
         order_chosen[decisions] = action
         # The same feasibility the live agent is held to, built from the same
         # `field` that encoded the state so the two describe one turn.
-        mask = feasible_actions(obs, farm, private, field, configuration)
+        mask = feasible_actions(obs, farm, private, field, configuration, roles=roles)
         # The demonstrator's order was accepted by the simulator, so it is
         # feasible by demonstration whatever the model of feasibility says.
         # Forced rather than dropped: the invariant the learner depends on is
@@ -270,6 +289,11 @@ def record_from_replay(
         gamma,
         emitted,
         opponent_weight=opponent_weight,
+        quadrants=quadrants,
+        days=days,
+        seeds=seeds,
+        standing=standing,
+        stock=stock,
     )
 
     record = EpisodeRecord(

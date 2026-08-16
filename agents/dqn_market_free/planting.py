@@ -80,17 +80,51 @@ def market_influenced_roles(
     if not allocation:
         return roles
 
-    # Prefer the donor's original location for a crop when one is available;
-    # otherwise use the next stable donor-ordered vacant crop slot.
+    # Two passes, and the split is the whole point.
+    #
+    # One pass taking `unassigned[0]` whenever a crop had no planned tile of its
+    # own cost the agent most of its income. `MELON` is last in `donor.CROPS`, and
+    # `CROP_MIX` plans no TOMATO or STRAWBERRY tile anywhere, so every tomato or
+    # strawberry seed fell through to the fallback and took a tile the donor had
+    # planned for melon -- the one crop worth 142 per tile-day against 24-40 for
+    # everything else. Seats buying a 5-40% melon share finished on a median of
+    # 64 against 2,568 for seats buying none at all: the mixed purchase was worse
+    # than either pure strategy, because it paid for melon tiles and then planted
+    # carrots on them.
     unassigned = list(candidates)
+    leftover: Counter[str] = Counter()
+
+    # Pass one: every crop claims the tiles the donor already planned for it,
+    # before any crop is allowed to look at a tile planned for something else.
     for crop in donor.CROPS:
-        count = allocation[crop]
-        for _ in range(count):
+        for _ in range(allocation[crop]):
             matching = next(
                 (position for position in unassigned if roles[position] == ("CROP", crop)),
                 None,
             )
-            position = matching if matching is not None else unassigned[0]
-            roles[position] = ("CROP", crop)
-            unassigned.remove(position)
+            if matching is None:
+                leftover[crop] += 1
+                continue
+            roles[matching] = ("CROP", crop)
+            unassigned.remove(matching)
+
+    # Pass two: a crop with no planned tile left may still use a *spare* one, but
+    # only where the planned crop has no seed held for it. Holding melon seed now
+    # protects every melon tile, and the leftover is dropped rather than planted
+    # -- an unplanted melon tile is worth more than a tomato growing on it, and a
+    # seed left in the shed is recoverable next turn while a converted tile is not.
+    for crop in donor.CROPS:
+        for _ in range(leftover[crop]):
+            spare = next(
+                (
+                    position
+                    for position in unassigned
+                    if seeds.get(roles[position][1], 0) <= 0
+                ),
+                None,
+            )
+            if spare is None:
+                break
+            roles[spare] = ("CROP", crop)
+            unassigned.remove(spare)
     return roles

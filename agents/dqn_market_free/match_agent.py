@@ -56,6 +56,9 @@ class MatchPolicyAgent:
                     *counts,
                     gain=rare_gain,
                     cap=float(config.get("rare_sigma_cap", 1.0 + rare_gain)),
+                    # Absent on a spec written before the rate arm existed, which
+                    # must keep reading the statistic it was measured with.
+                    novelty=str(config.get("rare_sigma_novelty", "count")),
                 )
         # Ape-X's per-actor temperature spread, transplanted onto the noise: one
         # scale per seed pair, so a single batch carries both an exploratory and

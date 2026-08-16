@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,7 +37,12 @@ import numpy as np
 import torch
 from torch import nn
 
-from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_replay
+from agents.dqn_market_free.diagnostics import (
+    BehaviorCounts,
+    OrderDiagnostics,
+    behavior_from_replay,
+    diagnose_replay,
+)
 from agents.dqn_market_free.order_space import (
     ACTION_COUNT,
     ACTION_INDEX,
@@ -97,6 +103,8 @@ from kaggriculture_lab.model_updates import (
 LEARNER_MANIFEST = "agents/dqn_market_free/match_agent.toml"
 SOURCE_KIND = "free_market_rollout"
 _PROMOTION_RULES = {"significant", "point_estimate", "always", "benchmark_ratchet"}
+#: Which measurement the learner slot's plateau detector reads. See `_slot_score`.
+_SCORE_SIGNALS = {"rollout", "benchmark"}
 
 #: The row `rare.py` exists for, kept as a named batch column. Not special to the
 #: mechanism -- the widening knows nothing about land -- but it is the action whose
@@ -124,6 +132,36 @@ VIABILITY_DEFAULTS = {
     # updates, zero promotions, and with nothing released the snapback machinery
     # has nothing to snap back to, so the run cannot escape on its own either.
     "viability_cold_start_reference_money": 1500.0,
+    # The cold-start money floors' own escape hatch, and the reason it is separate
+    # from `promotion_ratchet_grace_after_rejections`: the two gates fail
+    # independently, so standing one down does nothing for a slot the other is
+    # holding. Measured across every session in this database -- 35 updates over 20
+    # distinct never-released slots were rejected with `benchmark_ratchet.passed`
+    # true and `median_money` the only failing check, and 19 of those 35 were
+    # already in ratchet grace at the time. The hatch was open on the gate that was
+    # passing.
+    #
+    # `market-free-rarerate-v29@rarerate_03` is the shape: five updates, zero
+    # promotions, the ratchet passing from seq 30 onward, `a_money_median` climbing
+    # 348 -> 910 -> 940 against a fixed floor of `0.75 * 1500 = 1125`, and its
+    # `mean_money` clearing 1,200 the whole way. Nothing about that series is
+    # decaying; it is converging on a synthetic bar from below, and with nothing
+    # released the snapback machinery has nothing to snap back to either.
+    #
+    # 0 leaves it off, so every existing config reads byte for byte as it did.
+    "viability_grace_after_rejections": 0,
+    # The cold-start reference once viability grace is in force. Unset falls back to
+    # `benchmark_cold_start_min_money`, which is the same foothold the ratchet's own
+    # first release is measured against -- so grace lowers the synthetic bar to the
+    # one number this config already calls a first-checkpoint floor rather than to a
+    # new one.
+    #
+    # Only the *reference* moves. Both ratios still bind at their configured values
+    # and the activity floor is untouched, for the reason `_benchmark_ratchet`
+    # argues about keeping the relative term under grace: the mean/median shape is
+    # what catches a bankrupt policy, and dropping it would make this
+    # `promotion_rule = "always"` for any slot that has rejected enough times.
+    "viability_grace_cold_start_reference_money": None,
     # The fixed-reference release bar, read off the candidate's own money in the
     # index-0 benchmark series. Absolute, because everything else in this gate is
     # relative to the previous update and therefore drifts: `falloff_v1` released
@@ -322,6 +360,7 @@ def _arena_evaluate(
         results = play_series(spec, opponent, range(seed_start, seed_start + seeds), {}, jobs)
     summary = summarize(spec, opponent, results)
     diagnostics = _arena_order_diagnostics(results)
+    behavior = _arena_behavior(results)
     return {
         "opponent": opponent,
         "pairs": summary.pairs,
@@ -335,6 +374,12 @@ def _arena_evaluate(
         "b_money_mean": summary.b_money_mean,
         "b_money_median": summary.b_money_median,
         "order_diagnostics": diagnostics.as_dict(),
+        # The strategy fingerprint the mature group's reserved cells are keyed
+        # on. Measured here rather than from the rollout ring so it describes the
+        # same episodes the score does -- the arena is greedy against a pinned
+        # benchmark, the ring is noisy against the training mix, and a policy's
+        # crop spread is not the same in both.
+        "behavior": behavior.as_dict(),
     }
 
 
@@ -351,6 +396,38 @@ def _arena_order_diagnostics(results: dict[int, tuple[Any, Any]]) -> OrderDiagno
         if isinstance(reverse.replay, dict):
             diagnostics += diagnose_replay(reverse.replay, 1)
     return diagnostics
+
+
+def _arena_behavior(results: dict[int, tuple[Any, Any]]) -> BehaviorCounts:
+    """Aggregate the learner's strategy fingerprint over the same paired results."""
+
+    behavior = BehaviorCounts()
+    for forward, reverse in results.values():
+        if forward.failed or reverse.failed:
+            continue
+        if isinstance(forward.replay, dict):
+            behavior += behavior_from_replay(forward.replay, 0)
+        if isinstance(reverse.replay, dict):
+            behavior += behavior_from_replay(reverse.replay, 1)
+    return behavior
+
+
+def _rollout_behavior(rollouts: list[Any]) -> BehaviorCounts:
+    """The learner's fingerprint over the batch it just collected.
+
+    `_arena_behavior` above reads the promotion gate's paired matches, which are
+    played greedily against a fixed benchmark. This reads the noisy training
+    rollouts instead, so the land-use columns track the behaviour the buffer is
+    actually being filled with rather than the one being graded.
+    """
+
+    behavior = BehaviorCounts()
+    for rollout in rollouts:
+        match = getattr(rollout, "match", None)
+        replay = getattr(match, "replay", None)
+        if isinstance(replay, dict):
+            behavior += behavior_from_replay(replay, int(rollout.learner_seat))
+    return behavior
 
 
 def _records_diagnostics(records: list[EpisodeRecord]) -> OrderDiagnostics:
@@ -437,12 +514,22 @@ def _arena_viability(
     config: dict[str, Any],
     *,
     require_activity: bool = False,
+    reference_kind: str = "incumbent_seat",
+    grace: bool = False,
 ) -> dict[str, Any]:
     """Absolute money preservation plus order activity for one arena.
 
     Only applied where `reference` is the *same opponent on the same seeds*, so
     the floor compares like with like. That is the head-to-head, where the
     reference is the incumbent's own seat.
+
+    `reference_kind` and `grace` are recorded rather than used. They say which of
+    the two references the floors were measured against and whether
+    `viability_grace_after_rejections` stood the cold-start one down, which is not
+    otherwise recoverable from the payload: a grace floor and an ordinary one are
+    both just numbers once they are written, and 19 of the 35 updates that motivated
+    the hatch were already in *ratchet* grace, so a run that cannot tell the two
+    hatches apart in `gate_json` cannot say which one moved.
     """
 
     order = _order_viability(result, config, require_activity=require_activity)
@@ -466,6 +553,8 @@ def _arena_viability(
         "reference_money_median": reference_median,
         "mean_money_floor": mean_floor,
         "median_money_floor": median_floor,
+        "reference_kind": reference_kind,
+        "grace": grace,
     }
 
 
@@ -513,6 +602,90 @@ def _released_trading_rate(reader, active, opponent: str) -> float | None:
         if isinstance(diagnostics, dict) and diagnostics.get("trading_rate") is not None:
             return float(diagnostics["trading_rate"])
     return None
+
+
+def _released_behavior(reader, active, opponent: str) -> dict[str, Any] | None:
+    """The released incumbent's recorded strategy fingerprint on this benchmark.
+
+    Read exactly the way `_released_trading_rate` above reads its number and for
+    the same reason: `_arena_evaluate` wrote it into that update's `gate_json`
+    when the incumbent was a candidate, so this costs one row and no arena time.
+
+    `None` means *not recorded*, and the distinction from an all-zero descriptor
+    is load-bearing here in a way it is not for the trading rate. A member with
+    no fingerprint is never reserve-eligible, so returning zeros for one would
+    file every pre-existing checkpoint into the no-land, no-crop cell and let a
+    row nobody has measured occupy a reserved berth.
+    """
+
+    if active is None:
+        return None
+    row = reader.fetchone(
+        "SELECT gate_json FROM model_training_checkpoints WHERE checkpoint_id = %s",
+        [active.checkpoint_id],
+    )
+    if row is None:
+        return None
+    gate = row[0]
+    if isinstance(gate, (str, bytes, bytearray)):
+        gate = json.loads(gate)
+    if not isinstance(gate, dict):
+        return None
+    for result in gate.get("challenger_benchmarks") or []:
+        if not isinstance(result, dict) or str(result.get("opponent", "")) != opponent:
+            continue
+        behavior = result.get("behavior")
+        if isinstance(behavior, dict) and behavior.get("episodes"):
+            return dict(behavior)
+    return None
+
+
+#: Upper edges of the archive's two axes. Coarse on purpose: a cell nothing can
+#: reach is a reserved berth that stays empty, and the roster is ten slots, so
+#: nine cells is already more structure than the population can fill.
+CROP_BINS = (1, 2, 3)
+LAND_BINS = (0, 1, 2)
+
+
+def _behavior_cell(behavior: dict[str, Any] | None) -> tuple[int, int] | None:
+    """Which archive cell a fingerprint falls in, or `None` if unmeasured.
+
+    Two axes, both binned to their top edge so the highest bin is open-ended:
+    `crop_bin` is distinct crops planted capped at 3, `land_bin` is quadrants
+    bought per episode capped at 2.
+
+    The land axis is rounded rather than truncated because it is a per-episode
+    mean over the whole arena series -- a policy buying one quadrant in most of
+    its episodes is running the expansion strategy, and truncation would file it
+    with the policies that never buy any.
+    """
+
+    if not isinstance(behavior, dict) or not behavior.get("episodes"):
+        return None
+    crops = int(behavior.get("distinct_crops", 0) or 0)
+    land = behavior.get("land_per_episode")
+    if land is None:
+        land = float(behavior.get("land", 0) or 0) / max(1, int(behavior["episodes"]))
+    crop_bin = min(CROP_BINS[-1], max(CROP_BINS[0], crops))
+    land_bin = min(LAND_BINS[-1], max(LAND_BINS[0], int(round(float(land)))))
+    return crop_bin, land_bin
+
+
+def _reserved_cell(behavior: dict[str, Any] | None) -> tuple[int, int] | None:
+    """The cell a member may hold a *reserved* berth in, if any.
+
+    `(1, 0)` -- monoculture, no expansion -- is excluded, and it is the only
+    exclusion. That cell is the attractor the archive exists to escape:
+    `logmoney-v26` collapsed to 1.29 distinct crops per seat by generation 15 and
+    held there, on rising money, so the score bucket is already full of it.
+    Reserving a berth for it would spend one of six on the thing six others
+    already hold.
+    """
+
+    cell = _behavior_cell(behavior)
+    if cell is None or cell == (CROP_BINS[0], LAND_BINS[0]):
+        return None
+    return cell
 
 
 def _population_score(
@@ -852,10 +1025,17 @@ class SlotSpec:
     warmup_updates: int
     patience: int
     min_delta: float
+    best_decay: float
+    score_signal: str
     decay_factor: float
     graduate_cut: float
     min_updates: int
     mature_capacity: int
+    reserved_capacity: int
+    reserved_min_money: float
+    entry_updates: int
+    warm_start: bool
+    warm_start_min_updates: int
     dropout: float
     shrink: float
     sigma_reset: bool
@@ -880,10 +1060,17 @@ def _slot(config: dict[str, Any]) -> SlotSpec:
         warmup_updates=int(config.get("lr_warmup_updates", 3)),
         # Consecutive updates without a real improvement before the rate halves.
         patience=int(config.get("lr_plateau_patience", 4)),
-        # Relative, not absolute. The score is benchmark money, which spans three
-        # orders of magnitude across a run, so a fixed delta is either noise at
-        # the top of that range or unreachable at the bottom.
+        # Relative, not absolute. The score is money, which spans three orders of
+        # magnitude across a run, so a fixed delta is either noise at the top of
+        # that range or unreachable at the bottom.
         min_delta=float(config.get("lr_plateau_min_delta", 0.05)),
+        # How fast the plateau detector's high-water mark leaks. See
+        # `_settle_slot`: a plain maximum latches onto the luckiest draw the slot
+        # ever took and then demands `min_delta` on top of it, which ends slots
+        # that are still improving. 0.0 restores that latch exactly.
+        best_decay=float(config.get("lr_best_decay", 0.08)),
+        # Which measurement the plateau detector reads. See `_slot_score`.
+        score_signal=str(config.get("lr_score_signal", "rollout")).lower(),
         decay_factor=float(config.get("lr_decay_factor", 0.5)),
         # Below this the slot is finished. 0.0 switches the whole mechanism off
         # and reproduces the fixed-rate single lineage exactly.
@@ -892,6 +1079,28 @@ def _slot(config: dict[str, Any]) -> SlotSpec:
         # not had a chance to train. Counted from the reseed, not from the run.
         min_updates=int(config.get("lr_min_updates_before_graduation", 10)),
         mature_capacity=int(config.get("mature_capacity", 30)),
+        # How many of those berths the behaviour archive holds instead of the
+        # score ranking. Carved out of `mature_capacity`, not added to it, so the
+        # group's size and its arena cost are unchanged. 0 is the pre-archive cull.
+        reserved_capacity=int(config.get("mature_reserved_capacity", 0)),
+        # The money floor a cell occupant clears. Defaulted to the number this
+        # file already uses for "traded a season and did not die" rather than to a
+        # new one, so the archive and the cold-start viability check agree.
+        reserved_min_money=float(
+            config.get(
+                "mature_reserved_min_money",
+                VIABILITY_DEFAULTS["viability_cold_start_reference_money"],
+            )
+        ),
+        # How long a release must stand unbeaten by its own slot before it may
+        # enter the mature group. Parsed here rather than at the call site so the
+        # default lives in one place instead of being duplicated between this
+        # module and the manifest.
+        entry_updates=int(config.get("population_entry_updates", 2)),
+        # Adopt the mature group on a slot that has never been reseeded, rather
+        # than leaving it on the cold start. See `_warm_starts`.
+        warm_start=bool(config.get("population_warm_start", True)),
+        warm_start_min_updates=int(config.get("population_warm_start_min_updates", 0)),
         dropout=float(config.get("reseed_dropout", 0.10)),
         shrink=float(config.get("reseed_shrink", 1.0)),
         sigma_reset=bool(config.get("reseed_sigma_reset", True)),
@@ -902,8 +1111,35 @@ def _slot(config: dict[str, Any]) -> SlotSpec:
         raise ValueError(f"lr_decay_factor must be in (0, 1): {spec.decay_factor}")
     if spec.patience < 1:
         raise ValueError(f"lr_plateau_patience must be positive: {spec.patience}")
+    if not 0.0 <= spec.best_decay < 1.0:
+        raise ValueError(f"lr_best_decay must be in [0, 1): {spec.best_decay}")
+    if spec.score_signal not in _SCORE_SIGNALS:
+        raise ValueError(
+            f"lr_score_signal must be one of {sorted(_SCORE_SIGNALS)}: {spec.score_signal}"
+        )
     if spec.mature_capacity < 1:
         raise ValueError(f"mature_capacity must be positive: {spec.mature_capacity}")
+    if not 0 <= spec.reserved_capacity < spec.mature_capacity:
+        # Equal is refused as well as greater: an archive that takes every berth
+        # leaves the score ranking none, so nothing enters on merit and the pool
+        # stops selecting for anything at all.
+        raise ValueError(
+            f"mature_reserved_capacity {spec.reserved_capacity} must be in "
+            f"[0, mature_capacity) with mature_capacity {spec.mature_capacity}"
+        )
+    if spec.entry_updates < 1:
+        # 0 is entry-on-promotion, which `_release_age` and the manifest both
+        # record as strictly worse than the single lineage the population
+        # replaced: whichever slot released last becomes the ancestor for
+        # whichever slot reseeds next, and the roster converges on clones.
+        raise ValueError(
+            f"population_entry_updates must be positive: {spec.entry_updates}"
+        )
+    if spec.warm_start_min_updates < 0:
+        raise ValueError(
+            "population_warm_start_min_updates must not be negative: "
+            f"{spec.warm_start_min_updates}"
+        )
     if spec.enabled and spec.graduate_cut >= spec.peak:
         # Otherwise the very first steady update is already below the cut and the
         # slot graduates having trained nothing, forever, on every learner.
@@ -1036,12 +1272,40 @@ def _slot_state(previous: dict[str, Any], spec: SlotSpec) -> SlotState:
 def _settle_slot(state: SlotState, score: float | None, spec: SlotSpec) -> SlotState:
     """Fold this update's score into the slot, decaying on a plateau.
 
-    `score` is the windowed benchmark median rather than `mean_loss`. Loss is not
+    `score` is a windowed money median rather than `mean_loss`. Loss is not
     a progress signal on this family -- it sat at 0.0015 across 500 batches of a
     policy that was going nowhere -- and it is not even the right *sign*: a
     genuinely improving policy reaches harder states and its TD residual rises.
 
-    `None` means the benchmark did not measure, which is not a stall. An update
+    **`best` leaks, and that is `spec.best_decay`.** A plain maximum latches: the
+    high-water mark is set by the single luckiest draw the slot ever took, and
+    every update afterwards has to clear it by `min_delta` on top. On a signal
+    that moves tens of percent between updates that is unreachable by anything
+    short of another outlier, so the stall counter runs to `patience`, the rate
+    decays, and the slot is graduated while it is still improving. Measured on
+    `market-free-logmoney-v26`: `logmoney_07` pinned `lr_best_score` at 4,208.69,
+    a draw it never repeated, spent the rest of its life scoring 2,992-4,103, and
+    was reseeded -- while its rollout money climbed 4,673 -> 5,646 throughout.
+
+    Decaying the mark rather than widening `patience` or loosening `min_delta`,
+    because the three do different things. Patience says how long a genuine
+    plateau must last; `min_delta` says how big a move counts; this says how long
+    an unrepeatable measurement gets to stand as the thing to beat.
+
+    Sized against the patience budget rather than picked. An outlier `B` above a
+    level `L` stops blocking on the stall where `L > B * (1 - decay)**k * (1 +
+    min_delta)`, so the largest excess cleared before the `patience`-th stall
+    spends the budget is `1 / ((1 + min_delta) * (1 - decay)**(patience - 1))`. At
+    0.08, `min_delta` 0.05 and `patience` 4 that is 22%, and `logmoney_07`'s
+    stranding outlier was 20% -- the case this is sized on. At `patience` 8 it is
+    71%, so raising patience widens this rather than duplicating it.
+
+    `max(score, ...)` floors the leak at the current observation, which is what
+    makes a large decay safe: a slot that is genuinely flat at `L` has `best == L`
+    at every step no matter the decay, so it still stalls and still graduates.
+    Only *excess above the current level* leaks, and only an outlier has any.
+
+    `None` means the score did not measure, which is not a stall. An update
     that failed to produce a comparison says nothing about progress, and counting
     it would let a broken arena graduate every slot in the roster.
 
@@ -1061,6 +1325,10 @@ def _settle_slot(state: SlotState, score: float | None, spec: SlotSpec) -> SlotS
         stall += 1
         if stall >= spec.patience:
             decay_steps, stall = decay_steps + 1, 0
+        # Floored at this update's own score, so the leak only ever gives back
+        # ground an outlier took and never turns a decline into an improvement.
+        if spec.best_decay:
+            best = max(score, best * (1.0 - spec.best_decay))
     return SlotState(
         learning_rate=state.learning_rate,
         stage=state.stage,
@@ -1074,6 +1342,56 @@ def _settle_slot(state: SlotState, score: float | None, spec: SlotSpec) -> SlotS
     )
 
 
+def _rollout_score(
+    reader,
+    model_id: str,
+    candidate: float | None,
+    window: int,
+    batch_floor: int,
+) -> float | None:
+    """`_slot_score`'s rollout arm: a window median of `own_mean_final_money`.
+
+    The same shape as the benchmark arm below -- this update's own measurement
+    plus the previous `window - 1`, bounded below by the slot's reseed, median
+    taken -- so switching `lr_score_signal` changes only which number is being
+    smoothed and not how. That matters because `lr_plateau_min_delta` is a
+    *relative* threshold and both signals are money on the same stake, so the
+    patience budget means the same thing either way.
+
+    A median even though the input is already a 1,200-episode mean, and the extra
+    smoothing is close to free here: the ring turns over about 3.75 generations,
+    so adjacent updates are correlated rather than independent draws and the
+    median is guarding against the reseed discontinuity more than against noise.
+    """
+
+    if candidate is None:
+        return None
+    if window <= 1:
+        return float(candidate)
+    rows = reader.fetchall(
+        """
+        SELECT metrics_json FROM model_updates
+        WHERE model_id = %s AND metrics_json IS NOT NULL AND cutoff_batch_seq > %s
+        ORDER BY started_at DESC LIMIT %s
+        """,
+        [model_id, batch_floor, window - 1],
+    )
+    samples = [float(candidate)]
+    for row in rows or []:
+        metrics = row[0]
+        if isinstance(metrics, (str, bytes, bytearray)):
+            metrics = json.loads(metrics)
+        if not isinstance(metrics, dict):
+            continue
+        money = metrics.get("own_mean_final_money")
+        if money is None:
+            continue
+        samples.append(float(money))
+    samples.sort()
+    middle, odd = divmod(len(samples), 2)
+    return samples[middle] if odd else 0.5 * (samples[middle - 1] + samples[middle])
+
+
 def _slot_score(
     reader,
     model_id: str,
@@ -1081,16 +1399,41 @@ def _slot_score(
     candidate: float | None,
     window: int,
     batch_floor: int,
+    signal: str = "rollout",
+    rollout: float | None = None,
 ) -> float | None:
-    """The slot's progress signal: a median of its own recent benchmark money.
+    """The slot's progress signal: a median of its own recent money.
 
-    A median rather than the latest draw, for the reason `_benchmark_reference_window`
-    argues at length: one 100-seed arena series on this family swings between 0.93
-    and 427 on an unchanged policy, because `a_money_median` is 2 against a mean of
-    32.6 and the mean rides on a handful of survivors. A plateau detector reading
-    single draws would find an "improvement" by luck every few updates and the rate
-    would never decay -- which is the stagnation this exists to end, reproduced by
-    the thing meant to end it.
+    Which money is `signal`, and the choice is the one measurement that decided
+    it. Over `market-free-logmoney-v26` batches 200-360 -- all ten slots, 160
+    consecutive update pairs -- the mean absolute update-to-update change was:
+
+        own_mean_final_money   (1,200-episode rollout mean)   11.7%
+        benchmark arena money  (this window median)           48.2%
+
+    The arena number is four times noisier than one the update already computes
+    and, before this, used for nothing. That is not a precision problem the window
+    below can fix: it *is* the windowed median, and adjacent windows share ten of
+    their eleven samples, so the draw's heavy tail survives the smoothing. The
+    consequence was measured too -- `logmoney_07` read 2,992 / 4,103 / 4,103 /
+    2,992 / 2,992 and was graduated as a plateau while its rollout money went
+    4,673 -> 4,811 -> 5,272 -> 5,471 -> 5,646, then reseeded down to 828.
+    `logmoney_02` the same, 3,497 -> 332.
+
+    `"benchmark"` keeps the old signal, because the two are not the same
+    *quantity*: the rollout mean is measured against the training opponent mix at
+    collection sigma, the arena against the pinned benchmark greedily. The rollout
+    mean is the better *progress* signal and the arena is still the release
+    decision -- this changes which one ends a slot, not which one promotes.
+
+    A median rather than the latest draw either way, for the reason
+    `_benchmark_reference_window` argues at length: one 100-seed arena series on
+    this family swings between 0.93 and 427 on an unchanged policy, because
+    `a_money_median` is 2 against a mean of 32.6 and the mean rides on a handful
+    of survivors. A plateau detector reading single draws would find an
+    "improvement" by luck every few updates and the rate would never decay --
+    which is the stagnation this exists to end, reproduced by the thing meant to
+    end it.
 
     Bounded below by the slot's own reseed. Measurements from before it describe a
     policy this slot no longer is, and including them would let an inherited high
@@ -1100,6 +1443,8 @@ def _slot_score(
     rather than as a stall.
     """
 
+    if signal == "rollout":
+        return _rollout_score(reader, model_id, rollout, window, batch_floor)
     if candidate is None or opponent is None:
         return candidate
     if window <= 1:
@@ -1151,6 +1496,53 @@ def _graduates(state: SlotState, spec: SlotSpec) -> bool:
     return spec.peak * spec.decay_factor**state.decay_steps < spec.graduate_cut
 
 
+def _warm_starts(
+    state: SlotState, spec: SlotSpec, members: list[dict[str, Any]]
+) -> bool:
+    """Whether a slot that has never been reseeded should adopt the group instead.
+
+    A cold start is the right initialisation only when there is nothing to start
+    from. `declared_model_id` carries no session suffix, so the mature group
+    outlives the session that filled it, and a fresh roster begins beside
+    checkpoints of policies that already work. A slot starting from
+    `initial_network` there is not exploring a different basin -- it is
+    re-deriving from noise what the group already holds, and it does so for the
+    whole decay cycle before `_graduates` gives it its first ancestor.
+
+    `market-free-streak-v27` is the measurement rather than the hypothesis. Five
+    updates in, ten cold-started slots sat at 1,071-1,392 rollout money against a
+    group whose worst usable member scored 1,861 and whose best scored 6,270 --
+    and their rollout money was *falling*, 3,000 at update zero to 720 at update
+    four. A generation of compute spent re-learning the floor of what was already
+    on disk.
+
+    Not a graduation, and deliberately not routed through `_graduates`' floors.
+    Those floors exist so warmup noise cannot end a slot that has not had a chance
+    to train: they gate a claim about evidence. This reads no score and makes no
+    such claim. It corrects the slot's *initialisation*, and every update spent
+    waiting the floor out is another update spent training the initialisation
+    being corrected. `population_warm_start_min_updates` is the escape hatch for
+    anyone who disagrees.
+
+    Fires at most once per reseed lineage, and needs no flag of its own to say so:
+    the marker this update writes advances `lr_reseed_index` in `_slot_state`, and
+    the predicate is `reseed_index == 0`. So it is self-cancelling, and it
+    survives a process restart because the state is the update row rather than
+    memory.
+    """
+
+    if not spec.enabled or not spec.warm_start:
+        return False
+    if state.reseed_index > 0:
+        return False
+    if state.updates_since_reseed < spec.warm_start_min_updates:
+        return False
+    # The filtered list rather than a count. `mature_members` drops members whose
+    # `.npz` has been cleaned off disk, so a group of thirty rows with no
+    # artifacts is an empty group and the slot must cold-start rather than fail.
+    return bool(members)
+
+
 def _declared_model_id(reader, model_id: str) -> str:
     """The population every learner slot of this model shares.
 
@@ -1182,7 +1574,7 @@ def mature_members(reader, declared_model_id: str) -> list[dict[str, Any]]:
     rows = reader.fetchall(
         """
         SELECT p.member_id, p.model_id, p.checkpoint_id, p.score,
-               c.inference_artifact_path
+               c.inference_artifact_path, p.behavior_json
         FROM population_members p
         JOIN model_training_checkpoints c USING (checkpoint_id)
         WHERE p.declared_model_id = %s AND p.retired_at IS NULL
@@ -1190,17 +1582,60 @@ def mature_members(reader, declared_model_id: str) -> list[dict[str, Any]]:
         """,
         [declared_model_id],
     )
-    return [
+    members = [
         {
             "member_id": str(row[0]),
             "model_id": str(row[1]),
             "checkpoint_id": str(row[2]),
             "score": float(row[3]),
             "inference_artifact_path": str(row[4]),
+            "behavior": _decode_behavior(row[5]),
         }
         for row in rows or []
         if Path(str(row[4])).is_file()
     ]
+    return _mark_reserved(members)
+
+
+def _decode_behavior(value: Any) -> dict[str, Any] | None:
+    """`behavior_json` as a mapping, whatever the driver handed back.
+
+    The column is nullable and predates nothing -- every member graduated before
+    it existed carries NULL -- so an unreadable or absent value is `None` rather
+    than an error. `_reserved_cell` then declines to file it anywhere.
+    """
+
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return dict(value) if isinstance(value, dict) else None
+
+
+def _mark_reserved(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tag the best-scoring live member of each reserved cell.
+
+    Computed here, once, off the same score-ordered list the cull reads, so
+    `_reseed_source` never re-derives which rows the archive is holding and the
+    two cannot disagree about it. Ties break on the incoming order, which is
+    `score DESC, member_id` -- deterministic, and the same tiebreak the cull's
+    `DISTINCT ON` uses.
+
+    Only the *occupancy* is decided here. Whether a member cleared the money
+    floor was decided when it entered, so a row that is live is a row the cull
+    already accepted.
+    """
+
+    seen: set[tuple[int, int]] = set()
+    marked: list[dict[str, Any]] = []
+    for member in members:
+        cell = _reserved_cell(member.get("behavior"))
+        reserved = cell is not None and cell not in seen
+        if reserved:
+            seen.add(cell)
+        marked.append({**member, "cell": cell, "reserved": reserved})
+    return marked
 
 
 def _release_age(reader, model_id: str, checkpoint_id: str | None) -> int | None:
@@ -1247,8 +1682,186 @@ def _release_age(reader, model_id: str, checkpoint_id: str | None) -> int | None
     return int(row[0])
 
 
+_SLOT_ORDINAL = re.compile(r"(\d+)$")
+
+
+def _materialize_warm_start(context, reader, slot_metrics: dict[str, Any]) -> Path | None:
+    """Adopt the mature group *before* generation 0 is collected, or return None.
+
+    `_warm_starts` already decides that a fresh roster should start from the
+    group rather than from `initial_network`, and it is already on by default.
+    But it runs inside `update`, which fires after `rounds_per_generation`
+    rounds -- so every session still spends its whole first generation
+    collecting from a NOOP-only cold start and then trains its first update on
+    those episodes. Measured across v26 to v31: `own_mean_final_money` is exactly
+    3000.0 at `cutoff_batch_seq = 10` in all six, including the three whose first
+    update recorded `population.action = "warm_start"`. The adoption was landing
+    one generation too late to be collected from.
+
+    So the materialisation moves here, and only here. The update side loads these
+    bytes rather than drawing its own mask, which is the invariant
+    `reseed_artifact_path` exists for: `collect` and `update` must roll out and
+    train the same network, not two draws from one seed.
+
+    Returns None -- and leaves the cold-start path untouched -- whenever the
+    adoption does not apply: the population is off, `population_warm_start` is
+    off, the slot has already trained, or the mature group is empty. That last
+    one is the first session of a family, where a cold start is correct because
+    there is genuinely nothing to start from.
+    """
+
+    config = context.config
+    if slot_metrics:
+        # Not virgin. Either the slot has state and `update` owns the decision,
+        # or it has already been through here and `lineage_checkpoint` applies.
+        return None
+    spec = _slot(config)
+    if not spec.enabled or not spec.warm_start:
+        return None
+
+    network_path, sidecar = warm_start_paths(context.artifacts)
+    if network_path.is_file() and sidecar.is_file():
+        # Rounds two through ten of generation 0 land here. One draw, one mask,
+        # one set of bytes for the whole generation.
+        return network_path
+
+    declared = _declared_model_id(reader, context.model_id)
+    members = mature_members(reader, declared)
+    if not members:
+        return None
+
+    chosen = _reseed_source(
+        members,
+        config,
+        seed=int(config.get("seed", 0)),
+        # A virgin slot is at reseed zero by definition, and `spread` is exactly
+        # the whole-roster-restarts-at-once case this is -- ten slots drawing
+        # independently from one group collide most of the time.
+        reseed_index=0,
+        ordinal=_slot_ordinal(config, context.model_id),
+        roster=int(config.get("population_slots", 0)),
+        spread=True,
+    )
+    if chosen is None:
+        return None
+
+    seeded = reseed.perturb(
+        OrderQNetwork.load(chosen["inference_artifact_path"]),
+        spec.dropout,
+        spec.shrink,
+        # `+ 1` to match the update path's `reseed_index + 1` at reseed zero, so
+        # moving the materialisation did not quietly move the mask as well.
+        seed=int(config.get("seed", 0)) + 1,
+        sigma_reset=_noisy(config).sigma0 if spec.sigma_reset else None,
+    )
+    # The same guard the update path applies. A perturbation that zeroed the
+    # trunk leaves a network with no gradient outside its output bias, and a slot
+    # that starts there can never leave.
+    _reject_inert_network(seeded)
+
+    network_path.parent.mkdir(parents=True, exist_ok=True)
+    seeded.save(network_path)
+    sidecar.write_text(
+        json.dumps(
+            {
+                "checkpoint_id": chosen["checkpoint_id"],
+                "model_id": chosen["model_id"],
+                "score": chosen["score"],
+            },
+            sort_keys=True,
+        )
+    )
+    return network_path
+
+
+def warm_start_paths(artifacts) -> tuple[Path, Path]:
+    """Where a virgin slot's warm start lives, and its sidecar.
+
+    One place, named by neither an `update_id` nor a checkpoint id, because the
+    thing that materialises it runs before either exists. `collect` writes both
+    on the first round of generation 0 and `update` reads both on the first
+    update, so this function is the only thing the two sides have to agree on.
+
+    The sidecar carries the ancestor's identity rather than the filename doing
+    it. `update` re-derives its own draw from `_reseed_source` to fill
+    `reseed_source_rank` and the archive columns, and cross-checks it against
+    this -- a disagreement means the mature group moved between the collection
+    and the update, which cannot happen today and would silently pair one
+    ancestor's bytes with another's provenance if it ever did.
+    """
+
+    root = Path(artifacts) / "reseeds"
+    return root / "warm-start.npz", root / "warm-start.json"
+
+
+def _slot_ordinal(config: dict[str, Any], model_id: str) -> int | None:
+    """This slot's index in the roster, or None if it is not one of many.
+
+    The roster is `effective_model_id`'d instances of one declared model, so the
+    ordinal is already recorded in two places and needs deriving from neither:
+    `register_training_agent` stamps `name` into `config_json`, and the same
+    string is the `@` suffix of `model_id`. Preferring `name` avoids parsing an
+    identifier at all; the suffix is the fallback for a config that predates the
+    stamp.
+
+    None for `default`, or any name without a trailing number. That is a
+    population of one, and it draws the way it always did.
+    """
+
+    name = str(config.get("name") or "")
+    if not name and "@" in model_id:
+        name = model_id.rsplit("@", 1)[-1]
+    match = _SLOT_ORDINAL.search(name)
+    return None if match is None else int(match.group(1))
+
+
+def _capped_members(
+    members: list[dict[str, Any]], config: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The ranked group with each originating slot held to a fixed share.
+
+    `mature_capacity` is thirty and a healthy slot promotes repeatedly, so the
+    group is not thirty policies -- it is thirty *checkpoints of ten policies*,
+    and a slot that is genuinely ahead occupies the top of the ranking several
+    times over. Measured on the live group: `logmoney_04` held ranks 0, 1, 5, 6
+    and 9, so two of the top three were one policy's own history and a uniform
+    draw over `reseed_source_pool = 3` handed that lineage two thirds of every
+    restart. Ranked on score alone, a population of ten read as a population of
+    about four -- which is the failure `reseed_source_pool` exists to prevent,
+    reappearing one level down.
+
+    The best entry of each lineage rather than an arbitrary one, so the cap costs
+    rank and never costs quality: the member dropped is always one its own lineage
+    already beat.
+
+    What this gives up, stated rather than hidden: a lineage better than every
+    other by more than one rung cannot supply two slots' ancestry at once. That is
+    the intended trade. A second perturbation of an ancestor the roster already
+    holds is the cheapest thing the roster can hold, and diversity is the entire
+    reason there is a population.
+    """
+
+    cap = max(1, int(config.get("reseed_source_lineage_cap", 1)))
+    taken: dict[str, int] = {}
+    capped: list[dict[str, Any]] = []
+    for member in members:
+        lineage = str(member["model_id"])
+        if taken.get(lineage, 0) >= cap:
+            continue
+        taken[lineage] = taken.get(lineage, 0) + 1
+        capped.append(member)
+    return capped
+
+
 def _reseed_source(
-    members: list[dict[str, Any]], config: dict[str, Any], *, seed: int, reseed_index: int
+    members: list[dict[str, Any]],
+    config: dict[str, Any],
+    *,
+    seed: int,
+    reseed_index: int,
+    ordinal: int | None = None,
+    roster: int = 0,
+    spread: bool = False,
 ) -> dict[str, Any] | None:
     """Which mature member a restarting slot is rebuilt from.
 
@@ -1277,12 +1890,72 @@ def _reseed_source(
     Seeded from the slot and its reseed count so a restart is reproducible, and
     with entropy distinct from the perturbation's own seed so the choice of
     ancestor and the mask drawn from it do not move together.
+
+    Two things are layered on that.
+
+    The cap, always: see `_capped_members`. The top-k argument above assumes k
+    *distinct policies*, and without the cap it is k checkpoints of however few.
+
+    The spread, only when the whole roster restarts at once. Ten slots choosing
+    independently from a group of ten collide most of the time, and there is no
+    coordination point to prevent it -- each slot is a separate process on its own
+    round. The ordinal is the coordination: every slot reads the same ranked,
+    capped list and indexes it by its own position, so distinctness is a property
+    of the arithmetic rather than of the draw, and no slot has to know what the
+    others chose.
+
+    Deliberately not used for ordinary reseeds. Those happen at different times on
+    different slots, so there is nothing to spread against -- and a permanent
+    ordinal-to-rank map would hand slot 0 the group's single best on every restart
+    forever, which is the argmax-of-noisy-estimates failure this function was
+    written to avoid, reintroduced for a tenth of the roster.
+
+    And the bucket, whenever `reseed_source_explorer_share` is positive. The
+    ranked list above is ranked on one number, so drawing from it can only ever
+    return variations on whatever that number currently rewards -- measured on
+    `logmoney-v26`, that is a wheat monoculture from generation 12 onward. The
+    reserve is the archive's behaviour cells, and a draw from it restarts a slot
+    on a policy the ranking would have culled. `share = 0.0` skips it entirely and
+    reproduces the pre-archive draw exactly.
+
+    `roster` is how many slots exist, needed only by the spread path to know which
+    ordinals are the tail. 0 disables the reserve there rather than guessing.
     """
 
-    if not members:
+    capped = _capped_members(members, config)
+    if not capped:
         return None
+    # The lineage cap runs on each bucket separately. It is about ancestry, and a
+    # reserve holding three checkpoints of one lineage is the same failure inside
+    # the archive as outside it.
+    reserve = _capped_members([member for member in members if member.get("reserved")], config)
+    share = max(0.0, min(1.0, float(config.get("reseed_source_explorer_share", 0.0))))
+
+    if spread and ordinal is not None:
+        # Deterministic, because the whole roster is choosing at once and there is
+        # no coordination point but the arithmetic. The *highest* ordinals take
+        # the reserve: slot 0 is the one carrying the league's surrogate-propose
+        # entry, and the explorer slots are the roster's tail by convention in
+        # `train_market_free.py`, so the two agree without either knowing it.
+        explorers = int(round(share * roster)) if reserve and roster > 0 else 0
+        if explorers and ordinal >= roster - explorers:
+            return reserve[(ordinal - (roster - explorers)) % len(reserve)]
+        # Wraps when the group holds fewer lineages than the roster has slots.
+        # Collisions there are unavoidable -- there is nothing distinct left to
+        # hand out -- and wrapping keeps the shortfall at the *bottom* of the
+        # list, so the slots that double up double up on the best entries.
+        return capped[ordinal % len(capped)]
+
+    # Drawn with its own entropy, so which bucket a slot reads and which member
+    # it takes out of that bucket do not move together -- the same separation the
+    # member draw below already keeps from the perturbation's mask.
+    bucket = capped
+    if reserve and share > 0.0:
+        roll = float(np.random.default_rng([seed, reseed_index, 0xA5C]).random())
+        if roll < share:
+            bucket = reserve
     pool = max(1, int(config.get("reseed_source_pool", 3)))
-    top = members[:pool]
+    top = bucket[:pool]
     if len(top) == 1:
         return top[0]
     index = int(np.random.default_rng([seed, reseed_index, 0x5EED]).integers(len(top)))
@@ -1296,6 +1969,9 @@ def _graduate(
     checkpoint_id: str,
     score: float,
     capacity: int,
+    behavior: dict[str, Any] | None = None,
+    reserved: int = 0,
+    reserved_min_money: float = 0.0,
 ) -> dict[str, Any]:
     """Enter one checkpoint into the mature group and cull back to capacity.
 
@@ -1308,6 +1984,36 @@ def _graduate(
     the worst member is the one retired and the group cannot be made worse by
     admitting to it. Retirement sets a timestamp; the row and its artifacts stay,
     because a run has to be answerable afterwards about what it dropped.
+
+    The conflict clause clears `retired_at` as well as refreshing the score,
+    which it did not always do. Entry is idempotent per checkpoint and a standing
+    release re-enters on every one of its slot's updates -- `logmoney-v26` logged
+    87 entry events for 37 distinct members -- so a member culled while its slot
+    still holds it as the active release would have every later update rewrite its
+    score on a row that stayed retired. The cull counts only live rows, so at
+    `capacity - 1` live it then retires nothing, and the group sits below capacity
+    permanently. Re-entry is a claim that this checkpoint belongs in the group
+    now; the cull re-decides on merit in the very next statement.
+
+    `reserved` splits the capacity rather than adding to it. `capacity -
+    reserved` berths go to the score ranking exactly as they always did, and the
+    remainder are held for the best-scoring member of each behaviour cell that is
+    not the monoculture attractor, so the group stops being a ranking and becomes
+    a small archive. At `reserved = 0` the two `EXCEPT` clauses collapse to the
+    `OFFSET capacity` this used to run and nothing changes, which is what makes
+    the whole feature retirable through one config key.
+
+    Cells are ranked against each other before the limit rather than taken in bin
+    order, so an oversubscribed archive spends its berths on the best occupied
+    cells instead of on whichever cell sorts first.
+
+    `reserved_min_money` is the floor a cell occupant has to clear, and it is the
+    entire safety argument. Land buyers in the league finish on a median of 7
+    coins against 3,000 for the rest, so an unfloored cell would hold the day-0
+    bankrupts permanently and reseed the roster from them. It reads the
+    *undiscounted* money the fingerprint was measured with rather than `score`:
+    the activity discount is a ranking device, and applying it here would ask a
+    diversified policy to clear a bar that has already been bent against it.
     """
 
     member_id = hashlib.sha256(
@@ -1316,34 +2022,88 @@ def _graduate(
     reader.fetchall(
         """
         INSERT INTO population_members
-            (member_id, declared_model_id, model_id, checkpoint_id, score)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (member_id) DO UPDATE SET score = excluded.score
+            (member_id, declared_model_id, model_id, checkpoint_id, score, behavior_json)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (member_id) DO UPDATE SET score = excluded.score,
+                                              behavior_json = coalesce(
+                                                  excluded.behavior_json,
+                                                  population_members.behavior_json
+                                              ),
+                                              retired_at = NULL,
+                                              retired_reason = NULL
         RETURNING member_id
         """,
-        [member_id, declared_model_id, model_id, checkpoint_id, float(score)],
+        [
+            member_id,
+            declared_model_id,
+            model_id,
+            checkpoint_id,
+            float(score),
+            json.dumps(behavior) if behavior is not None else None,
+        ],
     )
     retired = reader.fetchall(
         """
+        WITH live AS (
+            SELECT member_id, score, behavior_json,
+                   (behavior_json ->> 'crop_bin')::int AS crop_bin,
+                   (behavior_json ->> 'land_bin')::int AS land_bin,
+                   (behavior_json ->> 'money')::float AS money
+            FROM population_members
+            WHERE declared_model_id = %s AND retired_at IS NULL
+        ),
+        kept_by_score AS (
+            SELECT member_id FROM live ORDER BY score DESC, member_id LIMIT %s
+        ),
+        kept_by_cell AS (
+            SELECT member_id FROM (
+                SELECT DISTINCT ON (crop_bin, land_bin) member_id, score
+                FROM live
+                WHERE crop_bin IS NOT NULL AND land_bin IS NOT NULL
+                  AND NOT (crop_bin = %s AND land_bin = %s)
+                  AND money >= %s
+                ORDER BY crop_bin, land_bin, score DESC, member_id
+            ) cells
+            ORDER BY score DESC, member_id
+            LIMIT %s
+        )
         UPDATE population_members SET retired_at = current_timestamp,
                                       retired_reason = 'capacity'
         WHERE member_id IN (
-            SELECT member_id FROM population_members
-            WHERE declared_model_id = %s AND retired_at IS NULL
-            ORDER BY score DESC, member_id
-            OFFSET %s
+            SELECT member_id FROM live
+            EXCEPT SELECT member_id FROM kept_by_score
+            EXCEPT SELECT member_id FROM kept_by_cell
         )
-        RETURNING member_id, score
+        RETURNING member_id, score, behavior_json
         """,
-        [declared_model_id, capacity],
+        [
+            declared_model_id,
+            max(0, capacity - max(0, reserved)),
+            CROP_BINS[0],
+            LAND_BINS[0],
+            float(reserved_min_money),
+            max(0, reserved),
+        ],
     )
+    cell = _reserved_cell(behavior)
     return {
         "member_id": member_id,
         "checkpoint_id": checkpoint_id,
         "score": float(score),
         "capacity": capacity,
+        "reserved_capacity": max(0, reserved),
+        "cell": list(cell) if cell is not None else None,
         "retired": [
-            {"member_id": str(row[0]), "score": float(row[1])} for row in retired or []
+            {
+                "member_id": str(row[0]),
+                "score": float(row[1]),
+                "cell": (
+                    list(retired_cell)
+                    if (retired_cell := _reserved_cell(_decode_behavior(row[2]))) is not None
+                    else None
+                ),
+            }
+            for row in retired or []
         ],
     }
 
@@ -1825,21 +2585,33 @@ class FreeMarketCollector:
             behavior_path = Path(reseed_path)
         else:
             checkpoint = lineage_checkpoint(context, reader)
-            network = (
-                OrderQNetwork.load(checkpoint.inference_artifact_path)
-                if checkpoint is not None
-                else initial_network(config)
+            warm_path = (
+                _materialize_warm_start(context, reader, slot_metrics)
+                if checkpoint is None
+                else None
             )
-            behavior_path = (
-                Path(context.artifacts)
-                / "rollout_policies"
-                / f"{checkpoint.checkpoint_id if checkpoint is not None else 'initial'}.npz"
-            )
-            behavior_path.parent.mkdir(parents=True, exist_ok=True)
-            # Checkpoint paths are content-addressed and immutable; `initial` is
-            # not, so it is rewritten in case an older run left a stale one behind.
-            if checkpoint is None or not behavior_path.is_file():
-                network.save(behavior_path)
+            if warm_path is not None:
+                # Same shape as the `reseed_pending` branch above: the bytes are
+                # already on disk and the workers read them themselves.
+                checkpoint = None
+                behavior_path = warm_path
+            else:
+                network = (
+                    OrderQNetwork.load(checkpoint.inference_artifact_path)
+                    if checkpoint is not None
+                    else initial_network(config)
+                )
+                behavior_path = (
+                    Path(context.artifacts)
+                    / "rollout_policies"
+                    / f"{checkpoint.checkpoint_id if checkpoint is not None else 'initial'}.npz"
+                )
+                behavior_path.parent.mkdir(parents=True, exist_ok=True)
+                # Checkpoint paths are content-addressed and immutable; `initial`
+                # is not, so it is rewritten in case an older run left a stale one
+                # behind.
+                if checkpoint is None or not behavior_path.is_file():
+                    network.save(behavior_path)
 
         total_transitions = int(
             reader.fetchone(
@@ -1871,6 +2643,14 @@ class FreeMarketCollector:
         rare_gain = float(config.get("rare_sigma_gain", 0.0))
         rare_sigma_cap = float(config.get("rare_sigma_cap", rare_gain))
         rare_decay = float(config.get("rare_sigma_decay", 0.9))
+        # Which novelty statistic the widening reads. `"count"` is what every run
+        # through v28 played and stays the default, so leaving this unset keeps a
+        # run byte-identical to those. See `rare.sigma_scale_vector`.
+        rare_novelty = str(config.get("rare_sigma_novelty", "count"))
+        if rare_novelty not in rare.NOVELTY_KINDS:
+            raise ValueError(
+                f"rare_sigma_novelty must be one of {list(rare.NOVELTY_KINDS)}: {rare_novelty}"
+            )
         # Held to a minority of the pairs by default, counted from the widest end
         # of the ladder. See `collect_batch`.
         rare_sigma_pairs = int(config.get("rare_sigma_pairs", max(1, episodes // 4)))
@@ -2002,6 +2782,7 @@ class FreeMarketCollector:
                 # loosening 97 spending rows. It arrives on batch two.
                 rare_sigma_gain=rare_gain if rare_counts is not None else 0.0,
                 rare_sigma_cap=rare_sigma_cap,
+                rare_sigma_novelty=rare_novelty,
                 rare_sigma_path=rare_path if rare_counts is not None else None,
                 rare_sigma_pairs=rare_sigma_pairs,
             )
@@ -2051,6 +2832,13 @@ class FreeMarketCollector:
             land_episodes = sum(
                 1 for record in records if int(np.count_nonzero(record.order_chosen == LAND_INDEX))
             )
+            # `buy_land_rate` below says how often the row was *chosen*. This says
+            # what the purchase then bought: when it was made, what it cost, how
+            # many of the 25 new tiles were ever planted, and whether the seat's
+            # hands went idle afterwards. Without it a falling money curve cannot
+            # be attributed to expansion being negative rather than to the field
+            # scheduler never working the tiles.
+            land_use = _rollout_behavior(rollouts).as_dict()
             batch = writer.record(
                 source_kind=SOURCE_KIND,
                 source_id=source_id,
@@ -2084,12 +2872,40 @@ class FreeMarketCollector:
                     # row that motivated the mechanism, kept as a named column so
                     # the question that started this is answerable in one query.
                     "rare_sigma_gain": rare_gain if rare_gain > 0.0 else None,
+                    # Which statistic produced that gain's multipliers. The two are
+                    # not calibrated alike, so a money series is only comparable
+                    # across batches that agree on this column.
+                    "rare_sigma_novelty": rare_novelty if rare_gain > 0.0 else None,
                     # Counted from the widest end of the ladder, so the clean arm
                     # is the greedy tail. A money series filters on both columns
                     # together.
                     "rare_sigma_pairs": rare_sigma_pairs if rare_gain > 0.0 else None,
                     "selection_entropy": rare.selection_entropy(batch_chosen),
                     "buy_land_rate": land_episodes / max(1, len(records)),
+                    "land_accepted": land_use["land_accepted"],
+                    "land_buying_episodes": land_use["land_episodes"],
+                    "land_day": land_use["land_day"],
+                    "land_money": land_use["land_money"],
+                    # Against 25 tiles per quadrant. Near zero means bought land
+                    # is never worked, which is a scheduler problem, not a Q one.
+                    "land_tiles_planted_per_purchase": land_use["land_tiles_planted_per_purchase"],
+                    "land_weed_digs_per_episode": land_use["land_weed_digs_per_episode"],
+                    "post_land_idle_delta": land_use["post_land_idle_delta"],
+                    # The lot ledger's side of the same question. `buy_land_rate`
+                    # and the columns above say what expansion did; these say what
+                    # a *seed* did, which is what `LOT_POTENTIAL_WEIGHT` pays
+                    # against. Holding turns falling while the margin holds is the
+                    # term working; spend rising with `unrecovered_seed_share` is
+                    # it buying more rather than earlier, which the potential
+                    # cannot cause -- look at `LAND_PURCHASE_BONUS` for that.
+                    "seed_lots": land_use["seed_lots"],
+                    "seed_lots_matched": land_use["seed_lots_matched"],
+                    "seed_lots_matched_share": land_use["seed_lots_matched_share"],
+                    "seed_spend": land_use["seed_spend"],
+                    "seed_proceeds": land_use["seed_proceeds"],
+                    "seed_margin": land_use["seed_margin"],
+                    "seed_holding_turns": land_use["seed_holding_turns"],
+                    "unrecovered_seed_share": land_use["unrecovered_seed_share"],
                     "mean_final_money": float(np.mean(final_money)),
                     "max_final_money": float(np.max(final_money)),
                     "solvent_episodes": int(sum(1 for value in final_money if value > 10_000)),
@@ -2579,13 +3395,44 @@ class FreeMarketUpdater:
         # with nothing released could not snap back either. A fixed cold-start
         # reference is what makes the *first* release reachable; from the second
         # onward the incumbent's real seat takes over again.
+        #
+        # That fixed reference is itself escapable, and only on a cold start. Once
+        # `active is not None` the reference is a real opponent's seat in this same
+        # paired series, which is the comparison worth keeping strict -- standing it
+        # down would let a run walk itself down through exactly the drift
+        # `_benchmark_ratchet` refuses. The synthetic bar has no such standing: it is
+        # a number this config picked, and a slot converging on it from below across
+        # every update it has ever run is being held by the number rather than by its
+        # own decay. See `viability_grace_after_rejections`.
+        head_viability_grace = False
         if active is not None:
+            head_reference_kind = "incumbent_seat"
             head_reference = {
                 "a_money_mean": head_to_head["b_money_mean"],
                 "a_money_median": head_to_head["b_money_median"],
             }
         else:
-            cold_start_reference = _limit(config, "viability_cold_start_reference_money")
+            viability_grace_limit = int(config.get("viability_grace_after_rejections", 0))
+            head_viability_grace = (
+                viability_grace_limit > 0 and rejection_streak >= viability_grace_limit
+            )
+            if head_viability_grace:
+                # `None` means "the ratchet's own first-release foothold", so a
+                # config that sets the streak limit and nothing else lands on a
+                # number it already declares rather than on a second new one.
+                configured = config.get(
+                    "viability_grace_cold_start_reference_money",
+                    VIABILITY_DEFAULTS["viability_grace_cold_start_reference_money"],
+                )
+                cold_start_reference = (
+                    _limit(config, "benchmark_cold_start_min_money")
+                    if configured is None
+                    else float(configured)
+                )
+                head_reference_kind = "cold_start_grace"
+            else:
+                cold_start_reference = _limit(config, "viability_cold_start_reference_money")
+                head_reference_kind = "cold_start_fixed"
             head_reference = {
                 "a_money_mean": cold_start_reference,
                 "a_money_median": cold_start_reference,
@@ -2626,7 +3473,12 @@ class FreeMarketUpdater:
         # the head-to-head keeps the floor rather than dropping it silently.
         require_head_activity = active is not None or not challenger_benchmarks
         head_viability = _arena_viability(
-            head_to_head, head_reference, config, require_activity=require_head_activity
+            head_to_head,
+            head_reference,
+            config,
+            require_activity=require_head_activity,
+            reference_kind=head_reference_kind,
+            grace=head_viability_grace,
         )
         benchmark_viability = [
             _order_viability(result, config, require_activity=True)
@@ -2739,7 +3591,20 @@ class FreeMarketUpdater:
                 "passed": hard_viability_passed,
                 "head_to_head": head_viability,
                 "benchmarks": dict(zip(benchmarks, benchmark_viability)),
-                "limits": {name: _limit(config, name) for name in VIABILITY_DEFAULTS},
+                # Skip the keys whose default is `None`, which means "fall back to
+                # another key" rather than a number -- `_limit` would `float(None)`
+                # and take the whole update down with a TypeError. Both such keys
+                # resolve through their own branch and both record what they
+                # resolved to where they are used, so nothing is lost here.
+                #
+                # `benchmark_grace_min_money` survived this for as long as it did
+                # only because `FREE_CONFIG` happens to set it; a config that left
+                # it unset would have hit exactly the same crash.
+                "limits": {
+                    name: _limit(config, name)
+                    for name in VIABILITY_DEFAULTS
+                    if config.get(name, VIABILITY_DEFAULTS[name]) is not None
+                },
             },
             "passed": promote,
         }
@@ -2895,13 +3760,28 @@ class FreeMarketUpdater:
             benchmark_ratchet.get("candidate_money"),
             int(_limit(config, "benchmark_reference_window")),
             slot.batch_floor,
+            signal=slot_spec.score_signal,
+            rollout=metrics.get("own_mean_final_money"),
         )
         slot = _settle_slot(slot, slot_score, slot_spec)
         metrics.update(slot.as_metrics())
         metrics["lr_score"] = slot_score
+        # Which measurement ended up in `lr_score`, recorded beside it. The two
+        # signals are different quantities on the same stake, so a series that
+        # spans a config change is only readable if each point says which it is.
+        metrics["lr_score_signal"] = slot_spec.score_signal
         population: dict[str, Any] = {"action": "train", "reseed_index": slot.reseed_index}
         declared = _declared_model_id(reader, context.model_id)
         graduating = _graduates(slot, slot_spec)
+        # Hoisted out of the reseed branch below, because the warm-start predicate
+        # is a question about the group and the group has to be read before the
+        # answer exists. Read only when a reseed is actually possible, so an
+        # ordinary training update still costs no extra query.
+        members: list[dict[str, Any]] = []
+        if graduating or (slot_spec.warm_start and slot.reseed_index == 0):
+            members = mature_members(reader, declared)
+        warming = not graduating and _warm_starts(slot, slot_spec, members)
+        reseeding = graduating or warming
 
         # Contribution and restart are separate events with separate triggers.
         # They used to share this branch, which meant a checkpoint could only
@@ -2913,9 +3793,22 @@ class FreeMarketUpdater:
         # What enters is still the *released* checkpoint, never the candidate this
         # update just trained: a mature member is meant to be a policy the gate
         # has already accepted, and the candidate has by definition not been.
-        if active is not None:
+        #
+        # A warm-starting slot contributes nothing, whatever the age. The
+        # load-bearing reason is the spread: every slot warm-starts inside one
+        # generation from a separate process, and `_graduate` is autocommit, so a
+        # contribution landing mid-generation changes the ranked list the slots
+        # still choosing are reading and the ordinal mapping silently collides.
+        # Suppressing it leaves the group with no writer for the duration, which
+        # is what turns "usually distinct" into distinct. It is also
+        # self-contradictory otherwise -- the slot would be declaring its own
+        # initialisation wrong while nominating a descendant of it as an ancestor
+        # for its peers. The `graduating` rule below does not transfer: that slot
+        # is finishing and would lose its release entirely, while this one keeps
+        # its id and its history and can contribute again in `entry_updates`.
+        if active is not None and not warming:
             release_age = _release_age(reader, context.model_id, active.checkpoint_id)
-            entry_after = int(config.get("population_entry_updates", 4))
+            entry_after = slot_spec.entry_updates
             # A graduating slot contributes whatever the age -- it is finishing
             # anyway, and holding its release back would lose it entirely.
             eligible = graduating or (release_age is not None and release_age >= entry_after)
@@ -2951,6 +3844,24 @@ class FreeMarketUpdater:
                 )
                 population["score_detail"] = scored
                 population["entered"] = True
+                # The strategy fingerprint, read back off the same gate payload
+                # the score came from so the two describe one arena series.
+                # `money` rides along undiscounted because the archive's floor is
+                # a viability question rather than a ranking one -- see
+                # `_graduate`. A member with no fingerprint keeps a NULL column
+                # and is never reserve-eligible.
+                behavior = _released_behavior(
+                    reader, active, benchmarks[0] if benchmarks else ""
+                )
+                if behavior is not None:
+                    cell = _behavior_cell(behavior)
+                    behavior = {
+                        **behavior,
+                        "money": float(scored["money"]),
+                        "crop_bin": None if cell is None else cell[0],
+                        "land_bin": None if cell is None else cell[1],
+                    }
+                population["behavior"] = behavior
                 population.update(
                     _graduate(
                         reader,
@@ -2959,13 +3870,25 @@ class FreeMarketUpdater:
                         active.checkpoint_id,
                         float(scored["score"]),
                         slot_spec.mature_capacity,
+                        behavior=behavior,
+                        reserved=slot_spec.reserved_capacity,
+                        reserved_min_money=slot_spec.reserved_min_money,
                     )
                 )
 
-        if graduating:
+        if reseeding:
             # `graduate` when there was something to contribute, `restart` when
-            # the slot reached its cut having never released. Both reseed.
-            population["action"] = "graduate" if active is not None else "restart"
+            # the slot reached its cut having never released, `warm_start` when it
+            # never reached its cut at all and is adopting the group instead. All
+            # three reseed, and the three are distinguishable in SQL because which
+            # one happened is the first question asked of a roster afterwards.
+            population["action"] = (
+                "warm_start"
+                if warming
+                else "graduate"
+                if active is not None
+                else "restart"
+            )
 
             # Seeded from the top of the mature group, which after a graduation
             # may include the member that just entered. That is correct rather
@@ -2976,12 +3899,25 @@ class FreeMarketUpdater:
             # From the *top*, not from the front -- see `_reseed_source`. The
             # scores are noisy estimates and the best of them is the luckiest one
             # as often as it is the best policy.
-            members = mature_members(reader, declared)
+            #
+            # Re-read after a graduation and not otherwise, which is the whole
+            # reason the hoisted read is not simply reused: `_graduate` ran above
+            # and is autocommit, so the list this slot should draw from is the one
+            # that includes its own release. A warm start contributes nothing, and
+            # neither does any other slot warm-starting in the same generation, so
+            # the group has no writer and the hoisted list is still current --
+            # which is exactly what makes the ordinal spread distinct rather than
+            # merely likely to be.
+            if graduating:
+                members = mature_members(reader, declared)
             chosen = _reseed_source(
                 members,
                 config,
                 seed=int(config.get("seed", 0)),
                 reseed_index=slot.reseed_index,
+                ordinal=_slot_ordinal(config, context.model_id),
+                roster=int(config.get("population_slots", 0)),
+                spread=warming,
             )
             if chosen is not None:
                 source_path = chosen["inference_artifact_path"]
@@ -2994,23 +3930,72 @@ class FreeMarketUpdater:
                 population["reseed_source_pool"] = min(
                     len(members), max(1, int(config.get("reseed_source_pool", 3)))
                 )
+                # `reseed_source_rank` above is the index into the *uncapped*
+                # list, so the row still reads "rank 4 of thirty checkpoints".
+                # These three say how many policies those checkpoints were, which
+                # is the number the diversity argument is actually about.
+                population["reseed_source_model_id"] = chosen["model_id"]
+                population["reseed_source_lineages"] = len(
+                    {member["model_id"] for member in members}
+                )
+                population["reseed_source_candidates"] = len(
+                    _capped_members(members, config)
+                )
+                # Which half of the group the restart came from, and where in the
+                # archive. Without these two columns "did reserve draws ever pay"
+                # is unanswerable, and that is the only question that retires the
+                # archive -- so they are written whether or not it is switched on.
+                population["reseed_source_bucket"] = (
+                    "reserve" if chosen.get("reserved") else "score"
+                )
+                population["reseed_source_cell"] = (
+                    list(chosen["cell"]) if chosen.get("cell") is not None else None
+                )
+                population["reseed_reserve_candidates"] = len(
+                    _capped_members(
+                        [member for member in members if member.get("reserved")], config
+                    )
+                )
             elif active is not None:
                 source_path, source_id = active.inference_artifact_path, active.checkpoint_id
             else:
                 source_path, source_id = None, None
 
-            source = (
-                OrderQNetwork.load(source_path)
-                if source_path is not None
-                else initial_network(config)
-            )
-            seeded = reseed.perturb(
-                source,
-                slot_spec.dropout,
-                slot_spec.shrink,
-                seed=int(config.get("seed", 0)) + slot.reseed_index + 1,
-                sigma_reset=noisy.sigma0 if slot_spec.sigma_reset else None,
-            )
+            # A warm start was already materialized and already rolled out -- see
+            # `_materialize_warm_start`. Load those exact bytes rather than
+            # drawing a second mask from the same seed: generation 0 was
+            # collected from this network, and a slot whose behaviour policy and
+            # trained policy are two different perturbations of one ancestor is
+            # the drift the comment below exists to prevent.
+            warm_network, warm_sidecar = warm_start_paths(context.artifacts)
+            adopted = warming and warm_network.is_file() and warm_sidecar.is_file()
+            if adopted:
+                recorded = json.loads(warm_sidecar.read_text())
+                if source_id is not None and str(recorded["checkpoint_id"]) != str(source_id):
+                    # The group moved between the collection and this update,
+                    # which nothing writes to it during generation 0 can cause.
+                    # Loud rather than silent: the alternative pairs one
+                    # ancestor's weights with another's provenance columns.
+                    raise ValueError(
+                        "warm start drifted: generation 0 collected from "
+                        f"{recorded['checkpoint_id']} but this update drew "
+                        f"{source_id}"
+                    )
+                source_id = str(recorded["checkpoint_id"])
+                seeded = OrderQNetwork.load(warm_network)
+            else:
+                source = (
+                    OrderQNetwork.load(source_path)
+                    if source_path is not None
+                    else initial_network(config)
+                )
+                seeded = reseed.perturb(
+                    source,
+                    slot_spec.dropout,
+                    slot_spec.shrink,
+                    seed=int(config.get("seed", 0)) + slot.reseed_index + 1,
+                    sigma_reset=noisy.sigma0 if slot_spec.sigma_reset else None,
+                )
             # The same guard the exported candidate goes through. A perturbation
             # that somehow zeroed the trunk produces a network with no gradient
             # outside its output bias, and a slot restarted onto one can never

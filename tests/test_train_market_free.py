@@ -105,7 +105,7 @@ def test_policy_kinds_do_not_collide_with_the_scaffolded_learner():
 
 
 def test_the_session_and_every_model_name_move_together():
-    """They moved at v23 for the roster, and again at v26 for the reward.
+    """They moved at v23 for the roster, and at v26 and v27 for the reward.
 
     They have to. `all_batches`, `_self_play_pool`, `lineage_checkpoint`,
     `training_models.active_checkpoint_id` and the slot state are every one of
@@ -114,19 +114,92 @@ def test_the_session_and_every_model_name_move_together():
     with nine cold slots and one carrying the stalled trajectory the population
     exists to leave. The mature group would then be seeded from exactly that.
 
-    v26 is the other trigger, and the stronger one. `OUTCOME_LOG_SCALE` replaced
-    a margin-based outcome with an absolute one, so a shaped return is not the
-    same quantity it was: every v25 episode in the buffer is mislabelled and
-    every v25 checkpoint was fitted to the old labels. Renaming is what severs
-    all four scopes at once.
+    A reward change is the other trigger, and the stronger one. At v26
+    `OUTCOME_LOG_SCALE` replaced a margin-based outcome with an absolute one; at
+    v27 `INSOLVENCY_GRACE_TURNS` stopped charging the dip between a purchase and
+    its sale. Either way a shaped return is not the same quantity it was: every
+    episode already in the buffer is mislabelled and every checkpoint was fitted
+    to the old labels. Renaming is what severs all four scopes at once.
 
     The earlier rule this replaces still holds for the ordinary case: a name is
     kept across a change that only moves the behaviour distribution, because v20's
     batches are the same kind of sample and inheriting them is the buffer working
     as intended. A reward change forces a new name; so does the roster.
+
+    The session id moves on a superset of that: `ensure_session` digests the league
+    config and this file's `model_config` together, so any `FREE_CONFIG` change
+    raises "run manifest mismatch" on a resume. v27 moves both.
+
+    v28 and v29 moved them for a third reason, weaker than a reward change and
+    still sufficient: `FREE_CONFIG` gained `population_slots` and then
+    `rare_sigma_novelty`, either of which raises "run manifest mismatch" on a
+    resume. The prefix follows so a run is not half count-arm batches and half
+    rate-arm ones in one buffer.
+
+    v30 folds the rate arm together with `LAND_POTENTIAL_WEIGHT`, so it is back to
+    the strong reason: the reward changed, and every earlier episode in the ring
+    would be mislabelled against it.
+
+    v31 is back to the weak one -- `rare_sigma_cap` alone, with the reward
+    untouched, so v30's money series stays directly comparable and is the control.
+    It still has to move, because `ensure_session` digests `FREE_CONFIG` and any key
+    here breaks a resume.
+
+    v32 is the strongest reason yet and it is not a config change at all: the
+    `planting.py` overlay was letting every non-melon seed take a tile the donor
+    had planned for melon, so every batch in every earlier session was collected
+    under a different farm than this one runs. The reward moved with it
+    (`LAND_PURCHASE_BONUS`), so both halves of the rule apply.
+
+    v33 is the strong reason on its own: `LAND_PURCHASE_BONUS` moves 0.02 -> 0.035
+    and nothing else does, so `ensure_session` would have resumed v32 without
+    complaint and left one session holding two reward regimes. Nothing in the
+    digest changed, which is why the rename has to carry it.
+
+    v34 is the first entry where the two names come apart, and that is the rule
+    working rather than an oversight. `opponents` gains the donor, which is a
+    `FREE_CONFIG` key, so `ensure_session` refuses a resume and `SESSION_ID` has to
+    move. The reward is untouched, so v33's episodes are the same quantity under
+    the same shaped return and `SLOT_PREFIX` stays: inheriting that buffer, its
+    self-play pool and its LR state is the point, not a hazard. The assertion below
+    pins both halves so a later change cannot quietly move one without the other.
+
+    v35 is the same shape as v34 and for a duller reason: `CONCURRENCY` is part of
+    `LeagueConfig`, which `ensure_session` digests, so three throughput changes
+    (`gradient_steps_per_batch`, `CONCURRENCY`, `promotion_seeds`) could not land on
+    a session that had already collected a generation. None of them touches the
+    reward, so `SLOT_PREFIX` stays again and v34's lineages carry forward whole.
+
+    v36 brings the two back together on the strong reason. `LOT_CREDIT_WEIGHT`
+    moves a seed lot's realised proceeds to the turn the seed was bought, so a
+    shaped return is not the quantity it was in v33-v35 however unchanged the
+    money is: the same episode now carries its credit on different turns, and a
+    checkpoint fitted to the old placement is fitted to different labels. The
+    reallocation being zero-sum does not rescue the inheritance -- the episode
+    total matching says nothing about the per-transition targets a buffer is
+    sampled for.
+
+    v37 is the same rule at the same strength, and v36 is the reason it is needed
+    so soon. `LOT_POTENTIAL_WEIGHT` replaces `LOT_CREDIT_WEIGHT` outright: the
+    credit is now a potential over held cost basis rather than a reallocation of
+    realised proceeds, so it is not a retune but a different kind of term. v36
+    charged the sale turn what it paid the buy turn, which preserved the episode
+    total and still cost the sale state its whole return-to-go while the buy
+    state recovered only `1 - gamma**D` of it -- a five-to-one sell deterrent at
+    melon's 240-turn cycle. Every v36 episode is labelled against that, so the
+    buffer and the checkpoints sever with the rename.
+
+    v38 is the weak reason again and the names come apart a second time.
+    `opponents` drops the donor and `self_play_ratio` returns to 0.65, both
+    `FREE_CONFIG` keys, so `ensure_session` refuses a resume and `SESSION_ID`
+    moves. The reward is untouched, so `SLOT_PREFIX` stays `lotbasis` and v37's
+    lineages continue -- which is the point rather than a concession: the whole
+    session exists to vary the opponent distribution against everything else held
+    fixed, and a severed buffer would make it vary two things.
     """
 
-    assert train_market_free.SESSION_ID == "market-free-logmoney-v26"
+    assert train_market_free.SESSION_ID == "market-free-mirroronly-v38"
+    assert train_market_free.SLOT_PREFIX == "lotbasis"
     names = [item["name"] for item in train_market_free.TRAINING_AGENTS]
     assert names == [
         f"{train_market_free.SLOT_PREFIX}_{index:02d}"
@@ -151,9 +224,32 @@ def test_the_core_budget_is_concurrency_times_jobs():
     config = train_market_free._effective_config()
     assert config.training_concurrency == train_market_free.CONCURRENCY
     assert train_market_free.FREE_CONFIG["jobs"] == train_market_free.JOBS_PER_LEARNER
-    # Not oversubscribed. The pools are `spawn` and unpinned BLAS workers that
-    # outnumber the cores are what `_single_threaded_workers` exists to prevent.
-    assert train_market_free.CONCURRENCY * train_market_free.JOBS_PER_LEARNER <= os.cpu_count()
+
+    # Mild oversubscription is allowed, and the exact-fit rule this replaces was
+    # sizing against a saturation that never happened: measured on v33, the box ran
+    # 12.7 busy cores of 32 under a 4 x 8 = 32 budget.
+    #
+    # What the old rule was really protecting is still protected, and not by this
+    # assertion: `sim/workers.py` pins `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 1
+    # on every worker, so the "unpinned BLAS workers outnumber the cores" failure
+    # cannot occur regardless of what this product is. Measured 150 threads across
+    # every python process, against the ~1,300 an unpinned cohort would carry.
+    #
+    # The ceiling is 2x rather than unbounded because these are `spawn` pools with
+    # a real per-process memory and startup cost, and past a queue a couple deep
+    # the scheduler stops buying anything.
+    assert train_market_free.CONCURRENCY * train_market_free.JOBS_PER_LEARNER <= 2 * os.cpu_count()
+
+    # The two knobs are waves, not a budget, which is why the product is the wrong
+    # thing to minimise. Ten models over `CONCURRENCY` threads and 16 episodes over
+    # `JOBS_PER_LEARNER` workers are both `list(pool.map(...))` barriers, so the
+    # round costs the product of the two wave counts. 4x8 is 3 x 2 = 6; 5x8 is
+    # 2 x 2 = 4. Every combination that keeps the product under 32 -- 5x6, 10x3 --
+    # is back at 6, which is why staying inside the old rule could not win.
+    model_waves = -(-train_market_free.LEARNERS // train_market_free.CONCURRENCY)
+    episode_waves = -(-16 // train_market_free.JOBS_PER_LEARNER)
+    assert model_waves * episode_waves <= 4
+
     # No point running more slots at once than there are slots.
     assert train_market_free.CONCURRENCY <= train_market_free.LEARNERS
 
@@ -481,19 +577,25 @@ def test_the_release_is_gated_on_a_fixed_benchmark():
     `falloff_v1` released nine of those in a row. The ratchet reads the
     candidate's own money against the fixed benchmark instead.
 
-    `resume_reset_after_rejections` is off under the population, and that is not
-    caution. The snapback and the population answer the same question -- this
-    trajectory has gone bad, restart it from something better -- and the snapback
-    answers it by restoring the slot's own incumbent, whose score is exactly what
-    the plateau detector reads. Leaving both on pins `lr_best_score` with the
-    mechanism meant to rescue the slot, and the slot never reaches its cut.
+    `resume_reset_after_rejections` was off under the population, and that was not
+    caution: the snapback restores the slot's own incumbent, whose score was
+    exactly what the plateau detector read, so leaving both on pinned
+    `lr_best_score` with the mechanism meant to rescue the slot. `lr_score_signal`
+    broke that coupling by moving the detector onto the rollout ring, so v27 turns
+    it back on -- and the three escape routes are now distinct: `lr_best_decay` for
+    a detector misreading a slot that is still improving, the population for one
+    that has genuinely stopped, and this for one that has diverged with nothing of
+    its own left to climb.
     """
 
     config = _manifest()["models"][0]["config"]
 
     assert config["promotion_rule"] == "benchmark_ratchet"
-    assert config["resume_reset_after_rejections"] == 0
-    assert train_market_free.FREE_CONFIG["resume_reset_after_rejections"] == 0
+    assert config["resume_reset_after_rejections"] == 2
+    assert train_market_free.FREE_CONFIG["resume_reset_after_rejections"] == 2
+    # The coupling that switched it off has to actually be gone, or this is a
+    # snapback feeding the plateau detector its own reference again.
+    assert config["lr_score_signal"] == "rollout"
     assert config["lr_graduate_cut"] > 0.0, "the population must be the live escape route"
     # The rule lives in the manifest, so the runner cannot disagree with it.
     assert "promotion_rule" not in train_market_free.FREE_CONFIG
@@ -568,3 +670,46 @@ def test_runner_uses_an_isolated_artifact_root_and_global_device():
     assert league.league == "dqn_market_free"
     assert train_market_free.ARTIFACTS == ARTIFACTS_ROOT / "dqn_market_free"
     assert train_market_free._device() == "auto"
+
+
+def test_the_archive_changes_retention_and_leaves_the_generator_alone():
+    """v28 adds no exploration. The roster stays uniform and v27 is the control.
+
+    Worth pinning because the obvious pairing -- give some slots the directed
+    widening and not others -- is wrong here. `rare_sigma_gain` is already 1.0 on
+    all ten slots and has been since v27, so a split could only be built by turning
+    it *down* on eight of them, and the comparison that buys is against a run worse
+    than the one already measured.
+
+    What v27 lacks is retention: the widening surfaces rare rows -- every run
+    spikes to 15-22% land purchase around generation 4 -- and the score-ranked cull
+    drops the result within a few generations.
+    """
+
+    by_name = {item["name"]: item["model_config"] for item in train_market_free.TRAINING_AGENTS}
+    gains = {config.get("rare_sigma_gain", 0.0) for config in by_name.values()}
+    assert gains == {train_market_free.FREE_CONFIG["rare_sigma_gain"]}
+    assert gains == {0.5}, "on, and uniform across the roster"
+    # 0.5 rather than v28's 1.0 because the arms are not calibrated alike. On v26's
+    # folded counts the rate arm at 0.5 puts WHEAT q1 at 1.000, MELON q1 at 1.846
+    # and BUY_LAND at the 3.0 cap, with 10 of 186 rows saturated; at 0.75 a third
+    # of the space saturates and the ordering between rare rows is destroyed.
+    novelty = {config["rare_sigma_novelty"] for config in by_name.values()}
+    assert novelty == {"rate"}
+    # And the manifest stays the count arm, so it still describes v25 through v28
+    # and the rate arm has a control to be read against.
+    assert _manifest()["models"][0]["config"]["rare_sigma_novelty"] == "count"
+
+    # The archive is the whole change, and its floor has to be a real bar: seats
+    # that buy land finish on a median of 7 coins against 3,000 for the rest.
+    manifest_config = _manifest()["models"][0]["config"]
+    assert 0 < manifest_config["mature_reserved_capacity"] < manifest_config["mature_capacity"]
+    assert manifest_config["mature_reserved_min_money"] > 0.0
+    assert 0.0 < manifest_config["reseed_source_explorer_share"] < 1.0
+
+    # And the roster size reaches the updater, which cannot see the other slots --
+    # `_reseed_source`'s whole-roster spread needs it to know which ordinals are
+    # the tail before it can hand them the reserved cells.
+    assert all(
+        config["population_slots"] == train_market_free.LEARNERS for config in by_name.values()
+    )

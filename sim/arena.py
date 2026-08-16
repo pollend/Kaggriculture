@@ -20,7 +20,7 @@ from typing import Any
 from sim import registry
 from sim.metrics import Summary, render, summarize
 from sim.runner import MatchResult, run_match
-from sim.workers import discard_pool, worker_pool
+from sim.workers import MAP_TIMEOUT_SECONDS, discard_pool, worker_pool
 
 
 def _job(args: tuple[tuple[str, str], int, dict[str, Any]]) -> MatchResult:
@@ -54,11 +54,22 @@ def play_series(
         # have to hold one.
         with worker_pool(jobs) as pool:
             try:
-                outcomes = list(pool.map(_job, tasks, chunksize=1))
+                outcomes = list(
+                    pool.map(_job, tasks, chunksize=1, timeout=MAP_TIMEOUT_SECONDS)
+                )
             except BrokenProcessPool:
                 discard_pool(pool)
                 with worker_pool(jobs) as retry:
-                    outcomes = list(retry.map(_job, tasks, chunksize=1))
+                    outcomes = list(
+                        retry.map(_job, tasks, chunksize=1, timeout=MAP_TIMEOUT_SECONDS)
+                    )
+            except TimeoutError:
+                # A pool that stalled must not go back on the free-list, or the
+                # next caller checks out the same wedged workers and inherits the
+                # hang. Dropped, and the timeout propagates: a series this far
+                # over budget is a bug to surface, not one to quietly replay.
+                discard_pool(pool)
+                raise
 
     return {seed: (outcomes[2 * i], outcomes[2 * i + 1]) for i, seed in enumerate(seeds)}
 

@@ -235,9 +235,24 @@ class ExperimentStore:
             )
 
     def add_replay_payload(self, match_id: str, replay: Any) -> str:
+        """Store one episode's replay, gzipped.
+
+        `compresslevel` is 1 rather than the default 6 because this runs on the
+        collecting thread, in the parent interpreter, once per episode. A free
+        market generation commits ~4,600 of them across only `training_concurrency`
+        threads, so the compression is GIL-bound work sitting directly on the
+        round's critical path -- level 6 is roughly 3x the CPU of level 1 for about
+        10% better ratio, which is the wrong side of that trade when
+        `episode_payloads` is already 15 GB of a 16 GB database and the bottleneck
+        is wall clock rather than disk.
+
+        The digest is taken over the *uncompressed* bytes, so it is unchanged by
+        this and payloads written at either level stay comparable.
+        """
+
         raw = json.dumps(replay, sort_keys=True, separators=(",", ":")).encode()
         digest = hashlib.sha256(raw).hexdigest()
-        payload = gzip.compress(raw, compresslevel=6)
+        payload = gzip.compress(raw, compresslevel=1)
         self.connection.execute(
             """INSERT INTO episode_payloads VALUES (%s, %s, %s)
             ON CONFLICT (match_id) DO UPDATE SET

@@ -254,8 +254,89 @@ _HIRE_HANDS = np.asarray(HIRE_QUANTITIES, dtype=np.intp)
 MASKED_SCORE = -1e4
 
 
+#: Earliest day a land purchase is offered. Measured over the 7,342 accepted
+#: purchases on record: day 0 finishes on a mean of 190 coins across 2,124 seats,
+#: day 1-4 on 1,025 and day 5-9 on 1,026. Day 0 alone is 29% of every purchase
+#: ever made and is the whole of the bankruptcy tail -- 1,000 against the 3,000
+#: stake, spent before a single crop has been sold. Opening at 1 rather than the
+#: donor's 5 because day 1-4 and day 5-9 are indistinguishable in the data and
+#: the earlier band is worth keeping.
+LAND_MIN_DAY = 1
+
+#: Days that must remain for a quadrant to pay for itself. Land has no salvage
+#: value -- the episode reward is cash on hand -- so a purchase after this point
+#: is a pure write-off. Day 18+ purchases finish on 616 while planting 2.0 of the
+#: 25 tiles they bought: cash dumped at the buzzer.
+LAND_MIN_DAYS_LEFT = 12
+
+
+def _land_is_survivable(
+    obs: dict,
+    farm: dict,
+    private: dict,
+    money: float,
+    extra: int,
+    roles: dict | None,
+) -> bool:
+    """Whether a quadrant can be worked, not merely afforded.
+
+    The single exception to this module's "feasibility, not preference" rule.
+    Affordability alone offers 1,000 against the 3,000 stake on turn 0, and the
+    measured result of taking it is 190 coins. Worse, **49.4% of all accepted
+    purchases planted zero of their 25 new tiles** -- the money bought area the
+    farm had neither the seed nor the hands to use.
+
+    So the test is readiness, in the farm's own terms:
+
+    * the seed already held covers every vacant crop role the plan wants filled,
+      so the new tiles are not competing for seed the old ones still need;
+    * cash covers the price *and* a day's hiring up to what the field plan asks
+      for. Hands expire nightly and are re-hired each morning, so hiring is a
+      recurring daily cost -- reserving one day's worth is what "can still staff
+      the farm tomorrow" means, and reserving the whole season would never fire.
+
+    This was tried once before and reverted, and the reason is worth keeping in
+    view: under the old day-and-reserve gate "the policy stopped buying land
+    entirely rather than buying it later". A masked row is starved of gradient,
+    so its Q value goes stale and is arbitrary whenever the gate opens. What
+    differs now is that `rare_sigma_gain` is on: `rare.sigma_scale_vector` pins
+    the widening to 1.0 where `opportunities <= 0`, so the row gets nothing on
+    gated turns and the full multiplier on open ones -- which is the regime the
+    earlier attempt never ran in. Watch `land_tiles_planted_per_purchase` and
+    `buy_land_rate` together; the rate going to zero is the known failure.
+    """
+
+    day = int(obs.get("day", 0) or 0)
+    if day < LAND_MIN_DAY:
+        return False
+    if donor.TOTAL_DAYS - day < LAND_MIN_DAYS_LEFT:
+        return False
+    # Tighter than the simulator, which sells three. The third costs 4,000 and
+    # nothing on record has come close to working two.
+    if extra >= donor.MAX_EXTRA_LAND:
+        return False
+
+    # `main.py` has already built this for the turn; recomputing it is only for
+    # callers that do not, and it is reached only once the cheap tests above pass.
+    if roles is None:
+        roles = donor._role_plan(obs, farm)
+
+    if sum(donor._seed_needs(obs, farm, private, roles).values()) > 0:
+        return False
+
+    target = donor._target_hands(obs, farm, private, roles)
+    hired = int(farm.get("hires_today", 0) or 0)
+    hiring = float(sum(donor._fib(index) for index in range(hired, target)))
+    return money >= float(donor.LAND_PRICES[extra]) + hiring
+
+
 def feasible_actions(
-    obs: dict, farm: dict, private: dict, field: dict, config=None
+    obs: dict,
+    farm: dict,
+    private: dict,
+    field: dict,
+    config=None,
+    roles: dict | None = None,
 ) -> np.ndarray:
     """[ACTION_COUNT] bool: True where the simulator would commit at least one unit.
 
@@ -266,14 +347,8 @@ def feasible_actions(
     same way `order_is_structurally_possible` already removes orders the game can
     never accept without expressing a view on the rest.
 
-    `BUY_LAND` was gated on the day and a cash reserve for one session and is
-    not any more, so the claim above is unqualified again. The measurement that
-    motivated it stands and is recorded in the roadmap: land-buying seats finish
-    far behind the rest because `LAND_PRICES` opens at 1,000 against a 3,000
-    stake, so the purchase is offered on turn 0 before any revenue exists. What
-    the gate could not show is that forbidding it *helps* -- under it the policy
-    stopped buying land entirely rather than buying it later. Revisit with that
-    evidence rather than from scratch.
+    `BUY_LAND` is the one exception to "feasibility, not preference", and it is
+    deliberate. See `_land_is_survivable` for the rule and the evidence.
 
     It exists because roughly half the action space is unusable until the farm
     produces something. Measured on a live run: SELL is 88 of the 186 actions,
@@ -340,7 +415,8 @@ def feasible_actions(
 
     extra = max(0, len(farm.get("unlocked_quadrants", ["NW"]) or ["NW"]) - 1)
     if extra < len(donor.LAND_PRICES) and money >= float(donor.LAND_PRICES[extra]):
-        mask[_BUY_LAND_ROW] = True
+        if _land_is_survivable(obs, farm, private, money, extra, roles):
+            mask[_BUY_LAND_ROW] = True
 
     # Every hand in the order has to be affordable, not just the first.
     #
