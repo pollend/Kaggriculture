@@ -11,15 +11,8 @@ State-dependent choices -- affordability, sale quantities, land timing, the feed
 floor, and terminal liquidation -- remain entirely for the network to learn from
 reward.
 
-One order per turn, not a list of ten. The earlier design factored the action
-into `MAX_MARKET_ORDERS` independent slots scoring a shared candidate grid, with
-total Q as the sum over slots. That sum is the only thing the TD target ever
-saw, so no slot received its own credit: once the network valued an order, every
-slot's argmax picked *that same order*, and one good buy became a tenfold spend.
-Measured over fourteen updates, every candidate produced that way finished a
-3,000-coin season near zero. Decisions here are turn-scale -- 720 an episode --
-so a single order per turn is ample throughput, and it makes the value function
-an ordinary Q(s, a) again.
+One order per turn, not a list of ten, which keeps the value function an ordinary
+Q(s, a). At 720 decisions an episode the throughput is ample.
 """
 
 from __future__ import annotations
@@ -28,46 +21,31 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from agents.dqn_market_free import donor
+from agents.dqn_market_free import donor, herd
 
-# The state half lives in `market_state.py` and is imported directly by whoever
-# needs it. It uses the same schema as the scaffolded agent: prices, market
-# inventory, the shed, the herd, and -- the part that matters here -- the donor's
-# own planning state, its seed deficit, its animal deficit, its hand target, its
-# phase. This module is only about what the agent may *do*.
+# The state half lives in `market_state.py`. This module is only about what the
+# agent may *do*.
 
 PRODUCTS: tuple[str, ...] = tuple(donor.PRODUCTS)
 CROPS: tuple[str, ...] = tuple(donor.CROPS)
 ANIMALS: tuple[str, ...] = tuple(donor.ANIMALS)
 
-#: Quantity ladder for bulk goods. Roughly geometric -- the marginal value of one
-#: more unit falls off with the price impact of the fill, so the interesting
-#: decisions are at the order of magnitude, not the unit -- but dense at the
-#: bottom and stretched to 45.
-#:
-#: The range is set by what real agents actually do. Stored league replays place
-#: orders at every quantity from 1 to 18 and then sparsely up to 45, so a
-#: shorter ladder cannot represent the behaviour `training/clone.py` reads out of
-#: them: snapping 13 to 16 and 45 to 25 distorts exactly the decisions being
-#: cloned. Eleven levels covers the observed range with a worst-case snap error
-#: under 20%.
+#: Quantity ladder for bulk goods: roughly geometric, since price impact makes the
+#: interesting decisions order-of-magnitude rather than per-unit, but dense at the
+#: bottom. The range is set by what stored replays actually contain -- every
+#: quantity from 1 to 18 and then sparsely to 45 -- so a shorter ladder would
+#: distort the behaviour `training/clone.py` reads out of them.
 QUANTITIES: tuple[int, ...] = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 45)
 
 #: Animals are indivisible capital at 300-500 each against a few thousand in
 #: cash, so the ladder is short.
 ANIMAL_QUANTITIES: tuple[int, ...] = (1, 2, 4)
 
-#: `HIRE` carries a hand count, and it is the one operation that has to.
-#:
-#: Hiring N hands means N separate `["HIRE"]` orders on the *same* turn: the
-#: fibonacci cost ladder is keyed on `hires_today`, hands last only the day they
-#: were hired, and a hand hired at hour 5 has lost a fifth of its shift. Spread
-#: over consecutive turns it is a different, worse action.
-#:
-#: Measured on a full donor episode, this is the difference between a usable
-#: demonstration set and a crippled one: of the 505 orders a one-order-per-turn
-#: agent had to drop, 314 were repeated HIREs, and the donor issues up to 9 in a
-#: single turn at each day boundary.
+#: `HIRE` carries a hand count, and it is the one operation that has to. Hiring N
+#: hands means N separate `["HIRE"]` orders on the *same* turn: the fibonacci cost
+#: ladder is keyed on `hires_today`, hands last only the day they were hired, and a
+#: hand hired late has lost part of its shift. Spread over consecutive turns it is
+#: a different, worse action.
 HIRE_QUANTITIES: tuple[int, ...] = tuple(range(1, int(donor.MAX_HANDS) + 1))
 
 
@@ -107,7 +85,20 @@ class Order:
 
 MARKET_BUYABLE_PRODUCTS = frozenset(("WHEAT", "FERTILIZER"))
 FIELD_CROPS = frozenset(donor.CROPS)
-FIELD_ANIMALS = frozenset(donor.CORE_HERD_SEQUENCE)
+
+#: Animals this agent's field layer can house, which is not the donor's herd.
+#:
+#: **Do not put `donor.CORE_HERD_SEQUENCE` back here on its own.** Deriving the head
+#: from a frozen donor constant is what silently made EGG unsellable: the donor's
+#: sequence is COW/SHEEP, so `REACHABLE_PRODUCTS` lost EGG, so `SELL EGG` was filtered
+#: out of `ACTIONS` below and `order_index("SELL", "EGG", n)` returned None -- there
+#: was no gate to inspect and no masked row to see, the column did not exist.
+#:
+#: The goose comes from `herd.py`, which gives a bought bird a coop the donor's
+#: planner would never assign. This set and that module have to agree exactly: an
+#: animal here that `herd` cannot house strands the purchase, and one `herd` houses
+#: that is missing here can never be bought.
+FIELD_ANIMALS = frozenset({*donor.CORE_HERD_SEQUENCE, herd.GOOSE})
 REACHABLE_PRODUCTS = frozenset(
     {
         *FIELD_CROPS,
@@ -126,8 +117,13 @@ def order_is_structurally_possible(order: Order) -> bool:
     or produce.
     """
 
-    if order.op in ("NOOP", "BUY_LAND", "HIRE"):
+    if order.op in ("NOOP", "HIRE"):
         return True
+    # `BUY_LAND` is not an action here at all. `land_score` decides it and
+    # `should_buy_land` emits it, so the head carries no column for it and there is
+    # no Q value to read -- see `LAND_BUY_SET_POINT`.
+    if order.op == "BUY_LAND":
+        return False
     if order.op == "BUY_PRODUCT":
         return order.item in MARKET_BUYABLE_PRODUCTS
     if order.op == "BUY_SEED":
@@ -142,17 +138,15 @@ def order_is_structurally_possible(order: Order) -> bool:
 def _enumerate_actions() -> tuple[Order, ...]:
     """Every order the network may emit, NOOP first.
 
-    Index 0 must stay NOOP. A network that scores every action equally breaks
-    ties to the lowest index, so an untrained policy trades nothing rather than
-    emitting a random order every turn. Doing nothing is a genuinely survivable
-    policy; a random one is not, and the difference decides whether the first few
-    hundred episodes carry any signal at all.
+    Index 0 must stay NOOP. A network that scores every action equally breaks ties
+    to the lowest index, so an untrained policy trades nothing rather than emitting
+    a random order every turn -- doing nothing is survivable and a random policy is
+    not.
 
-    Structurally impossible orders are filtered out here rather than masked at
-    score time. They were once retained so persisted action indices stayed
-    stable across the eligibility rule; nothing persisted uses the old numbering
-    any more, and carrying 91 permanently `-inf` rows through every forward pass
-    bought nothing.
+    Structurally impossible orders are filtered out here rather than masked at score
+    time, so the head carries no permanently dead rows. `BUY_LAND` is absent for the
+    same reason from the other direction: the row is reachable, but since v43 nothing
+    reads its Q, so a column for it is dead weight the learner still has to fit.
     """
 
     rows: list[Order] = [Order("NOOP")]
@@ -164,7 +158,6 @@ def _enumerate_actions() -> tuple[Order, ...]:
         rows += [Order("BUY_SEED", crop, quantity) for quantity in QUANTITIES]
     for animal in ANIMALS:
         rows += [Order("BUY_ANIMAL", animal, quantity) for quantity in ANIMAL_QUANTITIES]
-    rows.append(Order("BUY_LAND"))
     rows += [Order("HIRE", None, quantity) for quantity in HIRE_QUANTITIES]
     return tuple(order for order in rows if order_is_structurally_possible(order))
 
@@ -186,9 +179,14 @@ def order_index(op: str, item: str | None, quantity: int) -> int | None:
     is no meaningful nearest neighbour for those. An order this agent cannot
     emit at all -- unnameable, or structurally impossible -- returns None and the
     caller drops the demonstration slot rather than guessing.
+
+    `BUY_LAND` returns None like anything else off the head. It is not a
+    demonstration fault, though, so `training/clone.py` counts it on its own rather
+    than as an unreadable order: the demonstrator's quadrant is a decision this
+    agent's `land_score` makes for itself.
     """
 
-    if op in ("NOOP", "BUY_LAND"):
+    if op == "NOOP":
         return ACTION_INDEX.get((op, None, 0))
     if op == "HIRE":
         hands = min(max(1, int(quantity)), HIRE_QUANTITIES[-1])
@@ -203,7 +201,7 @@ def _indices_by_item(op: str) -> dict[str | None, np.ndarray]:
     """Action indices for one operation, grouped by item.
 
     Built once at import so a feasibility mask costs a handful of numpy slice
-    writes rather than a 186-iteration Python loop. This runs on every turn of
+    writes rather than a 199-iteration Python loop. This runs on every turn of
     every rollout episode.
     """
 
@@ -219,19 +217,105 @@ _BUY_PRODUCT_ROWS = _indices_by_item("BUY_PRODUCT")
 _BUY_SEED_ROWS = _indices_by_item("BUY_SEED")
 _BUY_ANIMAL_ROWS = _indices_by_item("BUY_ANIMAL")
 _HIRE_ROWS = _indices_by_item("HIRE").get(None, np.empty(0, dtype=np.intp))
-_BUY_LAND_ROW = ACTION_INDEX[("BUY_LAND", None, 0)]
 NOOP_INDEX = 0
+
+#: The land purchase, as a wire order rather than as an action.
+#:
+#: Off the head deliberately -- see `LAND_BUY_SET_POINT`. It still has to be an
+#: `Order`, because `MarketHistory.record_decision` encodes the last op into the
+#: state and "the turn I bought a quadrant" is worth a feature even when it is not
+#: worth a column.
+LAND_ORDER = Order("BUY_LAND")
+
+#: Each row's ladder quantity, so the seed affordability test is one vector compare
+#: rather than a Python loop on the per-turn path. Zero for NOOP, which carries no
+#: quantity.
+_ROW_QUANTITY = np.asarray([int(order.quantity) for order in ACTIONS], dtype=np.intp)
+
+#: Units of a crop the mask keeps open when none of it is held, whatever the plan says.
+#:
+#: Without this the cap is self-locking, and the lock is not hypothetical --
+#: `planting.market_influenced_roles` rewrites every vacant crop role from *held*
+#: seed in its second pass, so a farm hoarding wheat has its melon-planned tiles
+#: reassigned to wheat, `donor._seed_needs` then reports no melon demand, a strict cap
+#: shuts the melon rows, and no melon can ever be bought again. The plan follows the
+#: inventory, so a cap read only off the plan ratchets the agent into monoculture.
+#: Keying the floor on `held == 0` breaks the cycle: buy a few of a crop you hold none
+#: of, pass two plants them on spare tiles, the plan then wants that crop, and the
+#: full ladder unlocks on the deficit.
+#:
+#: 4 is the top of `QUANTITIES`' dense bottom (1, 2, 3, 4), it matches CARROT and
+#: TOMATO's `max_yield` and the donor plan's smallest per-crop allocation, and at
+#: melon's 80 coins it is 320 -- roughly a tenth of the stake, so a probe can never
+#: be a wallet event on its own.
+#:
+#: Watch `distinct_crops` and `top_crop_share`: crops collapsing toward 1 with the
+#: share toward 0.9 is this floor being too small. `trading_rate` falling toward the
+#: viability floor is the same thing seen from the other side -- raise this before
+#: reverting the cap.
+SEED_PROBE_UNITS = 4
+
+
+def seed_room(
+    obs: dict,
+    farm: dict,
+    private: dict,
+    roles: dict | None = None,
+    config=None,
+) -> dict[str, int]:
+    """Seed units per crop the mask will open, by crop, omitting the shut ones.
+
+    `donor._seed_needs` is the base: vacant tiles the plan wants, still plantable
+    today under `last_plant`, net of the seed already held. `SEED_PROBE_UNITS` is the
+    floor that keeps a crop reachable when none is held, which is what stops the cap
+    ratcheting into monoculture.
+
+    Deliberately *not* what `land_score` reads. That veto asks "does the plan still
+    want seed", which is the raw deficit; this asks "what may be bought", which
+    includes a probe for crops the plan has not asked for yet. Feeding the probe into
+    the land veto would leave it permanently vetoed, since some crop is almost always
+    held at zero.
+    """
+
+    if roles is None:
+        try:
+            roles = donor._role_plan(obs, farm)
+        except Exception:
+            # `feasible_actions` calls this every turn and its own contract is that it
+            # never raises -- `main.agent` swallows four exceptions an episode and the
+            # mask must not spend one. No plan is no proof of a deficit, and the proof
+            # is what opens the rows, so a malformed observation shuts them rather
+            # than reopening the old unbounded path.
+            return {}
+    try:
+        needs = donor._seed_needs(obs, farm, private, roles)
+    except Exception:
+        return {}
+
+    day = int(obs.get("day", 0) or 0)
+    held = private.get("seeds", {}) or {}
+    room: dict[str, int] = {}
+    for crop in CROPS:
+        allowance = int(needs.get(crop, 0) or 0)
+        # The probe rides the same `last_plant` gate `_seed_needs` applies, or it
+        # would leave "buy melon on day 25" open -- an order the game accepts and
+        # that can never mature, which is the class of divergence this cap exists
+        # to close.
+        if int(held.get(crop, 0) or 0) == 0 and day <= int(donor.CROPS[crop]["last_plant"]):
+            allowance = max(allowance, int(SEED_PROBE_UNITS))
+        if allowance > 0:
+            room[crop] = allowance
+    return room
 
 #: `HIRE n` costs `sum(_fib(hires_today) .. _fib(hires_today + n - 1))` times the
 #: hand multiplier, because `_do_hire` charges per hand and increments
 #: `hires_today` between them. Prefix sums turn that into one subtraction:
 #: `_FIB_PREFIX[h + n] - _FIB_PREFIX[h]`.
 #:
-#: The simulator puts no ceiling on `hires_today` -- only affordability stops it
-#: -- so the table is sized well past `MAX_HANDS`. It does not need to cover
-#: every reachable value: `_fib(40)` is already 165 million, so a farm that far
-#: into a day cannot afford another hand under any money the game produces, and
-#: falling off the end leaves the rows masked, which is the right answer.
+#: The simulator puts no ceiling on `hires_today`, only affordability, so the table
+#: is sized well past `MAX_HANDS`. It need not cover every reachable value --
+#: `_fib(40)` is 165 million, and falling off the end leaves the rows masked, which
+#: is the right answer.
 _FIB_PREFIX = np.concatenate(
     ([0.0], np.cumsum([float(donor._fib(index)) for index in range(64)]))
 )
@@ -241,93 +325,320 @@ _HIRE_HANDS = np.asarray(HIRE_QUANTITIES, dtype=np.intp)
 
 #: Score given to a masked action before an argmax, in both numpy and torch.
 #:
-#: Finite rather than -inf, and the same constant on both sides. Finite because
-#: a masked score can reach a multiply -- `-inf * 0.0` is nan, not zero, and one
-#: nan takes a whole minibatch down through the backward pass -- and because a
-#: cross-entropy whose target somehow landed on a masked class would return inf
-#: rather than a large, visible number. Shared because the numpy argmax and the
-#: torch argmax must break ties identically for identical weights, which is what
-#: the parity test between `policy.py` and `training/network.py` pins.
+#: Finite rather than -inf, for two reasons: a masked score can reach a multiply,
+#: and `-inf * 0.0` is nan, which takes a whole minibatch down through the backward
+#: pass; and a cross-entropy landing on a masked class would return inf rather than
+#: a large, visible number.
 #:
-#: -1e4 against Q values of single digits (`reward.MONEY_SCALE` sizes a season's
-#: return that way) leaves the ordering in no doubt.
+#: Shared by numpy and torch because the two argmaxes must break ties identically
+#: for identical weights, which the `policy.py` / `training/network.py` parity test
+#: pins. -1e4 against single-digit Q values leaves the ordering in no doubt.
 MASKED_SCORE = -1e4
 
 
-#: Earliest day a land purchase is offered. Measured over the 7,342 accepted
-#: purchases on record: day 0 finishes on a mean of 190 coins across 2,124 seats,
-#: day 1-4 on 1,025 and day 5-9 on 1,026. Day 0 alone is 29% of every purchase
-#: ever made and is the whole of the bankruptcy tail -- 1,000 against the 3,000
-#: stake, spent before a single crop has been sold. Opening at 1 rather than the
-#: donor's 5 because day 1-4 and day 5-9 are indistinguishable in the data and
-#: the earlier band is worth keeping.
+#: Earliest day a land purchase is offered. Day 0 is 29% of every purchase on record
+#: and the whole of the bankruptcy tail -- 1,000 coins against the 3,000 stake,
+#: spent before a single crop has been sold. Opens at 1 rather than the donor's 5
+#: because days 1-4 and 5-9 are indistinguishable in the data.
 LAND_MIN_DAY = 1
 
-#: Days that must remain for a quadrant to pay for itself. Land has no salvage
-#: value -- the episode reward is cash on hand -- so a purchase after this point
-#: is a pure write-off. Day 18+ purchases finish on 616 while planting 2.0 of the
-#: 25 tiles they bought: cash dumped at the buzzer.
+#: Days that must remain for a quadrant to pay for itself. Land has no salvage value
+#: -- the episode reward is cash on hand -- so a late purchase is a pure write-off.
 LAND_MIN_DAYS_LEFT = 12
 
 
-def _land_is_survivable(
+#: Tiles a quadrant unlocks. The board is 10x10 in four 5x5 quadrants, and
+#: `_do_buy_land` flips every `"LOCKED"` cell in the one it sells to `None` at once.
+QUADRANT_TILES = 25
+
+
+#: Extra quadrants this agent will buy, out of the three the simulator sells
+#: (`LAND_ORDER = ["NE", "SW", "SE"]` at 1,000 / 2,000 / 4,000, on top of a free NW).
+#: There is no fourth: four quadrants is the whole board.
+#:
+#: **The donor's `MAX_EXTRA_LAND = 2` is not this agent's number and was wrong
+#: here.** It is read out of a frozen file -- `donor.py` is byte-identical to the
+#: scorer's copy and license-pinned, so it cannot be edited -- and the reason given
+#: for it, "nothing on record has come close to working two", is false on the data:
+#: `land_accepted / land_buying_episodes` reaches 1.72-1.81 on `animallots_04/08`,
+#: `widecap_06` and `lotbasis_08`, so most buyers on those slots already take both
+#: and the cap binds. The leaderboard settles the direction: its best performers own
+#: all four quadrants.
+#:
+#: Raising it is safe *because the score is a score*. The third quadrant is 4,000
+#: coins and adds 25 tiles to a farm whose crew is already at the simulator's
+#: `MAX_HANDS = 13`, so it buys area with no labour to work it -- and that shows up
+#: directly in `land_utilisation`, which falls as soon as the second quadrant goes
+#: unworked and refuses the third on its own. A hard cap forbids the purchase the
+#: leaderboard says wins; the score prices it and declines it when the farm is not
+#: the kind that can use it.
+#:
+#: Watch `land_accepted / land_buying_episodes` against
+#: `land_tiles_planted_per_purchase`. Buyers moving past 2.0 with tiles per purchase
+#: holding is the change working; tiles per purchase falling as the ratio rises is
+#: the third quadrant being bought and abandoned, and the answer is to put this back
+#: to 2 rather than to touch the set point.
+LAND_MAX_EXTRA = len(donor.LAND_PRICES)
+
+
+#: Days of the expanded farm's wage bill to hold back on top of the land price.
+#:
+#: Hands are wiped at every day boundary and re-hired on a fibonacci ladder keyed to
+#: `hires_today`, so a day's wage is the whole prefix rather than the marginal hand:
+#: 143 coins at 10 hands, 609 at 13. A quadrant adds `QUADRANT_TILES` tiles, which
+#: raises due jobs, which raises `_target_hands` -- so the reserve is a function of
+#: the tile count, through the crew those tiles need.
+#:
+#: **Where that factor bites, measured rather than assumed.** `_target_hands` floors
+#: at 10 while `day <= 27` and the simulator caps at `MAX_HANDS = 13`, so the first
+#: quadrant moves the crew 10 -> 13 and the daily bill 143 -> 609, a 4.3x jump off a
+#: doubling of area. The second saturates against that cap and costs no more in
+#: wages -- it costs more in price instead, 2,000 against 1,000. So the tile term is
+#: live exactly once, which is also the only purchase anything on record has worked.
+#:
+#: **One day, chosen as the risk-taking end of a real trade.** One day is what
+#: "can still staff the farm tomorrow" means literally, and it is the smallest
+#: reserve that is still a reserve: hands are wiped nightly, so a farm that cannot
+#: cover one day's crew cannot work the tiles it just bought at all.
+#:
+#: The two directions this can be wrong, and the column that says which:
+#:
+#: * Too low, and expansion is bought out of the working capital the season runs
+#:   on. That is the v33 shape -- purchases landing on day 10.3 holding 1,965 coins
+#:   and finishing on a 304 median. At 609 a ready farm clears the set point around
+#:   1,767 on day 5, so that wallet does still buy.
+#: * Too high, and it is an off switch. Reserving until the new tiles pay back was
+#:   the alternative and is arithmetically dead: melon's `first_yield_day` is 10,
+#:   which at 609 a day is 6,090 coins against a run whose `mean_final_money` sits
+#:   near 3,500 -- the v10 day-gate outcome `roadmap.md` records, where the policy
+#:   stopped buying land at all and money fell.
+#:
+#: Read `buy_land_rate` against `land_tiles_planted_per_purchase` and the solvent
+#: fraction. Purchases rising while tiles worked stay flat is the first failure and
+#: this constant is the answer to it; `land_gate_open_rate` near zero is the second.
+LAND_RESERVE_DAYS = 1.0
+
+
+#: The set point on the land score. Land is bought when the score clears it.
+#:
+#:     horizon = clip((days_left - LAND_MIN_DAYS_LEFT) / (TOTAL_DAYS - LAND_MIN_DAYS_LEFT), 0, 1)
+#:     worked  = land_utilisation(farm)
+#:     runway  = clip((money - price - reserve) / reserve, 0, 1)
+#:     score   = horizon * worked * runway
+#:
+#: Land is decided by that score and the network is not consulted for it at all --
+#: which is why, since v44, there is no `BUY_LAND` column on the head to consult.
+#: A row nothing ranks is a row the learner still fits, still noises, still counts in
+#: `selection_entropy`, and still renumbers every index after it; leaving it in place
+#: cost all of that to represent a decision made somewhere else. `should_buy_land`
+#: emits `LAND_ORDER` directly and `choose_order` records the turn as NOOP, which is
+#: what the network actually contributed to it.
+#:
+#: v42 asked `Q(BUY_LAND) - Q(NOOP)` instead, and the row it read was dead:
+#: `buy_land_rate` ran 0.000-0.050 across all ten slots over batches 351-390, one
+#: purchase per twenty to two hundred episodes, against v33's 0.37. A gated row is
+#: starved of gradient, so its Q is arbitrary exactly when the gate opens, and every
+#: exploration lever aimed at the problem has been refused by measurement -- 212
+#: seats at sigma 3.159 bought zero quadrants, and every purchase on record happened
+#: at sigma <= 0.871. Land is chosen greedily or not at all.
+#:
+#: Why an argmax was the wrong home for it in the first place, kept because it is
+#: still the argument against putting it back:
+#:
+#: * **It is a capital decision priced on a marginal scale.** Every other row is a
+#:   turn's worth of coins; this one commits 1,000-4,000 against a payback 10-25
+#:   days out. `roadmap.md` measures the consequence -- `BUY_LAND` sits at *median
+#:   rank 33 of 104 feasible actions*. It does not need to be rank 1. It needs to be
+#:   "yes" at most twice in 720 turns, and an argmax has no way to say that.
+#: * **The competition it loses is one the simulator never staged.** `BUY_LAND` is a
+#:   market op resolved atomically against `maxMarketOrdersPerTurn = 10`, so it does
+#:   not contend with a farmer op at all. Ranking it against SELL and BUY_SEED is an
+#:   artefact of this module emitting one order per decision.
+#:
+#: The product is the point: a factor at zero is a veto, so the three cannot trade
+#: each other away. In particular `horizon` alone peaks on day 0 -- the timing that
+#: produced 649 of 707 purchases in the 0-3,000 money bucket -- and `worked` is what
+#: forbids it, because nothing is planted on turn 0 whatever the wallet says. The
+#: purchase therefore lands when the farm's own progress says so rather than on a
+#: hardcoded day like the donor's `LAND_OPEN_DAYS = (5, 9)`.
+#:
+#: 0.15 is the first measurement of this knob. It is the single dial: `land_gate_open_rate`
+#: near zero means it or `LAND_RESERVE_DAYS` is too tight, and this is the one to
+#: move first. Setting it to 0.0 buys on the vetoes alone, which is the loosest this
+#: knob goes; the pre-v42 revert -- put the row back in the argmax -- is no longer one
+#: constant away, because the column is gone.
+LAND_BUY_SET_POINT: float = 0.15
+
+
+def _daily_wage(hands: int, hire_mult: float) -> float:
+    """Coins to put `hands` hands in the field for one day, from a standing start.
+
+    The whole fibonacci prefix, not the marginal hand: `hires_today` resets at every
+    day boundary, so tomorrow's crew is bought again from rung zero.
+    """
+
+    index = min(max(0, int(hands)), _FIB_PREFIX.shape[0] - 1)
+    return float(hire_mult) * float(_FIB_PREFIX[index])
+
+
+def land_reserve(
+    obs: dict,
+    farm: dict,
+    private: dict,
+    roles: dict,
+    config=None,
+) -> float:
+    """Cash to hold back for the hands the *expanded* farm will need.
+
+    `_role_plan` builds no roles for a locked quadrant, so the post-purchase hand
+    target cannot be read off the plan -- it is scaled by tile count instead, which
+    is the same thing `_target_hands` is ultimately counting.
+    """
+
+    quadrants = max(1, len(farm.get("unlocked_quadrants", ["NW"]) or ["NW"]))
+    tiles_now = QUADRANT_TILES * quadrants
+    tiles_after = tiles_now + QUADRANT_TILES
+    target_now = max(0, int(donor._target_hands(obs, farm, private, roles)))
+    target_after = min(
+        int(donor.MAX_HANDS), -(-target_now * tiles_after // tiles_now)
+    )
+    hire_mult = float(donor._cfg(config, "farmHandCostMult", 1))
+    return LAND_RESERVE_DAYS * _daily_wage(target_after, hire_mult)
+
+
+def land_utilisation(farm: dict) -> float:
+    """Share of the unlocked board this farm is actually working, in [0, 1].
+
+    Counted off the tiles rather than off the role plan, and that is not a detail.
+    `planting.market_influenced_roles` rewrites every vacant crop role from the
+    seed actually held, so a farm holding seed for three tiles has a plan wanting
+    three tiles -- and a role-based utilisation reads it as nearly full while
+    twenty tiles sit bare. Measured: that read opened the gate on day 2 at 3,000
+    untouched coins, which is the day-0 purchase this whole score exists to refuse.
+
+    A tile counts as worked if something is on it that is not a weed: a standing
+    plant, an animal, or a structure waiting for one. `"LOCKED"` cells are not
+    tiles yet and are excluded on both sides of the ratio.
+    """
+
+    worked = idle = 0
+    for row in farm.get("tiles", []) or []:
+        for tile in row:
+            if tile == "LOCKED":
+                continue
+            if tile is None:
+                idle += 1
+            elif isinstance(tile, dict):
+                if tile.get("kind") == "WEED":
+                    idle += 1
+                else:
+                    worked += 1
+    return worked / max(1, worked + idle)
+
+
+def land_score(
     obs: dict,
     farm: dict,
     private: dict,
     money: float,
     extra: int,
     roles: dict | None,
-) -> bool:
-    """Whether a quadrant can be worked, not merely afforded.
+    config=None,
+) -> float:
+    """How much a quadrant is worth buying *now*, in [0, 1]. Zero means no.
 
-    The single exception to this module's "feasibility, not preference" rule.
-    Affordability alone offers 1,000 against the 3,000 stake on turn 0, and the
-    measured result of taking it is 190 coins. Worse, **49.4% of all accepted
-    purchases planted zero of their 25 new tiles** -- the money bought area the
-    farm had neither the seed nor the hands to use.
+    The single exception to this module's "feasibility, not preference" rule, and
+    since v43 it is a preference *score* rather than a readiness bool: the network
+    has no say in this row. Affordability alone offers 1,000 coins against the 3,000
+    stake on turn 0, and **49.4% of all accepted purchases planted zero of their 25
+    new tiles** -- the money bought area the farm had neither the seed nor the hands
+    to use.
 
-    So the test is readiness, in the farm's own terms:
+    Three vetoes and three factors. The vetoes are the old readiness test:
 
-    * the seed already held covers every vacant crop role the plan wants filled,
-      so the new tiles are not competing for seed the old ones still need;
-    * cash covers the price *and* a day's hiring up to what the field plan asks
-      for. Hands expire nightly and are re-hired each morning, so hiring is a
-      recurring daily cost -- reserving one day's worth is what "can still staff
-      the farm tomorrow" means, and reserving the whole season would never fire.
+    * mid-season, with `LAND_MIN_DAYS_LEFT` still to run and fewer than
+      `LAND_MAX_EXTRA` quadrants already bought;
+    * the seed already held covers every vacant crop role the plan wants filled, so
+      the new tiles are not competing for seed the old ones still need.
 
-    This was tried once before and reverted, and the reason is worth keeping in
-    view: under the old day-and-reserve gate "the policy stopped buying land
-    entirely rather than buying it later". A masked row is starved of gradient,
-    so its Q value goes stale and is arbitrary whenever the gate opens. What
-    differs now is that `rare_sigma_gain` is on: `rare.sigma_scale_vector` pins
-    the widening to 1.0 where `opportunities <= 0`, so the row gets nothing on
-    gated turns and the full multiplier on open ones -- which is the regime the
-    earlier attempt never ran in. Watch `land_tiles_planted_per_purchase` and
-    `buy_land_rate` together; the rate going to zero is the known failure.
+    The factors are lateness, utilisation and runway, multiplied so that any one of
+    them at zero refuses the purchase on its own. `worked` and the seed veto are
+    complementary rather than redundant: the veto catches a farm whose *plan* is
+    short of seed, and `worked` catches bare ground however the plan describes it.
+    They are also read off different things on purpose -- the veto off the effective
+    roles, utilisation off the tiles -- see `land_utilisation` for the measurement
+    that forced the split.
+
+    Watch `land_tiles_planted_per_purchase` against `buy_land_rate` and
+    `land_gate_open_rate`. A rate near zero with the gate open is impossible now --
+    the score *is* the decision -- so a rate near zero means the score never clears
+    `LAND_BUY_SET_POINT`, which is a constant to move rather than a policy to wait
+    on.
     """
 
     day = int(obs.get("day", 0) or 0)
     if day < LAND_MIN_DAY:
-        return False
-    if donor.TOTAL_DAYS - day < LAND_MIN_DAYS_LEFT:
-        return False
-    # Tighter than the simulator, which sells three. The third costs 4,000 and
-    # nothing on record has come close to working two.
-    if extra >= donor.MAX_EXTRA_LAND:
-        return False
+        return 0.0
+    days_left = donor.TOTAL_DAYS - day
+    if days_left < LAND_MIN_DAYS_LEFT:
+        return 0.0
+    if extra >= LAND_MAX_EXTRA:
+        return 0.0
 
     # `main.py` has already built this for the turn; recomputing it is only for
     # callers that do not, and it is reached only once the cheap tests above pass.
     if roles is None:
         roles = donor._role_plan(obs, farm)
 
+    # Seed the plan you have before buying a plan you do not.
+    #
+    # The raw deficit, deliberately not `seed_room`: that one carries a probe floor
+    # for crops held at zero, and since some crop almost always is, reading it here
+    # would veto land for the whole season. This veto also used to be gameable in the
+    # wrong direction -- driving the deficit to zero opened the land row, and
+    # over-buying was the cheapest way to do it. With the seed rows capped at the
+    # deficit, the only way to clear it is a purchase the plan can absorb, which is
+    # what the veto always meant.
     if sum(donor._seed_needs(obs, farm, private, roles).values()) > 0:
-        return False
+        return 0.0
 
-    target = donor._target_hands(obs, farm, private, roles)
-    hired = int(farm.get("hires_today", 0) or 0)
-    hiring = float(sum(donor._fib(index) for index in range(hired, target)))
-    return money >= float(donor.LAND_PRICES[extra]) + hiring
+    span = float(donor.TOTAL_DAYS - LAND_MIN_DAYS_LEFT)
+    horizon = min(1.0, max(0.0, (days_left - LAND_MIN_DAYS_LEFT) / span))
+
+    worked = land_utilisation(farm)
+
+    reserve = land_reserve(obs, farm, private, roles, config)
+    price = float(donor.LAND_PRICES[extra])
+    runway = min(1.0, max(0.0, (float(money) - price - reserve) / max(1.0, reserve)))
+
+    return horizon * worked * runway
+
+
+def should_buy_land(
+    obs: dict,
+    farm: dict,
+    private: dict,
+    roles: dict | None = None,
+    config=None,
+) -> bool:
+    """Whether to buy the next quadrant this turn. The whole land decision.
+
+    Affordability first, because `land_score`'s runway term needs a price to be
+    quoted against and there is none once the board is sold out.
+
+    This is the only decision in this module the network has no vote in, and it
+    deliberately does not go through the mask: a mask entry is a claim about what the
+    simulator would accept, and this is a claim about what is worth doing. Keeping
+    the two apart is what let the `BUY_LAND` column leave the head without the
+    decision leaving with it.
+    """
+
+    money = float(farm.get("money", 0) or 0)
+    extra = max(0, len(farm.get("unlocked_quadrants", ["NW"]) or ["NW"]) - 1)
+    if extra >= len(donor.LAND_PRICES) or money < float(donor.LAND_PRICES[extra]):
+        return False
+    score = land_score(obs, farm, private, money, extra, roles, config)
+    return score > 0.0 and score >= float(LAND_BUY_SET_POINT)
 
 
 def feasible_actions(
@@ -337,41 +648,43 @@ def feasible_actions(
     field: dict,
     config=None,
     roles: dict | None = None,
+    plantable: dict[str, int] | None = None,
 ) -> np.ndarray:
     """[ACTION_COUNT] bool: True where the simulator would commit at least one unit.
 
-    This is feasibility, not preference. Every rule below is read straight off
-    `_commit_unit`, `_do_hire` and `_do_buy_land` in the environment, so a False
-    here means the game would refuse the order outright -- never that the order
-    is unwise. Choosing among what remains is left entirely to the network, the
-    same way `order_is_structurally_possible` already removes orders the game can
-    never accept without expressing a view on the rest.
+    Feasibility, not preference. Every rule is read straight off `_commit_unit`,
+    `_do_hire` and `_do_buy_land`, so a False means the game would refuse the order
+    outright -- never that it is unwise.
 
-    `BUY_LAND` is the one exception to "feasibility, not preference", and it is
-    deliberate. See `_land_is_survivable` for the rule and the evidence.
+    **Forbidding an order the game would accept requires a proof that the order
+    cannot be worth taking.** Not a measurement that it usually is not: a proof. One
+    column now meets that bar, and no second should be added on statistics alone.
 
-    It exists because roughly half the action space is unusable until the farm
-    produces something. Measured on a live run: SELL is 88 of the 186 actions,
-    the policy emitted an order on 84% of turns, and the simulator accepted 1% of
-    them -- it was selling goods it did not own, and could not stop, because
-    nothing it could sell would exist until it first bought seed.
+    * `BUY_SEED`, past the plan's deficit. Seed is quoted at the constant
+      `CROPS[item]["seed"]` and commits into `private["seeds"]`, while `SELL` reads
+      `private["shed"]` only -- so seed can never be sold back, at any price, in any
+      state. `planting.py` drops what the tile plan cannot absorb, held seed does not
+      expire, and the reward stream liquidates it at nothing. A coin spent past the
+      deficit is therefore worth strictly less than the coin, always. See
+      `SEED_HEADROOM_TILES`.
 
-    An action counts as feasible when *one* unit would commit. `SELL WHEAT 45`
-    against a single wheat in the shed is feasible and fills partially, which is
-    exactly what the simulator does, so quantity never affects feasibility.
+    Four rules that decide the shape:
 
-    `field` is this turn's unit plan and is required. The environment applies
-    every DROP, PLACE and PICKUP *before* the market phase (`interpreter` calls
-    `_apply_unit_action` for both seats, then `_process_market`), so a hand
-    dropping a harvested melon this turn makes `SELL MELON` commit even though
-    the observation still shows an empty shed. Reading the raw shed alone would
-    forbid an order the game accepts -- the one direction this function must
-    never take.
-
-    Where the raw and post-field views disagree the permissive one wins:
-    `_post_field_storage` is a model of the simulator, not the simulator, so a
-    modelling error can only ever leave an extra action open -- which the game
-    then refuses exactly as it does today -- and never remove a real one.
+    * An action is feasible when *one* unit would commit. `SELL WHEAT 45` against a
+      single wheat fills partially, which is what the simulator does, so quantity
+      never affects feasibility. `HIRE` and `BUY_SEED` are the exceptions and for the
+      same reason: both spend on the whole quantity, so both are tested on it.
+    * `field` is this turn's unit plan and is required: the environment applies
+      every DROP, PLACE and PICKUP *before* the market phase, so a hand dropping a
+      harvested melon this turn makes `SELL MELON` commit even though the
+      observation still shows an empty shed.
+    * Where the raw and post-field views disagree the permissive one wins.
+      `_post_field_storage` is a model of the simulator, so an error there can only
+      leave an extra action open -- which the game then refuses -- and never remove
+      a real one.
+    * That permissiveness runs one way only. Where this function *does* forbid an
+      accepted order it is under the proof rule above, never under a model of the
+      simulator that might be wrong.
     """
 
     mask = np.zeros(ACTION_COUNT, dtype=np.bool_)
@@ -405,30 +718,37 @@ def feasible_actions(
         if has_room and money >= float(donor._price_at(item, stock - 1, obs)):
             mask[rows] = True
 
+    # Seed rows open only where the plan has a deficit to fill, and only at rungs the
+    # wallet covers *after* `choose_order` clamps them. Both halves are load-bearing:
+    # without the deficit test the 55 seed rows are open on essentially every turn of
+    # every episode, and without the affordability test on the clamped quantity a
+    # 3,600-coin order is offered against 80 coins and the simulator part-fills it by
+    # draining the wallet.
+    room = plantable if plantable is not None else seed_room(obs, farm, private, roles)
     for crop, rows in _BUY_SEED_ROWS.items():
-        if money >= float(donor.CROPS[crop]["seed"]):
-            mask[rows] = True
+        available = int(room.get(crop, 0))
+        if available <= 0:
+            continue
+        price = float(donor.CROPS[crop]["seed"])
+        quantities = _ROW_QUANTITY[rows]
+        # Rungs above the allowance are shut rather than clamped down onto it. Both
+        # bound the spend identically, but clamping would leave every rung above the
+        # allowance aliased onto the same emitted order -- eleven rows the argmax can
+        # pick between for one outcome, which is the row-count bias this cap is also
+        # meant to relieve. `_BUY_SEED_ROWS[crop]` is built in `QUANTITIES` order, so
+        # these line up positionally exactly as `_HIRE_HANDS` does.
+        mask[rows] = (quantities <= available) & (quantities * price <= money)
 
     for animal, rows in _BUY_ANIMAL_ROWS.items():
         if has_room and money >= float(donor.ANIMALS[animal]["cost"]):
             mask[rows] = True
 
-    extra = max(0, len(farm.get("unlocked_quadrants", ["NW"]) or ["NW"]) - 1)
-    if extra < len(donor.LAND_PRICES) and money >= float(donor.LAND_PRICES[extra]):
-        if _land_is_survivable(obs, farm, private, money, extra, roles):
-            mask[_BUY_LAND_ROW] = True
-
-    # Every hand in the order has to be affordable, not just the first.
-    #
-    # This is the one rule here that is stricter than `_do_hire`, which commits
-    # what it can and stops when the money runs out. It is still feasibility and
-    # not preference: `HIRE 13` against 700 coins partially commits as four
-    # hands, and `HIRE 4` is its own index on the same ladder, so no outcome the
-    # simulator would produce becomes unreachable -- only the mislabelled route
-    # to it does. Measured on `market-free-simple-v2`: hire cost is fibonacci in
-    # `hires_today`, so one `HIRE 13` is 609 coins against a 3,000 stake, and the
-    # policy that learned to emit it was bankrupt by turn four of 720 and spent
-    # the rest of the episode in a state where nothing but NOOP was feasible.
+    # Every hand in the order has to be affordable, not just the first. This is
+    # deliberately stricter than `_do_hire`, which commits what it can and stops
+    # when the money runs out -- do not "fix" the asymmetry. It is still
+    # feasibility: `HIRE 13` against 700 coins partially commits as four hands, and
+    # `HIRE 4` is its own index on the same ladder, so no reachable outcome is lost,
+    # only the mislabelled route to it.
     hire_mult = float(donor._cfg(config, "farmHandCostMult", 1))
     hires_today = int(farm.get("hires_today", 0) or 0)
     if hires_today + int(_HIRE_HANDS[-1]) < _FIB_PREFIX.shape[0]:
@@ -446,6 +766,11 @@ class OrderDecision:
     order: Order
     chosen: int  # index into ACTIONS
     mask: np.ndarray | None = None  # bool [ACTION_COUNT], feasibility at `state`
+    #: `should_buy_land` fired this turn, so `order` is `LAND_ORDER` and `chosen` is
+    #: NOOP. The two disagree on purpose: the wire carries a quadrant, and the row the
+    #: learner is credited with is the one the network actually contributed, which was
+    #: nothing.
+    buy_land: bool = False
 
     def wire(self) -> list[list]:
         """The order list as the simulator wants it; empty on NOOP."""
@@ -453,34 +778,59 @@ class OrderDecision:
         return self.order.to_wire()
 
 
+def _resolve(chosen: int, plantable: dict[str, int] | None) -> Order:
+    """The order a row emits, which for seed is the row clamped to the deficit.
+
+    `OrderDecision.chosen` stays the raw row index and only `.order` moves. That
+    split is load-bearing: `collect.Recorder.record_decision` stores the index into
+    `order_chosen`, `training/rare.py` bincounts it, and the replay buffer's masks are
+    keyed on it, so a clamped index would silently re-label which action the learner
+    took. The clamp is a property of the fill, not of the choice.
+    """
+
+    order = ACTIONS[chosen]
+    if plantable is None or order.op != "BUY_SEED":
+        return order
+    available = int(plantable.get(str(order.item), 0))
+    if available <= 0 or available >= int(order.quantity):
+        return order
+    return Order(order.op, order.item, available)
+
+
 def choose_order(
     state: np.ndarray,
     network,
     mask: np.ndarray | None = None,
+    plantable: dict[str, int] | None = None,
+    buy_land: bool = False,
 ) -> OrderDecision:
-    """Greedy argmax over the feasible action head.
+    """Greedy argmax over the feasible action head, with land taken out of it.
 
-    Exploration lives in the *weights*, not here. This took an `epsilon` and an
-    rng until v13, drawing a uniformly random real order on that fraction of
-    turns, and it was retired because the rate is the wrong thing to control: 97
-    of the 186 actions spend money, so every exploring turn was a forced purchase
-    chosen without reference to what the network believed anything was worth.
-    Measured at per-turn rates of 1.0, 0.1, 0.02 and even 0.005, the agent
-    finished the season on 5, 185, 48 and 4 coins from a 3,000 float while the
-    donor finished above 100,000. NoisyNet perturbs the weights instead, so the
-    argmax moves only among actions already near-tied in Q.
-
-    Directed exploration does not appear here either, for the same reason. A
-    structurally rare action is reached by widening *its own* sigma row in the
-    head -- see `training/rare.py` -- which keeps the mechanism zero-mean and
-    keeps this function a plain argmax over whatever the network just said.
+    Exploration lives in the *weights*, and neither NoisyNet nor the directed
+    widening in `training/rare.py` appears here: both are zero-mean perturbations of
+    the network, so this stays a plain argmax over whatever it just said. Keeping it
+    that way is what stops exploration forcing a purchase the policy has learned is
+    ruinous -- 99 of the 199 actions spend money.
 
     `mask` restricts the argmax to what the simulator would actually accept.
+
+    `buy_land` is `should_buy_land`'s answer and is not a row: the head has no
+    `BUY_LAND` column to rank, so the caller supplies the decision and the network is
+    not consulted. The quadrant takes the whole turn -- one market order is what this
+    module emits and `lots.py` reconciles the wallet against -- so the returned
+    decision carries `LAND_ORDER` on the wire and NOOP as the row the learner is
+    credited with. See `LAND_BUY_SET_POINT`.
     """
 
     if mask is None:
         mask = np.ones(ACTION_COUNT, dtype=np.bool_)
 
+    if buy_land:
+        # Resolved before the ranking, not inside it. The network still scored the
+        # state and the score is still discarded, which is the whole point of taking
+        # the row off the head rather than masking it.
+        return OrderDecision(state, LAND_ORDER, NOOP_INDEX, mask, buy_land=True)
+
     scores = np.asarray(network(state)).reshape(ACTION_COUNT)
     chosen = int(np.argmax(np.where(mask, scores, MASKED_SCORE)))
-    return OrderDecision(state, ACTIONS[chosen], chosen, mask)
+    return OrderDecision(state, _resolve(chosen, plantable), chosen, mask)

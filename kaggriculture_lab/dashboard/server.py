@@ -31,7 +31,7 @@ def make_server(
     # stream: that sharing is the point, since it makes N tabs on one page cost
     # one render rather than N.
     BoundDashboardHandler.render_cache = RenderCache()
-    server = ThreadingHTTPServer((host, port), BoundDashboardHandler)
+    server = ThreadingHTTPServer(("0.0.0.0", port), BoundDashboardHandler)
     server.daemon_threads = True
     server.database_available_at_startup = available  # type: ignore[attr-defined]
     # `server_close` is what tests and `serve` call on the way out; draining the

@@ -25,14 +25,13 @@ NOISY_LAYERS = ("none", "head", "all")
 class NoisyLinear(nn.Module):
     """Factorized Gaussian noisy linear layer (Fortunato et al., 2018).
 
-    Deliberately **not** a subclass of `nn.Linear`, and the reason is the
-    exporter rather than taste. `to_numpy` used to select layers with
-    `isinstance(layer, nn.Linear)`; a subclass passes that test, and whichever
-    tensor `layer.weight` happened to name would be exported. Name it anything
-    but the trained mean and the run ships a randomly initialized policy that
-    `has_inert_hidden_trunk` waves through because it is not all-zero, so the
-    gate rejects the candidate and every metric points at the policy instead of
-    at the export. `_exportable` dispatches on this class positively instead.
+    Deliberately **not** a subclass of `nn.Linear`, for the exporter's sake: a
+    subclass passes an `isinstance(layer, nn.Linear)` filter, so whichever tensor
+    `layer.weight` happened to name would be exported. Name anything but the
+    trained mean and the run ships a randomly initialized policy that
+    `has_inert_hidden_trunk` waves through -- the gate then rejects the candidate
+    and every metric points at the policy instead of the export. `_exportable`
+    dispatches on this class positively instead.
     """
 
     def __init__(self, in_features: int, out_features: int, sigma0: float = 0.5):
@@ -44,12 +43,10 @@ class NoisyLinear(nn.Module):
         self.weight_sigma = nn.Parameter(torch.empty(out_features, in_features))
         self.bias_mu = nn.Parameter(torch.empty(out_features))
         self.bias_sigma = nn.Parameter(torch.empty(out_features))
-        # Not persistent: `updater` syncs the target network with
-        # `target.load_state_dict(online.state_dict())` on every `target_sync`,
-        # and a persistent epsilon would copy the online network's *current*
-        # noise into the target, correlating the two sources until the next sync
-        # -- silently, and invisibly in every metric. It also keeps the buffers
-        # out of the `.pt` checkpoint and out of `_exportable`'s reach.
+        # Not persistent: the target network is synced with
+        # `load_state_dict(online.state_dict())`, so a persistent epsilon would copy
+        # the online network's *current* noise into the target and correlate the two
+        # sources until the next sync -- silently, and invisibly in every metric.
         self.register_buffer("epsilon_in", torch.zeros(in_features), persistent=False)
         self.register_buffer("epsilon_out", torch.zeros(out_features), persistent=False)
         self.reset_parameters()
@@ -73,20 +70,18 @@ class NoisyLinear(nn.Module):
     ) -> None:
         """Draw a fresh epsilon pair, optionally scaled.
 
-        Rebinds the buffers rather than filling them in place. The TD loop
-        resamples *between* forward passes, and mutating a tensor autograd saved
-        for backward either corrupts the gradient or raises outright.
+        Rebinds the buffers rather than filling them in place: the TD loop resamples
+        *between* forward passes, and mutating a tensor autograd saved for backward
+        corrupts the gradient or raises.
 
-        `scale` multiplies the *draw*, never `sigma`. The perturbation is
-        bilinear in the two epsilons, so folding the factor into one of them
-        scales the whole term by exactly `scale` -- and sigma stays the trained
-        parameter it is, so a scaled forward cannot leak into the checkpoint or
-        compound across repeated calls.
+        `scale` multiplies the *draw*, never `sigma`. The perturbation is bilinear in
+        the two epsilons, so folding the factor into one scales the whole term
+        exactly -- and sigma stays a trained parameter, so a scaled forward cannot
+        leak into the checkpoint or compound across calls.
 
-        A per-output vector is accepted as well, and applies only to a layer
-        whose width it matches: that is directed exploration, widening one
-        action's row rather than every action's. The numpy mirror in `policy.py`
-        takes the same argument under the same rule, which the parity test pins.
+        A per-output vector is also accepted, applying only to a layer whose width it
+        matches: directed exploration, widening one action's row. The numpy mirror in
+        `policy.py` takes the same argument under the same rule.
         """
 
         device = self.weight_mu.device
@@ -179,18 +174,12 @@ def build(
 def _exportable(module: nn.Sequential) -> list[nn.Module]:
     """Every parameter-bearing layer, in order, or a hard failure.
 
-    The filter this replaced -- `if isinstance(layer, nn.Linear)` -- silently
-    *skipped* anything it did not recognise. A layer type added to `build` and
-    not to the exporter therefore produced a short network: `to_numpy` would
-    return two layers instead of three, `has_inert_hidden_trunk` would inspect
-    `layers[:-1]`, see a nonzero 238x128 weight and wave it through, and `save`
-    would write it. The first evidence of the mistake was a shape error raised
-    inside an arena worker one update later, three call layers from the cause.
-
-    Skipping is never the right answer here: an unrecognised parameterised layer
-    means this exporter is out of date, and nothing downstream can detect that.
-    Activations carry no parameters and are genuinely not exportable, so they
-    are the one thing passed over.
+    Raises rather than skips, which is the point. A filter that silently ignores an
+    unrecognised layer produces a *short* network: the gate inspects `layers[:-1]`,
+    sees a nonzero weight and waves it through, and the first evidence is a shape
+    error inside an arena worker an update later. An unrecognised parameterised
+    layer means this exporter is out of date and nothing downstream can detect that.
+    Activations carry no parameters and are the one thing passed over.
     """
 
     exportable: list[nn.Module] = []

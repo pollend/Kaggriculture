@@ -1,24 +1,18 @@
 """Order-activity diagnostics for the free-market policy.
 
-The one number that separates this agent's two degenerate attractors is how
-often it trades: never is the NOOP collapse, on almost every turn is the
-bankruptcy collapse. These metrics make that visible without changing or
-filtering the policy's actions.
+The number that separates this agent's two degenerate attractors is how often it
+trades: never is the NOOP collapse, almost every turn is the bankruptcy collapse.
 
 Activity is counted by *effect*, not by emission, and that distinction is the
-whole point of this module. Invalid market orders are silent no-ops in the
-simulator, so a policy can emit an order every turn and change nothing. One
-measured run did exactly that: 57% of its decisions were `SELL WOOL 16` while it
-owned no sheep and therefore no wool, 40% were NOOP, and 98.4% of everything it
-emitted was rejected. Counting emissions reported 59% activity for a policy whose
-real activity was 1%, and the promotion gate's activity floor -- which exists
-precisely to catch a silent policy -- read that 59% and passed it.
+whole point of the module. Invalid market orders are silent no-ops, so a policy
+can emit an order every turn and change nothing -- one measured run sat on
+`SELL WOOL 16` for 57% of its decisions while owning no sheep, had 98.4% of its
+orders refused, and reported 59% activity against a real rate of 1%. The
+promotion gate's activity floor read that 59% and passed it.
 
-Effect is inferred from the money delta on the turn. The agent's own orders are
-the only thing that moves its cash, and every order the simulator accepts moves
-it by at least one coin: prices floor at 1, quantities start at 1, and hiring,
-land and seed all cost. So a turn that emitted an order and moved no money had
-that order refused.
+Effect is inferred from the money delta: the agent's own orders are the only
+thing that moves its cash, and every accepted order moves it by at least a coin.
+So a turn that emitted an order and moved no money had it refused.
 """
 
 from __future__ import annotations
@@ -75,17 +69,12 @@ class OrderDiagnostics:
 class BehaviorCounts:
     """What a policy *did*, as opposed to how often it did anything.
 
-    `OrderDiagnostics` above answers the activity question and deliberately
-    collapses every op into one counter, because the two attractors it separates
-    -- NOOP and bankruptcy -- are both visible in the rate alone. This one exists
-    for the opposite question: two policies trading at an identical rate can be
-    running completely different strategies, and the pool cannot hold them apart
-    unless something records which.
+    Two policies trading at an identical rate can be running completely different
+    strategies, and the pool cannot hold them apart unless something records which.
 
-    Kept separate from `OrderDiagnostics` rather than added to it because that
-    dataclass sums itself over `__dataclass_fields__`, which works only while
-    every field is a number. `seeds` is a mapping, so folding it in there would
-    break `__add__` for every existing caller.
+    Kept separate from `OrderDiagnostics` because that dataclass sums itself over
+    `__dataclass_fields__`, which works only while every field is a number. `seeds`
+    is a mapping, so folding it in would break `__add__`.
     """
 
     #: Episodes aggregated, so rates can be taken without a second count.
@@ -97,12 +86,10 @@ class BehaviorCounts:
     #: policy hedging one token crop against a staple does not read as diversified.
     seeds: dict[str, int] = field(default_factory=dict)
 
-    # Land *use*. `land` above says the policy asked for a quadrant, which is all
-    # the archive cell needs. It cannot distinguish the two explanations for land
-    # losing money -- that expanding is genuinely negative inside 30 days, or that
-    # the field scheduler never works the tiles -- and those want opposite fixes.
-    # Everything below is conditioned on purchases the simulator *accepted*,
-    # because only those cost money and gained tiles.
+    # Land *use*, conditioned on purchases the simulator *accepted*. `land` above
+    # cannot distinguish the two explanations for land losing money -- expanding is
+    # genuinely negative inside 30 days, or the scheduler never works the tiles --
+    # and those want opposite fixes.
 
     #: Quadrants that actually appeared in `unlocked_quadrants`.
     land_accepted: int = 0
@@ -124,12 +111,9 @@ class BehaviorCounts:
     #: per-episode figures above, which `episodes` would understate.
     land_episodes: int = 0
 
-    # Seed lots, from `lots.py`. `seeds` above says what was bought;
-    # these say whether it came back and how long it took, which is the only way
-    # to tell `LOT_POTENTIAL_WEIGHT` moving purchases *earlier* from it simply
-    # buying *more*. The ledger no longer feeds the reward -- the potential is
-    # state-only and needs no attribution -- so this is the whole of what it is
-    # for, and it is why the matching still has to be right.
+    # Seed lots, from `lots.py`. `seeds` above says what was bought; these say
+    # whether it came back and how long it took, which is the only way to tell
+    # `LOT_POTENTIAL_WEIGHT` moving purchases *earlier* from it simply buying more.
 
     #: Purchase lots opened, and how many of them ever saw a matched sale.
     seed_lots: int = 0
@@ -141,6 +125,33 @@ class BehaviorCounts:
     #: Turns from a lot's purchase to its first matched sale, summed over matched
     #: lots. The distance the credit used to have to cross.
     seed_holding_turn_sum: float = 0.0
+    #: Coins `reward.SEED_WASTE_WEIGHT` charged back onto buy turns, summed per lot
+    #: and clamped at zero per lot, which is why it is not just `spend - proceeds`:
+    #: a lot sold above cost does not offset a lot that was wasted.
+    seed_waste_cost: float = 0.0
+    #: Coins `reward.SEED_GAIN_WEIGHT` credited back onto buy turns, the mirror of
+    #: the above and capped at each lot's own cost. Not `seed_margin` clamped
+    #: upward: the cap is what keeps the reward pair bounded by the seed spend, and
+    #: a column that dropped it would over-report what the term actually paid.
+    seed_gain_credit: float = 0.0
+
+    # Animal lots, the same six columns for a bought cow or sheep. Kept apart from
+    # the seed ones rather than summed into them: an animal is a durable asset whose
+    # capacity is a deadline rather than a yield, its holding distance is several
+    # times longer, and a single column would hide a herd programme paying for a seed
+    # programme that was not working.
+
+    animal_lots: int = 0
+    animal_lots_matched: int = 0
+    animal_spend: float = 0.0
+    animal_proceeds: float = 0.0
+    animal_holding_turn_sum: float = 0.0
+    #: Coins `reward.ANIMAL_WASTE_WEIGHT` charged and `reward.ANIMAL_GAIN_WEIGHT`
+    #: credited, clamped and capped per lot exactly as the seed pair is. The two to
+    #: watch against each other: a herd that never gets placed shows the first
+    #: climbing with the second flat.
+    animal_waste_cost: float = 0.0
+    animal_gain_credit: float = 0.0
 
     def __add__(self, other: BehaviorCounts) -> BehaviorCounts:
         seeds = dict(self.seeds)
@@ -162,6 +173,17 @@ class BehaviorCounts:
             seed_spend=self.seed_spend + other.seed_spend,
             seed_proceeds=self.seed_proceeds + other.seed_proceeds,
             seed_holding_turn_sum=self.seed_holding_turn_sum + other.seed_holding_turn_sum,
+            seed_waste_cost=self.seed_waste_cost + other.seed_waste_cost,
+            seed_gain_credit=self.seed_gain_credit + other.seed_gain_credit,
+            animal_lots=self.animal_lots + other.animal_lots,
+            animal_lots_matched=self.animal_lots_matched + other.animal_lots_matched,
+            animal_spend=self.animal_spend + other.animal_spend,
+            animal_proceeds=self.animal_proceeds + other.animal_proceeds,
+            animal_holding_turn_sum=(
+                self.animal_holding_turn_sum + other.animal_holding_turn_sum
+            ),
+            animal_waste_cost=self.animal_waste_cost + other.animal_waste_cost,
+            animal_gain_credit=self.animal_gain_credit + other.animal_gain_credit,
         )
 
     @property
@@ -216,6 +238,33 @@ class BehaviorCounts:
                 max(0.0, 1.0 - self.seed_proceeds / self.seed_spend)
                 if self.seed_spend > 0
                 else 0.0
+            ),
+            # In coins, not reward units. The conversion needs `MONEY_SCALE` and the
+            # two weights, and this module is bundled into the submission while
+            # `training/` is not, so it must not import from there.
+            "seed_waste_cost": self.seed_waste_cost,
+            "seed_waste_cost_per_episode": self.seed_waste_cost / max(1, self.episodes),
+            "seed_gain_credit": self.seed_gain_credit,
+            "seed_gain_credit_per_episode": self.seed_gain_credit / max(1, self.episodes),
+            "animal_lots": self.animal_lots,
+            "animal_lots_matched": self.animal_lots_matched,
+            "animal_spend": self.animal_spend,
+            "animal_proceeds": self.animal_proceeds,
+            "animal_margin": self.animal_proceeds - self.animal_spend,
+            "animal_holding_turns": (
+                self.animal_holding_turn_sum / max(1, self.animal_lots_matched)
+            ),
+            "animal_lots_matched_share": self.animal_lots_matched / max(1, self.animal_lots),
+            "unrecovered_animal_share": (
+                max(0.0, 1.0 - self.animal_proceeds / self.animal_spend)
+                if self.animal_spend > 0
+                else 0.0
+            ),
+            "animal_waste_cost": self.animal_waste_cost,
+            "animal_waste_cost_per_episode": self.animal_waste_cost / max(1, self.episodes),
+            "animal_gain_credit": self.animal_gain_credit,
+            "animal_gain_credit_per_episode": (
+                self.animal_gain_credit / max(1, self.episodes)
             ),
         }
 
@@ -296,6 +345,15 @@ _LOT_USE_ZERO: dict[str, Any] = {
     "seed_spend": 0.0,
     "seed_proceeds": 0.0,
     "seed_holding_turn_sum": 0.0,
+    "seed_waste_cost": 0.0,
+    "seed_gain_credit": 0.0,
+    "animal_lots": 0,
+    "animal_lots_matched": 0,
+    "animal_spend": 0.0,
+    "animal_proceeds": 0.0,
+    "animal_holding_turn_sum": 0.0,
+    "animal_waste_cost": 0.0,
+    "animal_gain_credit": 0.0,
 }
 
 
@@ -338,35 +396,54 @@ def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
     seeds: list[list[int]] = []
     standing: list[list[int]] = []
     stock: list[list[int]] = []
+    owned: list[list[int]] = []
+    produce_room: list[list[int]] = []
+    days: list[int] = []
     money: list[float] = []
     ops: list[str | None] = []
     for index in range(len(steps) - 1):
         observation = _seat_observation(steps[index], seat)
-        private = observation.get("private") or {}
-        farms = observation.get("farms") or []
-        player = int(observation.get("player", seat) or seat)
-        farm = farms[player] if 0 <= player < len(farms) else {}
-        held_seeds, held_stock = lots.holdings(private if isinstance(private, dict) else {})
-        seeds.append(held_seeds)
-        standing.append(lots.standing_plants(farm if isinstance(farm, dict) else {}))
-        stock.append(held_stock)
+        view = lots.seat_view(observation, seat)
+        farm, private = view if view is not None else ({}, {})
+        # The same builder `collect.Recorder.record_turn` and `clone` use, so the
+        # column here describes the trace the reward acted on rather than a
+        # look-alike. The holdings and animal traces are wanted; the quadrant count
+        # rides along and is discarded, while the day is kept because an animal lot's
+        # capacity is a deadline rather than a fixed yield.
+        held = lots.sample(observation, farm, private, index)
+        seeds.append(held.seeds)
+        standing.append(held.standing)
+        stock.append(held.stock)
+        owned.append(held.owned)
+        produce_room.append(held.produce_room)
+        days.append(held.day)
         money.append(_seat_money(steps[index], seat))
         # The op chosen *from* this observation, which `_replay_orders` explains
         # is stored on the following step. `lots.match` needs it to tell a
         # BUY_PRODUCT from a harvest that happened to land on a spending turn.
+        #
+        # The *wire* op, deliberately unlike the reward path, which records
+        # `ACTIONS[chosen].op`. The two differ only when an order the action space
+        # cannot represent was played: this column describes what the seat did, the
+        # reward describes what the learner chose.
         ops.append(_market_op(steps[index + 1], seat))
 
-    ledger = lots.match(seeds, stock, money, ops, standing)
+    ledger = lots.match(
+        seeds,
+        stock,
+        money,
+        ops,
+        standing,
+        owned=owned,
+        produce_room=produce_room,
+        days=days,
+    )
     summary = ledger.summary()
-    # `not lot.bought` matters and is not decoration: WHEAT is both a crop and a
-    # `BUY_PRODUCT` item, so without it a bought-wheat lot lands in this sum while
-    # `summary["seed_lots_matched"]` -- which excludes bought lots -- leaves it out
-    # of the count. The batch column divides the two, so the mean came out above
-    # the 720-turn season it is measured in: 1,010 on `lotbasis` batches 0-9.
     matched = [
-        lot
-        for lot in ledger.lots
-        if lot.item in lots.CROP_ITEMS and not lot.bought and lot.first_sale_turn is not None
+        lot for lot in ledger.seed_lots() if lot.first_sale_turn is not None
+    ]
+    animal_matched = [
+        lot for lot in ledger.animal_lots() if lot.first_sale_turn is not None
     ]
     return {
         "seed_lots": int(summary["seed_lots"]),
@@ -378,6 +455,21 @@ def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
         "seed_holding_turn_sum": float(
             sum(lot.first_sale_turn - lot.buy_turn for lot in matched)
         ),
+        # The coins the two non-invariant lot legs actually moved on buy turns this
+        # episode, read off the same `unrecovered()` and `surplus()` the reward
+        # consumes. Both sides have to be visible or a run cannot tell a working
+        # pair from one where only the charge ever fires.
+        "seed_waste_cost": float(summary["unrecovered_seed_cost"]),
+        "seed_gain_credit": float(summary["recovered_seed_surplus"]),
+        "animal_lots": int(summary["animal_lots"]),
+        "animal_lots_matched": int(summary["animal_lots_matched"]),
+        "animal_spend": float(summary["animal_spend"]),
+        "animal_proceeds": float(summary["animal_proceeds"]),
+        "animal_holding_turn_sum": float(
+            sum(lot.first_sale_turn - lot.buy_turn for lot in animal_matched)
+        ),
+        "animal_waste_cost": float(summary["unrecovered_animal_cost"]),
+        "animal_gain_credit": float(summary["recovered_animal_surplus"]),
     }
 
 

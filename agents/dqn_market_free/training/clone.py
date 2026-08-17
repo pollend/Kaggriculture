@@ -1,20 +1,17 @@
 """Read demonstration transitions out of stored league replays.
 
-Uniform exploration cannot bootstrap this MDP. Measured: with a 3,000 starting
-float, a random order policy ends the episode on 5 coins at a per-turn
-exploration rate of 1.0, and still only 4 coins at 0.005, because BUY_LAND is
-1,000-4,000 and BUY_ANIMAL 300-500 while the one opening that matters -- buy
-seed, plant, sell -- is a specific needle in a wide list. A buffer filled that
-way contains nothing but bankruptcy, and the only policy consistent with it is
-NOOP.
+Uniform exploration cannot bootstrap this MDP: a random order policy finishes a
+3,000-coin season on single digits at every rate measured, because the openings
+that matter are a needle in a wide list of ways to spend the stake. A buffer
+filled that way contains nothing but bankruptcy, and the only policy consistent
+with it is NOOP.
 
-The league has already played hundreds of episodes of agents that do not go
-bankrupt, and `episode_payloads.replay_gzip` keeps every one of them. This module
-turns those into transitions in *this* agent's action space, so the buffer has
-something positive in it from the first update.
+`episode_payloads.replay_gzip` keeps every league episode of agents that do *not*
+go bankrupt. This module turns those into transitions in this agent's action
+space, so the buffer has something positive in it from the first update.
 
-Nothing here touches the inference path. The agent still emits raw orders with
-no market rules; these replays are an offline dataset, not a policy component.
+Nothing here touches the inference path: an offline dataset, not a policy
+component.
 
 Replay layout, which is easy to get wrong:
 
@@ -53,13 +50,11 @@ from agents.dqn_market_free.training.reward import episode_rewards
 class CloneStats:
     """What a conversion kept and what it had to drop.
 
-    Reported rather than swallowed: a demonstration set that silently dropped
-    most of its orders would train the network toward NOOP, which is the exact
-    failure the demonstrations exist to prevent. `orders_over_budget` is the
-    expected, structural loss -- the demonstrator's second and later orders on a
-    turn where this agent may emit only one -- while `orders_unrepresentable`
-    means the action list cannot name the order at all and is worth reading as a
-    schema problem.
+    Reported rather than swallowed: a set that silently dropped most of its orders
+    would train the network toward NOOP, the exact failure demonstrations exist to
+    prevent. `orders_over_budget` is the structural loss -- the demonstrator's
+    second and later orders on one turn -- while `orders_unrepresentable` means the
+    action list cannot name the order at all, and reads as a schema problem.
     """
 
     episodes: int = 0
@@ -71,7 +66,15 @@ class CloneStats:
     #: Turns where the feasibility mask forbade the order the demonstrator
     #: actually placed. Should be ~0: a solvent donor's accepted orders are
     #: feasible by definition, so anything here is the mask being wrong.
+    #:
+    #: `BUY_LAND` cannot appear here at all -- it is not a row -- and is counted in
+    #: `orders_land` instead. The demonstrator buying a quadrant this agent's
+    #: `should_buy_land` declines is the two policies disagreeing, which is the point
+    #: of having a heuristic, not a fault in the mask.
     orders_masked_infeasible: int = 0
+    #: `BUY_LAND` rows seen in demonstrations. Not a fault and not a loss: nothing
+    #: maps them because land is decided off the head.
+    orders_land: int = 0
 
     @property
     def mapped_fraction(self) -> float:
@@ -84,19 +87,23 @@ def decode_replay(blob: bytes) -> dict[str, Any]:
     return json.loads(gzip.decompress(blob))
 
 
-def _chosen_index(orders: Iterable[Any]) -> tuple[int, int, int]:
+def _chosen_index(orders: Iterable[Any]) -> tuple[int, int, int, int]:
     """Map one turn's order list onto the single action this agent can emit.
 
-    Returns `(index, unrepresentable, over_budget)`. Repeated `HIRE` rows are
-    folded into one `HIRE n` first, because that is a single action here and the
-    demonstrator's day-boundary hiring is otherwise the largest source of loss
-    by far. Then the first order the action list can name wins, and anything the
-    demonstrator placed after it on the same turn is `over_budget` -- this agent
-    emits one action per turn, and it has 720 turns to spread them over.
+    Returns `(index, unrepresentable, over_budget, land)`. Repeated `HIRE` rows fold
+    into one `HIRE n` first -- that is a single action here, and day-boundary hiring
+    is otherwise the largest source of loss. Then the first nameable order wins and
+    anything after it on the same turn is `over_budget`.
 
-    Orders the action list cannot name at all are `unrepresentable` and are
-    skipped rather than snapped, so the search continues to the next order
-    instead of turning a demonstration into a guess.
+    Orders the action list cannot name are skipped rather than snapped, so the
+    search continues instead of turning a demonstration into a guess.
+
+    `BUY_LAND` is skipped without being counted as unnameable, and does not claim the
+    turn. Since v44 it is not on the head, so there is no row to map it to -- but the
+    demonstrator buying a quadrant is not a hole in this agent's action space, it is
+    a decision `order_space.should_buy_land` makes on its own. Lumping it into
+    `unrepresentable` would make that counter unreadable, which is the same argument
+    the old `orders_masked_land` was carrying before the row left.
     """
 
     rows = [order for order in orders if order]
@@ -114,7 +121,11 @@ def _chosen_index(orders: Iterable[Any]) -> tuple[int, int, int]:
     chosen = 0
     unrepresentable = 0
     over_budget = 0
+    land = 0
     for order in rows:
+        if str(order[0]) == "BUY_LAND":
+            land += 1
+            continue
         if chosen:
             over_budget += _wire_count(order)
             continue
@@ -126,7 +137,7 @@ def _chosen_index(orders: Iterable[Any]) -> tuple[int, int, int]:
             unrepresentable += _wire_count(order)
             continue
         chosen = index
-    return chosen, unrepresentable, over_budget
+    return chosen, unrepresentable, over_budget, land
 
 
 def _wire_count(order: Any) -> int:
@@ -146,16 +157,13 @@ def record_from_replay(
     """Convert one seat of one replay into a trainable episode record.
 
     The reward comes from the same `episode_rewards` a live rollout uses, so a
-    cloned episode and a self-collected one are the same kind of sample and can
-    share a buffer -- a buffer holding demonstrations scored one way and rollouts
-    scored another would be bootstrapping across two different reward functions.
+    cloned episode and a self-collected one share a buffer without bootstrapping
+    across two reward functions.
 
-    `opponent_weight` is the one part of that the caller has to supply, because
-    the mirror gate is a fact about who played and a replay's seat specs are
-    where that lives here. It defaults to 0.0 rather than to `OPPONENT_WEIGHT`
-    for the same reason `match_agent` does: a demonstration whose provenance is
-    unknown is scored the absolute way, which is the only labelling that is
-    correct regardless of who the other seat was.
+    `opponent_weight` is the one part the caller supplies, because the mirror gate
+    is a fact about who played. Defaults to 0.0: a demonstration whose provenance is
+    unknown is scored the absolute way, the only labelling correct regardless of who
+    the other seat was.
     """
 
     steps = replay.get("steps") or []
@@ -168,13 +176,16 @@ def record_from_replay(
     seeds: list[list[int]] = []
     standing: list[list[int]] = []
     stock: list[list[int]] = []
+    owned: list[list[int]] = []
+    produce_room: list[list[int]] = []
+    ops: list[str | None] = []
     order_state = np.zeros((len(steps) - 1, STATE_DIM), dtype=np.float32)
     order_chosen = np.zeros(len(steps) - 1, dtype=np.int16)
     order_step = np.zeros(len(steps) - 1, dtype=np.int16)
     order_mask = np.ones((len(steps) - 1, ACTION_COUNT), dtype=np.bool_)
     configuration = replay.get("configuration")
 
-    seen = mapped = unrepresentable = over_budget = masked_infeasible = 0
+    seen = mapped = unrepresentable = over_budget = masked_infeasible = land_seen = 0
     decisions = 0
     # The history block of the state schema is the one part that cannot be read
     # off a single step, so it is replayed here exactly as `main.py` builds it
@@ -186,31 +197,34 @@ def record_from_replay(
         previous = steps[index - 1][seat]
         current = steps[index][seat]
         obs = previous.get("observation") or {}
-        farms = obs.get("farms") or []
-        player = int(obs.get("player", seat) or seat)
-        if not farms or not (0 <= player < len(farms)):
+        view = lots.seat_view(obs, seat)
+        if view is None:
             continue
-        farm = farms[player]
-        private = obs.get("private") or {}
+        farm, private = view
 
+        # Every trace off one `lots.sample`, appended in lockstep with `money` so a
+        # cloned episode and a self-collected one carry the same trace on the same
+        # index. `collect.Recorder.record_turn` is the other half of this, and it is
+        # now literally the same builder -- the two hand-written copies had already
+        # drifted on the `day` fallback. `standing` comes off `farm["tiles"]` rather
+        # than `private`, which is what makes it recoverable from a stored replay.
+        held = lots.sample(obs, farm, private, len(money))
         money.append(float(farm.get("money", 0) or 0))
-        # The land potential's two inputs, appended in lockstep with `money` so a
-        # cloned episode and a self-collected one carry the same trace on the
-        # same index. `collect.Recorder.record_turn` is the other half of this.
-        quadrants.append(len(farm.get("unlocked_quadrants", []) or ["NW"]))
-        days.append(int(obs.get("day", 0) or 0))
-        # And the lot potential's three, from the same observation, for the same
-        # reason: a demonstration and a rollout have to score the same quantity.
-        # `standing` comes off `farm["tiles"]` rather than `private`, which is
-        # what makes it recoverable from a stored replay at all.
-        held_seeds, held_stock = lots.holdings(private)
-        seeds.append(held_seeds)
-        standing.append(lots.standing_plants(farm))
-        stock.append(held_stock)
+        quadrants.append(held.quadrants)
+        days.append(held.day)
+        seeds.append(held.seeds)
+        standing.append(held.standing)
+        stock.append(held.stock)
+        owned.append(held.owned)
+        produce_room.append(held.produce_room)
         history.observe(obs, farm)
 
         orders = (current.get("action") or {}).get("market") or []
-        action, dropped, extra = _chosen_index(orders)
+        action, dropped, extra, land_orders = _chosen_index(orders)
+        # The mapped action's op, not the raw wire row: `collect` records
+        # `ACTIONS[chosen].op` too, and an order the space could not represent was
+        # never the decision the learner is being trained on.
+        ops.append(ACTIONS[action].op)
         seen += len(orders)
         # Counted in simulator orders, not actions, so the three totals add up
         # to `orders_seen`: one `HIRE 8` action preserves eight of them.
@@ -236,24 +250,18 @@ def record_from_replay(
         # The same feasibility the live agent is held to, built from the same
         # `field` that encoded the state so the two describe one turn.
         mask = feasible_actions(obs, farm, private, field, configuration, roles=roles)
-        # The demonstrator's order was accepted by the simulator, so it is
-        # feasible by demonstration whatever the model of feasibility says.
-        # Forced rather than dropped: the invariant the learner depends on is
-        # that a stored action is allowed by its stored mask, and violating it
-        # would put the clone's cross-entropy target on a masked class and the
-        # TD gather on an action the argmax can never reach. Counted, because
-        # the count is the direct measure of how over-restrictive the mask is
-        # against an agent that really farms.
+        # The simulator accepted this order, so it is feasible by demonstration
+        # whatever the model says. Forced rather than dropped, because the learner
+        # depends on a stored action being allowed by its stored mask -- otherwise
+        # the clone's cross-entropy target lands on a masked class and the TD gather
+        # on an action the argmax can never reach. Counted, since the count measures
+        # how over-restrictive the mask is against an agent that really farms.
         if not mask[action]:
             masked_infeasible += 1
             mask[action] = True
         order_mask[decisions] = mask
-        # Index into this record's own compacted reward stream, not into the
-        # replay. A step the loop skipped above appends no money and so no
-        # reward, and `replay.sample` walks `reward[order_step[d]:...]` -- with
-        # the raw replay index the window would silently slide off the decision
-        # it belongs to, guarded from crashing by the `min(..., record.steps)`
-        # clamp and therefore invisible.
+        # Index into this record's own compacted reward stream, not into the replay
+        # -- see `collect.Recorder.record_decision` for why.
         order_step[decisions] = decisions
         decisions += 1
 
@@ -294,6 +302,9 @@ def record_from_replay(
         seeds=seeds,
         standing=standing,
         stock=stock,
+        ops=ops,
+        owned=owned,
+        produce_room=produce_room,
     )
 
     record = EpisodeRecord(
@@ -313,6 +324,7 @@ def record_from_replay(
         orders_unrepresentable=unrepresentable,
         orders_over_budget=over_budget,
         orders_masked_infeasible=masked_infeasible,
+        orders_land=land_seen,
     )
     return record, stats
 
@@ -369,5 +381,6 @@ def load_demonstrations(
             orders_masked_infeasible=(
                 totals.orders_masked_infeasible + stats.orders_masked_infeasible
             ),
+            orders_land=totals.orders_land + stats.orders_land,
         )
     return records, totals

@@ -1,20 +1,15 @@
 """Roll out episodes and record the raw order decisions as compact training data.
 
-Transitions cannot be reconstructed from `env.steps` after the fact -- the
-replay stores filled orders, not the action set the policy chose from -- so
-the acting agent records its own decisions and this module owns that recorder.
+Transitions cannot be reconstructed from `env.steps` after the fact -- the replay
+stores filled orders, not the action set the policy chose from -- so the acting
+agent records its own decisions and this module owns that recorder.
 
-Records here are far smaller than the scorer's. Its candidate set is rebuilt per
-decision from live shed contents, so it has to store the whole encoded grid per
-decision. This agent's action is one index into a fixed list, so a decision is
-fully described by the state vector and a single integer. That is what makes a
-per-turn decision rate affordable: 720 decisions an episode costs less memory
-than the scorer's 60.
+A decision here is one index into a fixed list, so it is fully described by the
+state vector and a single integer. That is what makes a per-turn rate affordable:
+720 decisions an episode costs less memory than the scorer's 60, which have to
+store a whole rebuilt candidate grid each.
 
-The reward stream and its scales live in `training/reward.py`. They started as
-the scorer's and are no longer: this agent decides land and cash reserves itself,
-so the scales had to differ from the ones the scorer's market layer handled in
-code.
+The reward stream and its scales live in `training/reward.py`.
 """
 
 from __future__ import annotations
@@ -43,11 +38,6 @@ from sim.workers import (
 if TYPE_CHECKING:
     from sim.runner import MatchResult
 
-#: Fallback only, for the land potential's day when an observation carries none.
-#: The live value comes off `configuration.turnsPerDay` in `main.py`; this is the
-#: simulator's default and matches `donor.TOTAL_DAYS * 24 == 720` episode steps.
-_TURNS_PER_DAY = 24
-
 
 @dataclass
 class EpisodeRecord:
@@ -60,12 +50,10 @@ class EpisodeRecord:
     order_chosen: np.ndarray  # int16   [D]  index into ACTIONS
     order_step: np.ndarray  # int16   [D]  index into `reward` each decision is paid from
     #: bool [D, ACTION_COUNT]. Which actions the simulator would have accepted at
-    #: each decision. Stored rather than recomputed from `order_state`: every
-    #: input is technically recoverable from the normalised features, but that
-    #: would tie the mask to the exact scaling of six columns in `market_state`,
-    #: which is source-frozen against the scorer -- and a drift there would
-    #: corrupt the Double-DQN target silently. It compresses to almost nothing
-    #: beside `order_state`.
+    #: each decision. Stored rather than recomputed from `order_state`, which would
+    #: tie the mask to the exact scaling of six `market_state` columns and corrupt
+    #: the Double-DQN target silently if either drifted. Compresses to almost
+    #: nothing beside `order_state`.
     order_mask: np.ndarray
 
     @property
@@ -179,17 +167,19 @@ class Recorder:
     # than silently pairing a quadrant count with the wrong day.
     quadrants: list[int] = field(default_factory=list)
     days: list[int] = field(default_factory=list)
-    # The lot potential's three inputs, indexed the same way again. Counts rather
-    # than dicts, over `lots.CROP_ITEMS` and `lots.STOCK_ITEMS`, so an episode
-    # carries 720 x 19 small integers instead of 720 dictionaries.
-    #
-    # `standing` is the one that is not in `private`: a seed leaving the seed bag
-    # for a tile has not stopped being committed cost, and without the tile count
-    # `PHI` would fall on the turn the agent plants -- charging for the action the
-    # term exists to make cheaper.
+    # The lot potential's three inputs, counts rather than dicts over
+    # `lots.CROP_ITEMS` and `lots.STOCK_ITEMS`. `standing` is the one not in
+    # `private`: without the tile count `PHI` falls on the turn the agent plants,
+    # charging for the action the term exists to make cheaper.
     seeds: list[list[int]] = field(default_factory=list)
     standing: list[list[int]] = field(default_factory=list)
     stock: list[list[int]] = field(default_factory=list)
+    # The animal legs' two inputs, over `lots.ANIMAL_ITEMS`. `owned` counts an animal
+    # wherever it is, because all three places are one purchase; `produce_room` is what
+    # the season can still get out of the herd, which is what bounds an animal lot
+    # where `max_yield` bounds a seed one.
+    owned: list[list[int]] = field(default_factory=list)
+    produce_room: list[list[int]] = field(default_factory=list)
     order_steps: list[int] = field(default_factory=list)
     decisions: list[OrderDecision] = field(default_factory=list)
 
@@ -200,24 +190,24 @@ class Recorder:
         self.seeds.clear()
         self.standing.clear()
         self.stock.clear()
+        self.owned.clear()
+        self.produce_room.clear()
         self.order_steps.clear()
         self.decisions.clear()
 
     def record_decision(self, *, decision: OrderDecision) -> None:
         """Store a decision against the reward index it will be paid from.
 
-        The simulator's turn number is deliberately not what lands in
-        `order_step`. The reward stream is built from `self.money`, which is
-        appended by `record_turn` -- and the agent skips both on a malformed
-        observation, so a turn the simulator counted may contribute no reward at
-        all. Indexing by simulator step then slides every later decision's n-step
-        window forward, silently, because `replay.sample` clamps the window with
-        `min(end_step, record.steps)`. `clone.py` records the same compacted
-        index for the same reason; the two record kinds share one buffer and
-        must mean the same thing by it.
+        The simulator's turn number is deliberately **not** what lands in
+        `order_step`. The reward stream is built from `self.money`, and the agent
+        skips both on a malformed observation, so a turn the simulator counted may
+        contribute no reward. Indexing by simulator step then slides every later
+        decision's n-step window forward *silently*, because `replay.sample` clamps
+        with `min(end_step, record.steps)`. `clone.py` records the same compacted
+        index; the two record kinds share one buffer and must agree on it.
 
-        `record_decision` runs before `record_turn` in `main.py`, so
-        `len(self.money)` is exactly the slot this turn's reward will take.
+        `record_decision` runs before `record_turn`, so `len(self.money)` is exactly
+        the slot this turn's reward will take.
         """
 
         self.order_steps.append(len(self.money))
@@ -225,18 +215,19 @@ class Recorder:
 
     def record_turn(self, *, money: float, obs: Any, farm: dict, private: dict) -> None:
         self.money.append(float(money))
-        # Both already on hand and previously discarded. `unlocked_quadrants`
-        # defaults to what a fresh farm carries, so a malformed observation
-        # contributes no land potential rather than a spurious one, and the day
-        # falls back to this turn's own index the way `market_state` does -- a
-        # missing day must not read as "the whole season is still ahead".
-        self.quadrants.append(len(farm.get("unlocked_quadrants", []) or ["NW"]))
-        held_seeds, held_stock = lots.holdings(private)
-        self.seeds.append(held_seeds)
-        self.standing.append(lots.standing_plants(farm))
-        self.stock.append(held_stock)
+        # Every trace comes off one `lots.sample`, shared with `clone` and
+        # `diagnostics`: a cloned episode and a self-collected one are only the same
+        # kind of sample if the trace is built the same way, and the three copies this
+        # replaced had already drifted on the `day` fallback.
         turn = len(self.money) - 1
-        self.days.append(int(obs.get("day", turn // _TURNS_PER_DAY) or 0))
+        held = lots.sample(obs if isinstance(obs, dict) else {}, farm, private, turn)
+        self.quadrants.append(held.quadrants)
+        self.days.append(held.day)
+        self.seeds.append(held.seeds)
+        self.standing.append(held.standing)
+        self.stock.append(held.stock)
+        self.owned.append(held.owned)
+        self.produce_room.append(held.produce_room)
 
     def finish(
         self,
@@ -254,9 +245,17 @@ class Recorder:
         # Which turns put an order on the wire, indexed the same way the reward
         # stream is. A turn that emitted one and moved no money had it refused.
         emitted = [False] * len(self.money)
+        # The op each turn chose, indexed the same way. `SEED_WASTE_WEIGHT` needs it
+        # to tell a BUY_PRODUCT from a harvest that landed on a spending turn, and
+        # `ACTIONS[chosen].op` rather than the wire row is the *mapped* action the
+        # learner actually saw -- which is what `clone` records too.
+        ops: list[str | None] = [None] * len(self.money)
         for step, decision in zip(self.order_steps, self.decisions):
-            if 0 <= step < len(emitted) and decision.chosen:
+            if not 0 <= step < len(emitted):
+                continue
+            if decision.chosen:
                 emitted[step] = True
+            ops[step] = ACTIONS[int(decision.chosen)].op
 
         shaped, raw, money = episode_rewards(
             self.money,
@@ -270,6 +269,9 @@ class Recorder:
             seeds=self.seeds,
             standing=self.standing,
             stock=self.stock,
+            ops=ops,
+            owned=self.owned,
+            produce_room=self.produce_room,
         )
 
         count = len(self.decisions)
@@ -338,22 +340,17 @@ def learner_spec(
 ) -> str:
     """Address the exploring learner as an ordinary agent spec.
 
-    The per-episode trace path and revision id are deliberately separable: the
-    spec without them is the *policy identity*, and folding a per-episode trace
-    into it would mint one agent revision per episode.
+    The trace path and revision id are separable: the spec without them is the
+    *policy identity*, and folding a per-episode trace into it would mint one agent
+    revision per episode.
 
-    `gamma` sits in the identity spec although the policy never reads it -- only
-    `Recorder.finish` does -- because a run that relabels its rewards is worth
-    telling apart from one that does not.
+    Two reward-labelling parameters, treated oppositely:
 
-    `opponent_weight` is the other reward-labelling parameter and is treated the
-    *opposite* way, for the reason that separates the two: gamma is one number
-    for a whole run, and this one is per-opponent, since the mirror is gated off.
-    Folding a per-episode value into the identity would mint two revisions for
-    one set of weights and split both `rating_snapshots` and the self-play pool
-    down the middle. So it travels on the played spec beside `trace_path`, and
-    `_learner_policy` in `training/updater` -- which is what the identity is
-    actually built from -- does not carry it.
+    * `gamma` is in the identity, although only `Recorder.finish` reads it, because
+      a run that relabels its rewards is worth telling apart from one that does not.
+    * `opponent_weight` is not, because it is per-opponent -- the mirror is gated
+      off -- so folding it in would mint two revisions for one set of weights and
+      split both `rating_snapshots` and the self-play pool down the middle.
     """
 
     query: dict[str, Any] = {
@@ -418,15 +415,11 @@ def collect_episode(
     from sim.runner import OK_STATUSES, run_match
 
     trace_path = Path(trace_dir) / f"seed-{seed:010d}-seat-{learner_seat}.npz"
-    # The mirror gate on the reward's opponent-relative leg. This is the only
-    # place that holds both the opponent's spec and a route to `Recorder.finish`,
-    # which runs in the match subprocess and cannot see who it played.
-    #
-    # A mirror is anything addressed at this agent's own inference entry point --
-    # `_weights_spec` in `training/updater` builds every self-play opponent as
-    # `SELF_SPEC?weights=...`, so the prefix is the test. Against a recent
-    # checkpoint of the same slot the relative leg is noise by construction: the
-    # opponent's purse carries this policy's own variance and nothing else.
+    # The mirror gate on the reward's opponent-relative leg. Here because this is
+    # the only place holding both the opponent's spec and a route to
+    # `Recorder.finish`, which runs in the match subprocess and cannot see who it
+    # played. A mirror is anything addressed at this agent's own entry point, since
+    # `_weights_spec` builds every self-play opponent as `SELF_SPEC?weights=...`.
     opponent_weight = 0.0 if opponent_spec.startswith(SELF_SPEC) else OPPONENT_WEIGHT
     spec = learner_spec(
         weights_path,
@@ -487,29 +480,19 @@ def actor_sigma_scales(actors: int, alpha: float = 32.0) -> list[float]:
     """One NoisyNet sigma multiplier per actor, spread geometrically.
 
     One temperature for a whole batch fills the buffer with near-copies of one
-    trajectory. Measured on the epsilon spread this replaced: 81% mean pairwise
-    action agreement between the sixteen episodes of a batch, and on 38% of turns
-    all sixteen chose the identical action. The finding is about behavioural
-    diversity within a batch and is orthogonal to the exploration *mechanism*, so
-    a single sigma reproduces it exactly.
+    trajectory: on the spread this replaced, 81% mean pairwise action agreement
+    across a batch and 38% of turns identical on all sixteen episodes.
 
-    Actor `i` of `N` runs at `alpha ** (-i/(N-1))`: actor 0 plays the learned
-    sigma and the last actor is effectively greedy, so `trading_rate` and the
-    money diagnostics always have a clean read of what the policy actually does.
-    At alpha 32 and eight pairs that is 1.0 down to 0.031.
+    Actor `i` of `N` runs at `alpha ** (-i/(N-1))`, so actor 0 plays the learned
+    sigma and the last is effectively greedy -- which is what keeps `trading_rate`
+    and the money diagnostics a clean read of the policy. Ape-X's per-actor
+    temperature trick transplanted, *not* principled NoisyNet: the paper has one
+    learned sigma and no spread.
 
-    This is Ape-X's per-actor temperature trick transplanted, *not* principled
-    NoisyNet -- the paper has one sigma, learned, and no spread at all.
-
-    The spread is downward only, and the two mechanisms that tried to put rungs
-    *above* the setpoint are both retired: the periodic idle burst at v15, and
-    `noisy_actor_hot` here. Per-episode attribution across `burst-v9` and
-    `falloff-v18` says the same thing twice -- every land purchase in the run
-    happened at sigma <= 0.871, 49% of seats went bankrupt at 3.159, and the hot
-    rungs' land rate (4.6%) was indistinguishable from the ordinary rungs' (4.9%).
-    Widening the whole policy does not reach rare behaviour, it bankrupts the
-    wallet before the behaviour becomes affordable. `rare.sigma_scale_vector`
-    widens single rows instead, which is a different mechanism and stays.
+    Downward only. Widening the whole policy does not reach rare behaviour, it
+    bankrupts the wallet before the behaviour becomes affordable; the retired hot
+    rungs measured a land rate indistinguishable from the ordinary ones.
+    `rare.sigma_scale_vector` widens single rows instead.
     """
 
     if actors <= 1:
@@ -537,34 +520,15 @@ def collect_batch(
 ) -> list[OrderRollout]:
     """Play `len(seeds)` episodes, one opponent drawn per consecutive seed pair.
 
-    Seeds arrive in consecutive pairs -- the same seed twice -- so the learner
-    takes seat 0 in one orientation and seat 1 in the other. Drawing one
-    opponent per pair rather than per episode is what lets the resulting pairing
-    settle a seat-balanced margin.
+    Seeds arrive in consecutive pairs -- the same seed twice -- so the learner takes
+    seat 0 in one orientation and seat 1 in the other. Both the opponent and
+    `sigma_scales` are indexed by *pair*, never by episode: if the two orientations
+    were played by different policies or at different temperatures, the paired
+    margin the league settles would compare two different agents.
 
-    `sigma_scales` is indexed by pair for the same reason the opponent is: both
-    orientations of a seed must be played by the same policy at the same
-    temperature, or the paired margin the league settles is a comparison between
-    two different agents.
-
-    `rare_sigma_gain` goes to the first `rare_sigma_pairs` pairs -- the widest
-    rungs of the ladder -- at full gain rather than one scaled by the rung's own
-    sigma.
-
-    The widest end because that is already the arm whose job is finding things,
-    and because the near-greedy tail has to stay a clean read of the policy: the
-    money series is only comparable across this change if some pairs are
-    collecting what v18 collected.
-
-    Worth being explicit about one piece of evidence that looks like it argues the
-    other way. `market-free-burst-v9` attributed every episode to its rung across
-    212 seats and found land bought only at sigma <= 0.871, never at 3.159, where
-    49% went bankrupt. That measured *global* sigma -- every row widened at once,
-    which is a policy shaken into noise, and it says nothing about widening one
-    action's row while the other 185 stay where the controller put them. The
-    failure it records is bankruptcy from indiscriminate trading, and this cannot
-    produce that: `rare.sigma_scale_vector` leaves NOOP and every well-sampled row
-    at exactly 1.0.
+    `rare_sigma_gain` goes to the first `rare_sigma_pairs` pairs -- the widest rungs
+    -- at full gain. The near-greedy tail stays a clean read of the policy, so the
+    money series remains comparable across the change.
     """
 
     scales = sigma_scales or [1.0]

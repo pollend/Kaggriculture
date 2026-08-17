@@ -1,5 +1,9 @@
 # dqn_market_free — unblock promotion, then the v2 roadmap
 
+What each session changed and measured is in
+[dqn_market_free_sessions.md](dqn_market_free_sessions.md). This file is the
+argument about what to build next.
+
 ## Context
 
 `dqn_market_free` was rewritten at `a1c297e` as a single-action DQN: a 186-wide
@@ -956,6 +960,43 @@ under **Out of scope, worth recording**: pilkwang as a *training* opponent so it
 seats persist and become clonable, plus a DQfD large-margin term on
 `_behavior_clone_step`. It was deferred from v26 deliberately — landing it
 alongside three objective changes would have confounded all four.
+
+## Land is not a learned decision any more
+
+Six sessions tried to make the Q head value `BUY_LAND` and the last of them,
+`landhandle-v42`, tried to make the argmax stop being the obstacle — the row came
+out of the ranking and hung on `Q(BUY_LAND) - Q(NOOP)` instead. That did not take,
+because the row it read is dead. Over batches 351–390, all ten slots:
+
+| | |
+| --- | --- |
+| `buy_land_rate`, per batch | 0.000 – 0.050 |
+| the same column on v33 `landbonus` | 0.37 |
+| the same column on v41's first pure-mirror batches | 0.206 |
+
+One purchase per twenty to two hundred episodes. The mechanism is the one
+`order_space.py` has recorded since the v10 gate: a gated row is starved of
+gradient, so its Q is arbitrary in exactly the states where the gate opens, and a
+set point placed on an arbitrary number is not a decision rule. Everything tried
+against it before v42 was an exploration lever, and the per-episode attribution
+refused all of them — 212 seats at σ 3.159 bought *zero* quadrants, and every
+purchase on record happened at σ ≤ 0.871.
+
+**`market-free-landheuristic-v43` decides it in code.** `order_space.land_score`
+multiplies three factors — lateness, utilisation of the land already owned, and
+runway past the wage bill the extra tiles will need — and `choose_order` never
+reads the row. The product matters: `horizon` alone peaks on day 0, which is the
+timing that put 649 of 707 purchases in the 0–3,000 money bucket, and `worked`
+vetoes it because nothing is planted on turn 0 whatever the wallet says. Walked
+over a plant-up-then-earn season the first purchase lands on day 8, inside the
+donor's own `LAND_OPEN_DAYS = (5, 9)`, with no day hardcoded anywhere.
+
+`LAND_PURCHASE_BONUS` goes to 0.0 with it — it existed to tilt an argmax that no
+longer ranks the row — which makes this a reward move, so `SLOT_PREFIX` moves.
+That had been impossible: a fresh prefix restarts at batch 0, where the empty
+`opponents` base reached the updater with no mix and raised. It seeds the quiet
+network there now. Full argument and the pass condition are in
+[the sessions log](dqn_market_free_sessions.md).
 
 ## Phase 1 — promotion, if it is still blocked
 

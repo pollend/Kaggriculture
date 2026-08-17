@@ -1,20 +1,15 @@
 """Market-state encoder for the unscaffolded market learner.
 
-This began as the state half of the scorer's feature schema. The two have now
-forked: `dqn_market_scorer` keeps the 117-dim snapshot, this one is 238 dims and
-the extra 121 are the economics the scorer never had to learn because its donor
-market layer already knew them. The action encoding is still not copied -- this
-agent scores raw simulator orders instead of donor-market modifiers.
+238 dims: the scorer's 117-dim snapshot plus 121 of the economics its donor market
+layer already knew and this agent has to learn.
 
-The network here is a plain action head over 186 orders with no action features
-(`policy.py`), so anything about *quantity* -- what selling 45 melons does to the
-melon price -- has to arrive through the state or not at all. Blocks A through D
-below are that arrival.
+The network is a plain action head with no action features, so anything about
+*quantity* -- what selling 45 melons does to the melon price -- has to arrive
+through the state or not at all. Blocks A through D below are that arrival.
 
-`donor.py` is a byte-identical vendored copy (see `NOTICE`) and is never edited.
-Where the donor's own helper is wrong for the installed engine, or scalar where a
-vector is needed, the corrected or vectorised version lives here and the
-divergence is commented at the point it happens.
+`donor.py` is a byte-identical vendored copy and is never edited. Where its helper
+is wrong for the installed engine, or scalar where a vector is needed, the
+corrected version lives here and the divergence is commented where it happens.
 """
 
 from __future__ import annotations
@@ -50,6 +45,30 @@ OWN_HORIZONS: tuple[int, ...] = (1, 3)
 
 #: Turns of lag the history block differences over. One in-game day.
 HISTORY_LAG = 24
+
+#: Ceiling on the per-crop held-seed feature, in units.
+#:
+#: Every crop tile `donor.CROP_MIX` describes across all four quadrants, which is the
+#: most tiles any single crop could occupy after `planting.market_influenced_roles`
+#: has reassigned the plan. Seed held past that cannot be planted this season under
+#: any allocation.
+#:
+#: The seed columns were the one unbounded block in this vector -- shed counts are
+#: capped by `shedCapacity`, animals by the tile count, but `private["seeds"]` has no
+#: ceiling in the simulator, so a policy holding 300 wheat fed a 30.0 into a network
+#: whose other inputs sit in [0, 2]. Over-buying pushed the state out of distribution,
+#: degrading the Q estimate for exactly the rows that caused it.
+#:
+#: Deliberately sized to be *inert*: with `order_space.feasible_actions` capping seed
+#: orders at the plan's deficit, no reachable state reaches this clip, so the column's
+#: values do not move and a resumed checkpoint sees no distribution shift. It is a
+#: guard rail against a regression reopening the unbounded path, not a transform.
+#:
+#: If this clip ever binds, the demand cap has a hole and `seed_lots` per episode
+#: shows it first.
+SEED_FEATURE_CAP = sum(
+    count for quadrant in donor.CROP_MIX.values() for count in quadrant.values()
+)
 
 #: Operations the last-order one-hot spans, in `order_space.ACTIONS` order.
 ORDER_OPERATIONS: tuple[str, ...] = (
@@ -259,20 +278,15 @@ def projected_supply(farm: dict, item: str, day: int, horizon: int) -> int:
 class MarketHistory:
     """A short rolling window of the market, and how the last order went.
 
-    The observation the simulator hands an agent is a pure snapshot: no price
-    series, no previous market inventory, and -- the one that costs the most --
-    no indication that the order placed last turn was refused. The measured
-    failure mode this exists for is in `training/reward.py`: one run settled on
-    `SELL WOOL 16` for 57% of its decisions while owning no sheep, with 98.4% of
-    everything it emitted refused. The reward already charges for that
-    (`REJECTED_ORDER_PENALTY`); until now the state could not tell the turn it
-    entered the loop from the five hundredth turn inside it, so no policy defined
-    on the state could climb out.
+    The simulator's observation is a pure snapshot: no price series, no previous
+    market inventory, and -- the one that costs most -- no sign that last turn's
+    order was refused. `REJECTED_ORDER_PENALTY` charges for a refusal, but without
+    this the state cannot tell the turn a policy entered a refusal loop from the
+    five hundredth turn inside it, so no policy defined on the state can climb out.
 
-    Owned by the live agent (`main.py`) and rebuilt step by step from stored
-    replays (`training/clone.py`). The two must push in the same order -- observe
-    the turn, encode the state, then record the decision -- and
-    `test_clone_matches_live_features` is what holds them to it.
+    Owned by the live agent and rebuilt step by step from stored replays. Both must
+    push in the same order -- observe the turn, encode the state, record the
+    decision -- which `test_clone_matches_live_features` holds them to.
     """
 
     __slots__ = (
@@ -379,16 +393,12 @@ class MarketHistory:
             values += [
                 (new_inventory[item] - old_inventory[item]) / 1000.0 for item in PRODUCTS
             ]
-            # Clipped, because a coin-scaled delta is unbounded by construction
-            # and the opponent's leg is where that bites. See the wealth block in
-            # `market_features`: the training opponents hold 0-3,000 and the
-            # promotion benchmark holds ~142,000, so an unclipped opponent delta
-            # is a feature the network only ever meets at evaluation time.
-            #
-            # Both legs, symmetrically. This agent's own delta has never left
-            # [-1, 1] on any recorded run -- it is a 3,000-coin float over a
-            # `lag`-turn window -- so the clip is inert there today and stops it
-            # becoming the same problem in reverse if the policy ever gets rich.
+            # Clipped, because a coin-scaled delta is unbounded and the opponent's
+            # leg is where that bites: training opponents hold 0-3,000 and the
+            # promotion benchmark ~142,000, so an unclipped opponent delta is a
+            # feature the network only ever meets at evaluation time. Both legs
+            # symmetrically, so the own leg cannot become the same problem in
+            # reverse if the policy ever gets rich.
             values += [
                 float(np.clip((self._money[-1] - self._money[0]) / 10_000.0, -1.0, 1.0)),
                 float(
@@ -534,32 +544,23 @@ def market_state_features(
         # The opponent's wealth on the same log scale as our own two lines above,
         # and the share taken on logs as well.
         #
-        # These read raw until `market-free-logmoney-v26`, and that is where the
-        # gate and the buffer stopped describing the same policy. Every training
-        # opponent holds 0-3,000 -- the mirror runs this same policy off a 3,000
-        # stake, and the scripted one bankrupts -- so `opponent_money / 10_000`
-        # lived in about [0, 0.3] and the share sat near 0.5 in every transition
-        # the network ever trained on. pilkwang, which is the promotion
-        # benchmark and appears in no rollout, finishes on about 142,000: 14.2
-        # and 0.019. Fifty times outside the buffer, on two of the eight wealth
-        # features, at exactly the moment the run is being judged.
+        # **Both must stay on logs.** Read raw, these are where the gate and the
+        # buffer stop describing the same policy: every training opponent holds
+        # 0-3,000, while the promotion benchmark -- which appears in no rollout --
+        # finishes near 142,000. That is fifty times outside the buffer, on two of
+        # the eight wealth features, at exactly the moment the run is judged. One
+        # unchanged checkpoint read a `trading_rate` of 0.805 against the benchmark
+        # and 0.055 against its own incumbent in the same update: same weights, two
+        # behaviours, because one arena is in distribution and the other is not.
         #
-        # `market-free-population-v25` measured the consequence rather than
-        # inferring it. One unchanged `learner_04` checkpoint read a
-        # `trading_rate` of 0.805 against pilkwang and 0.055 against its own
-        # incumbent in the same update -- the same weights, two behaviours,
-        # because one arena is in distribution and the other is not.
-        #
-        # log1p compresses that 47x gap to 1.5x and is the treatment `money`
-        # already had one line up; the asymmetry was the tell. The share is a
-        # ratio of the same logs, which keeps it monotone in relative wealth and
-        # bounded well away from 0 and 1 -- it moves 0.89 to 0.38 across the
-        # whole range the old form spent between 0.9997 and 0.019.
+        # log1p compresses that 47x gap to 1.5x. The share is a ratio of the same
+        # logs, so it stays monotone in relative wealth and bounded well away from
+        # 0 and 1.
         float(np.log1p(max(0.0, opponent_money))) / 10.0,
         float(np.log1p(max(0.0, money)))
         / (float(np.log1p(max(0.0, money))) + float(np.log1p(max(0.0, opponent_money))) + 1.0),
     ]
-    values += [int(seeds.get(item, 0) or 0) / 10.0 for item in CROPS]
+    values += [min(int(seeds.get(item, 0) or 0), SEED_FEATURE_CAP) / 10.0 for item in CROPS]
     values += [int(shed.get(item, 0) or 0) / 50.0 for item in PRODUCTS]
     values += [carried[item] / 25.0 for item in PRODUCTS]
     values += [carried[item] / 10.0 for item in ANIMALS]

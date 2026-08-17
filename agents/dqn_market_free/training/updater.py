@@ -12,13 +12,11 @@ Double-DQN target index into `ACTIONS`. The buffer can also be seeded with
 demonstrations read out of stored league replays, because uniform exploration
 measurably cannot find a solvent trajectory in this action space on its own.
 
-Both the training resume and the rollout policy follow `lineage_checkpoint`, the
-same as the scorer. An earlier version gated rollouts on a hard viability check
-of their own, so collection stayed on the cold start until something passed the
-gate. Nothing did: three hundred batches were collected by an untrained,
-near-silent policy, its measured orders per decision decayed from 0.19 to 0.03 as
-epsilon annealed over a policy that never moved, and every candidate trained on
-that data was rejected. Release is gated; the behaviour distribution must not be.
+Both the training resume and the rollout policy follow `lineage_checkpoint`.
+**Release is gated; the behaviour distribution must not be.** An earlier version
+gated rollouts on a viability check of their own, so collection stayed on the cold
+start until something passed -- and nothing did: three hundred batches collected
+by an untrained near-silent policy, and every candidate trained on them rejected.
 """
 
 from __future__ import annotations
@@ -28,7 +26,7 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -43,9 +41,9 @@ from agents.dqn_market_free.diagnostics import (
     behavior_from_replay,
     diagnose_replay,
 )
+from agents.dqn_market_free.lots import median
 from agents.dqn_market_free.order_space import (
     ACTION_COUNT,
-    ACTION_INDEX,
     MASKED_SCORE,
     NOOP_INDEX,
 )
@@ -106,108 +104,44 @@ _PROMOTION_RULES = {"significant", "point_estimate", "always", "benchmark_ratche
 #: Which measurement the learner slot's plateau detector reads. See `_slot_score`.
 _SCORE_SIGNALS = {"rollout", "benchmark"}
 
-#: The row `rare.py` exists for, kept as a named batch column. Not special to the
-#: mechanism -- the widening knows nothing about land -- but it is the action whose
-#: absence was measurable across four sessions, so it is the one a run is read on.
-LAND_INDEX = ACTION_INDEX[("BUY_LAND", None, 0)]
-
 VIABILITY_DEFAULTS = {
     "viability_min_mean_money_ratio": 0.80,
     "viability_min_median_money_ratio": 0.75,
-    # The gate's other half. A policy that never trades preserves its money
-    # perfectly, so the money floors above pass -- they catch bankruptcy and wave
-    # the NOOP attractor straight through.
-    #
-    # Only applied once the model has a released incumbent to fall back to. A
-    # cold start is legitimately near-silent, and failing it there would leave
-    # the run with no promotable first checkpoint.
+    # The gate's other half: a policy that never trades keeps its money perfectly,
+    # so the floors above wave the NOOP attractor through. Applied only once there
+    # is a released incumbent -- a cold start is legitimately near-silent.
     "viability_min_orders_per_decision": 0.02,
-    # What the money floors above measure against before anything is released.
-    #
-    # It used to be the quiet baseline's own seat, and that is not a bar a
-    # trading policy can clear: the baseline emits nothing, so it keeps its full
-    # 3,000 stake on every seed and `0.80 * 3000 = 2400` asks the candidate to
-    # trade for a season and lose nothing. `coldstart_v1` failed exactly that,
-    # on `mean_money`/`median_money` only, at seq 40/60/80/120/140 -- seven
-    # updates, zero promotions, and with nothing released the snapback machinery
-    # has nothing to snap back to, so the run cannot escape on its own either.
+    # What the money floors measure against before any release. Not the quiet
+    # baseline's seat: it keeps the full stake, so `0.80 *` it asks a candidate to
+    # trade for a season and lose nothing.
     "viability_cold_start_reference_money": 1500.0,
-    # The cold-start money floors' own escape hatch, and the reason it is separate
-    # from `promotion_ratchet_grace_after_rejections`: the two gates fail
-    # independently, so standing one down does nothing for a slot the other is
-    # holding. Measured across every session in this database -- 35 updates over 20
-    # distinct never-released slots were rejected with `benchmark_ratchet.passed`
-    # true and `median_money` the only failing check, and 19 of those 35 were
-    # already in ratchet grace at the time. The hatch was open on the gate that was
-    # passing.
-    #
-    # `market-free-rarerate-v29@rarerate_03` is the shape: five updates, zero
-    # promotions, the ratchet passing from seq 30 onward, `a_money_median` climbing
-    # 348 -> 910 -> 940 against a fixed floor of `0.75 * 1500 = 1125`, and its
-    # `mean_money` clearing 1,200 the whole way. Nothing about that series is
-    # decaying; it is converging on a synthetic bar from below, and with nothing
-    # released the snapback machinery has nothing to snap back to either.
-    #
-    # 0 leaves it off, so every existing config reads byte for byte as it did.
+    # The cold-start floors' own escape hatch, separate from the ratchet's because
+    # the two gates fail independently -- standing one down does nothing for a slot
+    # the other is holding. 0 leaves it off.
     "viability_grace_after_rejections": 0,
-    # The cold-start reference once viability grace is in force. Unset falls back to
-    # `benchmark_cold_start_min_money`, which is the same foothold the ratchet's own
-    # first release is measured against -- so grace lowers the synthetic bar to the
-    # one number this config already calls a first-checkpoint floor rather than to a
-    # new one.
-    #
-    # Only the *reference* moves. Both ratios still bind at their configured values
-    # and the activity floor is untouched, for the reason `_benchmark_ratchet`
-    # argues about keeping the relative term under grace: the mean/median shape is
-    # what catches a bankrupt policy, and dropping it would make this
+    # The cold-start reference under that grace; unset means
+    # `benchmark_cold_start_min_money`. Only the *reference* moves -- both ratios
+    # still bind and the activity floor is untouched, or this becomes
     # `promotion_rule = "always"` for any slot that has rejected enough times.
     "viability_grace_cold_start_reference_money": None,
-    # The fixed-reference release bar, read off the candidate's own money in the
-    # index-0 benchmark series. Absolute, because everything else in this gate is
-    # relative to the previous update and therefore drifts: `falloff_v1` released
-    # nine consecutive updates whose benchmark money ran 2979, 54, 20, 1146, 18,
-    # 359, 1, 11, 107 while every head-to-head compared it only against whatever
-    # it had itself produced twenty batches earlier.
+    # The fixed-reference release bar. Absolute, because everything else in this
+    # gate is relative to the previous update and therefore drifts.
     "benchmark_release_min_money": 1000.0,
-    # The same bar for the first release only. Lower on purpose: a foothold, not
-    # a good policy. Below it a run has no incumbent at all, and that is the
-    # state the two anti-stall mechanisms are both inert in.
+    # The same bar for the first release only: a foothold, not a good policy. Below
+    # it there is no incumbent, the state both anti-stall mechanisms are inert in.
     "benchmark_cold_start_min_money": 750.0,
-    # The bar once `promotion_ratchet_grace_after_rejections` has stood the ratchet
-    # down. Left unset it is `benchmark_cold_start_min_money`, which keeps every
-    # existing config reading exactly as it did.
-    #
-    # It exists because the absolute floor turned out to be the term a stalled run
-    # cannot clear, not the relative one, which is the opposite of what grace
-    # originally assumed. Measured on `market-free-rare-v20`: 57 consecutive
-    # rejections against a floor of 1,000 with the candidate's benchmark money
-    # between 0.93 and 427, a median near 35, and a win rate of exactly 0.000 on
-    # every one of them -- while the *reference* those rejections were ratcheted
-    # against was 145.8, so the incumbent being protected could not have passed its
-    # own floor either. Dropping the floor and keeping the ratchet is what makes
-    # the hatch escapable: eight of those 57 updates already measured above
-    # `0.9 * 145.8`, so the relative term admits real movement while still refusing
-    # the walk-itself-down decay the ratchet exists to catch.
+    # The bar once ratchet grace is in force; unset means the cold-start floor.
+    # Grace drops the *absolute* term rather than the relative one, because the
+    # absolute is what a stalled run cannot clear -- a lineage can sit far below a
+    # fixed bar while never having regressed against its own recorded reference.
     "benchmark_grace_min_money": None,
-    # Non-regression against the released incumbent's *recorded* benchmark money.
-    # Deliberately not 1.0 -- a gate that admits no noise at all is a gate that
-    # eventually admits nothing.
+    # Non-regression against the incumbent's *recorded* benchmark money. Not 1.0: a
+    # gate admitting no noise eventually admits nothing.
     "benchmark_money_ratchet": 0.9,
-    # How many benchmark measurements the ratchet reference is a median over.
-    # 1 is the single stored draw, byte for byte the behaviour before the key
-    # existed.
-    #
-    # Above 1 because one 100-seed arena series is a draw and not a number here.
-    # `falloff_v1` measured 61 of them without the policy meaningfully moving --
-    # the snapback held it on `9071d2ad` for 55 -- and they ran 0.93 to 427 around
-    # a median of 36.7. `a_money_median` is 2 against a mean of 32.6, so the policy
-    # is bankrupt on most seeds and the mean is a lottery on the survivors.
-    #
-    # Ratcheting one such draw against another is not a weak gate, it is a biased
-    # one: the stored reference is whatever was lucky enough to promote, so each
-    # release re-aims the bar at a higher quantile of unchanged noise. `9071d2ad`
-    # recorded 145.8, its own p75, and the run then failed `no_regression` 57 times
-    # without having regressed.
+    # How many measurements the ratchet reference is a median over. 1 is the single
+    # stored draw. Above 1 because ratcheting one draw against another is not just
+    # weak but biased: the stored reference is whatever was lucky enough to promote,
+    # so each release re-aims the bar at a higher quantile of unchanged noise.
     "benchmark_reference_window": 11,
 }
 
@@ -219,6 +153,70 @@ POLICY_KINDS: dict[str, str] = {
     "market_learner": "raw_order_q",
     "training_opponent": "training_opponent",
 }
+
+
+def _json_column(value: Any) -> dict[str, Any] | None:
+    """A JSON column as a mapping, whatever the driver handed back.
+
+    psycopg decodes `jsonb` for us but not always -- a `text` column, a driver
+    without the adapter registered, or a value that round-tripped through a dump all
+    arrive as `str`/`bytes`. Every reader below wants the same thing, so they share
+    one decode rather than eight copies of the same three lines.
+
+    `None` for anything that is not a mapping, including a decode failure: an
+    unreadable payload is *not recorded*, which is the reading every caller needs.
+    """
+
+    if isinstance(value, (str, bytes, bytearray)):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def _released_gate(reader, active) -> dict[str, Any] | None:
+    """The `gate_json` the active checkpoint was promoted on, or None.
+
+    A pure read of a measurement already paid for: `_arena_evaluate` wrote it when
+    the incumbent was itself a candidate, so everything downstream costs one row and
+    no arena time. One helper because the three readers that want it -- the ratchet's
+    money, the cull's trading rate, the archive's fingerprint -- were each fetching
+    *the same row for the same checkpoint*, three round-trips per update.
+    """
+
+    if active is None:
+        return None
+    row = reader.fetchone(
+        "SELECT gate_json FROM model_training_checkpoints WHERE checkpoint_id = %s",
+        [active.checkpoint_id],
+    )
+    return None if row is None else _json_column(row[0])
+
+
+def _benchmark_entry(gate: dict[str, Any] | None, opponent: str) -> dict[str, Any] | None:
+    """One gate payload's result for `opponent`, or None if it holds none.
+
+    Matched on the opponent spec rather than index 0, so reconfiguring `benchmarks`
+    drops the term instead of silently comparing against a different opponent's
+    number -- the one way any of these could be wrong without looking wrong.
+    """
+
+    if not isinstance(gate, dict):
+        return None
+    for result in gate.get("challenger_benchmarks") or []:
+        if isinstance(result, dict) and str(result.get("opponent", "")) == opponent:
+            return result
+    return None
+
+
+def _benchmark_money(gate: dict[str, Any] | None, opponent: str) -> float | None:
+    """`a_money_mean` from one gate payload's benchmark entry, if it is usable."""
+
+    result = _benchmark_entry(gate, opponent)
+    if result is None or result.get("errors") or result.get("a_money_mean") is None:
+        return None
+    return float(result["a_money_mean"])
 
 
 def _weights_spec(weights_path: Path | str) -> str:
@@ -242,25 +240,17 @@ def _self_play_pool(
 ) -> list[str]:
     """The most recent checkpoints of this model, addressed as agent specs.
 
-    The scorer's shared `self_play_pool` filters on `promoted`, which is right
-    for a model whose gate passes. It is not right here, for the same reason the
-    module docstring gives for rollouts following `lineage_checkpoint` rather
-    than the release: *release is gated; the behaviour distribution must not be*.
-    Filtering on promotion makes self-play unreachable exactly when it would help
-    most -- `market-free-simple-v2` ran 33 updates and promoted none of them, so
-    the promoted pool was empty on every batch and the mirror never played.
+    Deliberately does **not** filter on `promoted`, unlike the scorer's shared
+    helper: release is gated, the behaviour distribution is not. Filtering makes
+    self-play unreachable exactly when it would help most, since a run that
+    promotes nothing has an empty promoted pool on every batch. The scorer's helper
+    is left alone, because a shared helper silently changing which checkpoints two
+    agents mirror is how one stops matching its own gate.
 
-    The scorer's helper is left alone. Its promotion record is healthy, and a
-    shared helper that silently changed which checkpoints two agents self-play
-    against is how one of them stops matching its own gate.
-
-    `after_checkpoint_id` bounds the pool below at a reseed. A restarted slot
-    whose mirror is still the graduated policy is training against the trajectory
-    it was restarted to escape, and the pool refills with its own checkpoints
-    within a few updates anyway -- so this only bites for exactly as long as it
-    has to. Returning nothing while it does is the intended answer: the caller
-    falls back to the mature group, which is a better mirror for a fresh slot
-    than the wreckage of the previous one.
+    `after_checkpoint_id` bounds the pool below at a reseed: a restarted slot whose
+    mirror is still the graduated policy trains against the trajectory it was
+    restarted to escape. Returning nothing meanwhile is intended -- the caller falls
+    back to the mature group.
     """
 
     if limit < 1:
@@ -296,15 +286,13 @@ def _learner_policy(
 ) -> EvaluationPolicy:
     """Identity of the exploring behaviour policy for one batch.
 
-    The spec actually played also carries a per-episode trace path and
-    exploration seed; folding those into the identity would mint one revision
-    per rollout episode. What defines the policy is its weights and how much it
-    explores, so the identity spec carries only those -- and stays resolvable.
+    The spec actually played also carries a per-episode trace path and exploration
+    seed; folding those in would mint one revision per rollout episode. What defines
+    the policy is its weights and how much it explores.
 
-    `sigma_scale` is bucketed to four decimals and carried because it is how much
-    the policy explores. Only the *base* is: the per-actor spread around it is
-    deliberately left out, since folding sixteen of them in would mint eight
-    revisions a batch, none with enough games to rate.
+    Only the *base* `sigma_scale` is carried, not the per-actor spread around it:
+    folding sixteen of those in would mint eight revisions a batch, none with enough
+    games to rate.
     """
 
     query: dict[str, Any] = {
@@ -341,6 +329,30 @@ def initial_network(config: dict[str, Any]) -> OrderQNetwork:
     return OrderQNetwork.quiet_start(seed=int(config.get("seed", 0)))
 
 
+def _quiet_opponent(context, config: dict[str, Any]) -> str:
+    """The cold-start network as a rollout opponent, materialised on first use.
+
+    Reached in exactly one place: batch 0 of a fresh `model_id` under
+    `opponents = []`, where `self_play_after` is read as `batch_index >= 1` so the
+    mirror pool is never consulted and the mix is the empty base. That used to
+    raise, which made a new `SLOT_PREFIX` illegal on a pure-mirror run -- and since
+    the prefix is what severs a stale reward regime, a rule that could not be
+    followed was protecting nothing.
+
+    One batch against an opponent that emits nothing is a small price for that, and
+    it is not a novel object: the same file is what the promotion gate measures a
+    cold-start candidate against, on the argument that the quiet network is a real
+    incumbent rather than an absence of one. Written once and reused, so the
+    opponent a run faces at batch 0 does not depend on when the file was made.
+    """
+
+    path = Path(context.artifacts) / "viability_baselines" / "quiet.npz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        initial_network(config).save(path)
+    return _weights_spec(path)
+
+
 def _arena_evaluate(
     weights_path: Path, opponent: str, seeds: int, jobs: int, seed_start: int = 0
 ) -> dict[str, Any]:
@@ -359,8 +371,7 @@ def _arena_evaluate(
     with _single_threaded_workers():
         results = play_series(spec, opponent, range(seed_start, seed_start + seeds), {}, jobs)
     summary = summarize(spec, opponent, results)
-    diagnostics = _arena_order_diagnostics(results)
-    behavior = _arena_behavior(results)
+    diagnostics, behavior = _arena_summary(results)
     return {
         "opponent": opponent,
         "pairs": summary.pairs,
@@ -383,39 +394,34 @@ def _arena_evaluate(
     }
 
 
-def _arena_order_diagnostics(results: dict[int, tuple[Any, Any]]) -> OrderDiagnostics:
-    """Aggregate the learner's seat from complete paired arena results."""
+def _arena_summary(
+    results: dict[int, tuple[Any, Any]],
+) -> tuple[OrderDiagnostics, BehaviorCounts]:
+    """The learner's seat over complete paired arena results, in one pass.
+
+    Both aggregates walk the same replays under the same completeness rule, so they
+    are read together rather than by two functions with an identical loop body
+    reading every replay dict twice.
+
+    Only complete seat-swapped pairs contribute, matching `summarize()`.
+    """
 
     diagnostics = OrderDiagnostics()
-    for forward, reverse in results.values():
-        # Match summarize(): only complete seat-swapped pairs contribute.
-        if forward.failed or reverse.failed:
-            continue
-        if isinstance(forward.replay, dict):
-            diagnostics += diagnose_replay(forward.replay, 0)
-        if isinstance(reverse.replay, dict):
-            diagnostics += diagnose_replay(reverse.replay, 1)
-    return diagnostics
-
-
-def _arena_behavior(results: dict[int, tuple[Any, Any]]) -> BehaviorCounts:
-    """Aggregate the learner's strategy fingerprint over the same paired results."""
-
     behavior = BehaviorCounts()
     for forward, reverse in results.values():
         if forward.failed or reverse.failed:
             continue
-        if isinstance(forward.replay, dict):
-            behavior += behavior_from_replay(forward.replay, 0)
-        if isinstance(reverse.replay, dict):
-            behavior += behavior_from_replay(reverse.replay, 1)
-    return behavior
+        for result, seat in ((forward, 0), (reverse, 1)):
+            if isinstance(result.replay, dict):
+                diagnostics += diagnose_replay(result.replay, seat)
+                behavior += behavior_from_replay(result.replay, seat)
+    return diagnostics, behavior
 
 
 def _rollout_behavior(rollouts: list[Any]) -> BehaviorCounts:
     """The learner's fingerprint over the batch it just collected.
 
-    `_arena_behavior` above reads the promotion gate's paired matches, which are
+    `_arena_summary` above reads the promotion gate's paired matches, which are
     played greedily against a fixed benchmark. This reads the noisy training
     rollouts instead, so the land-use columns track the behaviour the buffer is
     actually being filled with rather than the one being graded.
@@ -446,23 +452,16 @@ def _order_viability(
 ) -> dict[str, Any]:
     """Did the candidate trade at all, in one arena.
 
-    Read off `trading_rate`, the share of turns the simulator acted on, not off
-    the wire order count. Those differ: `HIRE n` is one decision whose wire form
-    is n rows, so a policy that only ever hires reports 13 wire orders per
-    decision while trading on one turn in fifty. The floor is about how often the
-    policy acts, so it is the decision share that belongs here.
+    Read off `trading_rate`, the share of turns the simulator acted on, not the wire
+    order count: `HIRE n` is one decision whose wire form is n rows, so a hire-only
+    policy reports 13 orders per decision while trading on one turn in fifty.
 
-    `OrderDiagnostics.as_dict` publishes that share already, over its own
-    `max(1, decisions)` guard. Take it as given rather than recomputing from the
-    counts: the recomputation named a key the payload does not carry, so the rate
-    read 0.0 for every real arena and the floor failed unconditionally wherever
-    `require_activity` was set.
+    Take `OrderDiagnostics.as_dict`'s published share as given rather than
+    recomputing it from the counts -- a recomputation naming a key the payload does
+    not carry reads 0.0 for every real arena and fails the floor unconditionally.
 
-    There is still no upper limit. Over-trading can only show up as lost money,
-    which the money floors in `_arena_viability` already measure. The three
-    cross-slot limits that used to live here (exact duplicates, repeated targets,
-    buy/sell conflicts within one decision) were counting a failure mode that a
-    single-order decision cannot have.
+    No upper limit: over-trading can only show up as lost money, which the floors in
+    `_arena_viability` already measure.
     """
 
     diagnostics = dict(result.get("order_diagnostics") or {})
@@ -486,21 +485,15 @@ def _order_viability(
 def _collapsed_against_baseline(result: dict[str, Any], config: dict[str, Any]) -> bool:
     """Did the candidate itself emit nothing in a zero-margin baseline match.
 
-    Only meaningful once the paired margin has already been found to be
-    zero-width, which against the quiet baseline is a rejection rather than a
-    harness fault. The question this answers is *which* of the two it is: the
-    NOOP collapse this family falls into, or a candidate that traded all season
-    against a counterparty offering nothing.
+    Only meaningful once the paired margin is already known to be zero-width. The
+    question is *which* of two things it is: the NOOP collapse, or a candidate that
+    traded all season against a counterparty offering nothing. The margin alone
+    cannot say -- round-trip trades are cash-neutral against an unchanged market, so
+    a seat can place thousands of orders and still finish on exactly the stake.
 
-    A zero margin does not settle it. Round-trip trades are cash-neutral against
-    an unchanged market, so `market-free-population-v25@learner_05` placed 16,686
-    orders over 35,950 decisions at cutoff 143 and still finished every paired
-    seed on exactly 3,000.0 against a baseline that did the same.
-
-    Read off `trading_rate` for the same reason `_order_viability` does: `HIRE n`
-    is one decision whose wire form is n rows, so the order count overstates a
-    hire-only policy by an order of magnitude. Shares the activity floor, so
-    setting `viability_min_orders_per_decision = 0` turns this off with it.
+    Read off `trading_rate` rather than the order count, because `HIRE n` is one
+    decision whose wire form is n rows. Shares the activity floor, so setting
+    `viability_min_orders_per_decision = 0` turns this off with it.
     """
 
     diagnostics = dict(result.get("order_diagnostics") or {})
@@ -523,13 +516,9 @@ def _arena_viability(
     the floor compares like with like. That is the head-to-head, where the
     reference is the incumbent's own seat.
 
-    `reference_kind` and `grace` are recorded rather than used. They say which of
-    the two references the floors were measured against and whether
-    `viability_grace_after_rejections` stood the cold-start one down, which is not
-    otherwise recoverable from the payload: a grace floor and an ordinary one are
-    both just numbers once they are written, and 19 of the 35 updates that motivated
-    the hatch were already in *ratchet* grace, so a run that cannot tell the two
-    hatches apart in `gate_json` cannot say which one moved.
+    `reference_kind` and `grace` are recorded rather than used: a grace floor and an
+    ordinary one are both just numbers once written, so without them `gate_json`
+    cannot say which of the two hatches moved.
     """
 
     order = _order_viability(result, config, require_activity=require_activity)
@@ -561,46 +550,41 @@ def _arena_viability(
 def _released_trading_rate(reader, active, opponent: str) -> float | None:
     """The released incumbent's own recorded trading rate on this benchmark.
 
-    The activity half of `_released_benchmark_money`, read the same way and for
-    the same reason: the number was written into that update's `gate_json` when
-    the incumbent was itself a candidate, so this costs one row and no arena time.
+    The activity half of `_released_benchmark_money`, read the same way: from the
+    incumbent's own `gate_json`, so it costs one row and no arena time. Matched on
+    the opponent spec, so reconfiguring `benchmarks` drops the term rather than
+    comparing against a different opponent.
 
-    Matched on the opponent spec, like the money, so reconfiguring `benchmarks`
-    drops the term instead of comparing against a different opponent's activity.
+    `None` means *not recorded*, deliberately not zero: a missing measurement is not
+    evidence of idleness, and treating it as such would retire every pre-existing
+    member the first time the pool was culled.
 
-    `None` means *not recorded* -- an older checkpoint, or a gate payload from
-    before this was written -- and is deliberately not the same as zero. A missing
-    measurement is not evidence of idleness, and treating it as such would retire
-    every pre-existing member the first time the pool was culled.
+    `hard_viability.benchmarks` is a **mapping keyed on the opponent spec** --
+    `update` writes `dict(zip(benchmarks, benchmark_viability))` -- so it is read by
+    key. Iterating it instead yields the spec strings, every `isinstance(item, dict)`
+    test fails, and the whole branch falls through to the head-to-head: a different
+    arena against a different opponent, silently, with a plausible number. That
+    happened, and it turned the pool's activity discount into a reading of the
+    incumbent match rather than the benchmark it claims to describe.
     """
 
-    if active is None:
-        return None
-    row = reader.fetchone(
-        "SELECT gate_json FROM model_training_checkpoints WHERE checkpoint_id = %s",
-        [active.checkpoint_id],
-    )
-    if row is None:
-        return None
-    gate = row[0]
-    if isinstance(gate, (str, bytes, bytearray)):
-        gate = json.loads(gate)
-    if not isinstance(gate, dict):
+    gate = _released_gate(reader, active)
+    if gate is None:
         return None
     viability = gate.get("hard_viability")
     if isinstance(viability, dict):
-        for item in viability.get("benchmarks") or []:
-            if isinstance(item, dict) and item.get("trading_rate") is not None:
-                return float(item["trading_rate"])
+        benchmarks = viability.get("benchmarks")
+        if isinstance(benchmarks, dict):
+            entry = benchmarks.get(opponent)
+            if isinstance(entry, dict) and entry.get("trading_rate") is not None:
+                return float(entry["trading_rate"])
         head = viability.get("head_to_head")
         if isinstance(head, dict) and head.get("trading_rate") is not None:
             return float(head["trading_rate"])
-    for result in gate.get("challenger_benchmarks") or []:
-        if not isinstance(result, dict) or str(result.get("opponent", "")) != opponent:
-            continue
-        diagnostics = result.get("order_diagnostics")
-        if isinstance(diagnostics, dict) and diagnostics.get("trading_rate") is not None:
-            return float(diagnostics["trading_rate"])
+    result = _benchmark_entry(gate, opponent)
+    diagnostics = (result or {}).get("order_diagnostics")
+    if isinstance(diagnostics, dict) and diagnostics.get("trading_rate") is not None:
+        return float(diagnostics["trading_rate"])
     return None
 
 
@@ -618,25 +602,10 @@ def _released_behavior(reader, active, opponent: str) -> dict[str, Any] | None:
     row nobody has measured occupy a reserved berth.
     """
 
-    if active is None:
-        return None
-    row = reader.fetchone(
-        "SELECT gate_json FROM model_training_checkpoints WHERE checkpoint_id = %s",
-        [active.checkpoint_id],
-    )
-    if row is None:
-        return None
-    gate = row[0]
-    if isinstance(gate, (str, bytes, bytearray)):
-        gate = json.loads(gate)
-    if not isinstance(gate, dict):
-        return None
-    for result in gate.get("challenger_benchmarks") or []:
-        if not isinstance(result, dict) or str(result.get("opponent", "")) != opponent:
-            continue
-        behavior = result.get("behavior")
-        if isinstance(behavior, dict) and behavior.get("episodes"):
-            return dict(behavior)
+    result = _benchmark_entry(_released_gate(reader, active), opponent)
+    behavior = (result or {}).get("behavior")
+    if isinstance(behavior, dict) and behavior.get("episodes"):
+        return dict(behavior)
     return None
 
 
@@ -702,25 +671,19 @@ def _population_score(
     source and the mirror opponent for every slot in the roster. The population
     would then propagate the collapse it exists to escape.
 
-    Measured on this run at the time this was written: eight of ten slots had
-    collapsed to a trading rate of 0.0000 carrying 468 to 924 coins, while the two
-    still trading (0.32 and 0.88) carried 8 and 231. Money and activity were
-    anti-correlated across the whole roster.
+    On this family money and activity are anti-correlated across the roster, so the
+    hoarder is not a hypothetical.
 
-    The discount is a linear ramp to `population_activity_reference`, saturating
-    at 1.0 above it. Deliberately not a threshold: hard viability already owns the
-    binary "did it act at all" question at
-    `viability_min_orders_per_decision`, and repeating that shape here would only
-    move the same cliff. What this adds is that *barely* clearing that floor no
-    longer buys a hoarder the top of the pool.
+    A linear ramp to `population_activity_reference`, saturating above it, and
+    deliberately not a threshold: hard viability already owns the binary "did it act
+    at all" question, and repeating that shape here would only move the same cliff.
+    What this adds is that *barely* clearing that floor no longer buys a hoarder the
+    top of the pool. No upper penalty -- over-trading shows up as lost money, which
+    the money term already carries.
 
-    No upper penalty, for the reason `_order_viability` gives: over-trading can
-    only show up as lost money, which the money term already carries.
-
-    Stated plainly because it is a judgement rather than a measurement: the
-    reference is a policy choice about how much activity counts as "trading for
-    real", and it is set from the observed bimodality (0.000 against 0.32-0.88)
-    rather than from any result. Setting it to 0 restores raw-money ranking.
+    The reference is a judgement about how much activity counts as trading for real,
+    set from the observed bimodality rather than from a result. 0 restores raw-money
+    ranking.
     """
 
     base = 0.0 if money is None else float(money)
@@ -750,42 +713,22 @@ def _population_score(
 def _released_benchmark_money(reader, active, opponent: str) -> tuple[float | None, str | None]:
     """The released incumbent's own recorded score on this benchmark.
 
-    A pure read of a measurement that has already been paid for. Re-simulating
-    the incumbent against every benchmark is what the comment above
-    `challenger_benchmarks` removed for wall clock, and this does not reinstate
-    it: the number was written into that update's `gate_json` when the incumbent
-    was itself a candidate, so the ratchet costs one row.
+    A pure read of a measurement already paid for: the number was written into that
+    update's `gate_json` when the incumbent was itself a candidate, so the ratchet
+    costs one row and no arena time.
 
-    Matched on the opponent spec rather than on index 0. Reconfiguring
-    `benchmarks` then resets the ratchet instead of silently comparing the
-    candidate's score against a different opponent's, which is the one way this
-    could be wrong without any of it looking wrong.
+    Matched on the opponent spec rather than index 0, so reconfiguring `benchmarks`
+    resets the ratchet instead of silently comparing against a different opponent's
+    score -- the one way this could be wrong without looking wrong.
 
-    `None` means *no ratchet term* -- there is nothing comparable to ratchet
-    against -- and never "the ratchet passes". The absolute floor still binds in
-    that case, and binds at the cold-start value.
+    `None` means *no ratchet term*, never "the ratchet passes". The absolute floor
+    still binds, at the cold-start value.
     """
 
     if active is None:
         return None, None
-    row = reader.fetchone(
-        "SELECT gate_json FROM model_training_checkpoints WHERE checkpoint_id = %s",
-        [active.checkpoint_id],
-    )
-    if row is None:
-        return None, None
-    gate = row[0]
-    if isinstance(gate, (str, bytes, bytearray)):
-        gate = json.loads(gate)
-    if not isinstance(gate, dict):
-        return None, None
-    for result in gate.get("challenger_benchmarks") or []:
-        if not isinstance(result, dict) or str(result.get("opponent", "")) != opponent:
-            continue
-        if result.get("errors") or result.get("a_money_mean") is None:
-            return None, None
-        return float(result["a_money_mean"]), active.checkpoint_id
-    return None, None
+    money = _benchmark_money(_released_gate(reader, active), opponent)
+    return (None, None) if money is None else (money, active.checkpoint_id)
 
 
 def _benchmark_reference_window(
@@ -793,26 +736,18 @@ def _benchmark_reference_window(
 ) -> list[float]:
     """Every benchmark measurement taken while the current incumbent has stood.
 
-    One arena series is not a number, it is a draw, and on this family it is a
-    very wide one. `falloff_v1` measured its benchmark money 61 times without the
-    policy meaningfully moving -- the snapback held it on one checkpoint for 55 of
-    them -- and got a median of 36.7, a p90 of 186 and a maximum of 427. The
-    reason is visible in the same payload: `a_money_median` is 2 against a mean of
-    32.6, so the policy is bankrupt on most of the 100 seeds and the mean is
-    carried by a handful of survivors.
+    One arena series is a draw, not a number, and a wide one here: the policy is
+    bankrupt on most seeds, so the mean rides on a handful of survivors.
 
-    Ratcheting a draw from that against a single earlier draw from it is a
-    coin-flip wearing a gate's clothes, and it is a *biased* coin-flip: the stored
+    Ratcheting one such draw against another is a *biased* coin flip -- the stored
     reference is whatever was lucky enough to promote, so each release raises the
-    bar to a higher quantile of unchanged noise and the gate tightens on itself.
-    `9071d2ad` recorded 145.8, which is its p75; the run then failed
-    `no_regression` 57 times against a policy it had not actually regressed from.
+    bar to a higher quantile of unchanged noise and the gate tightens on itself. A
+    run can then fail `no_regression` dozens of times without having regressed.
 
-    So the reference is a median over the window rather than one draw. Candidates
-    measured while an incumbent stands are near-neighbours of it -- under a held
-    snapback, literally the same weights plus one update's gradient steps -- so
-    they are repeated samples of the same underlying quantity and the median of
-    them estimates it far better than any single one.
+    So the reference is a median over the window. Candidates measured while an
+    incumbent stands are near-neighbours of it -- under a held snapback, literally
+    the same weights plus one update's gradient steps -- so they are repeated
+    samples of one quantity.
 
     What this gives up, stated rather than hidden: a lineage that decays slowly
     and uniformly drags its own window down with it, so the ratchet follows the
@@ -841,17 +776,9 @@ def _benchmark_reference_window(
     )
     measurements: list[float] = []
     for row in rows or []:
-        gate = row[0]
-        if isinstance(gate, (str, bytes, bytearray)):
-            gate = json.loads(gate)
-        if not isinstance(gate, dict):
-            continue
-        for result in gate.get("challenger_benchmarks") or []:
-            if not isinstance(result, dict) or str(result.get("opponent", "")) != opponent:
-                continue
-            if result.get("errors") or result.get("a_money_mean") is None:
-                continue
-            measurements.append(float(result["a_money_mean"]))
+        money = _benchmark_money(_json_column(row[0]), opponent)
+        if money is not None:
+            measurements.append(money)
     return measurements
 
 
@@ -883,22 +810,14 @@ def _benchmark_ratchet(
     can walk itself down indefinitely while every single comparison reads as an
     improvement.
 
-    `grace` drops the **floor**, to `benchmark_grace_min_money`, and keeps the
-    ratchet. That is the reverse of how it started, and the reversal is measured
-    rather than argued. The original reading -- floor absolute and permanent,
-    ratchet relative and droppable -- assumed the floor is the term a genuinely
-    improving run clears on its way past a stall. `market-free-rare-v20` is the
-    counterexample: 57 consecutive rejections, every one of them failing
-    `min_money` against a floor of 1,000 with the candidate between 0.93 and 427,
-    and the reference protecting them sitting at 145.8 -- below its own floor. The
-    floor was not waiting for the run to improve, it was unreachable, and grace as
-    written could only stand down the one term the run was already clearing on
-    eight of those 57 updates.
+    `grace` drops the **floor** and keeps the ratchet, which is the opposite of the
+    obvious reading. The floor is the term a stalled run cannot clear -- a lineage
+    can sit far below a fixed bar while never having regressed against its own
+    reference, and the incumbent protecting it may not clear that bar either.
 
-    Keeping the ratchet under grace is what stops this from becoming
-    `promotion_rule = "always"` in disguise. The decay it exists to catch is
-    relative, so the relative term is the one worth holding on to when the run has
-    proven it cannot clear an absolute bar.
+    Keeping the ratchet under grace is what stops this becoming
+    `promotion_rule = "always"` in disguise: the decay this gate exists to catch is
+    relative, so the relative term is the one worth holding on to.
     """
 
     floor_name = (
@@ -925,16 +844,13 @@ def _benchmark_ratchet(
     # The incumbent's own draw is one of the samples, not a separate authority --
     # it is the same measurement on the same benchmark, and singling it out is
     # exactly the selection bias the window exists to remove.
-    samples = sorted(reference_samples or [])
+    samples = list(reference_samples or [])
     if reference is not None:
-        samples = sorted([*samples, reference])
+        samples.append(reference)
     reference_used = reference
     reference_kind = "released_measurement"
     if len(samples) > 1:
-        middle, odd = divmod(len(samples), 2)
-        reference_used = (
-            samples[middle] if odd else 0.5 * (samples[middle - 1] + samples[middle])
-        )
+        reference_used = median(samples)
         reference_kind = "window_median"
     checks: dict[str, bool] = {
         "measured": result is not None and not result.get("errors"),
@@ -994,21 +910,18 @@ def _reset_learning_rates(
 
 # --- Population training -----------------------------------------------------
 #
-# The single ever-resuming lineage this replaced measured its own failure over
-# `market-free-falloff-v18`'s batches 1100-1688: rollout money oscillating around
-# 5,000 with no trend, `mean_loss` pinned at 0.0015, `mean_abs_q` at 0.2, and
-# benchmark money against pilkwang between 0.9 and 1,208 from a 3,000 stake. A
-# trajectory that has stopped moving cannot be pushed out of its basin by the
-# thing that put it there, and every exploration lever tried through v19 was
-# aimed at the behaviour distribution rather than at the trajectory.
+# The single ever-resuming lineage this replaced measured its own stall: hundreds
+# of batches with no trend in either direction, loss and `mean_abs_q` both flat.
+# A trajectory that has stopped moving cannot be pushed out of its basin by the
+# gradient that put it there, and every exploration lever aimed at the behaviour
+# distribution rather than at the trajectory.
 #
-# So a roster of named learner slots trains in parallel (one `training_models`
-# row each, `effective_model_id` namespacing them under one `declared_model_id`)
-# and a slot that stops improving is *ended* rather than nursed: its released
-# checkpoint graduates into `population_members`, the mature group drops its
-# lowest scorer to stay at capacity, and the slot restarts from the best mature
-# member with its learning rate back at zero and a fraction of its weights
-# redrawn.
+# So named learner slots train in parallel (one `training_models` row each,
+# namespaced under one `declared_model_id`) and a slot that stops improving is
+# *ended* rather than nursed: its released checkpoint graduates into
+# `population_members`, the group drops its lowest scorer to stay at capacity, and
+# the slot restarts from a mature member with its learning rate at zero and a
+# fraction of its weights redrawn.
 
 
 @dataclass(frozen=True)
@@ -1211,10 +1124,7 @@ def _slot_metrics(reader, model_id: str) -> dict[str, Any]:
     )
     if row is None:
         return {}
-    metrics = row[0]
-    if isinstance(metrics, (str, bytes, bytearray)):
-        metrics = json.loads(metrics)
-    return metrics if isinstance(metrics, dict) else {}
+    return _json_column(row[0]) or {}
 
 
 def _slot_state(previous: dict[str, Any], spec: SlotSpec) -> SlotState:
@@ -1272,48 +1182,33 @@ def _slot_state(previous: dict[str, Any], spec: SlotSpec) -> SlotState:
 def _settle_slot(state: SlotState, score: float | None, spec: SlotSpec) -> SlotState:
     """Fold this update's score into the slot, decaying on a plateau.
 
-    `score` is a windowed money median rather than `mean_loss`. Loss is not
-    a progress signal on this family -- it sat at 0.0015 across 500 batches of a
-    policy that was going nowhere -- and it is not even the right *sign*: a
-    genuinely improving policy reaches harder states and its TD residual rises.
+    `score` is a windowed money median, never `mean_loss`: loss is not a progress
+    signal here and is not even the right *sign*, since an improving policy reaches
+    harder states and its TD residual rises.
 
-    **`best` leaks, and that is `spec.best_decay`.** A plain maximum latches: the
-    high-water mark is set by the single luckiest draw the slot ever took, and
-    every update afterwards has to clear it by `min_delta` on top. On a signal
-    that moves tens of percent between updates that is unreachable by anything
-    short of another outlier, so the stall counter runs to `patience`, the rate
-    decays, and the slot is graduated while it is still improving. Measured on
-    `market-free-logmoney-v26`: `logmoney_07` pinned `lr_best_score` at 4,208.69,
-    a draw it never repeated, spent the rest of its life scoring 2,992-4,103, and
-    was reseeded -- while its rollout money climbed 4,673 -> 5,646 throughout.
+    **`best` leaks, and that is `spec.best_decay`.** A plain maximum latches on the
+    single luckiest draw the slot ever took, which every later update then has to
+    clear by `min_delta` on top -- unreachable on a signal moving tens of percent
+    between updates, so the slot graduates while it is still improving.
 
-    Decaying the mark rather than widening `patience` or loosening `min_delta`,
-    because the three do different things. Patience says how long a genuine
-    plateau must last; `min_delta` says how big a move counts; this says how long
-    an unrepeatable measurement gets to stand as the thing to beat.
+    Three knobs that look interchangeable and are not: `patience` says how long a
+    genuine plateau must last, `min_delta` how big a move counts, and this how long
+    an unrepeatable measurement stands as the thing to beat. The decay is sized
+    against the patience budget -- the largest excess cleared before the
+    `patience`-th stall is `1 / ((1 + min_delta) * (1 - decay)**(patience - 1))` --
+    so raising patience widens this rather than duplicating it.
 
-    Sized against the patience budget rather than picked. An outlier `B` above a
-    level `L` stops blocking on the stall where `L > B * (1 - decay)**k * (1 +
-    min_delta)`, so the largest excess cleared before the `patience`-th stall
-    spends the budget is `1 / ((1 + min_delta) * (1 - decay)**(patience - 1))`. At
-    0.08, `min_delta` 0.05 and `patience` 4 that is 22%, and `logmoney_07`'s
-    stranding outlier was 20% -- the case this is sized on. At `patience` 8 it is
-    71%, so raising patience widens this rather than duplicating it.
+    `max(score, ...)` floors the leak at the current observation, which is what makes
+    a large decay safe: a slot genuinely flat at `L` keeps `best == L` whatever the
+    decay, so it still stalls and still graduates. Only excess leaks.
 
-    `max(score, ...)` floors the leak at the current observation, which is what
-    makes a large decay safe: a slot that is genuinely flat at `L` has `best == L`
-    at every step no matter the decay, so it still stalls and still graduates.
-    Only *excess above the current level* leaks, and only an outlier has any.
+    Two things that are **not** stalls:
 
-    `None` means the score did not measure, which is not a stall. An update
-    that failed to produce a comparison says nothing about progress, and counting
-    it would let a broken arena graduate every slot in the roster.
-
-    Warmup is not a stall either, and for the same reason. A slot climbing from
-    zero is deliberately under-trained, so its scores are evidence about the ramp
-    rather than about the policy -- counting them spends the patience budget
-    before the slot has taken a single step at the resolved rate, and worse, sets
-    `best_score` from a measurement the slot is guaranteed to beat.
+    * `None` -- the score did not measure. A broken arena would otherwise graduate
+      every slot in the roster.
+    * Warmup. A slot climbing from zero is deliberately under-trained, so counting
+      it spends the patience budget before a single step at the resolved rate and
+      sets `best_score` from a measurement the slot is guaranteed to beat.
     """
 
     if score is None or not spec.enabled or state.stage == "warmup":
@@ -1349,7 +1244,7 @@ def _rollout_score(
     window: int,
     batch_floor: int,
 ) -> float | None:
-    """`_slot_score`'s rollout arm: a window median of `own_mean_final_money`.
+    """`_slot_score`'s rollout arm: a window median of `recent_mean_final_money`.
 
     The same shape as the benchmark arm below -- this update's own measurement
     plus the previous `window - 1`, bounded below by the slot's reseed, median
@@ -1358,10 +1253,20 @@ def _rollout_score(
     *relative* threshold and both signals are money on the same stake, so the
     patience budget means the same thing either way.
 
-    A median even though the input is already a 1,200-episode mean, and the extra
+    A median even though the input is already a many-episode mean, and the extra
     smoothing is close to free here: the ring turns over about 3.75 generations,
     so adjacent updates are correlated rather than independent draws and the
     median is guarding against the reseed discontinuity more than against noise.
+
+    The FIFO segment, not the whole buffer. `own_mean_final_money` includes the
+    reservoir -- a uniform sample of everything evicted since the reseed -- so it
+    lags the policy by a third of the buffer's history, and this median on top of
+    that lag was grading a slot on a policy several updates old.
+
+    Rows written before `recent_mean_final_money` existed are **skipped rather than
+    substituted**: the old key is the diluted quantity, and folding it into the same
+    median would put a step in the series that no policy change caused. The window
+    is short for one cycle after the change and exact throughout.
     """
 
     if candidate is None:
@@ -1378,18 +1283,11 @@ def _rollout_score(
     )
     samples = [float(candidate)]
     for row in rows or []:
-        metrics = row[0]
-        if isinstance(metrics, (str, bytes, bytearray)):
-            metrics = json.loads(metrics)
-        if not isinstance(metrics, dict):
-            continue
-        money = metrics.get("own_mean_final_money")
-        if money is None:
-            continue
-        samples.append(float(money))
-    samples.sort()
-    middle, odd = divmod(len(samples), 2)
-    return samples[middle] if odd else 0.5 * (samples[middle - 1] + samples[middle])
+        metrics = _json_column(row[0])
+        money = None if metrics is None else metrics.get("recent_mean_final_money")
+        if money is not None:
+            samples.append(float(money))
+    return median(samples)
 
 
 def _slot_score(
@@ -1404,43 +1302,26 @@ def _slot_score(
 ) -> float | None:
     """The slot's progress signal: a median of its own recent money.
 
-    Which money is `signal`, and the choice is the one measurement that decided
-    it. Over `market-free-logmoney-v26` batches 200-360 -- all ten slots, 160
-    consecutive update pairs -- the mean absolute update-to-update change was:
+    `signal` picks which money. The rollout mean changes ~12% between updates and
+    the benchmark arena ~48%, so the arena is four times noisier -- and that is not
+    a precision problem the window fixes, because adjacent windows share ten of
+    eleven samples and the draw's heavy tail survives the smoothing. Slots have been
+    graduated as plateaus on the arena number while their rollout money climbed
+    steadily.
 
-        own_mean_final_money   (1,200-episode rollout mean)   11.7%
-        benchmark arena money  (this window median)           48.2%
+    `"benchmark"` keeps the old signal, and the two are not the same *quantity*: the
+    rollout mean is measured against the training mix at collection sigma, the arena
+    against the pinned benchmark greedily. This changes which one ends a slot, never
+    which one promotes.
 
-    The arena number is four times noisier than one the update already computes
-    and, before this, used for nothing. That is not a precision problem the window
-    below can fix: it *is* the windowed median, and adjacent windows share ten of
-    their eleven samples, so the draw's heavy tail survives the smoothing. The
-    consequence was measured too -- `logmoney_07` read 2,992 / 4,103 / 4,103 /
-    2,992 / 2,992 and was graduated as a plateau while its rollout money went
-    4,673 -> 4,811 -> 5,272 -> 5,471 -> 5,646, then reseeded down to 828.
-    `logmoney_02` the same, 3,497 -> 332.
+    A median rather than the latest draw either way -- a detector reading single
+    draws would find an "improvement" by luck every few updates and the rate would
+    never decay, reproducing the stagnation it exists to end.
 
-    `"benchmark"` keeps the old signal, because the two are not the same
-    *quantity*: the rollout mean is measured against the training opponent mix at
-    collection sigma, the arena against the pinned benchmark greedily. The rollout
-    mean is the better *progress* signal and the arena is still the release
-    decision -- this changes which one ends a slot, not which one promotes.
-
-    A median rather than the latest draw either way, for the reason
-    `_benchmark_reference_window` argues at length: one 100-seed arena series on
-    this family swings between 0.93 and 427 on an unchanged policy, because
-    `a_money_median` is 2 against a mean of 32.6 and the mean rides on a handful
-    of survivors. A plateau detector reading single draws would find an
-    "improvement" by luck every few updates and the rate would never decay --
-    which is the stagnation this exists to end, reproduced by the thing meant to
-    end it.
-
-    Bounded below by the slot's own reseed. Measurements from before it describe a
-    policy this slot no longer is, and including them would let an inherited high
-    score keep a restarted slot's plateau counter pinned.
-
-    `None` when nothing measured, which `_settle_slot` treats as "no information"
-    rather than as a stall.
+    Bounded below by the slot's own reseed: earlier measurements describe a policy
+    this slot no longer is, and an inherited high score would pin a restarted slot's
+    plateau counter. `None` when nothing measured, which `_settle_slot` reads as no
+    information rather than as a stall.
     """
 
     if signal == "rollout":
@@ -1459,20 +1340,10 @@ def _slot_score(
     )
     samples = [float(candidate)]
     for row in rows or []:
-        gate = row[0]
-        if isinstance(gate, (str, bytes, bytearray)):
-            gate = json.loads(gate)
-        if not isinstance(gate, dict):
-            continue
-        for result in gate.get("challenger_benchmarks") or []:
-            if not isinstance(result, dict) or str(result.get("opponent", "")) != opponent:
-                continue
-            if result.get("errors") or result.get("a_money_mean") is None:
-                continue
-            samples.append(float(result["a_money_mean"]))
-    samples.sort()
-    middle, odd = divmod(len(samples), 2)
-    return samples[middle] if odd else 0.5 * (samples[middle - 1] + samples[middle])
+        money = _benchmark_money(_json_column(row[0]), opponent)
+        if money is not None:
+            samples.append(money)
+    return median(samples)
 
 
 def _graduates(state: SlotState, spec: SlotSpec) -> bool:
@@ -1503,18 +1374,10 @@ def _warm_starts(
 
     A cold start is the right initialisation only when there is nothing to start
     from. `declared_model_id` carries no session suffix, so the mature group
-    outlives the session that filled it, and a fresh roster begins beside
-    checkpoints of policies that already work. A slot starting from
-    `initial_network` there is not exploring a different basin -- it is
-    re-deriving from noise what the group already holds, and it does so for the
-    whole decay cycle before `_graduates` gives it its first ancestor.
-
-    `market-free-streak-v27` is the measurement rather than the hypothesis. Five
-    updates in, ten cold-started slots sat at 1,071-1,392 rollout money against a
-    group whose worst usable member scored 1,861 and whose best scored 6,270 --
-    and their rollout money was *falling*, 3,000 at update zero to 720 at update
-    four. A generation of compute spent re-learning the floor of what was already
-    on disk.
+    outlives the session that filled it and a fresh roster begins beside
+    checkpoints that already work. Starting from `initial_network` there is not
+    exploring a different basin -- it is re-deriving from noise what the group
+    already holds, for a whole decay cycle before `_graduates` supplies an ancestor.
 
     Not a graduation, and deliberately not routed through `_graduates`' floors.
     Those floors exist so warmup noise cannot end a slot that has not had a chance
@@ -1562,13 +1425,20 @@ def _declared_model_id(reader, model_id: str) -> str:
     return str(row[0])
 
 
-def mature_members(reader, declared_model_id: str) -> list[dict[str, Any]]:
+def mature_members(
+    reader, declared_model_id: str, reserved_min_money: float = 0.0
+) -> list[dict[str, Any]]:
     """The live mature group, best first.
 
     Missing artifacts are dropped rather than raising: a member whose `.npz` has
     been cleaned off disk is unusable as a reseed source or a mirror opponent,
     and the run has to keep going. It stays a live row so the count still reflects
     what graduated.
+
+    `reserved_min_money` is the archive's own floor and has to be passed by anything
+    whose result reaches `_reseed_source`'s reserve bucket -- see `_mark_reserved`.
+    0.0 is the unfloored marking, correct for a caller that only wants the ranked
+    list (the mirror pool) and never reads `reserved`.
     """
 
     rows = reader.fetchall(
@@ -1594,7 +1464,7 @@ def mature_members(reader, declared_model_id: str) -> list[dict[str, Any]]:
         for row in rows or []
         if Path(str(row[4])).is_file()
     ]
-    return _mark_reserved(members)
+    return _mark_reserved(members, reserved_min_money)
 
 
 def _decode_behavior(value: Any) -> dict[str, Any] | None:
@@ -1602,18 +1472,17 @@ def _decode_behavior(value: Any) -> dict[str, Any] | None:
 
     The column is nullable and predates nothing -- every member graduated before
     it existed carries NULL -- so an unreadable or absent value is `None` rather
-    than an error. `_reserved_cell` then declines to file it anywhere.
+    than an error, which `_json_column` already gets right. `_reserved_cell` then
+    declines to file it anywhere.
     """
 
-    if isinstance(value, (str, bytes, bytearray)):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            return None
-    return dict(value) if isinstance(value, dict) else None
+    decoded = _json_column(value)
+    return None if decoded is None else dict(decoded)
 
 
-def _mark_reserved(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _mark_reserved(
+    members: list[dict[str, Any]], reserved_min_money: float = 0.0
+) -> list[dict[str, Any]]:
     """Tag the best-scoring live member of each reserved cell.
 
     Computed here, once, off the same score-ordered list the cull reads, so
@@ -1622,40 +1491,64 @@ def _mark_reserved(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
     `score DESC, member_id` -- deterministic, and the same tiebreak the cull's
     `DISTINCT ON` uses.
 
-    Only the *occupancy* is decided here. Whether a member cleared the money
-    floor was decided when it entered, so a row that is live is a row the cull
-    already accepted.
+    **The money floor is applied here too, and has to be.** An earlier version
+    reasoned that a live row is a row the cull already accepted -- true of the
+    `kept_by_cell` half and false of the group as a whole, because
+    `kept_by_score` keeps a member on rank alone and never consults the floor.
+    So a bankrupt land-buyer held by score was still tagged `reserved` and drawn
+    by `reseed_source_explorer_share`, which is exactly the reseed the floor is
+    the safety argument against. `_graduate`'s `money >= %s` predicate reads the
+    same undiscounted `behavior_json ->> 'money'` this does.
+
+    A member with no fingerprint, or one carrying no `money`, stays unreserved:
+    unmeasured is not the same as below the floor, and neither may hold a berth.
     """
 
     seen: set[tuple[int, int]] = set()
     marked: list[dict[str, Any]] = []
     for member in members:
         cell = _reserved_cell(member.get("behavior"))
-        reserved = cell is not None and cell not in seen
+        reserved = (
+            cell is not None
+            and cell not in seen
+            and _behavior_money(member.get("behavior")) >= float(reserved_min_money)
+        )
         if reserved:
             seen.add(cell)
         marked.append({**member, "cell": cell, "reserved": reserved})
     return marked
 
 
+def _behavior_money(behavior: dict[str, Any] | None) -> float:
+    """The undiscounted benchmark money a fingerprint carries, or `-inf`.
+
+    `-inf` rather than 0.0 for an absent or unreadable value, so an unmeasured
+    member fails any floor including `0.0` -- the same "not recorded is not
+    evidence" rule `_released_trading_rate` follows, and the reading `_graduate`'s
+    SQL already has for free since `money >= %s` is NULL-false.
+    """
+
+    if not isinstance(behavior, dict) or behavior.get("money") is None:
+        return float("-inf")
+    try:
+        return float(behavior["money"])
+    except (TypeError, ValueError):
+        return float("-inf")
+
+
 def _release_age(reader, model_id: str, checkpoint_id: str | None) -> int | None:
     """How many of this slot's updates a release has stood without being replaced.
 
-    The lag on pool entry, and it is load-bearing rather than cautious. A release
-    that can be copied the moment it is promoted closes a loop: whichever slot
-    released most recently becomes the ancestor for whichever slot reseeds next,
-    and the roster converges on clones of the current best. That is a greedy
-    hill-climb running ten copies, which is strictly worse than the single lineage
-    the population replaced.
+    The lag on pool entry, and load-bearing rather than cautious: a release copyable
+    the moment it is promoted closes a loop where the newest release becomes the
+    next reseed's ancestor and the roster converges on clones of the current best --
+    a greedy hill-climb running ten copies. Gating entry on *graduation* is also a
+    lag, but an enormous one: a whole decay cycle, and only if the slot dies.
 
-    Gating entry on graduation, as this did before, *is* a lag -- an enormous one,
-    a whole decay cycle and only if the slot dies. This is the same idea sized to
-    something a healthy slot can reach.
-
-    What the count actually tests: a policy has to survive a stretch of its own
-    slot's continued training without a newer candidate beating it. A slot
-    promoting on every update is improving fast, its current best is a moving
-    target, and it contributes nothing until it settles.
+    What the count tests is survival: a policy has to stand through a stretch of its
+    own slot's training without a newer candidate beating it. A slot promoting on
+    every update has a moving target for a best and contributes nothing until it
+    settles.
 
     `None` when the release cannot be dated -- an unknown checkpoint, or one whose
     update row is gone. Callers treat that as "not old enough" rather than as
@@ -1688,15 +1581,11 @@ _SLOT_ORDINAL = re.compile(r"(\d+)$")
 def _materialize_warm_start(context, reader, slot_metrics: dict[str, Any]) -> Path | None:
     """Adopt the mature group *before* generation 0 is collected, or return None.
 
-    `_warm_starts` already decides that a fresh roster should start from the
-    group rather than from `initial_network`, and it is already on by default.
-    But it runs inside `update`, which fires after `rounds_per_generation`
-    rounds -- so every session still spends its whole first generation
-    collecting from a NOOP-only cold start and then trains its first update on
-    those episodes. Measured across v26 to v31: `own_mean_final_money` is exactly
-    3000.0 at `cutoff_batch_seq = 10` in all six, including the three whose first
-    update recorded `population.action = "warm_start"`. The adoption was landing
-    one generation too late to be collected from.
+    `_warm_starts` already decides a fresh roster should start from the group, but
+    it runs inside `update`, which fires only after `rounds_per_generation` rounds --
+    so a session would spend its whole first generation collecting from a NOOP-only
+    cold start and then train its first update on those episodes. The adoption has
+    to happen here or it lands a generation too late to be collected from.
 
     So the materialisation moves here, and only here. The update side loads these
     bytes rather than drawing its own mask, which is the invariant
@@ -1726,7 +1615,7 @@ def _materialize_warm_start(context, reader, slot_metrics: dict[str, Any]) -> Pa
         return network_path
 
     declared = _declared_model_id(reader, context.model_id)
-    members = mature_members(reader, declared)
+    members = mature_members(reader, declared, spec.reserved_min_money)
     if not members:
         return None
 
@@ -1820,15 +1709,12 @@ def _capped_members(
 ) -> list[dict[str, Any]]:
     """The ranked group with each originating slot held to a fixed share.
 
-    `mature_capacity` is thirty and a healthy slot promotes repeatedly, so the
-    group is not thirty policies -- it is thirty *checkpoints of ten policies*,
-    and a slot that is genuinely ahead occupies the top of the ranking several
-    times over. Measured on the live group: `logmoney_04` held ranks 0, 1, 5, 6
-    and 9, so two of the top three were one policy's own history and a uniform
-    draw over `reseed_source_pool = 3` handed that lineage two thirds of every
-    restart. Ranked on score alone, a population of ten read as a population of
-    about four -- which is the failure `reseed_source_pool` exists to prevent,
-    reappearing one level down.
+    The group is not `mature_capacity` policies -- it is that many *checkpoints of
+    however few*, since a slot that is genuinely ahead promotes repeatedly and
+    occupies the top of the ranking several times over. One lineage holding two of
+    the top three hands itself most of every restart, so a population of ten reads
+    as a population of about four: the failure `reseed_source_pool` exists to
+    prevent, reappearing one level down.
 
     The best entry of each lineage rather than an arbitrary one, so the cap costs
     rank and never costs quality: the member dropped is always one its own lineage
@@ -1865,61 +1751,40 @@ def _reseed_source(
 ) -> dict[str, Any] | None:
     """Which mature member a restarting slot is rebuilt from.
 
-    Drawn uniformly from the top `reseed_source_pool` by score rather than taken
-    from the front of the list, for two reasons.
+    Drawn uniformly from the top `reseed_source_pool` by score rather than from the
+    front of the list, for two reasons:
 
-    The first is the argument this file already makes about single draws, applied
-    one level up. A member's score is a windowed median of a benchmark that swings
-    three orders of magnitude, so it is an *estimate* of that policy's worth.
-    Taking the argmax of noisy estimates does not select the best policy, it
-    selects the luckiest estimate -- and it does so every time, because the
-    estimate is stored and reused. `_benchmark_reference_window` records what the
-    same mistake cost the ratchet.
+    * A member's score is a windowed median of a benchmark spanning three orders of
+      magnitude, so it *estimates* that policy's worth. Argmax over stored noisy
+      estimates selects the luckiest one, every time, because the estimate is reused.
+    * Diversity. Every restart pulling index 0 makes ten slots ten perturbations of
+      one ancestor in one basin -- a worse search than the single lineage it replaced.
 
-    The second is diversity, which is the whole reason a population exists. If
-    every restart pulls from index 0 then ten slots become ten perturbations of
-    one ancestor exploring one basin, which is a worse search than the single
-    lineage it replaced. Sampling from the top keeps the pressure toward good
-    policies while letting the roster spread.
+    Ranked rather than score-weighted: a softmax needs a temperature tied to the
+    scale, and the scale is neither stable nor fixed, since `_population_score`
+    discounts it by activity. Top-k is scale-free.
 
-    Ranked rather than score-weighted on purpose. A softmax over these scores
-    would need a temperature tied to their scale, and the scale is neither stable
-    -- money spans orders of magnitude -- nor fixed, since `_population_score`
-    discounts it by activity. Top-k is scale-free and survives both.
+    Seeded from the slot and its reseed count so a restart is reproducible, with
+    entropy distinct from the perturbation's own seed so the ancestor and the mask
+    do not move together.
 
-    Seeded from the slot and its reseed count so a restart is reproducible, and
-    with entropy distinct from the perturbation's own seed so the choice of
-    ancestor and the mask drawn from it do not move together.
+    Three things layered on top:
 
-    Two things are layered on that.
+    * **The cap, always** -- see `_capped_members`. The top-k argument assumes k
+      *distinct policies*; without it, k checkpoints of however few.
+    * **The spread, only on a whole-roster restart.** Ten slots choosing
+      independently collide, and each is a separate process with no coordination
+      point. The ordinal is the coordination: every slot indexes the same ranked
+      list by its own position. Deliberately *not* used for ordinary reseeds --
+      there is nothing to spread against, and a permanent ordinal-to-rank map would
+      hand slot 0 the single best on every restart forever.
+    * **The reserve bucket**, whenever `reseed_source_explorer_share` is positive.
+      A list ranked on one number can only return variations on what that number
+      rewards; a draw from the archive's behaviour cells restarts a slot on a policy
+      the ranking would have culled. `share = 0.0` reproduces the pre-archive draw.
 
-    The cap, always: see `_capped_members`. The top-k argument above assumes k
-    *distinct policies*, and without the cap it is k checkpoints of however few.
-
-    The spread, only when the whole roster restarts at once. Ten slots choosing
-    independently from a group of ten collide most of the time, and there is no
-    coordination point to prevent it -- each slot is a separate process on its own
-    round. The ordinal is the coordination: every slot reads the same ranked,
-    capped list and indexes it by its own position, so distinctness is a property
-    of the arithmetic rather than of the draw, and no slot has to know what the
-    others chose.
-
-    Deliberately not used for ordinary reseeds. Those happen at different times on
-    different slots, so there is nothing to spread against -- and a permanent
-    ordinal-to-rank map would hand slot 0 the group's single best on every restart
-    forever, which is the argmax-of-noisy-estimates failure this function was
-    written to avoid, reintroduced for a tenth of the roster.
-
-    And the bucket, whenever `reseed_source_explorer_share` is positive. The
-    ranked list above is ranked on one number, so drawing from it can only ever
-    return variations on whatever that number currently rewards -- measured on
-    `logmoney-v26`, that is a wheat monoculture from generation 12 onward. The
-    reserve is the archive's behaviour cells, and a draw from it restarts a slot
-    on a policy the ranking would have culled. `share = 0.0` skips it entirely and
-    reproduces the pre-archive draw exactly.
-
-    `roster` is how many slots exist, needed only by the spread path to know which
-    ordinals are the tail. 0 disables the reserve there rather than guessing.
+    `roster` is how many slots exist, needed only by the spread path. 0 disables the
+    reserve there rather than guessing.
     """
 
     capped = _capped_members(members, config)
@@ -1985,35 +1850,26 @@ def _graduate(
     admitting to it. Retirement sets a timestamp; the row and its artifacts stay,
     because a run has to be answerable afterwards about what it dropped.
 
-    The conflict clause clears `retired_at` as well as refreshing the score,
-    which it did not always do. Entry is idempotent per checkpoint and a standing
-    release re-enters on every one of its slot's updates -- `logmoney-v26` logged
-    87 entry events for 37 distinct members -- so a member culled while its slot
-    still holds it as the active release would have every later update rewrite its
-    score on a row that stayed retired. The cull counts only live rows, so at
-    `capacity - 1` live it then retires nothing, and the group sits below capacity
-    permanently. Re-entry is a claim that this checkpoint belongs in the group
-    now; the cull re-decides on merit in the very next statement.
+    **The conflict clause must clear `retired_at`, not just refresh the score.**
+    Entry is idempotent per checkpoint and a standing release re-enters on every one
+    of its slot's updates, so a member culled while its slot still holds it as the
+    active release would have every later update rewrite the score on a row that
+    stayed retired. The cull counts only live rows, so it then retires nothing and
+    the group sits below capacity permanently.
 
-    `reserved` splits the capacity rather than adding to it. `capacity -
-    reserved` berths go to the score ranking exactly as they always did, and the
-    remainder are held for the best-scoring member of each behaviour cell that is
-    not the monoculture attractor, so the group stops being a ranking and becomes
-    a small archive. At `reserved = 0` the two `EXCEPT` clauses collapse to the
-    `OFFSET capacity` this used to run and nothing changes, which is what makes
-    the whole feature retirable through one config key.
+    `reserved` splits the capacity rather than adding to it: `capacity - reserved`
+    berths go to the score ranking, the rest to the best-scoring member of each
+    behaviour cell that is not the monoculture attractor. At `reserved = 0` the two
+    `EXCEPT` clauses collapse to a plain `OFFSET capacity`, which is what makes the
+    whole feature retirable through one config key. Cells are ranked against each
+    other before the limit, so an oversubscribed archive spends berths on the best
+    occupied cells rather than on whichever sorts first.
 
-    Cells are ranked against each other before the limit rather than taken in bin
-    order, so an oversubscribed archive spends its berths on the best occupied
-    cells instead of on whichever cell sorts first.
-
-    `reserved_min_money` is the floor a cell occupant has to clear, and it is the
-    entire safety argument. Land buyers in the league finish on a median of 7
-    coins against 3,000 for the rest, so an unfloored cell would hold the day-0
-    bankrupts permanently and reseed the roster from them. It reads the
-    *undiscounted* money the fingerprint was measured with rather than `score`:
-    the activity discount is a ranking device, and applying it here would ask a
-    diversified policy to clear a bar that has already been bent against it.
+    `reserved_min_money` is the floor a cell occupant clears, and the entire safety
+    argument: unfloored, a cell would hold day-0 land bankrupts permanently and
+    reseed the roster from them. It reads the *undiscounted* money rather than
+    `score`, since applying the activity discount here would bend the bar against a
+    diversified policy twice.
     """
 
     member_id = hashlib.sha256(
@@ -2255,24 +2111,19 @@ def flip_rate_curve(
     into a real order, and is empty when the greedy policy never chooses NOOP on
     the probe, since there is then nothing to talk out of it.
 
-    Both are swept, and the second one is swept *because the first is not enough
-    on its own*. On a collapsed policy every action is near-tied around NOOP, so
-    the flip rate reads high while the agent trades nothing: `market-free-noisy-v6`
-    measured 0.28-0.39 against a 0.05 target and had sigma divided by up to six for
-    it, throttling all eight actors to `[0.33 .. 0.010]`. A controller cannot tell
-    those apart from one curve, which is why the controller reads this one.
+    The second exists because the first is not enough on its own: on a collapsed
+    policy every action is near-tied around NOOP, so the flip rate reads high while
+    the agent trades nothing, and a controller reading it throttles exploration at
+    the one moment it needs raising. That is why the controller reads `order_curve`.
 
-    Swept rather than measured once because one reading says whether exploration
-    is still there while the curve says what it would take to put it back, which
-    is what `collect` needs in order to choose a scale.
+    Swept rather than measured once, because one reading says whether exploration is
+    still there while the curve says what it would take to put it back.
 
     The ladder is clipped to `scale_limit` so a run is never measured at a scale
-    `resolve_sigma_scale` is not allowed to return, which would put a point on
-    the curve that the resolver silently clamps away from.
+    `resolve_sigma_scale` is not allowed to return.
 
-    Leaves the module's noise in whatever state the last draw left it. Every
-    caller either re-draws before its next forward or is finished with the
-    module, and silencing it here would be the more surprising behaviour.
+    Leaves the module's noise in whatever state the last draw left it: every caller
+    either re-draws before its next forward or is done with the module.
     """
 
     with torch.no_grad():
@@ -2394,23 +2245,18 @@ def collection_sigma_scale(
 ) -> float:
     """The scale the last update's probe resolved, or 1.0.
 
-    `collect` and `train` are different methods on different rounds, so the
-    number crosses through the database rather than through memory -- the same
-    route `lineage_checkpoint` and `_self_play_pool` already take. That also
-    makes it survive a restart, and makes what an actor played at answerable in
-    SQL beside the measurement that chose it.
+    `collect` and `train` are different methods on different rounds, so the number
+    crosses through the database rather than memory -- the same route
+    `lineage_checkpoint` takes. That also survives a restart and makes what an actor
+    played at answerable in SQL.
 
-    1.0 covers every way there is nothing to read: a cold start, a run with the
-    controller off, and a lineage whose updates predate the key. Deliberately not
-    the newest row unconditionally -- a rejected update still measured a real
-    curve on a real network, so its scale is usable, but a row that never ran the
-    probe must not be read as a scale of nothing.
+    1.0 covers every way there is nothing to read. Deliberately not the newest row
+    unconditionally: a rejected update still measured a real curve, so its scale is
+    usable, but a row that never ran the probe must not read as a scale of nothing.
 
-    `->> IS NOT NULL` rather than the `?` containment operator, which does say
-    "has this key" more directly. `?` is a placeholder in several drivers and
-    survives here only by the grace of psycopg's parameter style; `->>` returns
-    NULL both for an absent key and for a JSON null, which is the same set of
-    rows and cannot break on a driver change.
+    `->> IS NOT NULL` rather than the `?` containment operator: `?` is a placeholder
+    in several drivers and survives here only by psycopg's parameter style, while
+    `->>` returns NULL for both an absent key and a JSON null.
     """
 
     # Interpolated rather than parameterised: `metrics_json ->> %s` would make the
@@ -2715,13 +2561,13 @@ class FreeMarketCollector:
                         pool_offset=batch_index,
                     )
 
-            # Checked here rather than beside `base`, because an empty
+            # Resolved here rather than beside `base`, because an empty
             # `opponents` list is a legitimate configuration until the mirror
             # pool has been consulted: `compose_opponents` returns the pool
             # unmixed when there is no base, which is how pure self-play is
-            # expressed. Only having neither is an error.
+            # expressed.
             if not opponents:
-                raise ValueError("free-market collection needs at least one opponent")
+                opponents = [_quiet_opponent(context, config)]
 
             # `collect_batch` draws one opponent per seed *pair*, so a batch
             # advances the list by `episodes // 2`. Without the rotation a fixed
@@ -2735,27 +2581,16 @@ class FreeMarketCollector:
                 for value in rng.integers(0, 2**31 - 1, size=episodes // 2)
                 for _ in range(2)
             ]
-            # One scale per seed pair, so a single batch carries both
-            # exploratory and near-greedy data. The *identity* policy keeps the
-            # base: folding sixteen per-actor scales into it would mint eight
-            # revisions a batch, none of them with enough games to rate.
+            # One scale per seed pair, so a batch carries both exploratory and
+            # near-greedy data. `sigma_base` is what the last probe resolved, so
+            # actor 0 plays at the configured rate and the spread runs down from
+            # there; the identity policy carries the base only, since folding
+            # sixteen per-actor scales in would mint eight revisions a batch.
             #
-            # `sigma_base` is what the last probe resolved, so actor 0 plays at
-            # the configured rate and the spread runs down from there. With the
-            # controller off it is 1.0 and this list is byte for byte what it was
-            # before the controller existed.
-            #
-            # The identity policy carries `sigma_base` only. The per-actor spread
-            # around it is deliberately left out: folding sixteen scales in would
-            # mint eight revisions a batch, none with enough games to rate.
-            #
-            # One ladder, downward only. Both mechanisms that put rungs above the
-            # setpoint are retired -- the idle burst at v15, `noisy_actor_hot`
-            # with the population -- and for one measured reason: widening the
-            # whole policy bankrupts the wallet before rare behaviour becomes
-            # affordable. `rare_sigma_gain` widens single rows instead, and
-            # escaping a stuck trajectory is now the population's job rather than
-            # the ladder's.
+            # One ladder, downward only: widening the whole policy bankrupts the
+            # wallet before rare behaviour becomes affordable. `rare_sigma_gain`
+            # widens single rows, and escaping a stuck trajectory is the
+            # population's job.
             if not noisy.enabled:
                 sigma_scales = None
             else:
@@ -2828,12 +2663,16 @@ class FreeMarketCollector:
             played = [rollout.opponent_spec for rollout in rollouts]
             # Recorded whether or not the widening is on: the point of the columns is
             # to compare a run that has it against the runs that did not.
-            batch_chosen, _ = rare.visit_counts(records)
-            land_episodes = sum(
-                1 for record in records if int(np.count_nonzero(record.order_chosen == LAND_INDEX))
-            )
-            # `buy_land_rate` below says how often the row was *chosen*. This says
-            # what the purchase then bought: when it was made, what it cost, how
+            batch_chosen, batch_opportunities = rare.visit_counts(records)
+            # `buy_land_rate` and `land_gate_open_rate` were both read off the
+            # `BUY_LAND` column and are gone with it (v44). Neither is a loss.
+            # They were already the same event measured twice -- the mask was the
+            # decision, so a row that opened was a row that was chosen -- and the
+            # replay-derived block below answers the question they were standing in
+            # for, off the quadrant count rather than off the request. Read
+            # `land_buying_episodes` where `buy_land_rate` was read.
+            #
+            # This says what the purchase then bought: when it was made, what it cost, how
             # many of the 25 new tiles were ever planted, and whether the seat's
             # hands went idle afterwards. Without it a falling money curve cannot
             # be attributed to expansion being negative rather than to the field
@@ -2868,9 +2707,9 @@ class FreeMarketCollector:
                     # What the widening was worth this batch and whether it moved
                     # anything. Entropy is the gain-free reading -- a policy
                     # pouring every turn into three rows reads low here whatever
-                    # its money curve says -- and `buy_land_rate` is the specific
-                    # row that motivated the mechanism, kept as a named column so
-                    # the question that started this is answerable in one query.
+                    # its money curve says. Land was the row that motivated the
+                    # mechanism and is no longer a row at all, so the question that
+                    # started this is now answered by `land_buying_episodes`.
                     "rare_sigma_gain": rare_gain if rare_gain > 0.0 else None,
                     # Which statistic produced that gain's multipliers. The two are
                     # not calibrated alike, so a money series is only comparable
@@ -2881,7 +2720,6 @@ class FreeMarketCollector:
                     # together.
                     "rare_sigma_pairs": rare_sigma_pairs if rare_gain > 0.0 else None,
                     "selection_entropy": rare.selection_entropy(batch_chosen),
-                    "buy_land_rate": land_episodes / max(1, len(records)),
                     "land_accepted": land_use["land_accepted"],
                     "land_buying_episodes": land_use["land_episodes"],
                     "land_day": land_use["land_day"],
@@ -2891,8 +2729,8 @@ class FreeMarketCollector:
                     "land_tiles_planted_per_purchase": land_use["land_tiles_planted_per_purchase"],
                     "land_weed_digs_per_episode": land_use["land_weed_digs_per_episode"],
                     "post_land_idle_delta": land_use["post_land_idle_delta"],
-                    # The lot ledger's side of the same question. `buy_land_rate`
-                    # and the columns above say what expansion did; these say what
+                    # The lot ledger's side of the same question. The land columns
+                    # above say what expansion did; these say what
                     # a *seed* did, which is what `LOT_POTENTIAL_WEIGHT` pays
                     # against. Holding turns falling while the margin holds is the
                     # term working; spend rising with `unrecovered_seed_share` is
@@ -2906,6 +2744,29 @@ class FreeMarketCollector:
                     "seed_margin": land_use["seed_margin"],
                     "seed_holding_turns": land_use["seed_holding_turns"],
                     "unrecovered_seed_share": land_use["unrecovered_seed_share"],
+                    # The coins the two non-invariant lot legs moved on buy turns.
+                    # `unrecovered_seed_share` is the same fact as a ratio, but the
+                    # reward acts on the coins and a constant with no column showing
+                    # what it actually billed cannot be told apart from an inert one.
+                    # Read as a pair: the credit rising while the charge falls is the
+                    # policy trading better, both rising together is only volume.
+                    "seed_waste_cost": land_use["seed_waste_cost_per_episode"],
+                    "seed_gain_credit": land_use["seed_gain_credit_per_episode"],
+                    # The same pair for the herd. `animal_lots` sitting at zero while
+                    # the seat is buying animals means the trace never reached the
+                    # ledger; `animal_waste_cost` climbing with `animal_gain_credit`
+                    # flat means the animals are being bought and not placed, or
+                    # bought past the day they could still yield.
+                    "animal_lots": land_use["animal_lots"],
+                    "animal_lots_matched": land_use["animal_lots_matched"],
+                    "animal_lots_matched_share": land_use["animal_lots_matched_share"],
+                    "animal_spend": land_use["animal_spend"],
+                    "animal_proceeds": land_use["animal_proceeds"],
+                    "animal_margin": land_use["animal_margin"],
+                    "animal_holding_turns": land_use["animal_holding_turns"],
+                    "unrecovered_animal_share": land_use["unrecovered_animal_share"],
+                    "animal_waste_cost": land_use["animal_waste_cost_per_episode"],
+                    "animal_gain_credit": land_use["animal_gain_credit_per_episode"],
                     "mean_final_money": float(np.mean(final_money)),
                     "max_final_money": float(np.max(final_money)),
                     "solvent_episodes": int(sum(1 for value in final_money if value > 10_000)),
@@ -2970,6 +2831,28 @@ class FreeMarketUpdater:
         slot = _slot_state(previous_slot, slot_spec)
         reseeded = bool(previous_slot.get("reseed_pending"))
         reseed_source = previous_slot.get("reseed_artifact_path") if reseeded else None
+
+        # `collect` adopts the mature group *before* generation 0 and rolls it out
+        # -- see `_materialize_warm_start`. This update has to start from those same
+        # bytes, and the condition is deliberately the same one that wrote them: a
+        # virgin slot with the warm start on and both files on disk. Reading it off
+        # the artifacts rather than off a query is what makes the two sides unable
+        # to disagree about which network generation 0 actually played.
+        #
+        # Falling through to `initial_network` here is what the first version did,
+        # and it cost a whole update per slot three ways over: the cold start was
+        # trained on episodes collected from the adopted policy, the silent network
+        # was exported and paid a full `eval_seeds + promotion_seeds` arena, and the
+        # adoption was then deferred to a *second* update that `_slot_state` also
+        # ran at a learning rate of exactly zero.
+        warm_network_path, warm_sidecar_path = warm_start_paths(context.artifacts)
+        adopting_warm_start = (
+            not previous_slot
+            and slot_spec.enabled
+            and slot_spec.warm_start
+            and warm_network_path.is_file()
+            and warm_sidecar_path.is_file()
+        )
 
         # Batches collected before the reseed belong to a policy this slot has
         # abandoned. `landgate-v10` is the record of skipping this: a restored
@@ -3088,11 +2971,12 @@ class FreeMarketUpdater:
             torch.set_rng_state(state["torch_rng_state"])
         else:
             noisy_migration = False
-            seed_network = (
-                OrderQNetwork.load(reseed_source)
-                if reseed_source and Path(reseed_source).is_file()
-                else initial_network(config)
-            )
+            if reseed_source and Path(reseed_source).is_file():
+                seed_network = OrderQNetwork.load(reseed_source)
+            elif adopting_warm_start:
+                seed_network = OrderQNetwork.load(warm_network_path)
+            else:
+                seed_network = initial_network(config)
             online = net_module.from_numpy(seed_network, online)
             target.load_state_dict(online.state_dict())
             _reset_learning_rates(optimizer, clone_optimizer, config, slot.learning_rate)
@@ -3253,16 +3137,10 @@ class FreeMarketUpdater:
             flip_rate = flip_curve.get(1.0)
             flip_to_order = order_curve.get(1.0)
 
-        # Chosen here because this is where the network is; `collect` reads it
-        # back out of `metrics_json` on the next round. Recorded whether or not
-        # the controller is on, so a run that turns it on can see what it would
-        # have been playing at beforehand.
-        #
-        # Which curve drives it is the whole of the v6 fix. Controlling on the
-        # argmax flip rate reads a NOOP-collapsed policy as exploring -- every
-        # action near-tied, so flips are cheap -- and divides sigma down at the
-        # one moment it needs raising. Both curves are recorded either way, so a
-        # run that switches targets can see what the other would have said.
+        # Chosen here because this is where the network is; `collect` reads it back
+        # out of `metrics_json` next round. Recorded whether or not the controller
+        # is on, and both curves are recorded either way, so a run that switches
+        # targets can see what the other would have said.
         sigma_scale_target = (
             resolve_sigma_scale(
                 order_curve or {},
@@ -3356,28 +3234,17 @@ class FreeMarketUpdater:
         )
         # A zero-width paired margin against a *released* incumbent is a harness
         # fault -- a dropped `?weights=`, a missing checkpoint -- and must fail
-        # loudly. Against the quiet baseline it is not: the baseline emits
-        # nothing, so a candidate that collapsed to NOOP genuinely plays every
-        # paired seed identically. That is this agent's headline failure mode and
-        # it belongs in the gate as a rejection, not as an ERROR that discards
-        # the gate JSON and the diagnostics showing the collapse.
+        # loudly. Against the quiet baseline it is not: the baseline emits nothing,
+        # so a candidate that collapsed to NOOP genuinely plays every paired seed
+        # identically, and that belongs in the gate as a rejection rather than as an
+        # ERROR discarding the diagnostics that show the collapse.
         #
-        # But a zero margin does not *imply* the collapse, which is what this
-        # read as before, and the difference cost the population run its
-        # releases. Measured on `market-free-population-v25@learner_05`, cutoff
-        # 143: 16,686 orders over 35,950 decisions -- a trading rate of 0.464 --
-        # into a head-to-head that still scored an identically zero margin, with
-        # both seats on exactly 3,000.0. Round-trip trades are cash-neutral
-        # against an unchanged market by construction (README), so a candidate
-        # can trade all season against a counterparty that offers nothing and
-        # end where it started. That update passed the ratchet at 987 benchmark
-        # money and passed hard viability, and this check alone rejected it.
-        #
-        # So read the collapse off the candidate's own activity in that match
-        # rather than inferring it from the margin. A genuine NOOP policy reads
-        # a trading rate of 0.0 and is still rejected here, which is the case
-        # the check exists for. `viability_min_orders_per_decision = 0` turns it
-        # off along with the other activity floors, deliberately.
+        # But a zero margin does not *imply* the collapse. Round-trip trades are
+        # cash-neutral against an unchanged market, so a candidate can trade all
+        # season against a counterparty offering nothing and end where it started.
+        # So read the collapse off the candidate's own activity in that match. A
+        # genuine NOOP policy reads 0.0 and is still rejected, which is the case
+        # this exists for.
         degenerate_head_to_head = False
         try:
             _reject_degenerate(head_to_head, "head-to-head")
@@ -3388,13 +3255,10 @@ class FreeMarketUpdater:
 
         # The money floors measure against the incumbent's own seat in this same
         # paired series -- except on a cold start, where that seat is the quiet
-        # baseline and the baseline never trades. It therefore keeps its full
-        # stake on every seed, and `0.80 *` a perfect stake is a bar no policy
-        # that trades for a season can clear. `coldstart_v1` failed exactly and
-        # only those two checks on five of seven updates, promoted nothing, and
-        # with nothing released could not snap back either. A fixed cold-start
-        # reference is what makes the *first* release reachable; from the second
-        # onward the incumbent's real seat takes over again.
+        # baseline, which never trades and so keeps its full stake on every seed.
+        # `0.80 *` a perfect stake is a bar no policy that trades for a season can
+        # clear, so a fixed cold-start reference is what makes the *first* release
+        # reachable; from the second onward the real seat takes over.
         #
         # That fixed reference is itself escapable, and only on a cold start. Once
         # `active is not None` the reference is a real opponent's seat in this same
@@ -3437,40 +3301,22 @@ class FreeMarketUpdater:
                 "a_money_mean": cold_start_reference,
                 "a_money_median": cold_start_reference,
             }
-        # The activity floor binds unconditionally on the *benchmark* arena, and
-        # on the head-to-head only once there is a released incumbent to play.
+        # The activity floor binds unconditionally on the *benchmark* arena, and on
+        # the head-to-head only once there is a released incumbent to play. Both
+        # halves are load-bearing:
         #
-        # Both halves are load-bearing and the benchmark half is what preserves
-        # the guard this used to be. It exists because a candidate that never
-        # trades must never become the incumbent everything afterwards is
-        # measured against: with `opponents = [seeded_random]` and no incumbent
-        # the head-to-head is against a policy that reliably bankrupts --
-        # `evaluation_opponent` has never recorded a non-zero `final_money` -- so
-        # a pure-NOOP candidate keeps its 3,000 stake, wins 3,000-to-0
-        # significantly, and passes hard viability. `market-free-noisy-v6`
-        # recorded exactly that shape: `trading_rate: 0.0` beside
-        # `hard_viability.passed: true`. That candidate reads 0.0 against
-        # pilkwang as well, so `benchmark_viability` below still rejects it and
-        # nothing silent can release.
+        #   * The benchmark half stops a candidate that never trades becoming the
+        #     incumbent everything afterwards is measured against. With no incumbent
+        #     the head-to-head is against a policy that reliably bankrupts, so a
+        #     pure-NOOP candidate keeps its stake, wins outright and passes hard
+        #     viability. It reads 0.0 against the benchmark, where this catches it.
+        #   * On the cold-start head-to-head the floor measures nothing: the quiet
+        #     baseline offers no counterparty, so an order has nothing to fill
+        #     against. Binding it there rejected slots that were trading fine
+        #     against the benchmark and left the mature group empty.
         #
-        # What binding it on the cold-start head-to-head as well cost, measured
-        # on `market-free-population-v25` at cutoff 143: learner_01, learner_02
-        # and learner_09 traded at 0.633, 0.332 and 0.398 against the benchmark
-        # and emitted 0, 210 and 0 orders against the quiet baseline. Five of ten
-        # slots had never released after 143 batches and `population_members`
-        # held one row for the whole run, so every graduation took the `restart`
-        # branch and the mature group the population exists to build stayed
-        # empty.
-        #
-        # The floor measures nothing in that match. The baseline is a quiet
-        # network: it offers no counterparty, so an order the candidate would
-        # place against a live opponent has nothing to fill against, and the
-        # arena the release is actually decided on -- the index-0 benchmark
-        # under `benchmark_ratchet` -- already measures the same quantity
-        # against an opponent that trades.
-        #
-        # With no benchmark configured there is no other arena to carry it, so
-        # the head-to-head keeps the floor rather than dropping it silently.
+        # With no benchmark configured there is no other arena to carry it, so the
+        # head-to-head keeps the floor rather than dropping it silently.
         require_head_activity = active is not None or not challenger_benchmarks
         head_viability = _arena_viability(
             head_to_head,
@@ -3640,6 +3486,19 @@ class FreeMarketUpdater:
 
         own = [record for record in buffer.recent + buffer.reservoir if record.decisions]
         own_diagnostics = _records_diagnostics(own)
+        # The FIFO segment alone, which is a different question from `own` and has
+        # to be asked separately. `own` is what the gradient saw and includes the
+        # reservoir -- a uniform sample of everything evicted since the reseed --
+        # so `own_mean_final_money` is a third historical by construction. That is
+        # correct for "what was trained on" and wrong for "how is the policy
+        # doing", which is what `lr_score_signal = "rollout"` reads: measured on
+        # this session, `own_mean_final_money` ran 4,493 where the ten batches just
+        # collected ran 8,570, and `_rollout_score` then medians that over eleven
+        # updates. The plateau detector was grading a policy several updates old.
+        recent = [record for record in buffer.recent if record.decisions]
+        recent_mean_final_money = (
+            float(np.mean([record.money[-1] for record in recent])) if recent else None
+        )
         metrics = {
             "policy_kinds": POLICY_KINDS,
             "resumed_from_checkpoint_id": resumed_from,
@@ -3727,6 +3586,13 @@ class FreeMarketUpdater:
             "own_mean_final_money": (
                 float(np.mean([record.money[-1] for record in own])) if own else None
             ),
+            # The same money over the FIFO segment only. This is what the slot's
+            # plateau detector reads; `own_mean_final_money` stays as it was so a
+            # series spanning the change is still one readable curve and the two
+            # can be compared in SQL. The gap between them is the reservoir's
+            # share, so it also says how much history the buffer is carrying.
+            "recent_episodes": len(recent),
+            "recent_mean_final_money": recent_mean_final_money,
             "own_solvent_fraction": (
                 float(np.mean([record.money[-1] > 10_000 for record in own])) if own else None
             ),
@@ -3761,7 +3627,7 @@ class FreeMarketUpdater:
             int(_limit(config, "benchmark_reference_window")),
             slot.batch_floor,
             signal=slot_spec.score_signal,
-            rollout=metrics.get("own_mean_final_money"),
+            rollout=recent_mean_final_money,
         )
         slot = _settle_slot(slot, slot_score, slot_spec)
         metrics.update(slot.as_metrics())
@@ -3779,33 +3645,26 @@ class FreeMarketUpdater:
         # ordinary training update still costs no extra query.
         members: list[dict[str, Any]] = []
         if graduating or (slot_spec.warm_start and slot.reseed_index == 0):
-            members = mature_members(reader, declared)
+            members = mature_members(reader, declared, slot_spec.reserved_min_money)
         warming = not graduating and _warm_starts(slot, slot_spec, members)
         reseeding = graduating or warming
 
-        # Contribution and restart are separate events with separate triggers.
-        # They used to share this branch, which meant a checkpoint could only
-        # enter the pool at the moment its slot was destroyed -- so three slots
-        # could hold released policies no other slot was able to use, and the
-        # first slot to reach its cut would reseed from `initial_network` with a
+        # Contribution and restart are separate events with separate triggers. When
+        # they shared a branch a checkpoint could only enter the pool as its slot
+        # was destroyed, so a slot could reseed from `initial_network` with a
         # perfectly good ancestor sitting unreachable.
         #
-        # What enters is still the *released* checkpoint, never the candidate this
-        # update just trained: a mature member is meant to be a policy the gate
-        # has already accepted, and the candidate has by definition not been.
+        # What enters is the *released* checkpoint, never the candidate this update
+        # just trained: a mature member is a policy the gate has already accepted.
         #
-        # A warm-starting slot contributes nothing, whatever the age. The
-        # load-bearing reason is the spread: every slot warm-starts inside one
-        # generation from a separate process, and `_graduate` is autocommit, so a
-        # contribution landing mid-generation changes the ranked list the slots
-        # still choosing are reading and the ordinal mapping silently collides.
-        # Suppressing it leaves the group with no writer for the duration, which
-        # is what turns "usually distinct" into distinct. It is also
-        # self-contradictory otherwise -- the slot would be declaring its own
-        # initialisation wrong while nominating a descendant of it as an ancestor
-        # for its peers. The `graduating` rule below does not transfer: that slot
-        # is finishing and would lose its release entirely, while this one keeps
-        # its id and its history and can contribute again in `entry_updates`.
+        # **A warm-starting slot contributes nothing, whatever the age.** Every slot
+        # warm-starts inside one generation from a separate process and `_graduate`
+        # is autocommit, so a contribution landing mid-generation changes the ranked
+        # list the slots still choosing are reading and the ordinal mapping silently
+        # collides. Suppressing it leaves the group with no writer for the duration.
+        # The `graduating` rule below does not transfer: that slot is finishing and
+        # would lose its release entirely, while this one keeps its id and can
+        # contribute again in `entry_updates`.
         if active is not None and not warming:
             release_age = _release_age(reader, context.model_id, active.checkpoint_id)
             entry_after = slot_spec.entry_updates
@@ -3909,7 +3768,7 @@ class FreeMarketUpdater:
             # which is exactly what makes the ordinal spread distinct rather than
             # merely likely to be.
             if graduating:
-                members = mature_members(reader, declared)
+                members = mature_members(reader, declared, slot_spec.reserved_min_money)
             chosen = _reseed_source(
                 members,
                 config,
@@ -3961,16 +3820,27 @@ class FreeMarketUpdater:
             else:
                 source_path, source_id = None, None
 
-            # A warm start was already materialized and already rolled out -- see
-            # `_materialize_warm_start`. Load those exact bytes rather than
-            # drawing a second mask from the same seed: generation 0 was
-            # collected from this network, and a slot whose behaviour policy and
-            # trained policy are two different perturbations of one ancestor is
-            # the drift the comment below exists to prevent.
-            warm_network, warm_sidecar = warm_start_paths(context.artifacts)
-            adopted = warming and warm_network.is_file() and warm_sidecar.is_file()
-            if adopted:
-                recorded = json.loads(warm_sidecar.read_text())
+            # An adopted warm start is a reseed for *provenance* and not for
+            # evidence, and the two used to be conflated at the cost of a whole
+            # update per slot. `_materialize_warm_start` drew the ancestor, applied
+            # the mask and wrote the bytes before generation 0; `collect` rolled
+            # that generation out of them; and the resume above trained from those
+            # same bytes. So there is nothing left to materialize, nothing for a
+            # warmup to wait for, and no abandoned policy for a batch floor to
+            # discard -- `reseed_batch_floor` would have thrown away the generation
+            # collected from the very network being adopted.
+            #
+            # What the marker did carry and still has to happen is the bookkeeping:
+            # `lr_reseed_index` advances so `_warm_starts` self-cancels on the next
+            # update, and `lr_after_checkpoint_id` bounds the mirror pool below at
+            # the adoption. Both survive a restart because they are the update row.
+            #
+            # `warming` without `adopting_warm_start` is the
+            # `population_warm_start_min_updates > 0` case: the slot has trained,
+            # nothing was materialized before its collection, and it takes the
+            # ordinary reseed path below.
+            if warming and adopting_warm_start:
+                recorded = json.loads(warm_sidecar_path.read_text())
                 if source_id is not None and str(recorded["checkpoint_id"]) != str(source_id):
                     # The group moved between the collection and this update,
                     # which nothing writes to it during generation 0 can cause.
@@ -3982,7 +3852,17 @@ class FreeMarketUpdater:
                         f"{source_id}"
                     )
                 source_id = str(recorded["checkpoint_id"])
-                seeded = OrderQNetwork.load(warm_network)
+                slot = replace(
+                    slot,
+                    reseed_index=slot.reseed_index + 1,
+                    after_checkpoint_id=checkpoint_id,
+                )
+                # Rewritten rather than merged: `as_metrics` ran before `warming`
+                # was known, so the row would otherwise record the pre-adoption
+                # index and `_warm_starts` would fire again next update.
+                metrics.update(slot.as_metrics())
+                metrics["warm_start_adopted"] = True
+                metrics["warm_start_artifact_path"] = str(warm_network_path)
             else:
                 source = (
                     OrderQNetwork.load(source_path)
@@ -3996,32 +3876,34 @@ class FreeMarketUpdater:
                     seed=int(config.get("seed", 0)) + slot.reseed_index + 1,
                     sigma_reset=noisy.sigma0 if slot_spec.sigma_reset else None,
                 )
-            # The same guard the exported candidate goes through. A perturbation
-            # that somehow zeroed the trunk produces a network with no gradient
-            # outside its output bias, and a slot restarted onto one can never
-            # leave -- which would read as ten learners quietly going silent.
-            _reject_inert_network(seeded)
-            reseed_path = context.artifacts / "reseeds" / f"{context.update_id}.npz"
-            reseed_path.parent.mkdir(parents=True, exist_ok=True)
-            seeded.save(reseed_path)
+                # The same guard the exported candidate goes through. A
+                # perturbation that somehow zeroed the trunk produces a network
+                # with no gradient outside its output bias, and a slot restarted
+                # onto one can never leave -- which would read as ten learners
+                # quietly going silent.
+                _reject_inert_network(seeded)
+                reseed_path = context.artifacts / "reseeds" / f"{context.update_id}.npz"
+                reseed_path.parent.mkdir(parents=True, exist_ok=True)
+                seeded.save(reseed_path)
 
-            # Materialized rather than perturbed in place on the next update, so
-            # `collect` and `update` load identical bytes. The alternative -- each
-            # side drawing its own mask from a shared seed -- makes the behaviour
-            # policy and the trained policy agree only as long as two separate
-            # code paths keep agreeing, which is the class of drift the `to_numpy`
-            # exporter bug in this file already cost a debugging session to.
-            metrics.update(
-                {
-                    "reseed_pending": True,
-                    "reseed_artifact_path": str(reseed_path),
-                    "reseed_source_checkpoint_id": source_id,
-                    "reseed_batch_floor": context.cutoff_batch_seq,
-                    "reseed_after_checkpoint_id": checkpoint_id,
-                    "reseed_dropout": slot_spec.dropout,
-                    "reseed_shrink": slot_spec.shrink,
-                }
-            )
+                # Materialized rather than perturbed in place on the next update,
+                # so `collect` and `update` load identical bytes. The alternative
+                # -- each side drawing its own mask from a shared seed -- makes the
+                # behaviour policy and the trained policy agree only as long as two
+                # separate code paths keep agreeing, which is the class of drift the
+                # `to_numpy` exporter bug in this file already cost a debugging
+                # session to.
+                metrics.update(
+                    {
+                        "reseed_pending": True,
+                        "reseed_artifact_path": str(reseed_path),
+                        "reseed_source_checkpoint_id": source_id,
+                        "reseed_batch_floor": context.cutoff_batch_seq,
+                        "reseed_after_checkpoint_id": checkpoint_id,
+                        "reseed_dropout": slot_spec.dropout,
+                        "reseed_shrink": slot_spec.shrink,
+                    }
+                )
             population["reseed_source_checkpoint_id"] = source_id
             population["mature_members"] = len(members)
 

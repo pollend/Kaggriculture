@@ -80,7 +80,47 @@ def _top_level_main(manifest: dict[str, Any]) -> str:
     module, separator, attribute = entry_point.partition(":")
     if not separator or attribute != "agent" or not module.endswith(".main"):
         raise ValueError(f"unsupported submission entry_point: {entry_point!r}")
-    return f"from {module} import agent as agent\n"
+    package = module.split(".", 1)[0]
+    target = os.path.join(*module.split(".")) + ".py"
+    # `kaggle_environments` runs this file through `exec(code_object, {})` and
+    # only *appends* its directory to `sys.path`. Two consequences, both Kaggle-
+    # only and neither reproducible from a repo checkout:
+    #
+    #   * there is no `__file__` to locate ourselves with, so the directory is
+    #     recovered by looking for the package on the path instead;
+    #   * every bundled environment directory is already ahead of us, and
+    #     `envs/lux_ai_s3/` ships its own `agents.py`, so a plain
+    #     `from agents... import` binds *that* module and dies on its relative
+    #     import.
+    #
+    # So claim the name: move our own directory to the front and drop anything
+    # already bound under the package, leaving the import below to re-resolve.
+    #
+    # `get_last_callable` returns the last callable in these globals, so nothing
+    # callable may be defined after `agent`.
+    return f"""import os
+import sys
+
+_TARGET = {target!r}
+for _candidate in [*sys.path, os.getcwd()]:
+    if _candidate and os.path.isfile(os.path.join(_candidate, _TARGET)):
+        _HERE = os.path.abspath(_candidate)
+        break
+else:
+    _HERE = os.getcwd()
+
+while _HERE in sys.path:
+    sys.path.remove(_HERE)
+sys.path.insert(0, _HERE)
+for _shadow in [
+    _name
+    for _name in sys.modules
+    if _name == {package!r} or _name.startswith({package + "."!r})
+]:
+    del sys.modules[_shadow]
+
+from {module} import agent as agent
+"""
 
 
 def _safe_generated_directory(path: Path) -> None:

@@ -5,33 +5,23 @@ day-scale market MDP this one is turn-scale: a raw order is filled at this
 turn's quote and is gone, so the reward window between consecutive decisions is
 a single turn and the n-step horizon counts turns directly.
 
-The problem this buffer exists to solve is that solvent trajectories are rare:
-uniform exploration bankrupts the agent at every act rate measured, so an
+The problem this buffer solves is that solvent trajectories are rare: an
 unweighted draw over self-collected data is almost entirely episodes that ended
-near zero, and the only policy consistent with that is to do nothing.
+near zero, and the only policy consistent with that is to do nothing. Two
+mechanisms cover different halves of it:
 
-There are two mechanisms against it, and they cover different cases.
+* `demo_fraction` draws a fixed share of every minibatch from the pinned
+  demonstrations, which *are* solvent by construction -- but only while something
+  is pinned, and on the live run nothing is, so the share silently resolves to
+  zero.
+* `priority_alpha` ranks the agent's *own* episodes by shaped return, with the
+  importance-sampling correction prioritisation obliges. Self-imitation: the best
+  episodes the policy has produced are the only positive signal when there is no
+  demonstrator.
 
-`demo_fraction` draws a fixed share of every minibatch from the pinned
-demonstrations. When something is pinned, that share *is* solvent data by
-construction. It replaced an earlier rank-based prioritisation over episode
-final money, on the argument that it needs no sampling correction, no exponents
-and no anneal schedule to keep in step with a resume.
-
-What that argument missed is that the share is conditional on having a
-demonstrator. `demonstration_episodes` is 0 on the live run -- the family worth
-cloning has no persisted league episodes -- so `pinned` is empty, the updater
-forces the share to zero, and the mechanism contributes nothing while reporting
-nothing. Measured over 432 of that run's own episodes, a quarter finish below a
-shaped return of -1.0 and the solvent fraction reads 0.0023.
-
-So `priority_alpha` restores prioritisation for the agent's *own* episodes, over
-shaped return rather than final money, with the importance-sampling correction
-prioritisation obliges. It is self-imitation: the best episodes the policy has
-actually produced are the only positive signal available when there is no
-demonstrator. The two mechanisms compose -- demonstrations stay uniform inside
-their share, own episodes are ranked inside theirs. The exponents came back; the
-anneal schedule did not, and `_own_priorities` says why.
+The two compose -- demonstrations stay uniform inside their share, own episodes
+are ranked inside theirs. The exponents are fixed and never annealed; see
+`_own_priorities`.
 """
 
 from __future__ import annotations
@@ -52,12 +42,10 @@ DEFAULT_CAPACITY = 400
 #: from BUY_SEED to the harvest that pays for it.
 DEFAULT_N_STEP = 24
 DEFAULT_RESERVOIR_FRACTION = 0.35
-#: Rank exponent for the return-weighted draw over own episodes. 0.0 is the
-#: uniform draw this buffer took before return weighting existed, and is the
-#: default so every caller that does not ask for prioritisation keeps exactly
-#: what it had -- down to the bit-generator state. The live value is in
-#: `agent.toml`, not here, and not in `train_market_free.py`: `ensure_session`
-#: digests the runner's overrides, so a key added there stops v6 resuming.
+#: Rank exponent for the return-weighted draw over own episodes. 0.0 is the uniform
+#: draw, byte for byte down to the bit-generator state, so a caller that does not
+#: ask for prioritisation keeps exactly what it had. The live value is in
+#: `agent.toml` rather than in the runner, whose overrides `ensure_session` digests.
 DEFAULT_PRIORITY_ALPHA = 0.0
 #: Importance-sampling exponent. Fixed, never annealed -- see `_own_priorities`.
 DEFAULT_PRIORITY_BETA = 0.5
@@ -79,37 +67,30 @@ class OrderBatch:
     #: whole batch down through the backward pass.
     next_mask: np.ndarray
     #: float32 [B]. Importance-sampling correction for the return-weighted draw,
-    #: normalised so the largest is exactly 1.0. Every weight is therefore <= 1
-    #: and the reweighting can only shrink a gradient, never enlarge the
-    #: effective learning rate -- which matters because `clip_grad_norm_` clips
-    #: the batch norm and cannot see one row inflating itself. All-ones when
-    #: `priority_alpha` is 0, which is the uniform draw this buffer used to take.
+    #: normalised so the largest is exactly 1.0. Every weight is therefore <= 1, so
+    #: the reweighting can only shrink a gradient -- which matters because
+    #: `clip_grad_norm_` clips the batch norm and cannot see one row inflating
+    #: itself. All-ones at `priority_alpha = 0`.
     #:
-    #: Demonstration rows are always exactly 1.0: the correction undoes the
-    #: departure from uniform *within the own pool*, and the pinned pool is still
-    #: drawn uniformly, so there is no bias there to correct. The side effect is
-    #: that demo rows carry more gradient mass than their row share -- at
-    #: alpha 0.7 / beta 0.5 the mean own weight is ~0.6, so a nominal 25% demo
-    #: share is ~35% of the gradient. Inert while nothing is pinned, but a run
-    #: that re-enables demonstrations gets a share that does not match its config.
+    #: Demonstration rows are always exactly 1.0, because the correction undoes the
+    #: departure from uniform *within the own pool* and the pinned pool is drawn
+    #: uniformly. Side effect: demo rows carry more gradient mass than their row
+    #: share, so a run that re-enables demonstrations gets a share that does not
+    #: match its config.
     weight: np.ndarray
 
 
 class ReplayBuffer:
     """Recent episodes, a uniform sample of everything older, and pinned demos.
 
-    A plain FIFO ring turns over in `capacity / episodes_per_round` rounds, so
-    the network only ever trains on data generated by roughly its current
-    policy -- a standard recipe for catastrophic forgetting at a high replay
-    ratio. So the buffer is split. A FIFO segment keeps recent, on-policy data;
-    a reservoir segment holds a uniform sample of every episode ever evicted
-    (Vitter's Algorithm R), at fixed memory cost.
+    A plain FIFO ring turns over quickly, so the network would only ever train on
+    data from roughly its current policy -- catastrophic forgetting at a high replay
+    ratio. So the buffer is split: a FIFO segment for recent on-policy data, and a
+    reservoir segment holding a uniform sample of everything ever evicted (Vitter's
+    Algorithm R) at fixed memory cost.
 
-    Demonstrations added through `add(..., pinned=True)` sit outside both
-    segments and are never evicted. They are the only solvent data the run has
-    until its own policy becomes solvent, and letting the ring flush them would
-    return the buffer to all-bankruptcy exactly when the network is still
-    relying on them.
+    Demonstrations added with `pinned=True` sit outside both and are never evicted:
+    they are the only solvent data the run has until its own policy becomes solvent.
     """
 
     def __init__(
@@ -167,13 +148,10 @@ class ReplayBuffer:
         Returns `(recent_ids, reservoir_ids, evicted_seen)` over a flat episode
         numbering: batch `b` owns ids `sum(counts[:b]) .. +counts[b]`.
 
-        The point is that neither decision needs the episode itself. The FIFO
-        segment keeps the last `recent_capacity` ids by position, and Algorithm R
-        keeps or drops on a draw that does not look at the record either. So the
-        caller can run this over `sample_count`, which the batch row already
-        carries, and then load only the batches that still own a surviving id --
-        rather than decompressing the entire run history to fill a buffer that
-        holds `capacity` episodes.
+        Neither decision needs the episode itself -- the FIFO segment keeps ids by
+        position and Algorithm R draws without looking at the record -- so the
+        caller can run this over `sample_count` and then load only the batches that
+        still own a surviving id, instead of decompressing the whole run history.
 
         Draws are taken in the same order as the record-by-record path, so the
         resulting buffer is identical to the one `add` would have built.
@@ -252,45 +230,27 @@ class ReplayBuffer:
     ) -> tuple[list[EpisodeRecord], np.ndarray, np.ndarray, np.ndarray]:
         """The own-episode pool, its returns, its sampling law, and the IS weights.
 
-        Self-imitation. Drawing the agent's own best episodes more often is the
-        only positive signal available when there is no demonstrator to pin, and
-        on this run there is none; see the module docstring for the measurements.
+        Self-imitation: drawing the agent's own best episodes more often is the only
+        positive signal available with no demonstrator pinned.
 
-        Rank-based rather than proportional, because the shaped return is
-        *signed*. Measured over 432 of this run's own episodes it spans -1.94 to
-        +0.65 with a mode at exactly 0, so `return ** alpha` is not defined on
-        most of the buffer. Every repair is worse than the disease: shifting by
-        the minimum makes one episode's priority depend on the worst episode
-        currently held, which changes on every intake; clamping at zero gives
-        half the buffer probability 0 and deletes the reservoir segment, which is
-        the anti-forgetting mechanism. A rank is invariant to sign, scale and the
-        bimodality, and is bounded by construction, so one blowout episode cannot
-        take the batch -- the same argument `reward.py` makes for tanh over a
-        hard clip.
+        Four properties worth keeping:
 
-        Priorities are *static*. An episode's return is fixed the moment
-        `Recorder.finish` writes it and is never a TD error, so nothing is ever
-        updated in place and there is no sum-tree here: the whole distribution is
-        one 400-long vector rebuilt only when the pool changes. A sum-tree exists
-        to make incremental updates cheap, and there are none.
-
-        Episode-level weighting is transition-level weighting in this agent. The
-        horizon is fixed -- every episode records 719 turns, nothing terminates
-        early on bankruptcy -- so equal episodes means equal rows.
-
-        Beta is fixed and has no anneal, which is the substantive half of the
-        objection this mechanism was retired over. An anneal is state: it has to
-        key off `gradient_steps`, and `resume_reset_after_rejections` snaps that
-        backwards on a lineage reset while the buffer contents do not move, so
-        the correction and the data go out of phase exactly on the updates where
-        the run is already in trouble. A constant is re-read from config every
-        update, the way `learning_rate` now is, and cannot desynchronise.
-
-        It is also below 1.0 on purpose. At beta 1 the correction is exact,
-        `P(i) * w(i)` is flat, and the weighted gradient equals the uniform one
-        in expectation -- prioritisation would then buy nothing but variance.
-        Beta is the bias dial, not a correctness knob climbing toward 1: the bias
-        toward the agent's own best episodes is the entire mechanism.
+        * **Rank-based, not proportional**, because the shaped return is *signed* --
+          `return ** alpha` is undefined on most of the buffer. Shifting by the
+          minimum makes one episode's priority depend on the worst episode currently
+          held; clamping at zero deletes the reservoir segment, which is the
+          anti-forgetting mechanism. A rank is invariant to all of it.
+        * **Static priorities.** A return is fixed when `Recorder.finish` writes it
+          and is never a TD error, so there is nothing to update in place and no
+          sum-tree: the whole distribution is one vector rebuilt when the pool moves.
+        * **Episode weighting is transition weighting here**, because the horizon is
+          fixed -- nothing terminates early on bankruptcy -- so equal episodes means
+          equal rows.
+        * **Beta is fixed, never annealed.** An anneal keys off `gradient_steps`,
+          which a lineage reset snaps backwards while the buffer does not move, so
+          the correction and the data go out of phase exactly when the run is
+          already in trouble. It is also below 1.0 on purpose: at 1 the correction
+          is exact and prioritisation buys nothing but variance.
         """
 
         if self._priorities is not None:
@@ -366,18 +326,16 @@ class ReplayBuffer:
     ) -> OrderBatch:
         """Draw a minibatch, `demo_fraction` of it from the pinned demonstrations.
 
-        The demonstration share is drawn uniformly and is what guarantees solvent
-        transitions in every batch when anything is pinned; asking for it when
-        nothing is, is not an error, the batch is simply drawn entirely from
-        self-play. The own share is ranked by return when `priority_alpha` is
-        positive, and each row carries the matching correction in `weight`.
+        The demonstration share is drawn uniformly; asking for it when nothing is
+        pinned is not an error, the batch simply comes entirely from self-play. The
+        own share is ranked by return when `priority_alpha` is positive, with the
+        matching correction in `weight`.
 
-        `prioritized=False` forces the uniform draw whatever the configuration.
-        The flip-rate probe needs it: that probe measures the states the actor
-        really visits in order to resolve NoisyNet sigma against them, and a
-        return-weighted draw would resolve the controller against a distribution
-        no actor ever sees -- silently, since the probe reports a plausible
-        number either way.
+        `prioritized=False` forces the uniform draw whatever the configuration. The
+        flip-rate probe needs it: it measures the states the actor really visits, so
+        a return-weighted draw would resolve the controller against a distribution
+        no actor ever sees -- silently, since the probe reports a plausible number
+        either way.
         """
 
         own, _returns, own_probabilities, own_weights = self._own_priorities()

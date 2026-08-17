@@ -33,19 +33,16 @@ class MatchPolicyAgent:
         self.policy_revision_id = str(config.get("policy_revision_id", "free-market-learner"))
         self.trace_path = Path(str(config["trace_path"])) if config.get("trace_path") else None
         self.gamma = float(config.get("gamma", 0.999))
-        # Absent unless the caller gated it on, which `collect_episode` does only
-        # against a non-mirror opponent. Defaulting to 0.0 rather than to
-        # `OPPONENT_WEIGHT` on purpose: a spec that says nothing about the
-        # relative leg is a spec written before it existed, and it must label its
-        # rewards the way it did then.
+        # Defaults to 0.0 rather than to `OPPONENT_WEIGHT`: a spec saying nothing
+        # about the relative leg predates it, and must label its rewards as it did
+        # then.
         self.opponent_weight = float(config.get("opponent_weight", 0.0))
         self.recorder = Recorder() if self.trace_path is not None else None
         seed = int(config.get("exploration_seed", 0))
         network = OrderQNetwork.load(str(config["weights"]))
-        # Directed exploration: which of the head's 186 sigma rows this actor
-        # draws wider than the rest. Resolved once here -- the counts are a whole
-        # round old by the time an episode starts, so re-reading them per turn
-        # would buy nothing and cost a file read on every decision.
+        # Directed exploration: which sigma rows this actor draws wider. Resolved
+        # once, since the counts are a whole round old by the time an episode
+        # starts.
         action_noise_scale = None
         rare_gain = float(config.get("rare_sigma_gain", 0.0))
         rare_path = config.get("rare_sigma_path")
@@ -60,16 +57,9 @@ class MatchPolicyAgent:
                     # must keep reading the statistic it was measured with.
                     novelty=str(config.get("rare_sigma_novelty", "count")),
                 )
-        # Ape-X's per-actor temperature spread, transplanted onto the noise: one
-        # scale per seed pair, so a single batch carries both an exploratory and
-        # an effectively greedy read of the policy.
-        #
-        # Carried to the *draw* rather than multiplied into `network.sigma`,
-        # which is what this used to do. Both are exact -- the perturbation is
-        # bilinear in the two epsilons -- but scaling the checkpoint's sigma is
-        # correct only for as long as it happens exactly once per load, and the
-        # object gives no sign of that. The flip-rate probe in `training/updater`
-        # scales the same way for the same reason, so the two paths cannot drift.
+        # Ape-X's per-actor temperature spread on the noise: one scale per seed
+        # pair, so a batch carries both an exploratory and an effectively greedy
+        # read. Scaled at the draw, never into `network.sigma` -- see `MarketFreeAgent`.
         self.inner = MarketFreeAgent(
             network,
             rng=np.random.default_rng(seed),

@@ -6,12 +6,9 @@ submission bundle may not depend on torch -- but it carries its own shape, and
 `load` rejects a checkpoint whose input or output width disagrees with the
 current schema rather than silently reading it as a shape match.
 
-This replaced a candidate-scoring network that took `state ⊕ action_features`
-and returned a single score, evaluated over a 2,650-row block every turn. The
-head costs one `(117, 128) @ (128, 128) @ (128, 186)` chain instead -- roughly
-53k multiply-accumulates against 51M -- so scoring is no longer anywhere near the
-critical path of a rollout, and the training update no longer has to chunk a
-410 MB candidate expansion to fit in memory.
+One flat head, so scoring is roughly 53k multiply-accumulates a turn rather than
+the 51M a candidate-scoring network cost. That is why nothing here is chunked and
+why per-turn decisions are affordable.
 """
 
 from __future__ import annotations
@@ -53,14 +50,11 @@ class OrderQNetwork:
     layer and `None` where the layer is deterministic, so a checkpoint written
     before NoisyNet loads as an ordinary network and scores identically.
 
-    Noise is *state on the network*, drawn by `sample_noise` and held until it is
-    replaced or cleared, rather than an argument to `__call__`. That keeps
-    `order_space.choose_order` -- which is called with duck-typed stubs in the
-    tests and must stay identical to its torch counterpart -- completely
-    unaware that any of this exists, and it makes evaluation determinism
-    structural: the arena, the viability gates, the promotion head-to-head and
-    the Kaggle entry point all reach this class through `main.agent`, which
-    never calls `sample_noise`.
+    Noise is *state on the network*, drawn by `sample_noise` and held until replaced,
+    rather than an argument to `__call__`. That keeps `order_space.choose_order`
+    unaware it exists, and makes evaluation determinism structural: the arena, the
+    gates and the Kaggle entry point all reach this class through `main.agent`,
+    which never calls `sample_noise`.
     """
 
     def __init__(
@@ -92,22 +86,16 @@ class OrderQNetwork:
     ) -> None:
         """Draw one factorized epsilon pair per noisy layer, held until replaced.
 
-        Factorized rather than independent because the cost difference is three
-        orders of magnitude at this width: `p + q` draws per layer instead of
-        `p * q`. For the 186-wide head that is 314 draws against 23,994.
+        Factorized rather than independent: `p + q` draws per layer instead of
+        `p * q`, which at this width is 314 against 23,994.
 
-        `scale` multiplies the draw, not `sigma`. `_linear` is bilinear in the
-        two epsilons, so a factor on either scales the perturbation by exactly
-        `scale`; keeping it off `sigma` means it cannot compound across calls and
-        cannot reach `save`. The torch mirror takes the same argument in the same
-        place -- see `training/network.py`.
+        `scale` multiplies the draw, never `sigma`. `_linear` is bilinear in the two
+        epsilons, so a factor on either scales the perturbation exactly; keeping it
+        off `sigma` means it cannot compound across calls or reach `save`.
 
-        `scale` may also be a *vector*, one entry per output unit, which is how
-        directed exploration arrives: `epsilon_out` is already the per-output half
-        of the factored pair, so widening one entry widens exactly one action's
-        perturbation and nothing else. A vector applies only to layers whose
-        output width it matches -- the 186-wide head -- and every other noisy
-        layer draws unscaled, so the same vector is correct whether the run
+        `scale` may also be a *vector*, one entry per output unit -- directed
+        exploration, widening one action's row. It applies only to layers whose
+        output width it matches, so the same vector is correct whether the run
         perturbs the head alone or the whole trunk.
         """
 
@@ -137,15 +125,14 @@ class OrderQNetwork:
     ) -> OrderQNetwork:
         """All-zero network. Inference fallback only, never a training start.
 
-        Scores every action identically, so the argmax falls to index 0, which is
-        NOOP: the agent trades nothing. Survivable, and a defined behaviour for a
-        missing weights file.
+        Scores every action identically, so the argmax falls to NOOP at index 0 --
+        survivable, and a defined behaviour for a missing weights file.
 
-        It must never initialize training. An all-zero MLP has zero gradient
-        everywhere but its output bias -- both hidden activations are
-        identically zero for any input, and `relu'(0) == 0` closes the path back
-        to the biases -- so the symmetry never breaks and the run stays at NOOP
-        forever while reporting a healthy loss. Use `quiet_start`.
+        **Never initialize training with this.** An all-zero MLP has zero gradient
+        everywhere but its output bias, since both hidden activations are zero for
+        any input and `relu'(0) == 0` closes the path back to the biases. The
+        symmetry never breaks and the run stays at NOOP forever while reporting a
+        healthy loss. Use `quiet_start`.
         """
 
         sizes = (state_dim, *hidden, actions)

@@ -1,26 +1,19 @@
 """One-shot weight-space perturbation applied when a learner slot is reseeded.
 
-A learner that has decayed to `lr_graduate_cut` has stopped moving, and the slot
-restarts from the best mature member. Copying those weights unchanged would
-restart the slot *inside the basin the mature member is already sitting in*, at a
-learning rate warming back up -- which is the single-lineage run this replaced,
-with extra steps. The perturbation is what makes the restart a different search
-rather than a continuation of the same one.
+Copying a mature member's weights unchanged restarts the slot *inside the basin
+that member is already in*, at a learning rate warming back up -- the
+single-lineage run this replaced, with extra steps. The perturbation is what makes
+the restart a different search.
 
-Weight-space dropout, not an `nn.Dropout` layer, and the distinction is
-load-bearing here: `policy.py` (numpy, ships in the Kaggle bundle) and
-`training/network.py` (torch) must produce bit-identical outputs for identical
-weights, and the parity test in `tests/test_dqn_market_free.py` pins it. A layer
-added to one side and not the other breaks that; a function that rewrites the
-weights *before* either side loads them cannot. Nothing in this module runs at
-inference and neither network module knows it exists.
+**Weight-space dropout, not an `nn.Dropout` layer**, and that is load-bearing:
+`policy.py` (numpy, ships in the Kaggle bundle) and `training/network.py` (torch)
+must produce bit-identical outputs for identical weights, which a parity test
+pins. A layer added to one side breaks that; a function rewriting the weights
+*before* either side loads them cannot. Nothing here runs at inference.
 
-Shrink-and-perturb (Ash & Adams) rather than plain reinitialisation, with the
-shrink defaulted off. Reinitialising a fraction of the weights is the part that
-recovers plasticity; multiplying the survivors is the part that costs
-performance, and on this family the mature member's score is the whole reason it
-was chosen as the source. `reseed_shrink = 1.0` keeps the survivors exactly as
-they were and is the setting a run should start from.
+Shrink-and-perturb (Ash & Adams) with the shrink defaulted off: reinitialising a
+fraction of the weights recovers plasticity, multiplying the survivors is the half
+that costs performance.
 """
 
 from __future__ import annotations
@@ -39,28 +32,21 @@ def perturb(
 ) -> OrderQNetwork:
     """A copy of `network` with `rate` of its weights reinitialised.
 
-    The mask is drawn per weight rather than per unit. Dropping whole rows would
-    delete an action's entire readout, and at 186 outputs over a 128-wide trunk
-    that is a much larger intervention than the same expected count of scattered
-    entries -- a row of zeros has no gradient of its own to recover through
-    except via the bias.
+    Per weight rather than per unit: dropping whole rows would delete an action's
+    readout, and a row of zeros has no gradient of its own to recover through except
+    via the bias.
 
-    Reinitialised entries are drawn from the layer's own initialisation
-    distribution, `U(-1/sqrt(fan_in), +1/sqrt(fan_in))`, matching
-    `NoisyLinear.reset_parameters` and torch's default `nn.Linear`. A fresh entry
-    therefore sits at the scale the layer was born at rather than at the scale a
-    trained layer happens to have drifted to, which is what makes it explorable
-    again instead of immediately dominated.
+    Reinitialised entries come from the layer's own `U(-1/sqrt(fan_in), +1/sqrt
+    (fan_in))`, matching `NoisyLinear.reset_parameters` and torch's `nn.Linear`, so
+    a fresh entry sits at the scale the layer was born at and is explorable again
+    rather than immediately dominated.
 
-    `sigma_reset` restores every noisy layer's sigma to that same bound scaled by
-    `sigma0`. Sigma anneals toward zero over a learner's life -- the standing
-    NoisyNet failure mode `agent.toml` records -- so a slot that inherited a
-    collapsed sigma would restart with no exploration budget at all and could
-    only ever rediscover what the mature member already knows. `None` leaves
-    sigma exactly as the source carried it.
+    `sigma_reset` restores every noisy layer's sigma to that bound scaled by
+    `sigma0`. Sigma anneals toward zero over a learner's life, so an inherited one
+    leaves the restart with no exploration budget. `None` keeps the source's sigma.
 
-    `rate = 0.0` returns an unperturbed copy rather than the same object, so a
-    caller can always treat the result as its own to write.
+    `rate = 0.0` returns an unperturbed *copy*, so a caller can always treat the
+    result as its own to write.
     """
 
     if not 0.0 <= rate <= 1.0:
