@@ -27,10 +27,17 @@ class EpisodeHookContext:
 class EpisodeReader:
     """Narrow view over one persisted episode."""
 
-    def __init__(self, connection: Any, match_id: str, seat: int):
+    def __init__(
+        self,
+        connection: Any,
+        match_id: str,
+        seat: int,
+        replay: dict[str, Any] | None = None,
+    ):
         self._connection = connection
         self.match_id = match_id
         self.seat = seat
+        self._replay = replay
 
     def summary(self) -> dict[str, Any]:
         row = self._connection.execute(
@@ -62,14 +69,24 @@ class EpisodeReader:
         was briefly otherwise: rollouts were recorded without a payload to save
         disk, the hook fired for them anyway, and every replay-reading evaluator
         turned those episodes into `episode_evaluations` ERROR rows.
+
+        The hook fires immediately after the episode was persisted, in the
+        process that played it, so the caller hands the still-live replay in
+        rather than making this read back the multi-megabyte payload it just
+        compressed. Otherwise the first call fetches and decompresses once and
+        both seats share the result -- the two hooks for one episode used to
+        gunzip and re-parse the same ~4 MB of JSON twice.
         """
 
-        row = self._connection.execute(
-            "SELECT replay_gzip FROM episode_payloads WHERE match_id = %s", [self.match_id]
-        ).fetchone()
-        if row is None or row[0] is None:
-            raise ValueError(f"replay payload not found: {self.match_id}")
-        return json.loads(gzip.decompress(bytes(row[0])))
+        if self._replay is None:
+            row = self._connection.execute(
+                "SELECT replay_gzip FROM episode_payloads WHERE match_id = %s",
+                [self.match_id],
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise ValueError(f"replay payload not found: {self.match_id}")
+            self._replay = json.loads(gzip.decompress(bytes(row[0])))
+        return self._replay
 
     def fetchall(
         self, sql: str, parameters: list[Any] | tuple[Any, ...] = ()
@@ -154,6 +171,27 @@ class EpisodeReader:
 EpisodeEvaluator = Callable[[EpisodeHookContext, EpisodeReader], dict[str, Any]]
 
 
+#: Fingerprints by source path, keyed on what a rewrite would change. The digest
+#: is part of every `episode_evaluations` row's identity, so it has to track edits
+#: to the evaluator -- but it fired twice per episode, re-reading and re-hashing
+#: the whole source file each time, for a file that changes between runs at most.
+_FINGERPRINTS: dict[str, tuple[tuple[int, int], str]] = {}
+
+
+def _source_fingerprint(evaluator: EpisodeEvaluator) -> str:
+    source_file = inspect.getsourcefile(evaluator)
+    if not source_file:
+        return hashlib.sha256(inspect.getsource(evaluator).encode()).hexdigest()
+    stat = Path(source_file).stat()
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _FINGERPRINTS.get(source_file)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    digest = hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
+    _FINGERPRINTS[source_file] = (stamp, digest)
+    return digest
+
+
 def load_evaluator(path: str) -> tuple[EpisodeEvaluator, str]:
     module_name, separator, attribute = path.partition(":")
     if not separator:
@@ -161,9 +199,4 @@ def load_evaluator(path: str) -> tuple[EpisodeEvaluator, str]:
     evaluator = getattr(importlib.import_module(module_name), attribute)
     if not callable(evaluator):
         raise TypeError(f"episode evaluator is not callable: {path}")
-    source_file = inspect.getsourcefile(evaluator)
-    if source_file:
-        digest = hashlib.sha256(Path(source_file).read_bytes()).hexdigest()
-    else:
-        digest = hashlib.sha256(inspect.getsource(evaluator).encode()).hexdigest()
-    return evaluator, digest
+    return evaluator, _source_fingerprint(evaluator)

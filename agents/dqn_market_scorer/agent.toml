@@ -1,5 +1,5 @@
 family_id = "dqn_market_scorer"
-name = "Market Scorer (frozen donor field policy)"
+name = "Market Scorer (Q-guided donor policy)"
 entry_point = "agents.dqn_market_scorer.main:agent"
 parameter_schema_version = 1
 episode_evaluator = "agents.dqn_market_scorer.main:evaluate_episode"
@@ -7,9 +7,9 @@ episode_evaluator = "agents.dqn_market_scorer.main:evaluate_episode"
 # Inference only. `training/` is torch and is deliberately absent, so a bundle
 # built from this allowlist is submission-safe by construction.
 #
-# `donor.py` is a byte-for-byte copy of the pilkwang competitor snapshot and is
-# redistributed under Apache-2.0; LICENSE-pilkwang and NOTICE ship with it, as
-# that licence requires. No `competitor_*` path is ever bundled.
+# `donor.py` is an Apache-2.0 derivative of the pilkwang competitor snapshot;
+# LICENSE-pilkwang and NOTICE ship with it as that licence requires. No
+# `competitor_*` path is ever bundled.
 code_paths = [
   "agents/__init__.py",
   "agents/dqn_market_scorer/__init__.py",
@@ -24,7 +24,11 @@ code_paths = [
 ]
 
 [[models]]
-model_id = "dqn_market_scorer.donor_market_q_v1"
+# Named for what it is: one value-decomposed Q layer learning a bounded residual
+# over the donor-derived field policy and its market executor. It replaces
+# `donor_market_q_v1`, which described the market-only agent this stopped being
+# and read as though the donor were the learner. No stored run carried that ID.
+model_id = "dqn_market_scorer.joint_residual_q_v1"
 trainer = "agents.dqn_market_scorer.train:trainer"
 # One update per generation: the league schedules `rounds_per_generation` rounds
 # and each buys `batches_per_round`, so matching their product fires the update
@@ -72,10 +76,13 @@ market_epsilon_start = 1.0
 market_epsilon_end = 0.05
 epsilon_decay_transitions = 40000
 
-# A zero network makes every argmax fall to index 0 -- the donor-default
-# modifier and a zero reserve -- so round one rolls out unmodified pilkwang
-# rather than a random market policy it would have to climb back from.
-initialization = "zeros"
+# A trainable zero-Q network makes every argmax fall to index 0 -- the
+# donor-default modifier and a zero reserve -- so round one rolls out unmodified
+# pilkwang rather than a random market policy it would have to climb back from.
+# Only its output layer is zero; the hidden trunk must retain live gradients,
+# which is why this is not spelled "zeros" -- that literal value is accepted as
+# a deprecated alias and produces this same network, never an all-zero MLP.
+initialization = "donor_default"
 
 promotion_rule = "significant"
 resume_reset_after_rejections = 5
@@ -86,9 +93,12 @@ promotion_seed_stride = 10000
 jobs = 8
 seed = 0
 
-# The donor itself. With the field policy held identical on both sides, this
-# match measures the learned market layer and nothing else.
-benchmark = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+# The release suite, promotion baseline first. Index 0 is the unmodified donor
+# itself, so the gated match measures the complete Q-guided residual against the
+# policy it derives from; anything after it is a non-regression diagnostic.
+benchmarks = [
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+]
 opponents = [
   "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
   "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",
@@ -100,3 +110,13 @@ opponents = [
   "agents/competitor_alexandergremyakov_harvest_pulse_goose_dividend_v2/main.py",
   "agents/configurable_crop_surrogate/main.py",
 ]
+
+# The v1 model ID is retained for lineage compatibility. These semantic kinds
+# are authoritative in status, batch metadata, and update/evaluation records.
+[models.config.policy_kinds]
+base_market_planner = "base_market_planner"
+market_learner = "joint_residual_q"
+field_policy = "q_guided_field_policy"
+promotion_baseline = "promotion_baseline"
+training_opponent = "training_opponent"
+fixed_benchmark = "fixed_benchmark"

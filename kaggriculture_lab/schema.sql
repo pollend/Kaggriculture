@@ -87,6 +87,50 @@ CREATE TABLE IF NOT EXISTS model_training_checkpoints (
     created_at TIMESTAMP DEFAULT current_timestamp
 );
 
+-- The mature half of a population-trained model: released checkpoints that have
+-- stood long enough to be worth copying, serving as the reseed source and the
+-- self-play mirror.
+--
+-- Entry is no longer tied to a slot ending. A release enters once it has held its
+-- slot for `population_entry_updates` consecutive updates unbeaten, and a
+-- graduating slot contributes whatever the age. The lag is the point: a release
+-- copyable the moment it is promoted makes whichever slot released last the
+-- ancestor for whichever slot reseeds next, and the roster converges on clones.
+--
+-- Keyed on `declared_model_id` rather than `model_id` because that is what the
+-- learners share. A roster of ten named instances of one declared model
+-- (`decl@learner_00` .. `decl@learner_09`, see `effective_model_id`) is ten rows
+-- in `training_models` and one population, and a member graduating out of one
+-- slot is what the next slot reseeds from.
+--
+-- A member is live while `retired_at` is NULL. Retirement is a membership change
+-- and never a delete: the row and its artifacts stay, so a run can be read back
+-- afterwards to ask what was dropped and at what score.
+CREATE TABLE IF NOT EXISTS population_members (
+    member_id VARCHAR PRIMARY KEY,
+    declared_model_id VARCHAR NOT NULL,
+    model_id VARCHAR NOT NULL REFERENCES training_models (model_id) ON DELETE CASCADE,
+    checkpoint_id VARCHAR NOT NULL REFERENCES model_training_checkpoints (checkpoint_id) ON DELETE CASCADE,
+    -- Windowed median of the checkpoint's benchmark money, discounted by the
+    -- policy's trading rate so a hoarder cannot outrank a trader, and refreshed
+    -- on each upsert rather than frozen at graduation.
+    -- A single arena series is a draw and not a number here: `falloff_v1`
+    -- measured 61 of them on one unchanged checkpoint, running 0.93 to 427.
+    score DOUBLE PRECISION NOT NULL,
+    -- The strategy fingerprint the group's reserved berths are keyed on: crops
+    -- planted, quadrants bought, the undiscounted money both were measured with,
+    -- and the archive cell they bin to. Nullable, and NULL is not zero -- a
+    -- member graduated before this existed has no fingerprint, and filing it into
+    -- a cell on that basis would hand a reserved berth to an unmeasured row.
+    behavior_json JSONB,
+    graduated_at TIMESTAMP DEFAULT current_timestamp,
+    retired_at TIMESTAMP,
+    retired_reason VARCHAR
+);
+
+CREATE INDEX IF NOT EXISTS population_members_live_idx
+    ON population_members (declared_model_id, retired_at, score);
+
 CREATE TABLE IF NOT EXISTS agent_revisions (
     revision_id VARCHAR PRIMARY KEY,
     family_id VARCHAR NOT NULL REFERENCES agent_families (family_id) ON DELETE CASCADE,

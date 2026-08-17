@@ -1,0 +1,1168 @@
+family_id = "dqn_market_free"
+name = "Market Free (donor scheduler, market-directed planting)"
+entry_point = "agents.dqn_market_free.main:agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_market_free.main:evaluate_episode"
+
+# Inference and the torch-free episode hook. `training/` is deliberately absent,
+# so a bundle built from this allowlist is submission-safe by construction.
+#
+# `donor.py` and the state half of the scorer's feature schema are local copies.
+# Keeping them here makes this inference bundle independent of the scorer and
+# ensures the field policy and encoder share the donor's episode state. The
+# donor is redistributed under Apache-2.0; LICENSE-pilkwang and NOTICE ship with
+# it as required. No `competitor_*` path is ever bundled.
+#
+# Note there is no `market_exec.py` here. That is the entire point of this
+# agent: the donor's market layer is gone and the network emits orders itself.
+#
+# `weights.npz` is also absent, unlike the scorer's manifest. The league bundles
+# this agent as an anchor long before any checkpoint has been exported, and a
+# declared-but-missing path fails that bundle. Inference finds the file by path
+# when it exists (`policy.WEIGHTS_PATH`), and `export_submission.py` requires it
+# for a Kaggle build, which is the only place shipping without it would matter.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_market_free/__init__.py",
+  "agents/dqn_market_free/diagnostics.py",
+  "agents/dqn_market_free/evaluation.py",
+  "agents/dqn_market_free/donor.py",
+  "agents/dqn_market_free/LICENSE-pilkwang",
+  "agents/dqn_market_free/main.py",
+  "agents/dqn_market_free/market_state.py",
+  "agents/dqn_market_free/NOTICE",
+  "agents/dqn_market_free/order_space.py",
+  "agents/dqn_market_free/planting.py",
+  "agents/dqn_market_free/policy.py",
+]
+
+[[models]]
+model_id = "dqn_market_free.raw_order_q_v1"
+trainer = "agents.dqn_market_free.train:trainer"
+# Paired with `rounds_per_generation` in the league config -- see the comment
+# there for why both halved. `batches_per_round = 1`, so these two being equal is
+# what makes a generation exactly one update per slot.
+min_new_batches = 10
+
+[models.config]
+batches_per_round = 1
+# Must be even: seeds are played in consecutive pairs so each is seen from both
+# seats.
+episodes_per_batch = 16
+
+league_opponents = true
+
+# One decision per turn, so an episode yields 720 decisions against the scorer's
+# 60. That throughput is what makes one order per turn enough, and it is why the
+# buffer is sized in episodes rather than transitions.
+buffer_episodes = 400
+reservoir_fraction = 0.35
+warmup_episodes = 16
+
+# One in-game day. The credit this has to carry is a crop cycle, and
+# `CROPS[crop]["first_yield_day"]` at `turnsPerDay = 24` makes that 48 turns for
+# WHEAT and CARROT, 192 for TOMATO, and 240 for MELON and STRAWBERRY -- to the
+# first *legal* harvest, before the shed and the sale that turn it into coins.
+# BUY_SEED is also processed after the turn's field actions, so the seed is not
+# plantable until `t + 1`.
+#
+# This window closes none of that on its own: `planting.py` optimises for melon,
+# which is ten bootstraps out, not the two to four an earlier version of this
+# comment claimed. What it does is stop the previous 8 -- a third of a day --
+# walking the credit back at a crawl. The purchase turn gets its signal from
+# `LOT_POTENTIAL_WEIGHT` instead, which pays on the turn itself.
+n_step = 24
+
+# The season is a hard 720-turn deadline, not an infinite horizon: stock held
+# past the last turn scores nothing. Time to the end is already in the state
+# (`step/episode_steps`, turns remaining, days remaining), so the finite-horizon
+# problem is well posed and the discount only has to keep values bounded.
+#
+# At the previous 0.997 the horizon was 1/(1-gamma) = 333 turns, under half the
+# season: a melon planted on day 3 and sold on day 10 was discounted to 0.60,
+# and terminal liquidation seen from mid-season to about 0.4. 0.999 puts the
+# horizon at 1000 turns, past the end of the episode.
+gamma = 0.999
+
+# Share of every minibatch drawn from the pinned demonstrations rather than from
+# self-collected episodes. Solvent trajectories are rare enough that an
+# unweighted draw over the agent's own data is almost entirely bankruptcies, and
+# the only policy consistent with that is NOOP. Drawing a fixed share from the
+# demonstrations puts solvent transitions in every batch by construction, with no
+# sampling bias to correct.
+#
+# The catch, and the reason `priority_alpha` below exists: this is conditional on
+# having a demonstrator. It is ignored when nothing is pinned, and nothing is --
+# `demonstration_episodes` is 0, so the share silently resolves to zero and the
+# mechanism contributes nothing while reporting nothing.
+demo_fraction = 0.25
+
+# Rank exponent for the return-weighted draw over the agent's *own* episodes.
+# 0.0 is the uniform draw, byte for byte, down to the bit-generator state.
+#
+# Self-imitation, and it covers the case `demo_fraction` cannot: with no
+# demonstrator to pin, the best episodes the policy has actually produced are the
+# only positive signal there is. Episodes are ranked by shaped return descending
+# and drawn at P(i) proportional to rank^-alpha, with the resulting bias undone
+# by a per-row weight in the TD loss. The two mechanisms compose -- demonstrations
+# stay uniform inside their share, own episodes are ranked inside theirs.
+#
+# The buffer this is aimed at, measured over 432 of the live run's own episodes:
+# a quarter finish below a shaped return of -1.0, and the solvent fraction reads
+# 0.0023. A uniform draw over that teaches NOOP, because NOOP is the policy it is
+# consistent with.
+#
+# Rank-based, not proportional, because the shaped return is *signed*: it spans
+# -1.94 to +0.65 with a mode at 0, so there is no exponent of it that is even
+# defined. Shifting by the buffer minimum would make one episode's priority
+# depend on the worst episode currently held; clamping at zero would delete the
+# reservoir segment. A rank is invariant to all of it and bounded by
+# construction, so one blowout episode cannot take the batch.
+#
+# Switched on at `market-free-logmoney-v26`, having been landed inert so the
+# uniform draw was provably unchanged first. 0.7 is Schaul et al.'s rank-based
+# alpha -- note their proportional value is 0.6 and the two are not
+# interchangeable -- and it is the value `priority_beta`'s measurements below
+# were taken at, so the pair stays calibrated.
+#
+# It goes on now because the other half of the argument above finally resolved.
+# `demo_fraction` is conditional on a demonstrator and there is none, so until
+# this exponent moved, *nothing* was putting solvent transitions in a batch:
+# `market-free-population-v25` held `own_solvent_fraction` between 0.003 and
+# 0.028 for its entire eleven generations while drawing uniformly over it.
+priority_alpha = 0.7
+
+# Importance-sampling exponent, fixed. There is no anneal schedule and that is
+# deliberate. An anneal is state: it has to key off `gradient_steps`, and
+# `resume_reset_after_rejections` snaps that backwards on a lineage reset while
+# the buffer contents do not move -- so the correction and the data drift apart
+# exactly on the updates where the run is already failing. A constant is re-read
+# from this file every update, the way `learning_rate` now is, and cannot
+# desynchronise. That drift was the real half of the objection prioritisation was
+# retired over; the exponents themselves were not the problem.
+#
+# Strictly below 1.0, and not as an approximation. At 1.0 the correction is
+# exact, P(i) * w(i) is flat, and the weighted gradient equals the uniform one in
+# expectation -- prioritisation would then buy nothing but variance. Beta is the
+# bias dial, not a correctness knob climbing toward 1: the bias toward the
+# agent's own best episodes is the entire mechanism.
+#
+# Measured at (alpha 0.7, beta 0.5) over 400 real episodes: the best episode is
+# drawn 23x more often than uniform and carries weight 0.12, for a net 2.8x; the
+# expected return of a sampled episode rises from 0.213 to 0.406; effective
+# sample size holds at 93% of the batch.
+priority_beta = 0.5
+
+# The bootstrap is a max over the 186-wide action head, not over an expanded
+# candidate grid, so there is nothing left to chunk and a wide batch is cheap.
+batch_size = 256
+# 100 -> 400 at v34, on the throughput measurement rather than on any theory about
+# the optimiser.
+#
+# At 100 this was `min_new_batches` x 100 = 1,000 gradient steps per update, one
+# update per generation. Against a buffer holding ~1,100 episodes of ~720
+# decisions -- about 790k transitions -- 1,000 steps of `batch_size` 256 replays
+# each transition **0.32 times per generation**. Ordinary DQN runs a replay ratio
+# between 1 and 8; this was at a third of the bottom of that range, so most of
+# every episode the machine paid to simulate was never learned from twice.
+#
+# It is close to free, which is the other half of the argument. `train_seconds` is
+# 18-32 s of a ~1,900 s generation -- 1.6% of the wall clock -- and the arena is
+# 96% of an update (see `eval_seeds`). Quadrupling the steps costs about 90
+# seconds a generation, roughly +5%, and buys 4x the learning per episode
+# collected. Nothing else in this file has that ratio.
+#
+# 400 rather than 800 because 0.32 is the only replay ratio this agent has ever
+# run at: 1.3 is the low end of normal and 2.6 would be the largest untested jump
+# available. The failure to watch for is buffer over-fitting, which shows as
+# `mean_abs_q` climbing while `mean_loss` falls and the promote rate drops -- all
+# three are already in `model_updates.metrics_json`. If it appears, 200 is the
+# fallback rather than a revert to 100.
+gradient_steps_per_batch = 400
+learning_rate = 0.0001
+weight_decay = 0.0
+target_sync = 2000
+# Both learning rates are re-applied from config on every resume, so changing one
+# mid-run takes effect instead of being overwritten by the optimizer state the
+# checkpoint carries. The moments themselves survive unless this is set: turn it
+# on when the run is deliberately leaving a regime behind and the averaged
+# gradient history of the old one would only damp the change.
+reset_optimizer_moments = false
+
+
+# --- Population training -----------------------------------------------------
+#
+# A roster of named learner slots trains in parallel under one declared model,
+# and a slot that stops improving is ended rather than nursed: its released
+# checkpoint graduates into the mature group, the mature group drops its lowest
+# scorer to stay at capacity, and the slot restarts from the best mature member
+# with its learning rate back at zero and a fraction of its weights redrawn.
+#
+# It exists because the single ever-resuming lineage measured its own stall.
+# Over `market-free-falloff-v18`'s batches 1100-1688: rollout money oscillating
+# around 5,000 with no trend across twelve 50-batch buckets, `mean_loss` pinned
+# at 0.0015, `mean_abs_q` at 0.2, benchmark money against pilkwang between 0.9
+# and 1,208 from a 3,000 stake, and two promotions each immediately followed by
+# rejections. Nothing in that series is diverging; it is sitting still, and a
+# trajectory that has stopped moving cannot be pushed out of its basin by the
+# gradient that put it there.
+#
+# The learner roster itself lives in `train_market_free.py`, not here: it is
+# `TRAINING_AGENTS`, one entry per slot, and the harness already namespaces them
+# as `<declared_model_id>@<name>` with their own artifacts, batches and lineage.
+
+# Below this learning rate the slot is finished. 0.0 -- the default -- switches
+# the whole mechanism off and reproduces the fixed-rate single lineage exactly,
+# so every config that predates this reads as it did.
+#
+# 1e-5 against a peak of 1e-4 is three halvings, so a slot ends after three
+# plateaus rather than after one bad update. Must be strictly below
+# `learning_rate` or a slot graduates before it has trained.
+lr_graduate_cut = 0.00001
+
+# Updates spent climbing linearly from zero to `learning_rate` after a reseed.
+#
+# Zero on the first update is the point rather than an artifact of the ramp. The
+# rounds between a graduation and the update that consumes it are collected by
+# the reseeded policy, and a slot that trained at full rate on its first update
+# would be fitting the freshly perturbed weights to a buffer it has only just
+# started refilling.
+lr_warmup_updates = 3
+
+# Consecutive updates without a real improvement before the rate is multiplied by
+# `lr_decay_factor`. The counter resets on every improvement and on every decay.
+lr_plateau_patience = 4
+
+# What counts as an improvement, relative rather than absolute. The score is
+# benchmark money, which spans three orders of magnitude across a run, so a fixed
+# delta is either inside the noise at the top of that range or unreachable at the
+# bottom of it.
+lr_plateau_min_delta = 0.05
+
+# How fast the plateau detector's high-water mark leaks back toward the level.
+#
+# A plain maximum latches. `best_score` is set by the single luckiest draw the
+# slot ever took, every later update has to clear it by `lr_plateau_min_delta` on
+# top, and on a signal that moves tens of percent between updates that is
+# unreachable by anything but another outlier. Measured on `logmoney-v26`:
+# `logmoney_07` pinned it at 4,208.69, a draw it never repeated, scored 2,992 to
+# 4,103 for the rest of its life and was graduated and reseeded down to 828 --
+# while its rollout money climbed 4,673 to 5,646 across the same updates.
+# `logmoney_02` the same, 3,497 to 332.
+#
+# Sized against the patience budget rather than picked: the largest excess cleared
+# before the `lr_plateau_patience`-th stall spends it is
+# `1 / ((1 + min_delta) * (1 - decay)**(patience - 1))`, which at 0.08 is 22% at
+# patience 4 and 71% at patience 8. The stranding outlier was 20%.
+#
+# Safe at that size because `_settle_slot` floors the leak at the current score, so
+# a slot genuinely flat at L keeps `best == L` however fast this decays and still
+# stalls, still decays, still graduates. Only excess above the current level leaks.
+# 0.0 restores the latch exactly.
+lr_best_decay = 0.08
+
+# Which measurement the plateau detector reads: "rollout" or "benchmark".
+#
+# "rollout" is `own_mean_final_money`, the mean over the whole 1,200-episode ring
+# the update just trained on. "benchmark" is the windowed median arena money this
+# used to read, and is what `population_members.score` and the promotion gate still
+# read -- this key changes what ends a slot, not what releases one.
+#
+# Measured over `logmoney-v26` batches 200-360, all ten slots, 160 consecutive
+# update pairs, as mean absolute update-to-update change:
+#
+#     own_mean_final_money    11.7%
+#     benchmark arena money   48.2%
+#
+# Four times noisier, on a number three irreversible decisions were riding on. It
+# is not a precision problem more seeds fix on their own: 48.2% is what the
+# eleven-wide median *already* reads, because adjacent windows share ten of eleven
+# samples and the arena's tail survives the smoothing.
+#
+# The two are different quantities -- the rollout mean is measured against the
+# training opponent mix at collection sigma, the arena against the pinned benchmark
+# greedily -- so `metrics_json.lr_score_signal` records which one each point is.
+lr_score_signal = "rollout"
+
+# Quartering rather than halving, which shortens the ladder without weakening any
+# rung of it. The cut is reached when `peak * factor**decays < lr_graduate_cut`:
+# at 0.5 that is `0.5^d < 0.1`, so four decays; at 0.25 it is two. The terminal
+# rate is identical either way -- `0.25^2` and `0.5^4` are both 0.0625, so a slot
+# still finishes at 6.25e-6 -- and `lr_plateau_patience` is untouched, so every
+# decay is still four consecutive non-improving updates.
+#
+# That is the reason to move this knob rather than `lr_plateau_patience`. Cutting
+# patience would reach the same 12-update cycle by declaring each plateau on half
+# the evidence, and the score is a windowed median whose adjacent windows share
+# ten of eleven samples -- already autocorrelated, so two non-improving draws are
+# weak grounds for calling a slot finished. Premature plateaus mean premature
+# reseeds, which is the failure the mechanism exists to avoid.
+#
+# What is given up, stated rather than hidden: a coarser anneal. The slot goes
+# 1e-4 -> 2.5e-5 -> 6.25e-6 and never sees the intermediate rungs, so each drop is
+# a larger step for the optimizer to absorb.
+lr_decay_factor = 0.25
+
+# A floor on slot lifetime, counted from the reseed rather than from the run. A
+# slot cannot graduate before it has had a genuine chance to train, whatever the
+# early score readings do.
+lr_min_updates_before_graduation = 10
+
+# How many consecutive updates a release must stand, unbeaten by a newer
+# candidate of its own slot, before it may enter the mature group.
+#
+# The lag exists because contribution and restart are now separate triggers. A
+# release that could be copied the moment it was promoted would close a loop:
+# whichever slot released most recently becomes the ancestor for whichever slot
+# reseeds next, and the roster converges on clones of the current best. That is a
+# greedy hill-climb running ten copies, which is strictly worse than the single
+# lineage the population replaced.
+#
+# Gating entry on graduation -- which is what this did before -- was also a lag,
+# just an enormous one: a whole decay cycle, and only if the slot died. This is
+# the same idea sized to something a healthy slot can reach.
+#
+# 2, and this used to be 4 on the reasoning that it was "a third of the
+# twelve-update cycle". That justification does not survive contact with a
+# measured cycle. The eleven graduations in `logmoney-v26` ran 11, 13, 16, 18, 18,
+# 20, 24, 25, 29, 31 and 34 updates -- a median of 20, with two slots never
+# graduating at all in 38 -- so the proportional rule argues for a *longer* gate,
+# not this one. The number is set from the survival histogram instead.
+#
+# All 128 releases that run made, by how long they stood before a newer candidate
+# of their own slot beat them:
+#
+#     stood >= 1 update    128
+#     stood >= 2            57
+#     stood >= 3            38
+#     stood >= 4            29
+#
+# 71 of 128, 55%, were superseded within a single update. That is the churn
+# population this gate exists to exclude, and it is entirely excluded at 2. Going
+# to 3 keeps 38 instead of 57 -- a third less yield for no additional protection
+# that the histogram can show.
+#
+# The gate was also the binding constraint on the group's size rather than one
+# input among several: 27 of the 32 distinct members that run produced entered at
+# release_age exactly 4, so the group was a direct readout of this number.
+#
+# What it tests is survival: a policy has to hold its slot through a stretch of
+# continued training without being beaten. A slot promoting on every update is
+# improving fast, its current best is a moving target, and it contributes nothing
+# until it settles.
+#
+# The age gate does not have to carry the quality question as well, which is what
+# makes a short one safe. `_graduate` inserts and then culls `ORDER BY score DESC
+# OFFSET mature_capacity` in the same call, so a premature entrant that is bad is
+# the row retired by its own insertion.
+#
+# Must be at least 1. Zero is entry-on-promotion, and that closes a loop:
+# whichever slot released most recently becomes the ancestor for whichever slot
+# reseeds next, and the roster converges on clones of the current best -- a greedy
+# hill-climb running ten copies, strictly worse than the single lineage the
+# population replaced. `_slot` refuses it.
+#
+# A graduating slot contributes regardless of age -- it is finishing anyway, and
+# holding its release back would lose it entirely. A warm-starting slot
+# contributes nothing regardless of age; see `population_warm_start`.
+population_entry_updates = 2
+
+
+# Adopt the mature group on a slot that has never been reseeded, instead of
+# leaving it on the cold start it was created with.
+#
+# A cold start is the right initialisation only when there is nothing to start
+# from. `declared_model_id` carries no session suffix, so the group outlives the
+# session that filled it, and a fresh roster begins beside checkpoints of policies
+# that already work. A slot starting from noise there is not searching a different
+# basin -- it is re-deriving what the group already holds, from noise, for the
+# whole decay cycle before `_graduates` gives it its first ancestor.
+#
+# `market-free-streak-v27` is the measurement. Five updates in, ten cold-started
+# slots scored 1,071-1,392 rollout money against a group whose worst usable member
+# was 1,861 and whose best was 6,270 -- and they were getting worse, 3,000 at
+# update zero down to 720 at update four. A generation of compute spent
+# re-learning the floor of what was already on disk.
+#
+# Fires at most once per reseed lineage and needs no flag of its own to record
+# that: the marker it writes advances `lr_reseed_index`, and the predicate is
+# `lr_reseed_index == 0`. So it is self-cancelling, it survives a process restart
+# because the state is the update row rather than memory, and it is inert on the
+# first run of a new declared model, where the group is empty and a cold start is
+# the only option there is.
+#
+# It is not a graduation. `lr_warmup_updates` and
+# `lr_min_updates_before_graduation` are deliberately not consulted: those floors
+# stop warmup noise from ending a slot that has not had a chance to train, which
+# is a claim about evidence. This reads no score and makes no such claim, and
+# every update spent waiting the floor out is an update spent training the
+# initialisation being corrected.
+#
+# This is permanent behaviour, not a one-time migration. A later session's slots
+# will also warm-start on their first update, from whatever the group holds then.
+# A genuinely cold control arm needs this set to false, deliberately.
+population_warm_start = true
+
+# A floor on how long a slot trains before it may warm-start, counted the way
+# `lr_min_updates_before_graduation` counts. 0 is the honest default: if the cold
+# start was the wrong initialisation then it was wrong from update one, and the
+# batches collected before the warm start are discarded by `reseed_batch_floor`
+# either way. Raise it only to hold a roster together for a fixed stretch before
+# letting the group in.
+population_warm_start_min_updates = 0
+
+# How many of the mature group's best a restarting slot draws its ancestor from,
+# uniformly. 1 reproduces the old behaviour of always taking the single best.
+#
+# A member's score is a windowed median of a benchmark that swings three orders of
+# magnitude, so it estimates that policy's worth rather than measuring it. Argmax
+# over noisy estimates picks the luckiest estimate as often as the best policy,
+# and picks the same one every time because the estimate is stored and reused.
+#
+# The other half is diversity. Every restart pulling index 0 makes ten slots ten
+# perturbations of one ancestor in one basin, which is a worse search than the
+# single lineage the population replaced.
+#
+# 3 rather than more: the pool is expected to hold very few members early -- one
+# slot in ten currently holds a release -- and drawing from a wide top when the
+# group is small is just uniform sampling with extra steps.
+reseed_source_pool = 3
+
+# How many entries one originating slot may hold in the list a restart draws from.
+#
+# The group is `mature_capacity` *checkpoints*, not that many policies. A slot
+# that is genuinely ahead promotes repeatedly and occupies the top of the ranking
+# several times over, so ranking on score alone silently shrinks the population
+# the draw sees.
+#
+# Measured rather than hypothesised. Of the thirty live members at
+# `market-free-streak-v27`, ten lineages produced all of them and `logmoney_04`
+# alone held ranks 0, 1, 5, 6 and 9 -- so two of the top three were one policy's
+# own history, and `reseed_source_pool = 3` handed that lineage two thirds of
+# every restart. A population of ten read as a population of about four, which is
+# the failure `reseed_source_pool` is itself written to prevent, one level down.
+#
+# 1, meaning the best surviving checkpoint of each lineage and nothing else. That
+# makes the candidate list a list of *policies*, which is what the top-k argument
+# above assumes it is drawing from.
+#
+# The cap costs rank and never costs quality: the entry dropped is always one its
+# own lineage already beat. What it does give up is that a lineage better than
+# every other by more than one rung cannot supply two slots' ancestry at once.
+# That is the trade. A second perturbation of an ancestor the roster already holds
+# is the cheapest thing the roster can hold, and diversity is the entire reason
+# there is a population.
+#
+# Tuned to the run in front of it: ten lineages for ten slots, so at 1 every slot
+# can be given a different ancestor with none left over. A roster with more slots
+# than the group has lineages wraps onto the best entries instead, and a group
+# that consolidates onto few lineages may want this at 2.
+reseed_source_lineage_cap = 1
+
+# How many graduated checkpoints the mature group holds. Past this the lowest
+# scorer is retired -- a membership change, never a delete, so a run stays
+# answerable afterwards about what it dropped and at what score.
+#
+# A member's score is the windowed median of its benchmark money, taken from the
+# ratchet reference the gate already computed for it. Single draws are not
+# comparable on this family: `falloff_v1` measured 61 of them on one unchanged
+# checkpoint and got everything from 0.93 to 427.
+mature_capacity = 30
+
+# How many of those berths are held for *behaviour* instead of for score, which
+# turns the mature group from a ranking into a small quality-diversity archive.
+#
+# Carved out of `mature_capacity`, not added to it: 24 berths still go to the top
+# of the score ranking exactly as before, and 6 are held for the best-scoring
+# member of each behaviour cell. The group's size, and so its disk and its mirror
+# opponent cost, is unchanged.
+#
+# It exists because one scalar cannot hold a population apart, and the run says so
+# plainly. `logmoney-v26` by generation, distinct crops planted per seat against
+# the seat rate of `BUY_LAND`:
+#
+#     gen        0     4     9    12    15    20    30    38
+#     crops   3.31  3.66  2.32  1.37  1.29  1.85  1.82  1.89
+#     land     1.4% 18.5%  3.1%  0.3%  0.3%  0.4%  1.6%  1.7%
+#     money  8,726   454 1,669 2,460 3,365 3,054 4,061 3,916
+#
+# Money *rises* through the collapse, so this is not a failure the promotion gate
+# can catch and not one `_population_score`'s activity discount can catch either.
+# A wheat monoculture genuinely is the best thing the ranking has found; ranking is
+# simply the wrong instrument for keeping an alternative alive long enough to beat
+# it. The same schedule kills land in all three of v25, v26 and v27.
+#
+# Cells are `(distinct crops capped at 3) x (quadrants per episode capped at 2)`,
+# and `(1, 0)` -- monoculture, no expansion -- is deliberately not reserved. That
+# is the attractor, the score bucket is already full of it, and a berth spent
+# there is a berth spent on what twenty-four others already hold.
+#
+# 6 against 8 reservable cells, so the archive is slightly oversubscribed and the
+# cells compete on score rather than each drawing a free berth.
+#
+# 0 restores the old cull exactly -- `_graduate`'s two `EXCEPT` clauses collapse to
+# the `OFFSET mature_capacity` it used to run -- which is the retirement path if
+# the reserve turns out to be preserving losers rather than options.
+mature_reserved_capacity = 6
+
+# The money floor a member clears before it may occupy a reserved cell, and the
+# whole safety argument for reserving any.
+#
+# Diversity is not self-justifying here: across every session on this family, seats
+# that bought land finish on a median of 7 coins against 3,000 for seats that did
+# not, because `LAND_PRICES` opens at 1,000 against a 3,000 stake and the purchase
+# the policy can reach is the one on day 0. An unfloored cell would hold those
+# bankrupts permanently and reseed the roster from them, which is worse than the
+# collapse it is trying to prevent.
+#
+# Reads the *undiscounted* benchmark money rather than `score`. The activity
+# discount is a ranking device; applying it here would ask a diversified policy to
+# clear a bar that has already been bent against it once.
+#
+# 1,500 is not a new number: it is `viability_cold_start_reference_money`, which
+# this agent already uses to mean "traded for a season and did not die".
+mature_reserved_min_money = 1500.0
+
+# How often a restart draws its ancestor from the reserved cells instead of from
+# the top of the score ranking.
+#
+# The ranked draw can only ever return variations on what the ranking currently
+# rewards, so on its own the archive would fill up and never be read. This is the
+# read. At 0.25 a slot restarts from an archived behaviour on one reseed in four,
+# and from the score bucket otherwise -- so the roster keeps climbing the hill it
+# is on while spending a quarter of its restarts somewhere else.
+#
+# The whole-roster warm start does not roll for it. Ten slots choosing
+# independently would collide, so there the highest `round(share * slots)` ordinals
+# take the reserve by arithmetic and the rest index the score list, which is the
+# same coordination argument `reseed_source_pool`'s spread already makes.
+#
+# `reseed_source_lineage_cap` applies inside the reserve as well as outside it: a
+# reserve holding three checkpoints of one lineage is the same failure one level
+# down, which is the failure that comment was written about.
+#
+# 0.0 skips the bucket entirely and reproduces the pre-archive draw exactly.
+reseed_source_explorer_share = 0.25
+
+# The one-shot weight-space dropout applied when a slot is seeded from the best
+# mature member. Without it the restart lands inside the basin that member is
+# already in, at a learning rate warming back up -- which is the single lineage
+# this replaced, with extra steps.
+#
+# Per weight rather than per unit: dropping whole rows would delete an action's
+# entire readout, and a row of zeros has no gradient of its own to recover
+# through. Redrawn entries come from the layer's own initialisation distribution,
+# so they sit at the scale the layer was born at and are explorable again rather
+# than immediately dominated.
+reseed_dropout = 0.10
+
+# Multiplier on the weights that survive the mask. 1.0 is pure dropout and is
+# where a run should start: shrink-and-perturb's shrink term is the half that
+# costs performance, and the mature member's score is the entire reason it was
+# chosen as the source.
+reseed_shrink = 1.0
+
+# Restore sigma to `noisy_sigma0` on reseed. Sigma anneals toward zero over a
+# slot's life -- the standing NoisyNet failure mode this file records below -- so
+# a slot inheriting a collapsed sigma would restart with no exploration budget at
+# all and could only rediscover what the mature member already knows.
+reseed_sigma_reset = true
+
+
+# NoisyNet, and it is the only exploration mechanism there is.
+#
+# On here, unlike every earlier version of this file. The manifest used to be the
+# epsilon-greedy control arm with this off; epsilon was removed at v13, so leaving
+# it false would describe a configuration that never explores at all rather than a
+# control.
+#
+# Why epsilon went, since nothing else records it now: its explore branch drew
+# uniformly over feasible actions with NOOP removed, so every exploring turn was
+# forced to place a real order -- and 97 of the 186 actions spend money against 88
+# that sell. At 720 decisions an episode that is ~130 forced random purchases,
+# chosen without reference to what the network thought anything was worth.
+# Measured at per-turn rates of 1.0, 0.1, 0.02 and even 0.005, the agent finished
+# the season on 5, 185, 48 and 4 coins from a 3,000 float while the donor finished
+# above 100,000. Perturbing the *weights* moves the argmax only where actions are
+# already near-tied in Q, so a purchase the policy has learned is ruinous stays
+# unreachable.
+#
+# "head" rather than "all". It leaves `has_inert_hidden_trunk` -- the only
+# structural guard against the NOOP collapse -- correct as written, and keeps the
+# trunk shared with the behaviour-clone cross-entropy head deterministic. "all" is
+# the honest follow-up, not the safe default: head-only factorized noise
+# correlates all 186 action perturbations through one 128-dim `f_in`, so it picks
+# actions almost state-independently.
+noisy = true
+noisy_layers = "head"
+noisy_sigma0 = 0.5
+
+# How often the perturbation is redrawn. Not a cost trade: factorized noise
+# costs `in + out` draws per layer rather than `in * out` -- 314 for the 186-wide
+# head -- which is tens of microseconds against a simulator turn measured in
+# milliseconds. So this is chosen for exploration quality alone, and note it does
+# not bear on the overbuying at all: every setting perturbs the weights and is
+# therefore value-proportional, so all three kill the epsilon purchase pump
+# equally. What it decides is whether the exploration can express a *plan*.
+#
+# "day" -- redraw every `turnsPerDay` turns -- for two reasons specific to this
+# simulator rather than to NoisyNet:
+#
+# It matches `n_step` above, which is one in-game day because that is the crop
+# cycle's unit. Under per-decision noise a 24-step return is produced by 24
+# different perturbed policies, so the bootstrap values a return no single policy
+# would ever generate; under day cadence each n-step return belongs to one.
+#
+# And the day is a real economic boundary here, the one that caused the original
+# bankruptcy: hire cost is fibonacci in `hires_today` and resets daily, hands are
+# wiped at the day boundary, and `simple_v2` died on eighteen `HIRE 13` orders.
+# HIRE is inherently a daily posture, so perturbing it sub-day perturbs something
+# the economy does not vary at that rate.
+#
+# The alternatives, and what they cost. "decision" maximises state coverage but
+# cannot hold a multi-turn plan. "episode" holds one perturbed policy for the
+# whole season -- the only setting that can discover "buy seed day 1, sell day
+# 10" -- but yields 8 distinct policies per batch against day cadence's 480, and
+# one bad draw wastes a full 720-turn episode rather than 24 turns, which is a
+# poor trade for a family with this one's record of bankrupting in the first few
+# turns. Day cadence does *not* span the 48-96 turn BUY_SEED-to-harvest cycle;
+# that gap is why "episode" stays the follow-up experiment.
+noisy_cadence = "decision"
+
+# Actor `i` of `N` scales sigma by `alpha ** (-i/(N-1))`, one scale per seed
+# pair, so actor 0 plays the learned sigma and the last is effectively greedy.
+# The same Ape-X trick `epsilon_actor_alpha` applies, and it exists for the same
+# measured reason -- one temperature per batch fills the buffer with near-copies
+# of one trajectory. At alpha 32 and eight pairs: 1.0 down to 0.031.
+noisy_actor_alpha = 32.0
+
+# `noisy_actor_hot`, `noisy_hot_order_rate` and `noisy_hot_scale_limit` are gone,
+# and `_noisy` raises rather than ignoring them. The ladder is downward only.
+#
+# Both mechanisms that tried to put rungs above the setpoint are now retired --
+# the periodic idle burst at v15, the hot rungs with the population -- and the
+# per-episode attribution says the same thing about both. On `burst-v9`, 212
+# seats at sigma 3.159 finished 49% bankrupt against 8-26% across the ordinary
+# ladder and bought *zero* land; every land purchase in that run happened at
+# sigma <= 0.871, with the highest rate on the lowest rungs. On `falloff-v18` the
+# hot rungs' land rate was 4.6% against the ordinary rungs' 4.9%.
+#
+# The mechanism is the same one the reward comments have circled since
+# `simple_v2`: 97 of 186 actions spend money, so a widened policy is bankrupt in
+# its first turns and never reaches the state where a rare action is affordable.
+# Widening the whole policy cannot find rare behaviour. `rare_sigma_gain` widens
+# single rows and stays; escaping a stuck trajectory is the population's job.
+
+# The same controller, aimed at the flip-*to-order* rate instead: the share of
+# states the greedy policy would sit out that the perturbation talks into a real
+# order. 0.0 leaves it off. Set this and `noisy_flip_rate_target` is ignored --
+# exactly one curve may move sigma, or a run cannot say which number moved it.
+#
+# This exists because the warning three paragraphs up came true. On
+# `market-free-noisy-v6` the policy collapsed onto NOOP, the flip rate read
+# 0.28-0.39 against the 0.05 setpoint above, and the controller divided sigma by
+# up to six for it: `actor_sigma_scales` went to [0.33 .. 0.010], so not one of
+# the eight actors played at the learned sigma and the greediest played at a
+# hundredth of it. Exploration was throttled at the one moment it needed raising.
+# Twelve updates, zero promotions, `trading_rate` 0.0 on every gate.
+#
+# The flip-to-order rate cannot be fooled that way: near-ties around NOOP are
+# what makes the flip rate high, and they are precisely what leaves this one low.
+# It saturates once the perturbation always leaves NOOP, which `resolve_sigma_
+# scale` handles -- a target above the whole ladder takes the top rung.
+#
+# The manifest keeps this off, so it stays the epsilon-greedy control arm.
+noisy_order_rate_target = 0.0
+
+# Bound on how far the resolved multiplier may depart from the learned sigma, in
+# both directions -- the range is `[1/limit, limit]`. It also clips the probe
+# ladder, so a run cannot be measured at a scale it is not allowed to play.
+#
+# The bound matters most when sigma has genuinely collapsed: no multiplier can
+# recover exploration from a sigma of zero, and without a limit the resolver
+# would chase the target upward forever while every ladder point reads zero.
+# `resolve_sigma_scale` returns 1.0 on a flat curve for that reason, so the
+# saturation signature to watch for is `noisy_sigma_scale_target` pinned at this
+# value with `noisy_argmax_flip_rate` still under target -- which means a sigma
+# reset (`noisy_sigma0`, new lineage), not a larger limit.
+noisy_sigma_scale_limit = 8.0
+
+# Lower bound on the resolved scale. 0.0 keeps the implicit `1 / limit`, which is
+# what every run before this key played, so it is opt-in.
+#
+# The implicit clamp is not a floor on *exploration*; it only bounds how far the
+# resolver may depart from the learned sigma, and on a cold start those two come
+# apart. An untrained network's flip-to-order rate is high because the network is
+# random, not because sigma is large, so the controller reads over-exploration and
+# turns sigma down at the one moment there is nothing yet to exploit. Measured on
+# `market-free-landgate-v10`: update 20 resolved exactly 0.125 -- the `1 / 8`
+# clamp hit dead on -- with `mean_abs_q` at 0.046, and the run went quiet.
+#
+# Flooring the *base* costs nothing in diagnostics. `noisy_actor_alpha` already
+# spreads the ladder 32x downward, so the near-greedy actor that gives
+# `trading_rate` an honest read comes from the ladder rather than from letting the
+# base collapse. A base under half the learned sigma buys nothing the ladder does
+# not already provide.
+noisy_sigma_scale_floor = 0.0
+
+# Noise strictly hurts a 186-way classification fit, so the clone phase's
+# cheapest answer is to drive sigma to zero -- and it runs *before* the TD loop,
+# so it could zero out exploration before a single TD step has seen it. Sigma is
+# also excluded from the clone optimizer's parameter group for the same reason;
+# this key only controls whether the clone forward is noisy at all.
+behavior_clone_noise = false
+
+# Directed exploration for structurally rare actions. Off in the manifest, so
+# this file still describes undirected NoisyNet alone and every existing session
+# is byte-identical.
+#
+# It exists because uniform sigma has a blind spot that no amount of sigma fixes. Measured on `market-free-falloff-v18`'s checkpoint over
+# 23,008 of its own rollout states: `BUY_LAND` sits at median rank 33 of 104
+# feasible actions on a median Q gap of 0.031 -- comfortably inside what the
+# perturbation crosses -- and the greedy policy picks it on 0.0000% of states
+# while the flips concentrate on HIRE (35%) and BUY_SEED (20%). That is the
+# head-only factorized noise admitted above picking almost state-independently.
+# Across v15-v18, 7,266 league seats bought land 89 times, no seat ever bought a
+# second quadrant, and `hot_v1` had it affordable on 88% of turns and bought none.
+#
+# The fix is aimed at the correlation rather than the magnitude: widen the sigma
+# row of the rare action itself, by `1 + gain * sqrt(log(1 + total) / (1 + visits))`
+# on the head's `epsilon_out`. That vector is already the per-output half of the
+# factored perturbation, so one entry widens one action and leaves the other 185
+# where the controller put them.
+#
+# Noise rather than a bonus added to the scores, and the difference is the whole
+# safety argument. A score bonus is a deterministic tilt: a rare row whose Q gap
+# sits under the coefficient does not get explored occasionally, it wins every
+# turn it is feasible, which is a policy change wearing an exploration costume
+# and the exact shape the epsilon runs bankrupted on. Widening sigma is
+# zero-mean, the argmax stays a plain argmax over what the network said, and a
+# row the policy has learned is ruinous stays unreachable.
+#
+# Nothing here reaches the TD target, and the multiplier is bounded below at 1.0,
+# so this can only ever add variance to a row and never quietly remove it.
+rare_sigma_gain = 0.0
+
+# The clamp on the multiplier. Read it as a ceiling on the rarest rows rather than
+# as a safety bound -- the safety is `rare_sigma_gain`'s floor at 1.0 and the plain
+# argmax, not this.
+#
+# Measured on `landrate-v30`, 1,133,396 folded selections at gain 0.5: at 3.0 the
+# only rows touching the clamp were `BUY_LAND` and `BUY_ANIMAL SHEEP 4`, and every
+# crop row sat strictly inside it -- `WHEAT` and `CARROT` at exactly 1.000,
+# `MELON`/`TOMATO`/`STRAWBERRY` at 1.74/1.63/1.87, unchanged whether the cap is 3.0
+# or 10.0. So raising it moves the two rarest actions and nothing else, and it is
+# not a lever on the crop distribution however much it looks like one.
+#
+# 3.0 here because the manifest is the `rare_sigma_gain = 0.0` control and the cap
+# is inert at that gain. The runner sets its own.
+rare_sigma_cap = 3.0
+
+# Which novelty statistic the widening reads: "count" or "rate".
+#
+# "count" is `sqrt(log(1 + T) / (1 + n_a))`, the plain UCB shape on raw selection
+# counts, and is what every run through `market-free-archive-v28` played. "rate" is
+# `log(reference / rate_a)`, where `rate_a` is the share of the turns a row was
+# *feasible* on that it was actually chosen and `reference` is that ratio taken
+# over the whole action space -- the rate every row would show under evenly spread
+# attention.
+#
+# The count arm has a measured blind spot, and it is the one that matters on this
+# family. Folded over `logmoney-v26`'s ten slots, 1,150,400 selections, at gain 1.0:
+#
+#     row                    chosen    feasible   count x   rate x (gain 0.5)
+#     BUY_SEED WHEAT q1      44,610     937,244     1.018     1.000
+#     BUY_SEED CARROT q4      4,878     920,251     1.053     1.400
+#     BUY_SEED MELON q1       1,917     882,780     1.085     1.846
+#     BUY_SEED TOMATO q1        768     895,215     1.135     2.310
+#     BUY_LAND                   61     734,763     1.474     3.000
+#
+# `log1p(1,150,400)` is 13.96, so the count arm's numerator is nearly constant and
+# its entire spread lives in `1 + n_a`. A row feasible on 883,000 turns and chosen
+# on 1,917 of them earns 1.085, which is indistinguishable from no widening. One
+# row of 186 reached the cap; only NOOP sat at exactly 1.0.
+#
+# The count arm can see "never tried". It cannot see "tried, then abandoned" --
+# which is the failure this run actually has. Crop diversity per seat falls 3.66 to
+# 1.29 and locks onto wheat while MELON keeps a five-figure historical count that
+# holds its novelty near zero permanently. MELON is not rare, it is *declined*, and
+# by raw count those are the same number.
+#
+# Log-ratio rather than a square root because the compared quantity spans four
+# orders of magnitude and the run length must not enter: `chosen` grows without
+# bound as a session runs, so the count arm's calibration drifts across a run while
+# a ratio of two rates over the same window does not.
+#
+# The manifest keeps "count" so this file still describes what v28 and everything
+# before it played, and so the rate arm has a control to be read against.
+rare_sigma_novelty = "count"
+
+# How many seed pairs carry it, counted from the widest end of the ladder, at
+# full gain rather than one scaled by the rung's own sigma.
+#
+# The widest end is already the arm whose job is finding things, and the
+# near-greedy tail has to stay a clean read of the policy: the money series is
+# only comparable across this change if some pairs collect what the run before it
+# collected.
+#
+# One piece of evidence looks like it argues the other way and does not.
+# `market-free-burst-v9` found land bought only at sigma <= 0.871 and never at
+# 3.159, where 49% of seats went bankrupt. That is *global* sigma -- every row
+# widened at once, a policy shaken into indiscriminate trading -- and it says
+# nothing about widening one row while the rest hold still. `rare_sigma_gain`
+# cannot reproduce it: NOOP and every well-sampled action stay at exactly 1.0.
+rare_sigma_pairs = 4
+
+# How fast the running visit counts age between rounds. Without it the widening
+# freezes on the distribution of the first few rounds, when the policy was still
+# random: an action sampled heavily then stays narrow long after the policy
+# stopped choosing it. 1.0 keeps every count forever.
+rare_sigma_decay = 0.9
+
+# Demonstrations from stored league replays, pinned in the buffer and never
+# evicted. The manifest remains the reward-only control; named demo experiments
+# override both values and run supervised order classification before each DQN
+# fine-tuning phase.
+demonstration_episodes = 0
+demonstration_min_money = 10000.0
+
+# "benchmark_ratchet", "always", "significant" (lower CI bound above zero) or
+# "point_estimate" (margin above zero). The last two are measured on the paired
+# head-to-head against the released incumbent, and that is exactly why neither is
+# used here.
+#
+# The head-to-head incumbent is the previous update, so under any rule that reads
+# it the reference moves with the candidate. `falloff_v1` released nine
+# consecutive updates and scored 0.29, 0.00, 0.16, 1.00, 0.00, 0.38, 0.59, 0.94
+# win rate against its own predecessor while its money against the fixed pilkwang
+# benchmark fell 2,979 -> 54 -> 20 -> 1,146 -> 18 -> 359 -> 1 -> 11 -> 107. Every
+# one of those comparisons was locally honest and the series went nowhere. The
+# same drift is in the money floors below, whose reference is the incumbent's own
+# seat: at seq 80 that put the mean floor at 58 coins.
+#
+# "benchmark_ratchet" anchors the decision to the one thing that does not move --
+# the candidate's own money in the index-0 benchmark series -- through an absolute
+# floor plus a non-regression term against the incumbent's *recorded* score for
+# the same opponent. No extra arena time: that number was written into the
+# incumbent's `gate_json` when it was itself a candidate.
+#
+# "always" is what this ran on before, and its cost was real: `export-active`
+# ships whatever the last update produced, and the active checkpoint reached a
+# benchmark mean of 107 coins with a median of 1. Nothing here ever gated
+# *training* and still does not -- `lineage_checkpoint` takes the newest
+# checkpoint promoted or not and `_self_play_pool` does not filter on `promoted`,
+# so a rejected candidate goes straight into the next generation. A rejection
+# withholds the release: `export-active`, and the incumbent the next update is
+# measured against.
+promotion_rule = "benchmark_ratchet"
+
+# Both cut from 100 under the population roster, because the arena is what a
+# generation is made of. Measured over v23's first three generations: an update
+# averaged 223.8 seconds of which `train_seconds` was 8.3 -- **96% of it is the
+# arena** -- and `eval_seeds + promotion_seeds`, seat-swapped across ten slots, is
+# 4,000 episodes a generation against collection's 3,200. More than half the
+# machine's episodes were evaluation, and none of them land in the `episodes`
+# table, so every dashboard count understated the real load by more than half.
+#
+# `promotion_seeds` is cut hardest because under `benchmark_ratchet` the number it
+# buys is not used. `head_to_head_ok` is computed and never consulted by `promote`
+# -- see the comment above it in `updater.py` -- and what survives of the
+# head-to-head is the money floors in `hard_viability` and the zero-width
+# `degenerate_head_to_head` check. Both are threshold tests against the
+# incumbent's own seat. 100 paired seeds sizes the significance test this
+# promotion rule stopped running.
+#
+# **Half of that cut is now reversed, on measurement.** The argument below was
+# that the variance reduction happens *across* updates through the eleven-wide
+# median, not within one draw. It does not: `logmoney-v26` batches 200-360 put the
+# windowed median's own mean absolute update-to-update change at 48.2%, against
+# 11.7% for the rollout mean the same updates computed. Adjacent windows share ten
+# of eleven samples, so the arena's heavy tail survives the smoothing and the
+# median is not buying what it was assumed to.
+#
+# The graduation clock no longer reads this at all -- see `lr_score_signal` -- so
+# what is left riding on the arena is the release decision, where the thresholds
+# are `benchmark_money_ratchet` 0.9 and `viability_min_mean_money_ratio` 0.8, both
+# well inside a 48% band. `logmoney_04` was rejected on four consecutive updates
+# while its benchmark money went 5,022 to 6,742.
+#
+# The cost is real and is the reason this is 100/50 rather than back at 100/100:
+# ten slots at ~130 s of arena over `CONCURRENCY = 4` is ~325 s of a ~3,400 s
+# generation, so doubling the seed count is about +10% wall-clock.
+eval_seeds = 100
+# `promotion_seeds` stays cut hardest, for the reason above it: under
+# `benchmark_ratchet` the significance test 100 paired seeds paid for is computed
+# and never consulted by `promote`. 50 is sized for the money floors in
+# `hard_viability` and the zero-width `degenerate_head_to_head` check, which are
+# threshold tests against the incumbent's own seat rather than a paired test.
+#
+# 50 -> 30 at v34. `eval_seeds` above deliberately stays at 100: the measurement
+# recorded there says the arena is the noisy signal and cutting it is what the
+# reversal was for. This one is different in kind, not in degree -- the paired
+# significance test 50 seeds pays for is still computed and still never consulted
+# by `promote`, so the seeds are buying a number nothing reads. What survives is
+# threshold tests against the incumbent's own seat, which do not need a paired
+# design. 30 keeps the money floors sized and drops 40 episodes per model per
+# update, about 13% of the arena, without touching the series the ratchet reads.
+promotion_seeds = 30
+promotion_seed_base = 1000000
+promotion_seed_stride = 10000
+# Pins the benchmark seed window while the head-to-head window keeps rotating.
+# The two comparisons want opposite things: the head-to-head runs both policies
+# inside one update, so rotating stops the gate being read off one fixed hundred
+# seeds forever, while the ratchet compares this update against one recorded
+# twenty batches ago and a rotating window makes those unpaired. Safe because
+# arena evaluation draws no noise and the benchmark opponent is never in
+# `opponents`.
+benchmark_seed_stride = 0
+
+# The fixed-reference release bar, read off the candidate's own money against the
+# index-0 benchmark. Absolute, so a chain of individually-small regressions
+# cannot walk the release down: one third of the 3,000 stake.
+benchmark_release_min_money = 1000.0
+# The same bar for the first release only, a fifth of the stake. Lower on
+# purpose -- a foothold, not a good policy. Below the first release there is no
+# incumbent, which is the state both anti-stall mechanisms are inert in, so this
+# bar is what decides whether a cold start can ever get out.
+#
+# 600 rather than 750, and the reason is a distribution rather than a preference.
+# Over the population run's first hundred batches, 28 candidates traded at all
+# (`trading_rate >= viability_min_orders_per_decision`). Their benchmark money:
+#
+#   1266  1147 | 668  665  633  618  600  449  ... down to single digits
+#
+# Only the first two cleared 750, and they are this run's only two promotions,
+# both from one slot. Everything else piles up in a 600-670 cluster from three
+# further slots -- policies trading at 0.12 to 0.58, which is to say policies
+# doing the thing the agent exists to learn, held out by a bar none of them can
+# reach. Nine of ten slots have never released, so `population_members` stays
+# empty and every graduation takes the `restart` branch. That is the roadmap's
+# named failure shape, and it is a gate problem rather than a population one.
+#
+# What this deliberately does *not* touch is `viability_min_orders_per_decision`.
+# Loosening that would be the other way to raise the release rate and it is the
+# wrong way: every candidate this run has produced above 1,000 money is a hoarder,
+# the best of them scoring 3,631 at a trading rate of 0.0025. The activity floor
+# is what keeps those out of the pool, and pool rank is money, so admitting one
+# would put it at the top and make it every slot's reseed ancestor.
+#
+# So the bar comes down on money, where the traders are, and stays up on activity,
+# where the hoarders are.
+benchmark_cold_start_min_money = 600.0
+# Non-regression against the released incumbent's recorded benchmark money. Not
+# 1.0: a gate that admits no measurement noise eventually admits nothing.
+benchmark_money_ratchet = 0.9
+# How many benchmark measurements that reference is a median over. 1 is the
+# single stored draw and the behaviour this key replaced.
+#
+# One 100-seed arena series is a draw, not a number. `falloff_v1` measured 61 of
+# them while the snapback held it on one checkpoint, and they ran 0.93 to 427
+# around a median of 36.7 -- because `a_money_median` is 2 against a mean of 32.6,
+# so the policy is bankrupt on most seeds and the mean rides on a few survivors.
+#
+# Ratcheting one draw against another is not merely a weak gate, it is a biased
+# one: the stored reference is whatever was lucky enough to promote, so every
+# release re-aims the bar at a higher quantile of unchanged noise and the gate
+# tightens on itself. `9071d2ad` recorded 145.8 -- its own p75 -- and the run then
+# failed `no_regression` 57 consecutive times without having regressed at all.
+#
+# The window covers the incumbent's own draw plus every candidate measured since
+# it was promoted, newest first. Candidates measured against a standing incumbent
+# are near-neighbours of it, so they are repeated samples of one quantity.
+#
+# What it gives up: a lineage decaying slowly and uniformly drags its own window
+# down and the ratchet follows rather than catches. Bounded by the absolute floor,
+# which only stands down under grace, and by hard viability, whose cold-start
+# reference now stands down under a grace of its own --
+# `viability_grace_after_rejections`. Its incumbent-seat reference still never does.
+benchmark_reference_window = 11
+# After this many consecutive rejections the *absolute floor* stands down to
+# `benchmark_grace_min_money` and the relative ratchet alone decides. This is the
+# bound on how long *this* gate can block, and only this one: hard viability fails
+# independently and has its own hatch below. `market-free-simple-v2` ran 33 updates
+# promoting none, `market-free-rare-v20` 57, and a bar that cannot be reached is the
+# failure mode `always` was introduced to escape.
+#
+# It used to drop the relative term and keep the floor, and v20 is why it no
+# longer does: all 57 of those rejections failed on the floor, with the candidate
+# between 0.93 and 427 against a bar of 1,000, while the incumbent they were
+# ratcheted against measured 145.8 and so could not have cleared its own floor
+# either. Eight of the 57 were already above `0.9 * 145.8`. The relative term was
+# the escapable one all along.
+promotion_ratchet_grace_after_rejections = 4
+# The floor once grace is in force. Unset means `benchmark_cold_start_min_money`,
+# which is what the key defaults to and what every config predating it gets. Set
+# it to 0.0 on a run that is being deliberately unstuck, to let the ratchet alone
+# carry the gate until the lineage has something worth ratcheting against.
+# benchmark_grace_min_money = 750.0
+
+# Hard viability gate. Competitive margin is still the release objective, but a
+# candidate cannot improve it by bankrupting itself or by refusing to trade at
+# all. Money floors are relative to the incumbent's own seat in the same paired
+# head-to-head, so they compare like with like.
+#
+# Measured as the share of turns that emitted anything, not as a wire order
+# count -- `HIRE n` is one decision whose wire form is n rows, so a hire-only
+# policy reports 13 orders per decision while trading on one turn in fifty.
+#
+# There is no upper limit: over-trading can only surface as lost money, which the
+# floors above already measure.
+viability_min_mean_money_ratio = 0.80
+viability_min_median_money_ratio = 0.75
+# The floor that catches the other attractor. A policy that never trades
+# preserves its money perfectly and so clears both floors above.
+#
+# Applied unconditionally to the index-0 benchmark, and to the head-to-head only
+# once a checkpoint has been released. The cold-start head-to-head opponent is
+# the quiet baseline, which offers no counterparty, so the floor measures nothing
+# there -- v25 rejected three slots trading at 0.33-0.63 against the benchmark
+# for emitting nothing against it. A policy that genuinely never trades reads 0.0
+# on the benchmark too and is still caught.
+#
+# Read from `trading_rate`, which counts decisions the simulator actually acted
+# on. It used to count emitted orders, and that let a policy clear the floor
+# while doing nothing: one measured run sat on `SELL WOOL 16` for 57% of its
+# decisions while owning no sheep, 98.4% of its orders refused, and reported 59%
+# activity against a real rate of 1%.
+viability_min_orders_per_decision = 0.02
+# The same failure mode, caught a second time where the floor above cannot reach:
+# inside the mature pool.
+#
+# `population_members` is culled `ORDER BY score DESC OFFSET mature_capacity` and
+# the score was benchmark money alone. Money rewards idleness on this family --
+# the stake is 3,000 and a policy that never trades keeps it -- so a hoarder that
+# got a release would enter the pool at the top, never be culled, and become both
+# the reseed source and the mirror opponent for all ten slots. The floor above is
+# the only thing standing between that and the run, and it is a binary at 0.02:
+# it separates "never acts" from "acts", not "trades" from "hoards", so a policy
+# clearing 0.021 while sitting on its stake passes and then dominates the pool.
+#
+# This discounts a graduating checkpoint's pool score by its own recorded trading
+# rate, ramping linearly to this reference and saturating above it. Deliberately
+# a ramp rather than a second threshold: repeating the floor's shape would only
+# move the same cliff.
+#
+# 0.10 from the observed bimodality rather than from a result -- at the time this
+# was written eight of ten slots sat at 0.0000 while the two that traded ran 0.32
+# and 0.88, so anything between the two clusters behaves alike and this is a
+# judgement about how much activity counts as trading for real. Set to 0 to rank
+# the pool on raw money again.
+population_activity_reference = 0.10
+# What the money floors measure against before anything has been released. The
+# incumbent's own seat is the quiet baseline there, and the baseline never trades,
+# so it keeps the full 3,000 stake on every seed -- `0.80 *` a perfect stake asks a
+# candidate to trade for a season and lose nothing. `coldstart_v1` failed exactly
+# and only those two checks on five of its seven updates, released nothing, and
+# with nothing released could not snap its lineage back either. 1500 puts the
+# floors at 1,200 mean / 1,125 median: survivable, and still fatal to bankruptcy.
+viability_cold_start_reference_money = 1500.0
+# And the hatch for when 1500 is still not survivable, counted on the same
+# consecutive-rejection streak the ratchet's grace reads. It moves the reference
+# above and nothing else: both ratios still bind, the activity floor is untouched,
+# and it applies *only* while nothing has been released. From the first release
+# onward the reference is a real opponent's seat in the same paired series and never
+# stands down -- that comparison is what stops a lineage walking itself down.
+#
+# It exists because the two gates fail independently and the ratchet's hatch does
+# not help a slot this one is holding. Measured over every session in the lab
+# database: 35 updates across 20 distinct never-released slots were rejected with
+# `benchmark_ratchet` passing and `median_money` the only failing check, and 19 of
+# those 35 were already in ratchet grace when it happened -- the hatch was open on
+# the gate that was passing. `market-free-rarerate-v29@rarerate_03` is the shape:
+# ratchet passing from seq 30, `a_money_median` climbing 348 -> 910 -> 940 into a
+# fixed 1,125, `mean_money` clearing 1,200 the whole way, five updates and no
+# release. Converging on a synthetic bar from below is not the decay this gate
+# exists to catch.
+#
+# 4 to match `promotion_ratchet_grace_after_rejections`: the point is that both
+# hatches open together, since the run cannot tell in advance which gate is the one
+# holding it. 0 turns it off, which is what every config predating the key reads as.
+viability_grace_after_rejections = 4
+# The cold-start reference once viability grace is in force. Unset means
+# `benchmark_cold_start_min_money`, the same foothold the ratchet measures a first
+# release against -- 600 here, so the floors land at 480 mean / 450 median. That
+# admits rarerate_03's 940 and still refuses its own 348 twenty batches earlier.
+#
+# Set it explicitly to hold the two apart: this reference and that floor mean the
+# same thing only as long as a first release and a survivable season are the same
+# bar, and nothing enforces that.
+# viability_grace_cold_start_reference_money = 750.0
+
+# Both training and collection follow the newest checkpoint on the lineage,
+# promoted or not; release is gated, the behaviour distribution is not. Snap the
+# lineage back to the released checkpoint after this many consecutive rejections
+# so a diverged trajectory is not carried forward forever. 0 disables the reset.
+#
+# 2, down from 5, because 5 never fires in time. Measured across v7, v8 and v9 the
+# run oscillates rather than diverging monotonically: it promotes, then produces
+# candidates at 1,335 / 975 / 3,877 against a released incumbent scoring ~17,000,
+# and sometimes recovers on its own before the limit is reached. That recovery is
+# what made 5 look adequate. It is not -- each rejected update in between is a
+# generation spent collecting from a policy the gate has already judged far worse
+# than one sitting released and unused, and the buffer fills with its behaviour.
+# Snapping back after two costs at most one salvageable update and bounds how far
+# the collection distribution can drift from something known good.
+#
+# Back to 2 with `benchmark_ratchet`. It was 0 only as a consequence of
+# `promotion_rule = "always"`: every update promoted, so
+# `rejections_since_promotion` was permanently 0 and the streak could never trip,
+# and 2 would have read as a live safety net that cannot fire. With a gate that
+# can reject, this is the run's own escape route -- re-explore from something
+# known good rather than release something known bad.
+#
+# Off again under the population, and not as caution. The two mechanisms answer
+# the same question -- this trajectory has gone bad, restart it from something
+# better -- and they answer it differently: the snapback restores the slot's *own*
+# release and keeps training, the population ends the slot and reseeds it from the
+# best member of a thirty-deep group with its weights perturbed and its optimizer
+# cleared. Leaving both on means a stalling slot is repeatedly snapped back onto
+# the incumbent whose score is exactly what the plateau detector is reading, which
+# pins `lr_best_score` and stops the slot ever reaching its cut. One escape route,
+# and the deeper one wins.
+#
+# **Back on at v27, because that coupling no longer exists.** It ran entirely
+# through the plateau detector reading the incumbent's arena score;
+# `lr_score_signal = "rollout"` moved the detector onto the ring the slot just
+# trained on, which a snapback moves rather than pins. The two escape routes are
+# now genuinely different: `lr_best_decay` unsticks a detector misreading a slot
+# that is still improving, the population ends one that has genuinely stopped, and
+# this one covers the case neither does -- a slot that has diverged and has
+# nothing of its own left to climb.
+resume_reset_after_rejections = 2
+
+# Self-play against this model's own recent checkpoints, mixed into `opponents`
+# at `self_play_ratio` once `self_play_after` batches have been collected. The
+# pool follows the lineage rather than the release, for the same reason the
+# rollout policy does: gating it on promotion made the mirror unreachable on a
+# run that promoted nothing in 33 updates.
+#
+# 0 disables it, and that is the manifest default: the bare manifest is the
+# control. `train_market_free.py` is where the mirror curriculum is turned on.
+self_play_after = 0
+self_play_pool = 5
+self_play_ratio = 0.3
+
+# The insolvency floor and its per-turn charge are deliberately *not* keys here.
+# They live beside `MONEY_SCALE` and `REJECTED_ORDER_PENALTY` in
+# `training/reward.py`, because the reward stream is part of the policy's
+# identity: `match_agent.toml` lists that file in `code_paths` so changing one of
+# those constants mints a new revision rather than silently re-labelling old
+# rollouts. A config key would put the same number outside that fingerprint.
+
+jobs = 8
+seed = 0
+
+# The release suite, promotion baseline first -- the same benchmark the scorer
+# uses. The field policy is identical on both sides, so this match still
+# isolates the market layer, and it is now the comparison that says whether an
+# unscaffolded market can reach a hand-written one.
+benchmarks = [
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+]
+opponents = [
+  "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+  "agents/competitor_kaitofukami_44_46_strict_future_top_30_v22_price_impact/main.py",
+  "agents/competitor_lucifer19_kaggriculture_night_harvest/main.py",
+  "agents/competitor_tetsutani_adaptive_farming_strategy_for_kaggriculture/main.py",
+  "agents/configurable_crop_surrogate/main.py",
+]

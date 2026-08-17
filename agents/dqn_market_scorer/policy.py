@@ -39,6 +39,12 @@ class MarketQNetwork:
         Outputs all-zero Q, so every argmax falls to index 0 -- which is the
         donor-default modifier and a zero reserve. A zero net therefore plays
         the unmodified donor policy, not a random one.
+
+        Inference fallback only. It is what `load_network` reaches for when
+        there is no readable `weights.npz`, and it is deliberately never a
+        training initialization: an all-zero MLP has no gradient anywhere
+        except its output bias, so it cannot learn its way out. Use
+        `donor_default` to start training from donor-equivalent behaviour.
         """
         sizes = (feature_dim, *hidden, 1)
         return cls(
@@ -47,6 +53,40 @@ class MarketQNetwork:
                 for a, b in zip(sizes, sizes[1:])
             ]
         )
+
+    @classmethod
+    def donor_default(
+        cls,
+        seed: int = 0,
+        feature_dim: int = MARKET_FEATURE_DIM,
+        hidden: tuple[int, ...] = HIDDEN,
+    ) -> MarketQNetwork:
+        """Random hidden layers, zero output layer: donor behaviour, live gradients.
+
+        Every candidate scores exactly 0.0 regardless of state, so each argmax
+        ties to index 0 and round one rolls out unmodified pilkwang -- the same
+        starting behaviour `zeros` gave, and the whole reason a zero start was
+        wanted in the first place.
+
+        Unlike `zeros` it can actually train. With the hidden layers random the
+        output gradient `dL/dw_out` is proportional to a non-zero activation, so
+        the output layer moves on the first optimizer step and the hidden layers
+        receive gradient through a non-zero `w_out` from the second onward. Only
+        the first step is degenerate, rather than every step forever.
+        """
+        rng = np.random.default_rng(seed)
+        sizes = (feature_dim, *hidden)
+        layers = [
+            (
+                rng.standard_normal((a, b)).astype(np.float32) / np.sqrt(a),
+                rng.standard_normal(b).astype(np.float32) * 0.01,
+            )
+            for a, b in zip(sizes, sizes[1:])
+        ]
+        layers.append(
+            (np.zeros((sizes[-1], 1), dtype=np.float32), np.zeros(1, dtype=np.float32))
+        )
+        return cls(layers)
 
     @classmethod
     def random(
@@ -69,10 +109,16 @@ class MarketQNetwork:
         with np.load(str(path), allow_pickle=False) as data:
             count = len([key for key in data.files if key.startswith("w")])
             network = cls([(data[f"w{index}"], data[f"b{index}"]) for index in range(count)])
-        observed = network.layers[0][0].shape[0] if network.layers else 0
-        if observed != MARKET_FEATURE_DIM:
+        expected = (MARKET_FEATURE_DIM, *HIDDEN, 1)
+        observed = tuple(
+            (weight.shape, bias.shape) for weight, bias in network.layers
+        )
+        expected_shapes = tuple(
+            ((left, right), (right,)) for left, right in zip(expected, expected[1:])
+        )
+        if observed != expected_shapes:
             raise ValueError(
-                f"checkpoint feature dimension {observed} does not match schema {MARKET_FEATURE_DIM}"
+                f"checkpoint shape {observed} does not match schema {expected_shapes}"
             )
         return network
 

@@ -11,16 +11,16 @@ from __future__ import annotations
 
 import argparse
 import itertools
-import multiprocessing
 import os
 import sys
 from collections.abc import Iterable
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Any
 
 from sim import registry
 from sim.metrics import Summary, render, summarize
 from sim.runner import MatchResult, run_match
+from sim.workers import MAP_TIMEOUT_SECONDS, discard_pool, worker_pool
 
 
 def _job(args: tuple[tuple[str, str], int, dict[str, Any]]) -> MatchResult:
@@ -46,10 +46,30 @@ def play_series(
     if jobs == 1:
         outcomes = [_job(task) for task in tasks]
     else:
-        with ProcessPoolExecutor(
-            max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
-        ) as pool:
-            outcomes = list(pool.map(_job, tasks, chunksize=1))
+        # Borrowed from the shared free-list and returned, not spawned here,
+        # because a promotion gate is two series back to back (eval seeds, then
+        # head-to-head) once per model per update, and spawning eight interpreters
+        # for each of them cost more than the ~150 episodes they play. The pin the
+        # workers need is taken inside `worker_pool`, so this call site does not
+        # have to hold one.
+        with worker_pool(jobs) as pool:
+            try:
+                outcomes = list(
+                    pool.map(_job, tasks, chunksize=1, timeout=MAP_TIMEOUT_SECONDS)
+                )
+            except BrokenProcessPool:
+                discard_pool(pool)
+                with worker_pool(jobs) as retry:
+                    outcomes = list(
+                        retry.map(_job, tasks, chunksize=1, timeout=MAP_TIMEOUT_SECONDS)
+                    )
+            except TimeoutError:
+                # A pool that stalled must not go back on the free-list, or the
+                # next caller checks out the same wedged workers and inherits the
+                # hang. Dropped, and the timeout propagates: a series this far
+                # over budget is a bug to surface, not one to quietly replay.
+                discard_pool(pool)
+                raise
 
     return {seed: (outcomes[2 * i], outcomes[2 * i + 1]) for i, seed in enumerate(seeds)}
 

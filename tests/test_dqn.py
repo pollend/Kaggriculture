@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import importlib
 import json
 import pathlib
 import time
@@ -1137,18 +1138,29 @@ def test_point_estimate_rule_admits_what_significance_withholds():
 
 
 class _StubReader:
-    """Answers the lineage lookup, then the rejection-streak count."""
+    """Answers the lineage lookup, the rejection streak, and the reset flag.
 
-    def __init__(self, row, rejections=0):
+    Dispatches on the table each query reads rather than on `model_updates`
+    appearing anywhere in it: `lineage_checkpoint` now asks `model_updates` two
+    different questions, and a substring test that broad answered both with the
+    streak count.
+    """
+
+    def __init__(self, row, rejections=0, reset=False):
         self.row = row
         self.rejections = rejections
+        self.reset = reset
         self.statements: list[str] = []
 
     def fetchone(self, sql, _parameters):
         self.statements.append(sql)
-        if "model_updates" in sql:
+        if "model_training_checkpoints" in sql:
+            return self.row
+        # Both streak queries mention `lineage_reset` and `PROMOTED`; only the
+        # rejection count filters on `REJECTED`, so that is the discriminator.
+        if "status = 'REJECTED'" in sql:
             return (self.rejections,)
-        return self.row
+        return (1 if self.reset else 0,)
 
 
 def _lineage_context(tmp_path, active_id, active_trainer, config=None):
@@ -1246,6 +1258,143 @@ def test_lineage_resets_to_the_release_after_a_rejection_streak(tmp_path):
     # would be back to re-deriving one candidate from the release forever.
     streak_query = next(s for s in tripped_reader.statements if "model_updates" in s)
     assert "lineage_reset" in streak_query and "PROMOTED" in streak_query
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "agents.dqn_job_scorer.training.updater",
+        "agents.dqn_market_scorer.training.updater",
+    ],
+)
+def test_a_run_that_never_promoted_is_never_reset(tmp_path, module):
+    """The guard must *not* fire on a run that has never promoted.
+
+    Decided both ways, so the history is the test. It originally did nothing
+    there, because the snapback was written as "fall back to the release" and
+    there was none -- `market-free-selfplay-v3` took twelve consecutive rejections
+    at a limit of five that way, carrying one trajectory through all of them. So
+    `None` was made the reset: a cold start, reinitialized.
+
+    That is worse. With nothing released the reset is not a snapback to something
+    known good, it is a **wipe** -- the whole training history discarded. A cold
+    start needs many generations to reach a first promotion, so at any useful
+    limit it is wiped long before it gets there. Measured on
+    `market-free-landgate-v10` at a limit of 2: zero promotions, two consecutive
+    rejections, and the next update due to discard all sixty batches behind it and
+    then repeat every two rejections.
+
+    The v3 hole is knowingly reinstated in exchange. A wipe is only defensible
+    when there is something better to fall back to.
+    """
+    lineage_checkpoint = importlib.import_module(module).lineage_checkpoint
+
+    rejected = tmp_path / "rejected.pt"
+    rejected.write_bytes(b"rejected")
+    row = ("rejected-id", str(rejected), str(tmp_path / "rejected.npz"))
+    context = _lineage_context(tmp_path, None, None, {"resume_reset_after_rejections": 5})
+
+    below = lineage_checkpoint(context, _StubReader(row, rejections=4))
+    assert below is not None and below.checkpoint_id == "rejected-id"
+    assert below.rejection_streak == 4 and not below.reset
+
+    # Over the limit, far over it, and with a reset already recorded: still the
+    # lineage row, never `None` and never `reset`. Each of these would otherwise
+    # throw the run's training away.
+    for rejections, reset in ((5, False), (50, False), (0, True), (50, True)):
+        carried = lineage_checkpoint(context, _StubReader(row, rejections, reset=reset))
+        assert carried is not None, "a cold start must never be wiped"
+        assert carried.checkpoint_id == "rejected-id"
+        assert not carried.reset
+
+
+def test_market_scorer_streak_restarts_at_a_recorded_reset(tmp_path):
+    """Counting only from the last promotion leaves the streak over the limit.
+
+    The job scorer's copy has always read `lineage_reset` as ending the streak;
+    this one did not, so once it tripped it tripped on every later update -- which
+    pins a released run to its incumbent forever and puts a never-released one on
+    a reinitialize-every-update treadmill.
+    """
+    from agents.dqn_market_scorer.training.updater import lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    rejected = tmp_path / "rejected.pt"
+    released.write_bytes(b"released")
+    rejected.write_bytes(b"rejected")
+    row = ("rejected-id", str(rejected), str(tmp_path / "rejected.npz"))
+    context = _lineage_context(
+        tmp_path, "released-id", released, {"resume_reset_after_rejections": 5}
+    )
+
+    reader = _StubReader(row, rejections=5)
+    tripped = lineage_checkpoint(context, reader)
+    assert tripped.reset and tripped.released
+
+    streak_query = next(s for s in reader.statements if "model_updates" in s)
+    assert "lineage_reset" in streak_query and "PROMOTED" in streak_query
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "agents.dqn_job_scorer.training.updater",
+        "agents.dqn_market_scorer.training.updater",
+    ],
+)
+def test_a_reset_holds_until_something_promotes(tmp_path, module):
+    """The snapback used to last exactly one update, which wasted it.
+
+    A reset zeroes the streak -- correctly, the diverged trajectory is gone. But
+    the resetting update still trains and still writes a checkpoint row, and the
+    lineage lookup takes the newest by `created_at`, so the next update pointed
+    straight at whatever that one produced. Both training *and* collection follow
+    the lineage, so a bad restart became the next generation's behaviour policy.
+
+    Measured on `market-free-landgate-v10`: the reset fired, produced a candidate
+    worth 357 against a released checkpoint worth 18,339, and the twenty batches
+    after it collected at 3-8k against the 11-16k before it.
+    """
+    lineage_checkpoint = importlib.import_module(module).lineage_checkpoint
+
+    released = tmp_path / "released.pt"
+    rejected = tmp_path / "rejected.pt"
+    released.write_bytes(b"released")
+    rejected.write_bytes(b"rejected")
+    row = ("post-reset-id", str(rejected), str(tmp_path / "rejected.npz"))
+    context = _lineage_context(
+        tmp_path, "released-id", released, {"resume_reset_after_rejections": 2}
+    )
+
+    # The update straight after a reset: streak back to 0, a fresh checkpoint on
+    # the lineage, and the release still the only thing worth following.
+    held = lineage_checkpoint(context, _StubReader(row, rejections=0, reset=True))
+    assert held is not None
+    assert held.released and held.reset
+    assert held.checkpoint_id == "released-id", "must not follow the restart's output"
+
+    # A promotion since the reset ends it, and the lineage moves again.
+    resumed = lineage_checkpoint(context, _StubReader(row, rejections=0, reset=False))
+    assert resumed.checkpoint_id == "post-reset-id"
+    assert not resumed.released and not resumed.reset
+
+    # With nothing ever released neither the hold nor the streak applies: there is
+    # no release to hold on, and the only alternative is a wipe. See
+    # `test_a_run_that_never_promoted_is_never_reset`.
+    cold = _lineage_context(tmp_path, None, None, {"resume_reset_after_rejections": 2})
+    running = lineage_checkpoint(cold, _StubReader(row, rejections=0, reset=True))
+    assert running is not None and running.checkpoint_id == "post-reset-id"
+    assert not running.reset
+    over = lineage_checkpoint(cold, _StubReader(row, rejections=2, reset=True))
+    assert over is not None and over.checkpoint_id == "post-reset-id"
+    assert not over.reset
+
+    # And it is gated on the limit like every other part of the reset: a run with
+    # the feature off never asks, and never holds.
+    off = _lineage_context(tmp_path, "released-id", released)
+    assert lineage_checkpoint(off, _StubReader(row, rejections=0, reset=True)).checkpoint_id == (
+        "post-reset-id"
+    )
 
 
 def test_lineage_reset_is_off_until_configured(tmp_path):

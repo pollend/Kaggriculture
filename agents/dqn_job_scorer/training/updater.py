@@ -172,6 +172,33 @@ def _rejections_since_restart(reader, model_id: str) -> int:
     return 0 if row is None else int(row[0])
 
 
+def _reset_since_restart(reader, model_id: str) -> bool:
+    """Whether a reset has been recorded with nothing promoted after it.
+
+    The companion to `_rejections_since_restart`, and it exists because the streak
+    alone cannot express "the restart is still in progress". A reset ends the
+    streak by design, so one update later the counter reads healthy while the only
+    evidence available says otherwise. Kept identical to the market scorer's
+    `reset_since_promotion`; these two copies diverging is what produced the
+    streak bug the docstring above records.
+    """
+
+    row = reader.fetchone(
+        """
+        SELECT count(*) FROM model_updates
+        WHERE model_id = %s
+          AND coalesce((gate_json ->> 'lineage_reset')::boolean, false)
+          AND started_at > coalesce(
+              (SELECT max(started_at) FROM model_updates
+               WHERE model_id = %s AND status = 'PROMOTED'),
+              '-infinity'::timestamp
+          )
+        """,
+        [model_id, model_id],
+    )
+    return bool(row and int(row[0]) > 0)
+
+
 def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
     """The newest checkpoint on the model's lineage, promoted or not.
 
@@ -190,9 +217,24 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
     snaps back to the release, because carrying a diverged trajectory forward
     forever is how it stays diverged.
 
+    **A run that has never promoted does not reset at all.** It has no release to
+    snap back to, so the only "not carried forward" available is `None` -- a wipe
+    back to a fresh network, discarding the run's whole training history. That was
+    the behaviour until a genuine cold start showed what it costs: such a run needs
+    many generations to reach a first promotion, so at any useful limit it is
+    reinitialized long before it gets there. Measured on the free-market agent's
+    `market-free-landgate-v10` at a limit of 2 -- zero promotions, two consecutive
+    rejections, and the next update due to discard all sixty batches behind it.
+
+    The cost, taken knowingly and kept in step with the market scorer's copy: a
+    never-released run can ride one diverged trajectory indefinitely, which is
+    what that copy measured as twelve consecutive rejections at a limit of five.
+    A wipe is only defensible when there is something better to fall back to.
+
     Falls back to the released checkpoint when the newer artifact is missing --
     trainer `.pt` files are large and a pruned artifact root must not silently
-    restart the run from random weights.
+    restart the run from random weights. That case is deliberately *not* a reset:
+    the artifact being absent says nothing about the trajectory.
     """
 
     def released() -> LineageCheckpoint | None:
@@ -222,10 +264,32 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
 
     limit = int(getattr(context, "config", {}).get("resume_reset_after_rejections", 0))
     streak = _rejections_since_restart(reader, context.model_id) if limit > 0 else 0
-    if limit > 0 and streak >= limit:
-        fallback = released()
-        if fallback is not None:
-            return replace(fallback, rejection_streak=streak, reset=True)
+    # A reset holds until something promotes. It used to last exactly one update:
+    # the reset ends the streak, but the resetting update still trains and still
+    # writes a checkpoint row, and the newest-by-`created_at` rule above then
+    # handed the lineage back to whatever that update produced -- for training
+    # *and* for collection. Measured on the free-market agent, whose copy of this
+    # had the same hole: a reset produced a candidate worth 357 against a released
+    # checkpoint worth 18,339, and the next twenty batches were collected from the
+    # 357 policy. Skipping just that checkpoint would be worse, since the next
+    # newest is the diverged row the reset existed to escape.
+    #
+    # It is a real departure from `_rejections_since_restart`'s note that
+    # "resetting buys another `limit` updates, not a permanent policy" -- the hold
+    # *is* semi-permanent, ending only at a promotion. That note is right in
+    # general and stops being right once `limit` consecutive rejections have
+    # already proven the trajectory bad. The hold also repairs itself: collection
+    # follows the release too, so the ring refills with the released policy's
+    # episodes instead of the discarded one's.
+    #
+    # Both conditions require a release, so `fallback` gates the whole branch.
+    # With nothing promoted there is no snapback available -- only a wipe back to
+    # a fresh network, which discards the run's entire training history and which
+    # a cold start cannot survive at any useful limit. See the docstring.
+    fallback = released()
+    held = fallback is not None and _reset_since_restart(reader, context.model_id)
+    if limit > 0 and fallback is not None and (streak >= limit or held):
+        return replace(fallback, rejection_streak=streak, reset=True)
     return LineageCheckpoint(
         str(row[0]),
         Path(str(row[1])),

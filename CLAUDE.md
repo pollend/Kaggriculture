@@ -33,6 +33,21 @@ Transport specifics, if you are speaking JSON-RPC by hand: POST only,
 protocol revisions `2025-11-25`, `2025-06-18`, `2025-03-26`. An `Origin` header, if
 sent, must match `Host`.
 
+## Dashboard pages
+
+| Path | Shows |
+| --- | --- |
+| `/` | Every session, with pairing or round progress and the current leader |
+| `/sessions/<session_id>` | Rating trend, head-to-head margin by opponent family, models, generations |
+| `/sessions/<session_id>/failures` | Failures grouped by cause; tracebacks collapsed to their exception line |
+| `/generations/<generation_id>` | Leaderboard, margin distribution, seat bias, per-agent behaviour, runtime, pairings |
+| `/models/<model_id>` | Update gate timeline, metric trends, checkpoint lineage, batch watermark |
+| `/episodes/<match_id>` | Both seats' money and behaviour, plus the embedded replay |
+
+Pages update live over `/events/dashboard`, and both the stream and ordinary
+requests share a render cache keyed by a database watermark, so an idle tab costs
+one cheap query per tick rather than a full re-render.
+
 ## Tools
 
 Four bounded inspection tools, plus one open SQL tool. Start from the top when you
@@ -94,12 +109,44 @@ matches, `model_round_hooks` records which round hooks already fired
 (`round_index = -1` means generation scope). `episode_training_artifacts` links
 rollout artifacts to batches through `training_batch_artifacts`.
 
+**Population training.** `population_members` is the mature half of a
+population-trained model: checkpoints that graduated out of a learner slot, keyed
+on `declared_model_id` because that is what a roster of named instances shares
+(`decl@learner_00` … `decl@learner_09`). Live members are `retired_at IS NULL`;
+retirement is a membership change and never a delete, so what was dropped and at
+what `score` stays answerable. `score` is a windowed median of benchmark money,
+not a single arena draw. The learner side is not a table — it is per-update state
+in `model_updates.metrics_json` under the `lr_*` keys plus `population`.
+
 **Self-play.** `policy_mixtures` + `policy_mixture_members` define a weighted
 opponent blend; `pairing_policy_assignments` records which member a pairing drew.
 
 **Older cycle tables.** `runs`, `strategies`, `ratings`, `models`, `proposals` back
 `kaglab cycle`, not the league. `model_checkpoints` is superseded by
 `model_training_checkpoints` and no code writes it.
+
+## What the rollups mean
+
+`kaggriculture_lab/league_queries.py` holds the SQL behind both the dashboard and
+the four inspection tools, so the two now answer every question the same way. The
+definitions worth knowing, because the two used to disagree:
+
+- **A round is complete when *every* model's hook completed** — `bool_and(status =
+  'COMPLETE')` over `model_round_hooks` grouped by `(generation_id, round_index)`.
+  One model finishing does not finish the round.
+- **Pairing failure is `league_pairings.status = 'FAILED'`.** That column is only
+  ever written `COMPLETE` or `FAILED`, so the old `pairing_errors` field counted a
+  status that never occurs and was structurally zero. It is now `failed_pairings`.
+- **A failed episode is `episodes.failed`,** not `episode_players.failed`. An
+  episode that crashed is excluded whole from seat balance and per-agent money,
+  which is how `failed_episodes` is counted everywhere else.
+- **`should_reevaluate` is read only from `episode_evaluations` rows with
+  `status = 'COMPLETE'`.** An evaluator that raised has no meaningful result.
+- **Rating trend columns are `champion_conservative` and `median_conservative`.**
+
+`list_training_sessions` also returns `completed_rounds` and `failed_pairings`, and
+`get_generation_progress` returns the full margin distribution (`min_paired_margin`,
+`max_paired_margin`, `drawn`, `mean_outcome_a`) rather than mean/median alone.
 
 ## Query patterns that come up
 

@@ -1,16 +1,14 @@
-"""Frozen donor field policy, learned market layer.
+"""Q-guided donor field policy and learned market layer.
 
 `dqn_job_scorer` learns two Q-networks off one scalar reward -- a per-turn job
 net and a daily market net -- and they share the credit for every dollar. This
-agent removes that coupling by freezing a field policy that already wins and
-learning only the market: one network, one credit-assignment problem.
+agent removes the independent job-scoring network and uses one economic
+Q-network to guide both donor field expansion and the market executor.
 
-The field policy is `donor.py`, an unmodified copy of the pilkwang competitor
-snapshot (see NOTICE). It is used exactly as written: `_role_plan` then
-`_unit_actions`. The donor's dependency runs field -> market and never back, and
-it gates every market-supplied resource at runtime (`seeds.get(crop, 0) > 0`
-before PLANT, live `farm["hands"]`, live `unlocked_quadrants`), so replacing its
-market layer degrades gracefully instead of desynchronising.
+The field policy is derived from the pilkwang competitor snapshot (see NOTICE).
+The Q-selected modifier bounds new crop and herd roles before `_unit_actions`,
+then the same modifier controls the market executor. Existing crops and animals
+remain donor-managed safety obligations regardless of the learned choice.
 """
 
 from __future__ import annotations
@@ -96,7 +94,10 @@ class MarketScorerAgent:
             if self.recorder is not None:
                 self.recorder.reset()
 
-        roles = donor._role_plan(obs, farm)
+        # Start from the last economic decision. On decision turns this is the
+        # provisional donor plan the Q-network observes before selecting the
+        # next bounded modifier.
+        roles = donor._role_plan(obs, farm, self._modifier)
         field = donor._unit_actions(obs, configuration, farm, private, roles)
 
         if self.network is not None and (step == 0 or hour in DECISION_HOURS) and step != self._decided_step:
@@ -114,6 +115,11 @@ class MarketScorerAgent:
             self._modifier = decision.modifier
             self._reserves = decision.reserves
             self._decided_step = step
+            # Apply the new economic guidance on the same turn. Candidate
+            # features use the provisional plan above to avoid a circular
+            # dependency; execution uses this recomputed guided plan.
+            roles = donor._role_plan(obs, farm, self._modifier)
+            field = donor._unit_actions(obs, configuration, farm, private, roles)
             if self.recorder is not None:
                 self.recorder.record_market(step=step, decision=decision)
 

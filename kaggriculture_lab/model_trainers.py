@@ -27,7 +27,7 @@ import multiprocessing
 import statistics
 import traceback
 from collections.abc import Sequence
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -685,6 +685,7 @@ def run_round_hooks(
     artifacts: str | Path = "artifacts",
     model_id: str | None = None,
     force: bool = False,
+    concurrency: int = 1,
 ) -> list[RoundReport]:
     """Offer one round to every declared model's trainer, at most once.
 
@@ -696,87 +697,142 @@ def run_round_hooks(
     A trainer that raises is recorded and skipped, never propagated: one agent's
     broken trainer must not abort another family's league, the same posture the
     episode-evaluator hook already takes.
+
+    `concurrency` above 1 runs that many models at once, each on **its own
+    `ExperimentStore`**. A store is one psycopg connection and a connection is not
+    thread-safe, so sharing the caller's would interleave statements from
+    different hooks on one socket; worse, `advisory_lock` is per-connection and
+    re-entrant, so a shared connection would make the model lock stop serializing
+    the thing it exists to serialize. The models are independent lineages --
+    separate `model_id`, separate artifact root, separate ledger rows -- so there
+    is nothing else to coordinate.
+
+    Reports come back in model order whatever the concurrency, so a caller cannot
+    tell the two paths apart from the return value. At `concurrency = 1` the
+    caller's own store is used and no connection is opened, which keeps the
+    default path byte-for-byte what it was.
     """
 
-    reports: list[RoundReport] = []
-    for identifier, family_id, trainer_path, config, active_id in session_training_models(
-        store, family_ids, model_ids=model_ids
-    ):
-        if model_id is not None and identifier != model_id:
-            continue
-        known = _ledger_status(store, identifier, scope, generation_id, round_index)
-        if known in {"COMPLETE", "SKIPPED"} and not force:
-            reports.append(RoundReport(identifier, scope, round_index, known.lower()))
-            continue
-        _ledger_begin(
-            store,
-            model_id=identifier,
+    models = [
+        entry
+        for entry in session_training_models(store, family_ids, model_ids=model_ids)
+        if model_id is None or entry[0] == model_id
+    ]
+    if not models:
+        return []
+
+    def run(own_store: ExperimentStore, entry) -> RoundReport:
+        return _run_round_hook(
+            own_store,
+            entry,
             session_id=session_id,
             generation_id=generation_id,
+            generation_index=generation_index,
             scope=scope,
             round_index=round_index,
-            known=known,
+            artifacts=artifacts,
+            force=force,
         )
-        writer = TrainingBatchWriter(store, identifier)
-        try:
-            trainer = load_trainer(trainer_path)
-            hook = getattr(trainer, "on_round", None)
-            if hook is None:
-                _ledger_finish(
-                    store,
-                    model_id=identifier,
-                    generation_id=generation_id,
-                    scope=scope,
-                    round_index=round_index,
-                    status="SKIPPED",
-                )
-                reports.append(RoundReport(identifier, scope, round_index, "skipped"))
-                continue
-            context = RoundContext(
-                model_id=identifier,
-                family_id=family_id,
-                scope=scope,
-                session_id=session_id,
-                generation_id=generation_id,
-                generation_index=generation_index,
-                round_index=round_index,
-                active_checkpoint=_active_checkpoint(store, active_id),
-                config=config,
-                artifacts=training_artifact_root(artifacts, config),
-            )
-            hook(context, ModelTrainingReader(store), writer)
-        except Exception as error:
+
+    if concurrency <= 1 or len(models) == 1:
+        return [run(store, entry) for entry in models]
+
+    def isolated(entry) -> RoundReport:
+        # `initialize=False`: the caller's store has already ensured the schema,
+        # and running that bootstrap from several connections at once deadlocks.
+        # See `ExperimentStore`.
+        with ExperimentStore(store.target, initialize=False) as own_store:
+            return run(own_store, entry)
+
+    with ThreadPoolExecutor(max_workers=min(concurrency, len(models))) as pool:
+        return list(pool.map(isolated, models))
+
+
+def _run_round_hook(
+    store: ExperimentStore,
+    entry: tuple[str, str, str, dict[str, Any], str | None],
+    *,
+    session_id: str,
+    generation_id: str,
+    generation_index: int,
+    scope: RoundScope,
+    round_index: int,
+    artifacts: str | Path,
+    force: bool,
+) -> RoundReport:
+    """One model's hook, ledger entry to ledger entry.
+
+    Split out of `run_round_hooks` so the same body serves the serial walk and the
+    concurrent fan-out. Everything it touches is scoped to `entry`'s model, which
+    is what makes running several at once safe.
+    """
+
+    identifier, family_id, trainer_path, config, active_id = entry
+    known = _ledger_status(store, identifier, scope, generation_id, round_index)
+    if known in {"COMPLETE", "SKIPPED"} and not force:
+        return RoundReport(identifier, scope, round_index, known.lower())
+    _ledger_begin(
+        store,
+        model_id=identifier,
+        session_id=session_id,
+        generation_id=generation_id,
+        scope=scope,
+        round_index=round_index,
+        known=known,
+    )
+    writer = TrainingBatchWriter(store, identifier)
+    try:
+        trainer = load_trainer(trainer_path)
+        hook = getattr(trainer, "on_round", None)
+        if hook is None:
             _ledger_finish(
                 store,
                 model_id=identifier,
                 generation_id=generation_id,
                 scope=scope,
                 round_index=round_index,
-                status="ERROR",
-                batches=len(writer.recorded),
-                error="".join(traceback.format_exception(error)),
+                status="SKIPPED",
             )
-            reports.append(
-                RoundReport(
-                    identifier,
-                    scope,
-                    round_index,
-                    "error",
-                    writer.recorded,
-                    str(error),
-                )
-            )
-            continue
+            return RoundReport(identifier, scope, round_index, "skipped")
+        context = RoundContext(
+            model_id=identifier,
+            family_id=family_id,
+            scope=scope,
+            session_id=session_id,
+            generation_id=generation_id,
+            generation_index=generation_index,
+            round_index=round_index,
+            active_checkpoint=_active_checkpoint(store, active_id),
+            config=config,
+            artifacts=training_artifact_root(artifacts, config),
+        )
+        hook(context, ModelTrainingReader(store), writer)
+    except Exception as error:
         _ledger_finish(
             store,
             model_id=identifier,
             generation_id=generation_id,
             scope=scope,
             round_index=round_index,
-            status="COMPLETE",
+            status="ERROR",
             batches=len(writer.recorded),
+            error="".join(traceback.format_exception(error)),
         )
-        reports.append(
-            RoundReport(identifier, scope, round_index, "complete", writer.recorded)
+        return RoundReport(
+            identifier,
+            scope,
+            round_index,
+            "error",
+            writer.recorded,
+            str(error),
         )
-    return reports
+    _ledger_finish(
+        store,
+        model_id=identifier,
+        generation_id=generation_id,
+        scope=scope,
+        round_index=round_index,
+        status="COMPLETE",
+        batches=len(writer.recorded),
+    )
+    return RoundReport(identifier, scope, round_index, "complete", writer.recorded)

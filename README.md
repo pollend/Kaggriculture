@@ -48,10 +48,10 @@ python train_mixed_farm.py
 # only the external yardstick the promotion gate measures against.
 python train_dqn.py
 
-# Train one market Q-network on top of a frozen field policy. The field play is
-# an unmodified copy of the pilkwang snapshot, and the promotion benchmark is
-# that same snapshot, so the paired margin measures the learned market layer and
-# nothing else.
+# Train one economic Q-network over a field policy derived from the pilkwang
+# snapshot. The learned modifier gates new crop and herd roles and funds the
+# matching demand; the promotion benchmark is the unmodified snapshot, so the
+# paired margin measures the complete learned residual over its source policy.
 python train_market_scorer.py
 
 # Compare named profiles directly.
@@ -505,11 +505,11 @@ The shed sits at the center of the board and is not a tile — it never appears 
 
 ### Town Buildings
 
-As the season progresses, new shops unlock at regular intervals (every `townShopUnlockInterval` days, default 3). Each unlock is randomly selected from the shops that have not yet been added; once unlocked, a shop stays active for the rest of the game. Total demand grows monotonically as more shops unlock.
+As the season progresses, new shops unlock at regular intervals (every `townShopUnlockInterval` days, default 3). Each unlock is drawn uniformly **with replacement**, so the same shop can be unlocked more than once and each instance consumes independently; once unlocked, a shop stays active for the rest of the game, up to a cap of 8 instances. Total demand grows monotonically as more shops unlock.
 
-Each unlocked shop consumes one of every product it demands every `townShopSellInterval` turns (default 4). So with the default interval, a shop demanding wheat removes 6 wheat from the market per day. Single-product shops consume 2x.
+Each unlocked shop instance consumes one of every product it demands every `townShopSellInterval` turns (default 4). So with the default interval, a shop demanding wheat removes 6 wheat from the market per day. Single-product shops consume 2x.
 
-In addition, the town center consumes one of every product (excluding fertilizer) every `townCenterSellInterval` turns (default 12). After day 10 this is increased to 2 of each, and after day 20 it is increased to 4 of each.
+In addition, the town center consumes one of every product (excluding fertilizer) every `townCenterSellInterval` turns (default 24 — one of each per day). This rate is flat: it does not ramp with the day.
 
 | Shop Type | Increases Demand For |
 | :---- | :---- |

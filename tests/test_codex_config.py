@@ -5,6 +5,7 @@ import tomllib
 import pytest
 
 from kaggriculture_lab import dashboard
+from kaggriculture_lab.dashboard import server as dashboard_server
 from kaggriculture_lab.codex_config import (
     MANAGED_END,
     MANAGED_START,
@@ -123,9 +124,11 @@ def test_standalone_dashboard_registers_its_actual_port(monkeypatch, tmp_path, c
             calls.append("close")
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(dashboard, "make_server", lambda *args: FakeServer())
+    # `serve` lives in `dashboard.server` and resolves both of these from that
+    # module's globals, so patching the package facade would be silently ignored.
+    monkeypatch.setattr(dashboard_server, "make_server", lambda *args: FakeServer())
     monkeypatch.setattr(
-        dashboard,
+        dashboard_server,
         "sync_codex_mcp_config",
         lambda url: calls.append(url)
         or tmp_path / ".codex" / "config.toml",

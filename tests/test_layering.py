@@ -36,7 +36,15 @@ INFRA_ALLOWED_DIRS = ("training",)
 # SP-PSRO is deliberately an alternate training curriculum and artifact layer
 # over the DQN job scorer. Keeping that relationship explicit here preserves
 # the no-accidental-cross-agent rule for every other family.
-AGENT_EXTENSIONS = {("sp_psro_job_scorer", "dqn_job_scorer")}
+#
+# `dqn_market_free` shares training-only utilities with `dqn_market_scorer`.
+# Its submission path is self-contained: the donor and market-state encoder are
+# copied locally and parity-tested, while training reuses device, replay-reward,
+# progress, and arena-gate machinery that is never bundled.
+AGENT_EXTENSIONS = {
+    ("sp_psro_job_scorer", "dqn_job_scorer"),
+    ("dqn_market_free", "dqn_market_scorer"),
+}
 
 
 def _module_imports(path: Path) -> set[str]:

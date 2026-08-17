@@ -11,12 +11,14 @@ from __future__ import annotations
 import copy
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
 from agents.dqn_market_scorer import donor, market_exec
+from agents.dqn_market_scorer.evaluation import evaluate_episode
 from agents.dqn_market_scorer.main import MarketScorerAgent
 from agents.dqn_market_scorer.market_policy import (
     DEFAULT_MODIFIER,
@@ -24,6 +26,7 @@ from agents.dqn_market_scorer.market_policy import (
     MARKET_FEATURE_DIM,
     MARKET_STATE_DIM,
     MODIFIERS,
+    POLICY_KINDS,
     PRODUCTS,
     MarketModifier,
     choose_market,
@@ -32,18 +35,26 @@ from agents.dqn_market_scorer.market_policy import (
     modifier_action_features,
     reserve_action_features,
 )
-from agents.dqn_market_scorer.policy import MarketQNetwork
+from agents.dqn_market_scorer.policy import WEIGHTS_PATH, MarketQNetwork
 from agents.dqn_market_scorer.training import network as net_module
 from agents.dqn_market_scorer.training.collect import (
     EPISODE_ARRAY_FIELDS,
     MONEY_SCALE,
     TERMINAL_MARGIN_SCALE,
-    Recorder,
     collect_episode,
     load_episode_batch,
     save_episode_batch,
 )
 from agents.dqn_market_scorer.training.replay import ReplayBuffer
+from agents.dqn_market_scorer.training.updater import (
+    _benchmark_kind,
+    _has_inert_hidden_trunk,
+    _materialize_behavior_policy,
+    _reject_degenerate,
+    _reject_inert_network,
+    initial_network,
+    policy_improvement,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DONOR_PATH = REPO_ROOT / "agents/dqn_market_scorer/donor.py"
@@ -63,21 +74,15 @@ def _digest(path: Path) -> str:
 # --------------------------------------------------------------------------
 
 
-def test_donor_is_a_verbatim_copy_of_the_licensed_snapshot():
-    """The NOTICE claims donor.py is unmodified. Keep that claim true.
-
-    Everything the licence obligation rests on -- and the argument that only
-    `market_exec.py` is a derivative work -- is that this file was not touched.
-    Edit the donor and this test is what tells you to edit `market_exec.py`
-    instead.
-    """
-
-    assert _digest(DONOR_PATH) == _digest(SNAPSHOT_PATH)
+def test_donor_is_a_declared_derivative_of_the_licensed_snapshot():
+    assert _digest(DONOR_PATH) != _digest(SNAPSHOT_PATH)
 
 
 def test_donor_digest_matches_the_recorded_provenance():
     notice = (REPO_ROOT / "agents/dqn_market_scorer/NOTICE").read_text()
+    assert _digest(SNAPSHOT_PATH) in notice
     assert _digest(DONOR_PATH) in notice
+    assert "donor.py IS A MODIFIED DERIVATIVE" in notice
     assert (REPO_ROOT / "agents/dqn_market_scorer/LICENSE-pilkwang").is_file()
 
 
@@ -172,6 +177,59 @@ def test_assembled_candidates_match_the_network_input_width(live_states):
     assert len(decision.chosen) == candidates.factor_count
 
 
+def test_q_guidance_gates_only_new_field_expansion(live_states):
+    obs, _config, farm, _private, _roles, _field = live_states[0]
+    default_roles = donor._role_plan(obs, farm, DEFAULT_MODIFIER)
+    blocked = donor._role_plan(
+        obs,
+        farm,
+        MarketModifier(seed_scale=0.0, animal_gate=0),
+    )
+    half_crops = donor._role_plan(
+        obs,
+        farm,
+        MarketModifier(seed_scale=0.5, animal_gate=1),
+    )
+
+    assert len(blocked) < len(default_roles)
+    default_crops = sum(kind == "CROP" for kind, _item in default_roles.values())
+    half_crop_count = sum(kind == "CROP" for kind, _item in half_crops.values())
+    assert 0 < half_crop_count < default_crops
+
+    for (x, y), (kind, _item) in blocked.items():
+        tile = farm["tiles"][y][x]
+        if kind == "CROP":
+            assert isinstance(tile, dict) and tile.get("kind") == "PLANT"
+        elif kind == "ANIMAL":
+            assert isinstance(tile, dict) and tile.get("animal") in donor.ANIMALS
+
+
+def test_q_modifier_replans_the_donor_field_on_the_same_turn(live_states):
+    class BlockExpansionNetwork:
+        def __call__(self, features):
+            rows = np.asarray(features, dtype=np.float32)
+            actions = rows[..., MARKET_STATE_DIM:]
+            modifier_rows = actions[..., 0] > 0.5
+            # Among modifier rows, prefer seed_scale=0 and animal_gate=0.
+            scores = np.where(
+                modifier_rows,
+                10.0 - actions[..., 2] - actions[..., 4],
+                0.0,
+            )
+            return scores.reshape(-1)
+
+    obs, config, farm, private, _roles, _field = live_states[0]
+    agent = MarketScorerAgent(BlockExpansionNetwork())
+    action = agent(copy.deepcopy(obs), config)
+
+    assert agent._modifier.seed_scale == 0.0
+    assert agent._modifier.animal_gate == 0
+    guided_roles = donor._role_plan(obs, farm, agent._modifier)
+    expected = donor._unit_actions(obs, config, farm, private, guided_roles)
+    assert action["farmer"] == expected["farmer"]
+    assert action["hands"] == expected["hands"]
+
+
 def test_reserve_levels_never_exceed_what_is_in_the_shed(live_states):
     for obs, config, farm, private, roles, field in live_states:
         candidates = enumerate_market_candidates(obs, farm, private, roles, field, config=config)
@@ -186,6 +244,7 @@ def test_reserve_levels_never_exceed_what_is_in_the_shed(live_states):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.slow
 def test_cold_start_reproduces_the_donor_exactly():
     """A zero network must play unmodified pilkwang, action for action.
 
@@ -327,11 +386,194 @@ def test_numpy_and_torch_networks_agree():
     assert np.allclose(network(features), expected, atol=1e-5)
 
 
+def test_training_initialization_starts_at_the_donor_default(live_states):
+    """The trainable cold start must still score every candidate identically.
+
+    That tie is what makes round one roll out unmodified pilkwang instead of a
+    random market policy, and it is the property the all-zero network was
+    originally chosen for.
+    """
+
+    obs, config, farm, private, roles, field = live_states[1]
+    candidates = enumerate_market_candidates(obs, farm, private, roles, field, config=config)
+    decision = choose_market(candidates, initial_network({"initialization": "donor_default"}))
+    assert decision.modifier == DEFAULT_MODIFIER
+    assert set(decision.reserves.values()) == {0}
+
+
+def test_an_unknown_initialization_is_rejected_rather_than_defaulted():
+    """Including `zeros`, which used to mean a literal all-zero MLP.
+
+    Silently resolving an unrecognised name to the cold start would let a typo,
+    or that old spelling, quietly select a policy nobody asked for.
+    """
+
+    with pytest.raises(ValueError, match="unsupported market initialization"):
+        initial_network({"initialization": "zeros"})
+
+
+def test_training_initialization_leaves_every_layer_trainable():
+    """Gradients must reach the hidden layers, not just the output bias.
+
+    An all-zero MLP zeroes both hidden activations for any input, so
+    `dL/dw` is zero for every layer and `relu'(0) == 0` closes the path back to
+    the biases. Only the output bias moves, the symmetry never breaks, and the
+    network stays byte-identical to the donor for the life of the run while the
+    promotion gate reports a healthy checkpoint. This is the check that catches
+    that.
+    """
+
+    module = net_module.from_numpy(
+        initial_network({"initialization": "donor_default"}), net_module.build()
+    )
+    linears = [layer for layer in module if isinstance(layer, torch.nn.Linear)]
+    before = [layer.weight.detach().clone() for layer in linears]
+
+    optimizer = torch.optim.Adam(module.parameters(), lr=1e-3)
+    generator = torch.Generator().manual_seed(0)
+    features = torch.randn(64, MARKET_FEATURE_DIM, generator=generator)
+    targets = torch.randn(64, 1, generator=generator) * 100.0
+    for _ in range(20):
+        loss = torch.nn.SmoothL1Loss()(module(features), targets)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+    for index, (layer, original) in enumerate(zip(linears, before)):
+        assert not torch.equal(layer.weight.detach(), original), f"layer {index} never trained"
+
+
+def test_an_inert_network_is_rejected_before_it_can_be_promoted():
+    _reject_inert_network(initial_network({"initialization": "donor_default"}))
+    assert not _has_inert_hidden_trunk(initial_network({"initialization": "donor_default"}))
+    assert _has_inert_hidden_trunk(MarketQNetwork.zeros())
+    with pytest.raises(RuntimeError, match="all-zero hidden weights"):
+        _reject_inert_network(MarketQNetwork.zeros())
+
+
+def test_a_fresh_run_replaces_a_cached_initial_policy(tmp_path):
+    """`initial.npz` is a fixed name, so a second session must overwrite it."""
+
+    path = tmp_path / "rollout_policies" / "initial.npz"
+    _materialize_behavior_policy(MarketQNetwork.zeros(), path)
+    assert _has_inert_hidden_trunk(MarketQNetwork.load(path))
+
+    replacement = initial_network({"initialization": "donor_default", "seed": 73})
+    _materialize_behavior_policy(replacement, path, refresh=True)
+
+    restored = MarketQNetwork.load(path)
+    assert not _has_inert_hidden_trunk(restored)
+    assert np.all(restored(np.zeros((1, MARKET_FEATURE_DIM), dtype=np.float32)) == 0.0)
+
+
+def test_a_zero_width_evaluation_interval_is_rejected():
+    """Exact cancellation over many paired seeds is a fault, not a tie."""
+
+    degenerate = {
+        "opponent": "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py",
+        "pairs": 100,
+        "margin_ci": [0.0, 0.0],
+        "errors": {},
+    }
+    with pytest.raises(RuntimeError, match="identically zero"):
+        _reject_degenerate(degenerate, "benchmark")
+
+    # A real interval that merely straddles zero is a legitimate "no better than
+    # the donor yet" and must pass through.
+    _reject_degenerate({**degenerate, "margin_ci": [-120.0, 340.0]}, "benchmark")
+    # So must a single pair, where exact cancellation is not evidence of
+    # anything, and an errored evaluation, which is reported by its own path.
+    _reject_degenerate({**degenerate, "pairs": 1}, "benchmark")
+    _reject_degenerate({**degenerate, "errors": {"seat0": "boom"}}, "benchmark")
+
+
+def test_initial_release_requires_primary_benchmark_improvement():
+    tied = {"errors": {}, "margin": 0.0, "margin_ci": [0.0, 0.0]}
+    worse = {"errors": {}, "margin": -10.0, "margin_ci": [-20.0, -1.0]}
+    noisy_gain = {"errors": {}, "margin": 10.0, "margin_ci": [-2.0, 22.0]}
+    resolved_gain = {"errors": {}, "margin": 10.0, "margin_ci": [1.0, 19.0]}
+
+    assert not policy_improvement(tied, "significant")
+    assert not policy_improvement(worse, "significant")
+    assert not policy_improvement(noisy_gain, "significant")
+    assert policy_improvement(resolved_gain, "significant")
+    assert policy_improvement(noisy_gain, "point_estimate")
+
+
+def test_primary_evaluation_kind_is_not_a_generic_fixed_benchmark():
+    assert _benchmark_kind(0) == POLICY_KINDS["promotion_baseline"]
+    assert _benchmark_kind(1) == "fixed_benchmark:1"
+
+
+def test_rollout_results_never_request_checkpoint_reevaluation():
+    """A changing exploration opponent is not a checkpoint trend."""
+
+    class Reader:
+        def summary(self):
+            return {
+                "final_money": 1.0,
+                "money_difference": -2_000.0,
+                "win": 0.0,
+                "metrics": {},
+            }
+
+        def fetchone(self, sql, parameters=()):
+            assert "pairing_kind" in sql
+            return ("market_rollout",)
+
+        def history(self, revision_id, limit=50):
+            # Newest first: a large apparent regression that would normally
+            # exceed the evaluator threshold.
+            margins = [-2_000.0] * 10 + [0.0] * 10
+            return [
+                {"failed": False, "money_difference": margin, "win": 0.0}
+                for margin in margins
+            ]
+
+    result = evaluate_episode(
+        SimpleNamespace(match_id="match", revision_id="checkpoint"), Reader()
+    )
+    assert result["margin_regression"] == 2_000.0
+    assert result["pairing_kind"] == "market_rollout"
+    assert not result["should_reevaluate"]
+    assert result["reevaluate_reason"] == "training rollout"
+
+    class ComparableReader(Reader):
+        def fetchone(self, sql, parameters=()):
+            assert "pairing_kind" in sql
+            return ("fixed_benchmark",)
+
+    comparable = evaluate_episode(
+        SimpleNamespace(match_id="match", revision_id="checkpoint"), ComparableReader()
+    )
+    assert comparable["should_reevaluate"]
+    assert comparable["reevaluate_reason"].startswith("mean margin fell 2,000")
+
+
 def test_saved_weights_reject_a_stale_feature_schema(tmp_path):
     path = tmp_path / "stale.npz"
     MarketQNetwork.zeros(feature_dim=MARKET_FEATURE_DIM - 1).save(path)
-    with pytest.raises(ValueError, match="feature dimension"):
+    with pytest.raises(ValueError, match="does not match schema"):
         MarketQNetwork.load(path)
+
+
+def test_saved_weights_reject_a_stale_output_schema(tmp_path):
+    path = tmp_path / "stale-output.npz"
+    MarketQNetwork.zeros().save(path)
+    with np.load(path, allow_pickle=False) as data:
+        payload = {key: data[key] for key in data.files}
+    payload["w2"] = np.zeros((128, 2), dtype=np.float32)
+    payload["b2"] = np.zeros(2, dtype=np.float32)
+    np.savez_compressed(path, **payload)
+
+    with pytest.raises(ValueError, match="does not match schema"):
+        MarketQNetwork.load(path)
+
+
+def test_packaged_weights_match_the_current_scorer_schema():
+    network = MarketQNetwork.load(WEIGHTS_PATH)
+    assert network.layers[0][0].shape == (MARKET_FEATURE_DIM, 128)
+    assert network.layers[-1][0].shape == (128, 1)
 
 
 # --------------------------------------------------------------------------

@@ -1,8 +1,5 @@
-"""Deterministic scenario-aware economic policy for Kaggriculture."""
-
-from collections import deque
 import math
-
+from collections import deque
 
 # Domain constants
 
@@ -567,12 +564,30 @@ def _herd_targets(obs, farm, private, capacity):
     return targets
 
 
-def _role_plan(obs, farm):
+def _guidance_value(guidance, name, default):
+    if guidance is None:
+        return default
+    if isinstance(guidance, dict):
+        return guidance.get(name, default)
+    return getattr(guidance, name, default)
+
+
+def _role_plan(obs, farm, guidance=None):
+    """Assign field roles, bounded by the Q-selected economic guidance.
+
+    Defaults preserve the upstream policy exactly. ``animal_gate`` may prevent
+    new herd slots and ``seed_scale`` may reduce new crop slots, but neither is
+    allowed to abandon a live plant or animal that still needs field care.
+    """
+
     private = obs.get("private", {}) or {}
     tiles = farm.get("tiles", []) or []
     animal_slots, zones = _reserved_animal_slots(farm)
     targets = _herd_targets(obs, farm, private, len(animal_slots))
-    desired_animals = min(len(animal_slots), sum(targets.values()))
+    animal_gate = int(_guidance_value(guidance, "animal_gate", 1) or 0)
+    desired_animals = (
+        min(len(animal_slots), sum(targets.values())) if animal_gate > 0 else 0
+    )
     active_slots = list(animal_slots[:desired_animals])
     for position in animal_slots:
         x, y = position
@@ -605,6 +620,15 @@ def _role_plan(obs, farm):
         roles[position] = ("ANIMAL", animal)
         assigned[animal] += 1
 
+    raw_seed_scale = _guidance_value(guidance, "seed_scale", 1.0)
+    try:
+        seed_scale = float(raw_seed_scale)
+    except (TypeError, ValueError):
+        seed_scale = 1.0
+    if not math.isfinite(seed_scale):
+        seed_scale = 1.0
+    expansion_scale = max(0.0, min(1.0, seed_scale))
+
     melon_target = _melon_target(obs)
     for quadrant in ("NW", "NE", "SW", "SE"):
         zone = zones.get(quadrant)
@@ -623,7 +647,26 @@ def _role_plan(obs, farm):
         sequence.extend(["CARROT"] * fixed.get("CARROT", 0))
         if quadrant != "NW":
             sequence.extend(["MELON"] * fixed.get("MELON", 0))
+
+        new_by_crop = {crop: 0 for crop in CROPS}
         for position, crop in zip(cells, sequence):
+            x, y = position
+            tile = tiles[y][x]
+            if not (isinstance(tile, dict) and tile.get("kind") == "PLANT"):
+                new_by_crop[crop] += 1
+        allowed_new = {
+            crop: int(math.ceil(count * expansion_scale))
+            for crop, count in new_by_crop.items()
+        }
+        assigned_new = {crop: 0 for crop in CROPS}
+        for position, crop in zip(cells, sequence):
+            x, y = position
+            tile = tiles[y][x]
+            existing_plant = isinstance(tile, dict) and tile.get("kind") == "PLANT"
+            if not existing_plant:
+                if assigned_new[crop] >= allowed_new[crop]:
+                    continue
+                assigned_new[crop] += 1
             roles[position] = ("CROP", crop)
     return roles
 
@@ -1588,10 +1631,10 @@ def _schedule_market_adjustment(obs, config, farm, private, orders):
     result = [list(order) for order in orders[:max_orders]]
     if hour == 2 and _SCHEDULE_WHEAT_REQUESTED == 0:
         wheat_price = float(
-            (((obs.get("market", {}) or {}).get("prices", {}) or {}).get(
+            ((obs.get("market", {}) or {}).get("prices", {}) or {}).get(
                 "WHEAT", MARKET["WHEAT"][0]
             )
-            or MARKET["WHEAT"][0])
+            or MARKET["WHEAT"][0]
         )
         money = float(farm.get("money", 0) or 0)
         committed = _market_commitment_cost(obs, farm, result)
@@ -1712,9 +1755,7 @@ def _market_actions(obs, config, farm, private, roles, field):
     shed, post_field_inventories = _post_field_storage(
         private, field, shed_capacity
     )
-    market_inventory = dict(
-        ((obs.get("market", {}) or {}).get("inventory", {}) or {})
-    )
+    market_inventory = dict((obs.get("market", {}) or {}).get("inventory", {}) or {})
     max_orders = int(_cfg(config, "maxMarketOrdersPerTurn", MAX_MARKET_ORDERS))
     summary = _survey(farm, private, roles, day)
     phase = _policy_phase(obs, farm, private, summary)

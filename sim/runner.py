@@ -26,6 +26,8 @@ from typing import Any
 
 from kaggle_environments import make
 
+from sim import fastenv
+
 ENV_NAME = "kaggriculture"
 
 # Everything else (ERROR, INVALID, TIMEOUT, ...) means the agent failed rather
@@ -126,6 +128,7 @@ def run_match(
     agents = [registry.resolve(spec) for spec in specs]
     configuration = {**(config or {}), "seed": seed}
 
+    fastenv.install()
     started = time.perf_counter()
     env = make(env_name, configuration=configuration, debug=False)
     env.run(agents)
@@ -167,7 +170,7 @@ def run_match(
         seats=seats,
         steps=len(env.steps),
         wallclock=wallclock,
-        replay=env.toJSON(),
+        replay=fastenv.to_json(env),
         training_artifacts=training_artifacts,
     )
 

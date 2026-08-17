@@ -20,6 +20,8 @@ from __future__ import annotations
 import statistics
 from typing import TYPE_CHECKING, Any
 
+from agents.dqn_market_scorer.market_policy import POLICY_KINDS
+
 if TYPE_CHECKING:  # pragma: no cover -- typing only, never imported at runtime
     from kaggriculture_lab.hooks import EpisodeHookContext, EpisodeReader
 
@@ -46,6 +48,15 @@ def evaluate_episode(context: EpisodeHookContext, reader: EpisodeReader) -> dict
     """Summarise this episode and flag whether the checkpoint should be re-evaluated."""
     summary = reader.summary()
     metrics = summary["metrics"]
+    pairing = reader.fetchone(
+        """
+        SELECT lp.pairing_kind FROM pairing_episodes pe
+        JOIN league_pairings lp USING (pairing_id)
+        WHERE pe.match_id = %s
+        """,
+        [context.match_id],
+    )
+    pairing_kind = str(pairing[0]) if pairing is not None else None
     history = reader.history(context.revision_id, limit=WINDOW * 2)
 
     played = [row for row in history if not row["failed"]]
@@ -63,11 +74,17 @@ def evaluate_episode(context: EpisodeHookContext, reader: EpisodeReader) -> dict
     regression = older_mean - recent_mean
 
     enough = len(played) >= MIN_HISTORY and len(older) > 0
-    should_reevaluate = bool(enough and regression >= REGRESSION_MARGIN)
+    # A rollout opponent faces a deliberately changing epsilon and curriculum.
+    # Its margin trend describes that schedule, not drift in the checkpoint.
+    comparable = pairing_kind != "market_rollout"
+    should_reevaluate = bool(comparable and enough and regression >= REGRESSION_MARGIN)
 
     return {
         "schema_version": SCHEMA_VERSION,
         "revision_id": context.revision_id,
+        "policy_kind": POLICY_KINDS["market_learner"],
+        "base_market_planner_kind": POLICY_KINDS["base_market_planner"],
+        "field_policy_kind": POLICY_KINDS["field_policy"],
         # This episode.
         "final_money": summary["final_money"],
         "money_difference": summary["money_difference"],
@@ -86,10 +103,15 @@ def evaluate_episode(context: EpisodeHookContext, reader: EpisodeReader) -> dict
         "recent_margin_mean": recent_mean,
         "older_margin_mean": older_mean,
         "margin_regression": regression,
+        "pairing_kind": pairing_kind,
         "should_reevaluate": should_reevaluate,
         "reevaluate_reason": (
             f"mean margin fell {regression:,.0f} over the last {len(recent)} episodes"
             if should_reevaluate
-            else ("insufficient history" if not enough else "stable")
+            else (
+                "training rollout"
+                if not comparable
+                else ("insufficient history" if not enough else "stable")
+            )
         ),
     }

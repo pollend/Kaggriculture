@@ -1,6 +1,6 @@
 [league]
 league = "dqn_market_scorer"
-name = "dqn-market-scorer-v1"
+name = "dqn-market-scorer-joint03"
 
 # The market trainer collects its own full-length episodes, so the league runs
 # trainer-only: no breedable population, no anchor pairings, no hall of fame.
