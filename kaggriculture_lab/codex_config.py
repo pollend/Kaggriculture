@@ -7,8 +7,8 @@ import tempfile
 import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
-from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
+from typing import IO
 
 SERVER_NAME = "kaggriculture_progress"
 MANAGED_START = "# BEGIN KAGGRICULTURE DASHBOARD MCP (managed)"
@@ -17,6 +17,28 @@ MANAGED_END = "# END KAGGRICULTURE DASHBOARD MCP (managed)"
 
 class CodexConfigConflict(ValueError):
     """The target config contains an unmanaged table owned by the user."""
+
+
+try:
+    from fcntl import LOCK_EX, LOCK_UN, flock
+except ModuleNotFoundError:  # Windows has no fcntl; msvcrt locks byte ranges.
+    import msvcrt
+
+    def _acquire(lock_file: IO[str]) -> None:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+
+    def _release(lock_file: IO[str]) -> None:
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+
+else:
+
+    def _acquire(lock_file: IO[str]) -> None:
+        flock(lock_file.fileno(), LOCK_EX)
+
+    def _release(lock_file: IO[str]) -> None:
+        flock(lock_file.fileno(), LOCK_UN)
 
 
 def _managed_block(servers: dict[str, str]) -> str:
@@ -53,11 +75,11 @@ def _config_lock(destination: Path) -> Iterator[None]:
 
     lock_path = destination.with_name(f".{destination.name}.kaggriculture.lock")
     with lock_path.open("a+", encoding="utf-8") as lock_file:
-        flock(lock_file.fileno(), LOCK_EX)
+        _acquire(lock_file)
         try:
             yield
         finally:
-            flock(lock_file.fileno(), LOCK_UN)
+            _release(lock_file)
 
 
 def sync_codex_mcp_config(
