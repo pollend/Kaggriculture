@@ -125,12 +125,10 @@ _REGISTRY_LOCK = threading.Lock()
 
 #: Ceiling on one `map` over a checked-out pool, in seconds.
 #:
-#: Sized off the measurement in `_update_session_models`: 222.6 seconds per update
-#: of which 96% is simulation, and an update is two series back to back. Half an
-#: hour is roughly eight times the worst observed series, so nothing healthy trips
-#: it -- it exists because the alternative is what four runs did on 2026-08-15,
-#: which is sit at "model updates started" forever with 32 idle workers, no log
-#: line, and no traceback. A stall has to become a failure to be a bug you can see.
+#: Roughly eight times the worst observed series, so nothing healthy trips it. It
+#: exists because the alternative is a run sitting at "model updates started"
+#: forever with idle workers, no log line and no traceback: a stall has to become a
+#: failure to be a bug you can see.
 MAP_TIMEOUT_SECONDS = 1800.0
 
 #: How often a worker checks whether it still has the parent it was spawned for.
@@ -144,21 +142,17 @@ def _noop(_index: int) -> None:
 def _worker_guard(parent_pid: int) -> None:
     """Worker initializer: exit if the parent process goes away.
 
-    Nothing in a `spawn` child notices its parent dying, so a parent killed while
-    a pool is checked out leaves `jobs` workers reparented to init, holding their
-    memory and their share of the cores forever. Three runs left 99 such orphans
-    behind on 2026-08-15 -- 21GB and 272% of the box -- because `atexit` does not
-    run on SIGTERM and there was no other backstop.
+    Nothing in a `spawn` child notices its parent dying, so a parent killed while a
+    pool is checked out leaves its workers reparented to init, holding memory and
+    cores forever. `atexit` does not run on SIGTERM, so there is no other backstop.
 
-    `PR_SET_PDEATHSIG` is the obvious mechanism and the wrong one here: it fires
-    when the *creating thread* exits, and the free-list above exists precisely so a
-    pool outlives the thread that spawned it. Round-hook threads are recreated per
-    batch, so pdeathsig would shoot the workers of a perfectly live pool the moment
-    its original borrower was recycled. Polling `getppid` is keyed on the process,
-    which is the thing that actually has to still be there.
+    `PR_SET_PDEATHSIG` is the obvious mechanism and the wrong one: it fires when the
+    *creating thread* exits, and the free list above exists precisely so a pool
+    outlives the thread that spawned it. Polling `getppid` keys on the process,
+    which is the thing that has to still be there.
 
-    `os._exit` rather than `sys.exit`: this is a daemon thread in a child whose
-    parent is already gone, and there is no one left to flush to.
+    `os._exit` rather than `sys.exit`: a daemon thread in a child whose parent is
+    already gone has no one left to flush to.
     """
 
     def watch() -> None:
@@ -237,20 +231,15 @@ def worker_pool(jobs: int):
 def _reap(pool: ProcessPoolExecutor, grace: float) -> None:
     """Shut a pool down and make sure its workers are actually gone.
 
-    `shutdown(wait=False, cancel_futures=True)` cancels what is still *queued*; it
-    has no say over a worker already inside a task, and `wait=True` just blocks on
-    one. Either way `concurrent.futures.process` installs its own `atexit` hook
-    that joins every live worker at interpreter shutdown, so a single wedged worker
-    means the process cannot exit at all and the `resource_tracker` prints its
-    leaked-semaphore warning on the way down. Reproduced directly: a pool discarded
-    after a stalled `map` left the interpreter unkillable and leaked 5 semaphores --
-    the same signature the hung runs of 2026-08-15 left behind.
+    `shutdown(wait=False, cancel_futures=True)` cancels what is still *queued* and
+    has no say over a worker already inside a task; `wait=True` just blocks on one.
+    Either way `concurrent.futures.process` installs an `atexit` hook joining every
+    live worker, so one wedged worker makes the process unkillable and leaks
+    semaphores on the way down.
 
-    So: ask nicely, wait `grace` seconds in total, then SIGKILL whatever is left.
-    A pool reaches here only on the way out, so being blunt costs nothing.
-
-    `_processes` is private and there is no public way to reach the workers of an
-    executor being torn down, hence the defensive read.
+    So: ask nicely, wait `grace` seconds, then SIGKILL whatever is left. A pool
+    reaches here only on the way out, so being blunt costs nothing. `_processes` is
+    private and there is no public way to reach the workers, hence the guarded read.
     """
 
     workers = list((getattr(pool, "_processes", None) or {}).values())
@@ -288,12 +277,10 @@ _SHUTDOWN_GRACE_SECONDS = 10.0
 def shutdown_worker_pools() -> None:
     """Tear every live pool down. Registered at exit; safe to call early.
 
-    This is where the children are actually reaped -- returning before they exit is
-    what leaves the `resource_tracker` complaining about leaked semaphores. But it
-    is also on the SIGTERM path, and an unbounded `wait=True` there means a run
-    that wedged mid-arena cannot be stopped by the signal that is supposed to stop
-    it: the handler blocks on the very worker that is stuck. Bounded instead, so
-    the teardown always finishes. See `_reap`.
+    Where the children are actually reaped. Bounded rather than `wait=True`,
+    because this is also on the SIGTERM path: an unbounded wait means a run that
+    wedged mid-arena cannot be stopped by the signal meant to stop it, since the
+    handler blocks on the very worker that is stuck. See `_reap`.
     """
     with _REGISTRY_LOCK:
         pools = [pool for free in _IDLE.values() for pool in free]
@@ -316,28 +303,24 @@ atexit.register(shutdown_worker_pools)
 def install_signal_handlers() -> None:
     """Make SIGTERM tear pools down, and SIGUSR1 dump every thread's stack.
 
-    `atexit` covers a clean return and it covers `KeyboardInterrupt`, because that
-    unwinds through the interpreter. It does not cover SIGTERM, whose default
-    disposition kills the process outright -- so `kill` on a long run, which is how
-    one is actually stopped, is exactly the case the `atexit` hook above misses.
-    That is where the 99 orphans came from.
+    `atexit` covers a clean return and `KeyboardInterrupt`, but not SIGTERM, whose
+    default disposition kills the process outright -- and `kill` is how a long run
+    is actually stopped, so that is exactly the case it misses. Orphaned pools come
+    from there.
 
-    SIGUSR1 is the other half. A run that wedges gives no traceback because nothing
-    raised: on 2026-08-15 four runs stopped at "model updates started" with all 32
-    workers idle and the main thread parked on the `ThreadPoolExecutor` join, and
-    the process had to be killed to be cleared, which destroyed the only evidence.
-    `kill -USR1 <pid>` now writes all thread stacks to stderr -- the nohup log --
-    and leaves the process running, so the next one can be diagnosed instead of
-    just cleaned up.
+    SIGUSR1 is the other half: a wedged run gives no traceback because nothing
+    raised, and killing it to clear it destroys the only evidence.
+    `kill -USR1 <pid>` writes all thread stacks to stderr and leaves the process
+    running.
 
     Idempotent, and a no-op on platforms without the signals.
     """
 
     faulthandler.enable()
     if hasattr(signal, "SIGUSR1"):
-        # `chain=False` deliberately. SIGUSR1's default disposition is to terminate,
-        # so chaining dumps the stacks and then kills the very process you were
-        # trying to inspect -- which is the whole thing this exists to avoid.
+        # `chain=False` deliberately: SIGUSR1's default disposition is to
+        # terminate, so chaining would dump the stacks and then kill the process
+        # you were trying to inspect.
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
 
     def terminate(signum: int, _frame) -> None:

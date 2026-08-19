@@ -64,6 +64,10 @@ class MatchResult:
     wallclock: float
     replay: Any | None = field(default=None, repr=False)
     training_artifacts: list[dict[str, Any] | None] = field(default_factory=list, repr=False)
+    #: Whatever `sim.arena.play_series(..., reduce=...)` folded out of `replay`
+    #: inside the worker that played the episode. Stays None on every other path.
+    #: See `sim.arena._job` for why a caller would want this.
+    reduction: Any | None = field(default=None, repr=False)
 
     @property
     def failed(self) -> bool:

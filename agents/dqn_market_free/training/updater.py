@@ -39,7 +39,6 @@ from agents.dqn_market_free.diagnostics import (
     BehaviorCounts,
     OrderDiagnostics,
     behavior_from_replay,
-    diagnose_replay,
 )
 from agents.dqn_market_free.lots import median
 from agents.dqn_market_free.order_space import (
@@ -353,6 +352,11 @@ def _quiet_opponent(context, config: dict[str, Any]) -> str:
     return _weights_spec(path)
 
 
+#: `sim.arena` resolves this by name in each worker, so it must stay importable
+#: without torch -- which is why it lives in `diagnostics` and not here.
+ARENA_REDUCER = "agents.dqn_market_free.diagnostics:arena_reduction"
+
+
 def _arena_evaluate(
     weights_path: Path, opponent: str, seeds: int, jobs: int, seed_start: int = 0
 ) -> dict[str, Any]:
@@ -369,7 +373,14 @@ def _arena_evaluate(
 
     spec = _weights_spec(weights_path)
     with _single_threaded_workers():
-        results = play_series(spec, opponent, range(seed_start, seed_start + seeds), {}, jobs)
+        results = play_series(
+            spec,
+            opponent,
+            range(seed_start, seed_start + seeds),
+            {},
+            jobs,
+            reduce=ARENA_REDUCER,
+        )
     summary = summarize(spec, opponent, results)
     diagnostics, behavior = _arena_summary(results)
     return {
@@ -403,6 +414,12 @@ def _arena_summary(
     are read together rather than by two functions with an identical loop body
     reading every replay dict twice.
 
+    The walk itself now happens in the worker -- `diagnostics.arena_reduction`,
+    passed to `play_series` as `ARENA_REDUCER` -- so what arrives here is already
+    the pair of aggregates and `replay` is None. This loop only folds them, which
+    is what makes it cheap enough to run five of concurrently. The fold order is
+    unchanged, so the totals are identical to walking the replays here.
+
     Only complete seat-swapped pairs contribute, matching `summarize()`.
     """
 
@@ -411,10 +428,12 @@ def _arena_summary(
     for forward, reverse in results.values():
         if forward.failed or reverse.failed:
             continue
-        for result, seat in ((forward, 0), (reverse, 1)):
-            if isinstance(result.replay, dict):
-                diagnostics += diagnose_replay(result.replay, seat)
-                behavior += behavior_from_replay(result.replay, seat)
+        for result in (forward, reverse):
+            if result.reduction is None:
+                continue
+            match_diagnostics, match_behavior = result.reduction
+            diagnostics += match_diagnostics
+            behavior += match_behavior
     return diagnostics, behavior
 
 

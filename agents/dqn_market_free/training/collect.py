@@ -25,7 +25,12 @@ import numpy as np
 
 from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
-from agents.dqn_market_free.order_space import ACTION_COUNT, ACTIONS, OrderDecision
+from agents.dqn_market_free.order_space import (
+    ACTION_COUNT,
+    ACTIONS,
+    LAND_ORDER,
+    OrderDecision,
+)
 from agents.dqn_market_free import lots
 from agents.dqn_market_free.training.reward import OPPONENT_WEIGHT, episode_rewards
 from sim.workers import (
@@ -253,9 +258,23 @@ class Recorder:
         for step, decision in zip(self.order_steps, self.decisions):
             if not 0 <= step < len(emitted):
                 continue
-            if decision.chosen:
+            # `buy_land`, not just `chosen`. A land turn puts `[["BUY_LAND"]]` on the
+            # wire while `chosen` stays NOOP, because `OrderDecision` splits the two
+            # so the learner is credited with the row it actually contributed --
+            # which, for a decision `should_buy_land` made without consulting the
+            # network, is nothing. `emitted` is not credit: it is whether an order
+            # went out. Reading `chosen` alone charged `IDLE_PENALTY` on every turn
+            # the agent spent a quadrant's price, and told `order_refused` to skip a
+            # turn that did emit.
+            if decision.chosen or decision.buy_land:
                 emitted[step] = True
-            ops[step] = ACTIONS[int(decision.chosen)].op
+            # The wire op on a land turn, for the same reason. `lots.match` reads this
+            # only through `_is_bought_stock`'s `op == "BUY_PRODUCT"` test, so the
+            # label cannot open or close a lot either way -- but a turn that moved a
+            # quadrant's price is not a NOOP, and the trace should not say it was.
+            ops[step] = (
+                LAND_ORDER.op if decision.buy_land else ACTIONS[int(decision.chosen)].op
+            )
 
         shaped, raw, money = episode_rewards(
             self.money,

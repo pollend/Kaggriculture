@@ -517,6 +517,30 @@ def behavior_from_replay(replay: dict[str, Any], seat: int) -> BehaviorCounts:
     )
 
 
+def arena_reduction(result: Any, seat: int) -> tuple[OrderDiagnostics, BehaviorCounts] | None:
+    """Both replay aggregates for one seat, folded inside the worker.
+
+    Passed to `sim.arena.play_series(..., reduce=...)` by name, so it runs in the
+    process that played the episode rather than in the updater thread that
+    collects the series. Two things move with it: the replay stops being pickled
+    back (it is the largest thing a `MatchResult` carries and the gate never
+    persists it), and these two walks -- `_lot_use` alone rebuilds the whole
+    per-turn trace and re-runs `lots.match` -- stop being serialised by the GIL
+    against every other model updating at the same time.
+
+    A failed match reduces to None: `_arena_summary` already drops incomplete
+    pairs, so nothing reads it, and a crashed episode's replay is not worth
+    walking.
+    """
+
+    if getattr(result, "failed", False):
+        return None
+    replay = getattr(result, "replay", None)
+    if not isinstance(replay, dict):
+        return None
+    return diagnose_replay(replay, seat), behavior_from_replay(replay, seat)
+
+
 def _seat_observation(step: Any, seat: int) -> dict[str, Any]:
     if not isinstance(step, list) or not (0 <= seat < len(step)):
         return {}

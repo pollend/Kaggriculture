@@ -20,13 +20,19 @@ import torch
 from numpy.testing import assert_array_equal
 
 from agents.dqn_market_free import diagnostics, donor
-from agents.dqn_market_free.diagnostics import OrderDiagnostics, diagnose_order_lists
+from agents.dqn_market_free.diagnostics import (
+    OrderDiagnostics,
+    arena_reduction,
+    diagnose_order_lists,
+)
+from agents.dqn_market_free.herd import goose_influenced_roles
 from agents.dqn_market_free.main import MarketFreeAgent, load_network
 from agents.dqn_market_free.market_state import MARKET_STATE_DIM as STATE_DIM
 from agents.dqn_market_free.order_space import (
     ACTION_COUNT,
     ACTIONS,
     HIRE_QUANTITIES,
+    LAND_ORDER,
     NOOP_INDEX,
     QUANTITIES,
     Order,
@@ -35,6 +41,7 @@ from agents.dqn_market_free.order_space import (
     nearest_quantity,
     order_index,
     order_is_structurally_possible,
+    should_buy_land,
 )
 from agents.dqn_market_free.planting import market_influenced_roles
 from agents.dqn_market_free.policy import OrderQNetwork
@@ -51,7 +58,7 @@ from agents.dqn_market_free.training.replay import ReplayBuffer
 from agents.dqn_market_free.training.updater import (
     SELF_SPEC,
     SOURCE_KIND,
-    _arena_order_diagnostics,
+    _arena_summary,
     _arena_viability,
     _behavior_clone_step,
     _behavior_clone_steps_per_update,
@@ -384,10 +391,10 @@ def test_every_action_round_trips_to_wire_form():
         if order.op == "HIRE":
             # No hand count exists on the wire: N hands is N identical orders.
             assert wire == [["HIRE"]] * order.quantity
-        elif order.op == "BUY_LAND":
-            assert wire == [["BUY_LAND"]]
         else:
             assert wire == [[order.op, order.item, order.quantity]]
+    # Off the head, but still an order: `should_buy_land` emits it directly.
+    assert LAND_ORDER.to_wire() == [["BUY_LAND"]]
 
 
 def test_hire_carries_a_hand_count_because_the_simulator_will_not():
@@ -422,7 +429,8 @@ def test_quantity_ladder_covers_what_real_agents_order():
 
 def test_order_index_maps_observed_orders_and_rejects_unknown_ones():
     assert ACTIONS[order_index("SELL", "WHEAT", 13)].op == "SELL"
-    assert ACTIONS[order_index("BUY_LAND", None, 0)] == Order("BUY_LAND")
+    # Not a row since v44, so it has no index -- `clone` counts it apart instead.
+    assert order_index("BUY_LAND", None, 0) is None
     # A bare `["HIRE"]` row carries no count; it means one hand.
     assert ACTIONS[order_index("HIRE", None, 0)] == Order("HIRE", None, 1)
     # Unnameable here: the caller must drop the demonstration order, not guess.
@@ -447,17 +455,24 @@ def test_structurally_impossible_orders_are_absent_from_the_action_list():
     assert emittable("BUY_PRODUCT", "FERTILIZER")
     assert not emittable("BUY_PRODUCT", "CARROT")
 
-    # Market-directed planting makes every crop actionable. Goose remains
-    # impossible because the donor scheduler never creates a goose role.
+    # Market-directed planting makes every crop actionable, and `herd.py` houses a
+    # bought goose the donor's COW/SHEEP planner would never assign, so EGG is
+    # reachable too -- the donor's `CORE_HERD_SEQUENCE` is no longer what decides.
     assert emittable("BUY_SEED", "TOMATO")
-    assert not emittable("BUY_ANIMAL", "GOOSE")
+    assert emittable("BUY_ANIMAL", "GOOSE")
     assert emittable("SELL", "TOMATO")
-    assert not emittable("SELL", "EGG")
+    assert emittable("SELL", "EGG")
     assert emittable("BUY_SEED", "MELON")
     assert emittable("BUY_ANIMAL", "COW")
     assert emittable("SELL", "MILK")
 
-    assert len(ACTIONS) == ACTION_COUNT == 186
+    # Land is not an action here: `land_score` decides it and `should_buy_land`
+    # emits it, so the head carries no column whose Q anything would read.
+    assert not emittable("BUY_LAND")
+    assert not order_is_structurally_possible(LAND_ORDER)
+    assert not [order for order in ACTIONS if order.op == "BUY_LAND"]
+
+    assert len(ACTIONS) == ACTION_COUNT == 199
     assert all(order_is_structurally_possible(order) for order in ACTIONS)
 
 
@@ -574,6 +589,120 @@ def test_a_crop_with_no_planned_tile_cannot_take_a_melon_one():
     )
     tomato = {position for position, role in roles.items() if role == ("CROP", "TOMATO")}
     assert not (tomato & planned_melon), "tomato took a melon tile"
+
+
+def test_a_bought_goose_claims_a_slot_the_donor_planner_never_would():
+    """The purchase has to reach the field layer or it is 300 coins in the shed.
+
+    `donor._role_plan` binds every reserved animal slot from `("COW", "SHEEP")`,
+    so nothing downstream ever emits `BUILD_COOP`. `herd` claims the slot instead,
+    and the donor's own job scheduler -- which reads `ANIMALS[role_item]` rather
+    than a species name -- builds the right structure with no donor change.
+    """
+
+    obs, farm, private = _fresh_market_free_state({})
+    private["shed"]["GOOSE"] = 1
+    base = donor._role_plan(obs, farm)
+    assert not [role for role in base.values() if role == ("ANIMAL", "GOOSE")]
+
+    roles = goose_influenced_roles(obs, farm, private, base)
+    geese = [position for position, role in roles.items() if role == ("ANIMAL", "GOOSE")]
+    assert len(geese) == 1, "one bird, one slot"
+    # Nearest to the shed first, which is `_reserved_animal_slots`' own ordering:
+    # `interval` 1 against `max_held` 4 is a harvest visit every three days.
+    assert geese[0] == donor._reserved_animal_slots(farm)[0][0]
+
+    jobs = donor._field_jobs(obs, farm, private, roles, liquidation=False)
+    assert [job["action"] for job in jobs].count(["BUILD_COOP"]) == 1
+    # And a second bird is not conjured for a slot nobody bought.
+    assert [job["action"] for job in jobs].count(["BUILD_PASTURE"]) == len(
+        [role for role in roles.values() if role == ("ANIMAL", "COW")]
+    ) + len([role for role in roles.values() if role == ("ANIMAL", "SHEEP")])
+
+
+def test_an_empty_coop_is_not_dug_out_before_the_bird_can_be_placed():
+    """The failure mode that makes the whole overlay load-bearing.
+
+    `BUILD_COOP` and `PLACE GOOSE` are different turns, so every goose passes
+    through a bare coop. The donor plans that slot from `("COW", "SHEEP")` alone,
+    and a COW role on a `COOP` with no `"animal"` is exactly the
+    `replace_incompatible_structure` condition -- the untouched donor demolishes
+    the coop in the gap, every time, and the bird never lands. The same tile state
+    recurs after the simulator's two-unfed-days escape rule.
+    """
+
+    obs, farm, private = _fresh_market_free_state({})
+    private["shed"]["GOOSE"] = 1
+    x, y = donor._reserved_animal_slots(farm)[0][0]
+    farm["tiles"][y][x] = {"kind": "COOP"}
+
+    base = donor._role_plan(obs, farm)
+    assert base[(x, y)] == ("ANIMAL", "COW"), "the donor still mis-plans it; that is the point"
+    dug = [
+        job
+        for job in donor._field_jobs(obs, farm, private, base, liquidation=False)
+        if job["reason"] == "replace_incompatible_structure"
+    ]
+    assert [job["target"] for job in dug] == [(x, y)]
+
+    roles = goose_influenced_roles(obs, farm, private, base)
+    assert roles[(x, y)] == ("ANIMAL", "GOOSE")
+    jobs = donor._field_jobs(obs, farm, private, roles, liquidation=False)
+    assert "replace_incompatible_structure" not in [job["reason"] for job in jobs]
+    assert [job["target"] for job in jobs if job["action"] == ["PLACE", "GOOSE"]] == [(x, y)]
+
+
+def test_a_placed_goose_keeps_its_own_role_rather_than_being_re_planned():
+    """A live bird is never handed back to the donor's COW/SHEEP binding.
+
+    `_role_plan` preserves an animal already standing on a slot only through
+    `if actual in assigned`, and `assigned` is `{"COW": 0, "SHEEP": 0}`. The
+    mismatch dig spares the tile while it carries an `"animal"`, so this one is not
+    immediately destructive -- but the role is what `_seed_needs`, the state's
+    `role_targets` block and the liquidation path all read, and a goose counted as
+    a cow misreports every one of them.
+    """
+
+    obs, farm, private = _fresh_market_free_state({})
+    x, y = donor._reserved_animal_slots(farm)[0][0]
+    farm["tiles"][y][x] = {"kind": "COOP", "animal": "GOOSE", "placed_day": 0, "yield_units": 0}
+
+    base = donor._role_plan(obs, farm)
+    assert base[(x, y)] == ("ANIMAL", "COW")
+
+    roles = goose_influenced_roles(obs, farm, private, base)
+    assert roles[(x, y)] == ("ANIMAL", "GOOSE")
+    jobs = donor._field_jobs(obs, farm, private, roles, liquidation=False)
+    assert ["DIG"] not in [job["action"] for job in jobs if job["target"] == (x, y)]
+    # Feed and care are keyed off the tile, not the role, so they survive either
+    # way -- what must not appear is a second bird planned for an occupied slot.
+    assert [job["action"] for job in jobs].count(["PLACE", "GOOSE"]) == 0
+
+
+def test_a_bare_coop_is_adopted_even_where_the_donor_planned_nothing():
+    """A built-but-unfilled coop is invisible to the donor's role back-fill.
+
+    `_unit_actions` back-fills a role for a tile outside `roles` only when it
+    already carries an `"animal"` (`donor.py:929-936`), so an empty coop -- the
+    turn after `BUILD_COOP`, and again after the simulator's two-unfed-days escape
+    rule reverts the tile -- would never receive its `PLACE GOOSE` job.
+    """
+
+    obs, farm, private = _fresh_market_free_state({})
+    private["shed"]["GOOSE"] = 1
+    slots, _zones = donor._reserved_animal_slots(farm)
+    spare = next(position for position in [(0, 0), (1, 0), (0, 1)] if position not in slots)
+    x, y = spare
+    farm["tiles"][y][x] = {"kind": "COOP"}
+
+    roles = goose_influenced_roles(obs, farm, private, donor._role_plan(obs, farm))
+    assert roles[spare] == ("ANIMAL", "GOOSE")
+    # The coop already houses the bird we hold, so no second slot is claimed.
+    assert [position for position, role in roles.items() if role == ("ANIMAL", "GOOSE")] == [spare]
+
+    jobs = donor._field_jobs(obs, farm, private, roles, liquidation=False)
+    placements = [job for job in jobs if job["action"] == ["PLACE", "GOOSE"]]
+    assert [job["target"] for job in placements] == [spare]
 
 
 def test_the_seed_deficit_the_network_is_shown_counts_the_whole_plan():
@@ -706,28 +835,43 @@ def _diagnostic_replay(seat_zero_orders: list, seat_one_orders: list) -> dict:
     }
 
 
+def _reduced(replay: dict, seat: int, *, failed: bool = False) -> SimpleNamespace:
+    """A match as it comes back from `play_series(..., reduce=ARENA_REDUCER)`.
+
+    The worker folds the replay and clears it, so this mirrors both halves --
+    reducing for the given seat and handing `_arena_summary` a result with no
+    replay left to read.
+    """
+
+    result = SimpleNamespace(failed=failed, replay=replay)
+    result.reduction = arena_reduction(result, seat)
+    result.replay = None
+    return result
+
+
 def test_arena_diagnostics_follow_the_learner_across_seat_swaps():
     """The learner is seat 0 forward and seat 1 reverse; only its orders count."""
 
-    forward = SimpleNamespace(
-        failed=False,
-        replay=_diagnostic_replay([["SELL", "WHEAT", 2]], []),
-    )
-    reverse = SimpleNamespace(
-        failed=False,
+    forward = _reduced(_diagnostic_replay([["SELL", "WHEAT", 2]], []), 0)
+    reverse = _reduced(
         # Seat 0 here is the opponent and must not be counted.
-        replay=_diagnostic_replay(
+        _diagnostic_replay(
             [["SELL", "CARROT", 2], ["BUY_PRODUCT", "CARROT", 2]],
             [["BUY_SEED", "WHEAT", 2]],
         ),
+        1,
     )
 
-    diagnostics = _arena_order_diagnostics({7: (forward, reverse)})
+    diagnostics, behavior = _arena_summary({7: (forward, reverse)})
     assert diagnostics.decisions == 2
     assert diagnostics.orders == 2
+    # Read in the same pass, so the fingerprint has to cover the same two seats.
+    assert behavior.episodes == 2
 
-    failed = SimpleNamespace(failed=True, replay=forward.replay)
-    assert _arena_order_diagnostics({7: (forward, failed)}).decisions == 0
+    # A failed match reduces to nothing, and its pair is dropped whole.
+    failed = _reduced(_diagnostic_replay([["SELL", "WHEAT", 2]], []), 1, failed=True)
+    assert failed.reduction is None
+    assert _arena_summary({7: (forward, failed)})[0].decisions == 0
 
 
 def _viability_result(
@@ -1447,6 +1591,38 @@ def test_self_play_pool_addresses_the_free_market_entry_point(tmp_path: Path):
     assert all(spec.startswith("agents/dqn_market_free/") for spec in pool)
 
 
+def test_batch_zero_of_a_pure_mirror_run_seeds_the_quiet_network(tmp_path: Path):
+    """The one index a pure-mirror run cannot serve, and what fills it now.
+
+    `opponents = []` with `self_play_after` read as `batch_index >= 1` leaves batch
+    0 with no mix at all. Raising there made a fresh `SLOT_PREFIX` illegal, and the
+    prefix is the only thing that severs a stale reward regime -- so the rule
+    "move the prefix when the reward moves" could not be followed. The quiet network
+    is the same baseline the promotion gate already treats as a real incumbent.
+    """
+
+    from agents.dqn_market_free.training.updater import _quiet_opponent, _weights_spec
+
+    context = SimpleNamespace(artifacts=tmp_path, model_id="free.model")
+    spec = _quiet_opponent(context, {"seed": 0})
+    baseline = tmp_path / "viability_baselines" / "quiet.npz"
+
+    assert baseline.exists()
+    assert spec == _weights_spec(baseline)
+    assert spec.startswith("agents/dqn_market_free/")
+
+    # Written once and reused, so batch 0 does not face a different opponent
+    # depending on when the file happened to be created.
+    stamp = baseline.stat().st_mtime_ns
+    assert _quiet_opponent(context, {"seed": 7}) == spec
+    assert baseline.stat().st_mtime_ns == stamp
+
+    # And it really is the silent policy: every action scores 0.0, so the argmax
+    # ties to NOOP and the opponent trades nothing.
+    network = OrderQNetwork.load(baseline)
+    assert np.allclose(network(np.zeros(STATE_DIM, dtype=np.float32)), 0.0)
+
+
 def test_self_play_pool_follows_the_lineage_not_the_release():
     """A run that has promoted nothing must still be able to face itself.
 
@@ -1780,6 +1956,14 @@ def test_the_slot_score_reads_the_rollout_mean_by_default():
     `own_mean_final_money` against 48.2% for the windowed benchmark median. The
     arena number is four times noisier than one the update already computes, and
     three irreversible decisions were riding on it.
+
+    The key is `recent_mean_final_money`, not `own_mean_final_money`. The latter is
+    taken over `recent + reservoir`, and the reservoir is a uniform sample of
+    everything evicted since the reseed, so a third of it is history by
+    construction: measured on `market-free-mirroronly-v38`, `own_mean_final_money`
+    read 4,493 where the ten batches just collected averaged 8,570. Medianing that
+    over eleven updates left the plateau detector grading a policy several updates
+    old.
     """
 
     seen: list[str] = []
@@ -1788,20 +1972,44 @@ def test_the_slot_score_reads_the_rollout_mean_by_default():
         def fetchall(self, sql, parameters):
             seen.append(sql)
             return [
-                (json.dumps({"own_mean_final_money": value}),)
+                (json.dumps({"recent_mean_final_money": value}),)
                 for value in (2_000.0, 6_000.0, 3_000.0, 9_000.0)
             ]
 
     # The default arm reads `metrics_json`, never `gate_json`, and never needs an
     # opponent -- a rollout mean is not a comparison against anybody.
-    score = updater_module._slot_score(Reader(), "free.model", None, None, 5, 0, rollout=4_000.0)
-    assert score == pytest.approx(4_000.0), "the median of the window including this update"
+    score = updater_module._slot_score(Reader(), "free.model", None, None, 5, 0, rollout=8_000.0)
+    # Median of [8000, 2000, 6000, 3000, 9000], which is neither this update's own
+    # draw nor the window's mean -- so the windowing is actually exercised.
+    assert score == pytest.approx(6_000.0)
     assert "metrics_json" in seen[-1] and "gate_json" not in seen[-1]
 
     # And it is the default, so a config that names nothing gets it.
     assert updater_module._slot(_SLOT_CONFIG).score_signal == "rollout"
     # A slot with no rollout measurement is "no information", not a stall.
     assert updater_module._slot_score(Reader(), "free.model", None, 40.0, 5, 0) is None
+
+
+def test_the_rollout_window_skips_rows_written_before_the_signal_narrowed():
+    """The diluted key is not a substitute for the FIFO-only one.
+
+    `own_mean_final_money` is a different quantity -- the whole buffer rather than
+    its recent segment -- and folding old rows into the same median would put a step
+    in the series that no policy change caused. A short window for one cycle is the
+    honest cost.
+    """
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            return [
+                (json.dumps({"own_mean_final_money": 1.0}),),
+                (json.dumps({"recent_mean_final_money": 5_000.0}),),
+                (json.dumps({}),),
+            ]
+
+    score = updater_module._slot_score(Reader(), "free.model", None, None, 5, 0, rollout=9_000.0)
+    # Only this update and the one row carrying the new key.
+    assert score == pytest.approx(7_000.0)
 
 
 def test_an_unrepeatable_high_score_does_not_end_a_slot():
@@ -2069,11 +2277,22 @@ def test_a_missing_money_measurement_scores_zero_rather_than_raising():
 
 
 def test_the_released_trading_rate_is_read_not_re_simulated():
-    """Same route as `_released_benchmark_money`: one row, no arena time."""
+    """Same route as `_released_benchmark_money`: one row, no arena time.
+
+    `hard_viability.benchmarks` is built exactly as `update` writes it --
+    `dict(zip(benchmarks, benchmark_viability))`, a **mapping keyed on the opponent
+    spec**. The fixture used to be a list of dicts, which no code path produces, and
+    that is the whole reason this passed while the reader iterated the mapping's
+    keys, matched nothing, and silently returned the head-to-head's rate instead:
+    a different arena against a different opponent, with a plausible number.
+    """
 
     gate = {
         "hard_viability": {
-            "benchmarks": [{"trading_rate": 0.31, "passed": True}],
+            "benchmarks": {
+                "other": {"trading_rate": 0.77, "passed": True},
+                "bench": {"trading_rate": 0.31, "passed": True},
+            },
             "head_to_head": {"trading_rate": 0.29},
         }
     }
@@ -2094,8 +2313,50 @@ def test_the_released_trading_rate_is_read_not_re_simulated():
     assert updater_module._released_trading_rate(reader, Active(), "bench") == 0.31
     assert reader.queries == 1
 
+    # The named opponent, never index 0 and never the head-to-head.
+    assert updater_module._released_trading_rate(Reader(), Active(), "other") == 0.77
+
     # No incumbent, and a payload that never recorded it, both read as "unknown".
     assert updater_module._released_trading_rate(reader, None, "bench") is None
+
+
+def test_the_released_trading_rate_survives_the_payload_update_actually_writes():
+    """End to end against `update`'s own construction, not a hand-built dict.
+
+    The reader and the writer live 3,000 lines apart and disagreed about the shape
+    of this key for as long as the fixture above was a list. Building the payload
+    the way `update` does is the only version of this test that can catch that.
+    """
+
+    benchmarks = ["agents/donor/main.py", "agents/second/main.py"]
+    viability = [
+        {"passed": True, "trading_rate": 0.42},
+        {"passed": True, "trading_rate": 0.08},
+    ]
+    gate = {
+        "hard_viability": {
+            "passed": True,
+            "head_to_head": {"passed": True, "trading_rate": 0.001},
+            "benchmarks": dict(zip(benchmarks, viability)),
+        }
+    }
+
+    class Reader:
+        def fetchone(self, sql, parameters):
+            return (json.dumps(gate),)
+
+    class Active:
+        checkpoint_id = "ckpt-a"
+
+    rate = updater_module._released_trading_rate(Reader(), Active(), benchmarks[0])
+    assert rate == 0.42
+
+    # And the discount it feeds. Reading the head-to-head instead put a policy that
+    # traded 42% of its turns on the pool at 1% of its money -- a 100x error in the
+    # ranking the cull and every reseed draw read.
+    scored = updater_module._population_score(3000.0, rate, {})
+    assert scored["activity_factor"] == 1.0
+    assert scored["score"] == 3000.0
 
 
 def test_an_older_gate_payload_falls_back_through_the_benchmark_diagnostics():
@@ -2493,10 +2754,20 @@ def test_a_warm_start_bypasses_the_graduation_floors():
 
 
 def test_a_slot_warm_starts_once_and_then_never_again():
-    """The marker it writes advances `lr_reseed_index`, which is the whole defence.
+    """The advanced `lr_reseed_index` is the whole defence.
 
     No separate flag to reconcile, and a re-firing warm start would restart the
     slot on every update forever -- it would never train at all.
+
+    An *adopted* warm start advances that index without writing `reseed_pending`.
+    `_materialize_warm_start` drew the ancestor and wrote the bytes before
+    generation 0, `collect` rolled that generation out of them, and the update
+    trained from them -- so there is nothing left to materialize and no abandoned
+    policy for a batch floor to discard. Writing the marker anyway sent
+    `_slot_state` back through the reseed branch, which reset
+    `updates_since_reseed` to 0 a second time: two consecutive updates at a
+    learning rate of exactly zero, and `reseed_batch_floor` throwing away the
+    generation collected from the very network being adopted.
     """
 
     spec = updater_module._slot(_SLOT_CONFIG)
@@ -2504,14 +2775,49 @@ def test_a_slot_warm_starts_once_and_then_never_again():
 
     first = _warm_start_state(spec)
     assert first.reseed_index == 0
+    assert first.learning_rate == 0.0, "the first update of a virgin slot is the warmup floor"
     assert updater_module._warm_starts(first, spec, members)
 
-    # What the warm-starting update records: its own state plus the marker.
+    # What an adopted warm-starting update records: its own state, with the index
+    # advanced and the mirror bound set. No `reseed_pending`.
+    adopted = replace(first, reseed_index=first.reseed_index + 1, after_checkpoint_id="ckpt-1")
+    recorded = {**adopted.as_metrics(), "warm_start_adopted": True}
+    assert "reseed_pending" not in recorded
+
+    second = updater_module._slot_state(recorded, spec)
+
+    assert second.reseed_index == 1
+    assert not updater_module._warm_starts(second, spec, members)
+    # The point of the change: the slot trains on its second update rather than
+    # spending another whole generation at zero.
+    assert second.updates_since_reseed == 1
+    assert second.learning_rate == pytest.approx(spec.peak / spec.warmup_updates)
+    assert second.learning_rate > 0.0
+    # Generation 0 was collected from the adopted network, so it is kept.
+    assert second.batch_floor == 0
+    # And the mirror is still bounded below at the adoption.
+    assert second.after_checkpoint_id == "ckpt-1"
+
+
+def test_an_unadopted_warm_start_still_takes_the_ordinary_reseed_path():
+    """`population_warm_start_min_updates > 0` is the case with nothing on disk.
+
+    That slot has trained, its collection came from its own lineage rather than
+    from a materialized adoption, and the batches behind it do belong to a policy
+    it is leaving. So it writes the marker, discards them, and warms up from zero
+    exactly as a graduation does.
+    """
+
+    spec = updater_module._slot(_SLOT_CONFIG)
+    members = _members(900.0)
+
+    first = _warm_start_state(spec)
     recorded = {**first.as_metrics(), "reseed_pending": True, "reseed_batch_floor": 50}
     second = updater_module._slot_state(recorded, spec)
 
     assert second.reseed_index == 1
     assert second.batch_floor == 50, "the pre-warm-start batches are discarded"
+    assert second.learning_rate == 0.0
     assert not updater_module._warm_starts(second, spec, members)
 
 
@@ -2985,24 +3291,25 @@ def test_a_half_written_sigma_pair_is_refused(tmp_path):
 def test_noise_explores_like_the_policy_not_like_a_coin():
     """The claim this whole change rests on, stated as a measurement.
 
-    Epsilon draws uniformly over feasible actions with NOOP removed, so 97 of the
-    186 actions -- every BUY, HIRE and BUY_LAND rung -- are spending, and the
-    share of exploring turns that spend money is a property of the action space
-    rather than of the policy. Weight noise perturbs Q instead, so it can only
-    move the argmax between actions that were already close: a purchase the
-    network scores far below its best action stays unreachable.
+    Epsilon draws uniformly over feasible actions with NOOP removed, so 99 of the
+    199 actions -- every BUY and HIRE rung -- are spending, and the share of
+    exploring turns that spend money is a property of the action space rather
+    than of the policy. Weight noise perturbs Q instead, so it can only move the
+    argmax between actions that were already close: a purchase the network scores
+    far below its best action stays unreachable.
+
+    The ruinous row used to be `BUY_LAND`, the most expensive one there is. It is
+    not on the head any more, so the largest remaining outlay stands in: four
+    sheep at 500 apiece, against a 3,000 stake.
     """
 
-    ruinous = order_index("BUY_LAND", None, 1)
-    if ruinous is None:
-        ruinous = next(
-            index for index, action in enumerate(ACTIONS) if action.op == "BUY_LAND"
-        )
+    ruinous = order_index("BUY_ANIMAL", "SHEEP", 4)
+    assert ruinous is not None
     preferred = order_index("SELL", "WHEAT", 1)
     assert preferred is not None
 
     network = OrderQNetwork.random(seed=7, sigma0=0.5)
-    # A head whose mu says, unambiguously, that BUY_LAND is the worst thing here.
+    # A head whose mu says, unambiguously, that the purchase is the worst thing here.
     weight, bias = network.layers[-1]
     bias = np.zeros_like(bias)
     bias[preferred] = 10.0
@@ -3020,7 +3327,7 @@ def test_noise_explores_like_the_policy_not_like_a_coin():
     assert ruinous not in chosen, "weight noise must never reach a clearly-bad purchase"
 
     # The contrast this replaced: uniform exploration over the feasible actions
-    # reached the same purchase constantly, because 97 of the 186 actions spend
+    # reached the same purchase constantly, because 99 of the 199 actions spend
     # money and the draw never consulted the network. That branch was removed at
     # v13, so what is asserted here is the bound alone: the perturbation is
     # scaled by the Q gap, and a purchase mu says is ruinous stays unreachable.
@@ -3103,7 +3410,7 @@ def test_the_ladder_never_explores_above_the_setpoint():
     across the ordinary ladder and bought zero land; on `falloff-v18` the hot
     rungs' land rate was 4.6% against the ordinary rungs' 4.9%.
 
-    97 of 186 actions spend money, so a widened policy is broke before a rare
+    99 of 199 actions spend money, so a widened policy is broke before a rare
     action is affordable. Escaping a stuck trajectory is the population's job now.
     """
 
@@ -4161,6 +4468,117 @@ def test_cloned_history_block_matches_the_live_agent():
     assert np.abs(live[start:, block:]).sum() > 0.0
 
 
+def test_a_land_purchase_is_not_recorded_as_an_idle_turn():
+    """`buy_land` is the wire, `chosen` is the credit, and `emitted` follows the wire.
+
+    `order_space.OrderDecision` deliberately splits the two: `should_buy_land` decides
+    land without consulting the network, so the row the learner is credited with is
+    NOOP while `[["BUY_LAND"]]` goes out on the wire. `Recorder.finish` used to build
+    `emitted` from `chosen` alone, which made every land turn look like a turn the
+    policy sat out -- so `IDLE_PENALTY` was charged on the one turn an episode spends
+    a quadrant's price, and `order_refused` was told to skip a turn that did emit.
+
+    Nothing pinned this, and the flag existed unread for exactly that reason.
+    """
+
+    from agents.dqn_market_free.market_state import MARKET_STATE_DIM
+    from agents.dqn_market_free.order_space import (
+        LAND_ORDER,
+        NOOP_INDEX,
+        OrderDecision,
+        ACTIONS,
+    )
+    from agents.dqn_market_free.training.reward import IDLE_PENALTY
+
+    def _record(*, buy_land: bool):
+        recorder = Recorder()
+        state = np.zeros(MARKET_STATE_DIM, dtype=np.float32)
+        obs, farm, private = _fresh_market_free_state({})
+        for turn in range(4):
+            order = LAND_ORDER if (buy_land and turn == 1) else ACTIONS[NOOP_INDEX]
+            recorder.record_decision(
+                decision=OrderDecision(
+                    state,
+                    order,
+                    NOOP_INDEX,
+                    None,
+                    buy_land=buy_land and turn == 1,
+                )
+            )
+            # The same wallet in both arms, so the flag is the only difference --
+            # otherwise the comparison picks up the outcome annuity too.
+            #
+            # The 1,000 lands at index 2, not 1. `record_decision` runs before
+            # `record_turn`, and the money in `farm` has only been through the
+            # *previous* turn's market phase, so the spend from the decision paid at
+            # index 1 first shows up in `money[2]`. Dropping it at index 1 instead
+            # makes `raw[1]` zero, and an emitted order that moved no money is a
+            # refusal -- which is what this test caught on its first run.
+            money = 3000.0 - (1000.0 if turn >= 2 else 0.0)
+            recorder.record_turn(money=money, obs=obs, farm=farm, private=private)
+        return recorder.finish(3000.0, 3000.0, gamma=0.999)
+
+    idle = _record(buy_land=False)
+    land = _record(buy_land=True)
+
+    # Index 1 is idle in one arm and a land purchase in the other, so the land arm
+    # must be better by exactly the charge the idle arm pays and by nothing else.
+    spared = float(land.reward[1] - idle.reward[1])
+    assert spared == pytest.approx(IDLE_PENALTY * (1 - 1 / 4), abs=1e-7), (
+        "the land turn is still being charged as idle"
+    )
+    # It is spared, not merely repriced: an emitted order that moved no money would
+    # take `REJECTED_ORDER_PENALTY` instead, which is five times larger.
+    assert float(land.reward[1]) == pytest.approx(0.0, abs=1e-9)
+    # Every other turn is untouched.
+    np.testing.assert_allclose(
+        np.delete(land.reward, 1), np.delete(idle.reward, 1), atol=1e-9
+    )
+
+
+@pytest.mark.slow
+def test_a_cloned_episode_and_a_live_one_carry_the_same_reward_stream():
+    """One episode, two recorders, one stream. The other half of the history check.
+
+    A demonstration and a rollout share one buffer, so they are only the same kind
+    of sample if every trace behind the reward is built the same way. Three copies
+    of that builder used to exist and had already drifted -- `collect` fell back to
+    `turn // TURNS_PER_DAY` for a missing `day` while `clone` fell back to 0, which
+    reads as "the whole season is still ahead" to `land_potential`. They now share
+    `lots.sample`, and `ops` is `ACTIONS[chosen].op` on both sides so
+    `SEED_WASTE_WEIGHT` bills the same lots either way.
+    """
+
+    from kaggle_environments import make
+
+    recorder = Recorder()
+    learner = MarketFreeAgent(
+        OrderQNetwork.random(seed=3),
+        rng=np.random.default_rng(0),
+        recorder=recorder,
+    )
+    env = make("kaggriculture", debug=True)
+    env.run([learner, str(SNAPSHOT_PATH)])
+    replay = env.toJSON()
+
+    final = replay["steps"][-1][0]["observation"]["farms"]
+    live = recorder.finish(
+        float(final[0].get("money", 0) or 0),
+        float(final[1].get("money", 0) or 0),
+        0.999,
+    )
+    cloned, _stats = record_from_replay(replay, seat=0)
+    assert cloned is not None
+
+    # The clone is one turn behind: `steps[0]` is the environment's own reset, so
+    # it cannot compute a difference for the live agent's first turn.
+    assert live.reward.shape[0] >= cloned.reward.shape[0]
+    width = cloned.reward.shape[0]
+    np.testing.assert_allclose(cloned.reward[:width], live.reward[:width], atol=1e-6)
+    # Not trivially equal because both are flat: a random head trades.
+    assert float(np.abs(np.diff(live.reward[:width])).sum()) > 0.0
+
+
 @pytest.mark.slow
 def test_demonstrations_convert_without_losing_orders_to_the_action_list():
     """Every order a real agent placed must be nameable, or the clone learns NOOP.
@@ -4170,6 +4588,13 @@ def test_demonstrations_convert_without_losing_orders_to_the_action_list():
     all -- a schema problem, and it must be zero. `orders_over_budget` is the
     demonstrator's second and later orders on one turn, which this agent
     structurally cannot emit; that loss is expected and bounded.
+
+    `orders_land` is the third acceptable bucket and the newest. `BUY_LAND` is no
+    longer a column in the head -- `should_buy_land` owns that decision and the
+    network never votes on it -- so a demonstrator's land order is neither mapped
+    nor unrepresentable. It has to be counted separately or the totals come up
+    short by exactly the land rows, which is what they did for as long as
+    `orders_land` was accumulated nowhere.
     """
 
     # Measured whole: the opening turns are the burstiest part of an episode,
@@ -4181,7 +4606,13 @@ def test_demonstrations_convert_without_losing_orders_to_the_action_list():
     assert record.order_chosen.shape == (record.decisions,)
 
     assert stats.orders_unrepresentable == 0
-    assert stats.orders_mapped + stats.orders_over_budget == stats.orders_seen
+    assert (
+        stats.orders_mapped + stats.orders_over_budget + stats.orders_land
+        == stats.orders_seen
+    )
+    # And land is genuinely accounted for rather than the sum being made to close
+    # by a bucket that is always zero.
+    assert stats.orders_land > 0
 
     # The standing check on the feasibility mask. The donor is solvent and the
     # simulator accepted every order it placed, so those orders are feasible by
@@ -4191,6 +4622,11 @@ def test_demonstrations_convert_without_losing_orders_to_the_action_list():
     assert stats.orders_masked_infeasible == 0, (
         f"mask forbade {stats.orders_masked_infeasible} orders the donor actually placed"
     )
+    # `BUY_LAND` is excluded from that count and tracked on its own, because since
+    # v43 the row carries `land_score`'s decision rather than a feasibility claim.
+    # The donor buys a quadrant this heuristic declines, and that disagreement is
+    # the change working rather than the mask being wrong.
+    assert stats.orders_masked_land >= 0
     assert record.order_mask.shape == (record.decisions, ACTION_COUNT)
     for index in range(record.decisions):
         assert record.order_mask[index][int(record.order_chosen[index])]
@@ -4347,11 +4783,9 @@ def test_agent_completes_an_episode_against_the_donor():
 # --------------------------------------------------------------------------
 # Framework seams
 #
-# The three objects the lab actually reaches for. None of them was covered
-# before, and each is a place where a signature change fails at run time rather
-# than at import: `train.trainer` is resolved by string, `finalize_episode` is
-# duck-typed by `sim.runner`, and `evaluate_episode` is resolved through
-# `main.__getattr__`.
+# Three objects the lab resolves late -- `train.trainer` by string,
+# `finalize_episode` by duck-typing, `evaluate_episode` through
+# `main.__getattr__` -- so a signature change fails at run time, not at import.
 # --------------------------------------------------------------------------
 
 
@@ -4836,13 +5270,7 @@ def test_the_opponent_leg_keeps_the_annuity_flat_across_the_season():
 
 
 # --------------------------------------------------------------------------
-# The outcome annuity
-#
-# The terminal margin lump lands on one turn of ~720 and the buffer samples
-# 24-turn windows, so ~3% of transitions ever saw it as a reward. The rest waited
-# on a bootstrap chain up to 720 links deep to learn whether their episode made
-# money. The annuity pays `(1 - gamma) * outcome` on every step so the signal
-# arrives by gradient instead.
+# The outcome annuity -- see `reward.OUTCOME_ANNUITY_WEIGHT`.
 # --------------------------------------------------------------------------
 
 
@@ -5160,19 +5588,8 @@ def test_the_penalty_is_smaller_than_the_terminal_signal():
 
 
 # --------------------------------------------------------------------------
-# The insolvency floor
-#
-# Bankruptcy is an opportunity cost, and the money delta cannot express one: the
-# wallet does not go negative, so spending the last of the stake reads as a
-# one-off -0.15 and everything it forecloses shows up only as the absence of
-# later fills. Measured on `market-free-simple-v2`: the policy spent the whole
-# 3,000 on `HIRE 13` orders by turn four and then held NOOP for 715 turns, which
-# is what the buffer was made of.
-#
-# It is charged on a *streak*, not on a turn. Pricing every below-floor turn also
-# priced the wallet dipping under the floor between a purchase and the sale that
-# funds it, which is the opposite of what the constant was bought for -- see
-# `INSOLVENCY_GRACE_TURNS` for the v26 measurement that moved it.
+# The insolvency floor, charged on a *streak* rather than on a turn -- see
+# `reward.INSOLVENCY_GRACE_TURNS`.
 # --------------------------------------------------------------------------
 
 
@@ -5305,16 +5722,7 @@ def test_the_insolvency_charge_is_the_scale_of_the_outcome_not_of_a_fill():
 
 
 # --------------------------------------------------------------------------
-# The unlocked-land potential
-#
-# The one policy-invariant term in `reward.py`, and the only reason it is allowed
-# to exist beside four terms that are deliberately not. Buying a plot creates
-# crop roles the frozen donor can work, but it pays back through harvests ten
-# days later, which reaches the purchase decision only through a terminal outcome
-# discounted 0.999^720 = 0.49 in 24-turn hops -- while the 1,000-coin cost lands
-# in the money trace immediately. Measured on `market-free-streak-v27`
-# generations 2-6: seats that bought land planted 38.0 against 36.9, lost 22.6
-# plants against 15.1, and finished on a median of 2 coins against 400.
+# The unlocked-land potential -- see `reward.LAND_POTENTIAL_WEIGHT`.
 # --------------------------------------------------------------------------
 
 
@@ -5475,22 +5883,29 @@ def test_the_land_trace_is_optional_and_absent_is_bit_identical():
 
 
 def test_the_purchase_bonus_is_paid_once_on_the_turn_the_quadrant_appears():
-    """The non-telescoping term, and the reason it exists.
+    """The non-telescoping term, and the reason it existed.
 
     The potential above is policy-invariant by construction -- it can move when
     credit arrives and can never change which policy is optimal, which is why it
     has never moved the land rate in six sessions. This one is meant to change
     the optimum, so it has to land on the purchase and survive the discount.
+
+    Passed explicitly since v43, because the module default is 0.0: `BUY_LAND` left
+    the head and the tilt has nothing left to tilt. The mechanism stays tested --
+    turning it back on is the revert path if land returns to the argmax.
     """
 
     from agents.dqn_market_free.training.reward import LAND_PURCHASE_BONUS, episode_rewards
+
+    assert LAND_PURCHASE_BONUS == 0.0, "retired with the handle; this test drives it directly"
+    bonus = 0.035
 
     money, days = _land_season()
     turns_per_day = 24
     quadrants = [1 if day < 5 else 2 for day in days]
 
     with_bonus, _, _ = episode_rewards(
-        money, money[-1], money[-1], 0.999, quadrants=quadrants, days=days
+        money, money[-1], money[-1], 0.999, quadrants=quadrants, days=days, land_bonus=bonus
     )
     without, _, _ = episode_rewards(
         money, money[-1], money[-1], 0.999, quadrants=quadrants, days=days, land_bonus=0.0
@@ -5499,7 +5914,7 @@ def test_the_purchase_bonus_is_paid_once_on_the_turn_the_quadrant_appears():
 
     paid = np.flatnonzero(np.abs(delta) > 1e-9)
     assert paid.tolist() == [5 * turns_per_day - 1], "one payment, on the buying turn"
-    assert float(delta.sum()) == pytest.approx(LAND_PURCHASE_BONUS, abs=1e-6)
+    assert float(delta.sum()) == pytest.approx(bonus, abs=1e-6)
     # And unlike the potential it does *not* telescope away -- that is the point.
     assert _discounted(delta) > 1e-3
 
@@ -5511,17 +5926,17 @@ def test_the_purchase_bonus_never_repays_the_whole_outlay():
     the purchase turn. A bonus at or above that makes the land free and the
     agent buys it whether or not it can work it -- the failure that ran through
     v26 generations 2-5 at 18% of seats and a mean of 488 coins.
+
+    Driven at the retired 0.035 rather than at the module default, which is 0.0
+    since v43; see the test above.
     """
 
-    from agents.dqn_market_free.training.reward import (
-        LAND_PURCHASE_BONUS,
-        MONEY_SCALE,
-        episode_rewards,
-    )
+    from agents.dqn_market_free.training.reward import MONEY_SCALE, episode_rewards
     from agents.dqn_market_free import donor
 
+    bonus = 0.035
     outlay = donor.LAND_PRICES[0] / MONEY_SCALE
-    assert LAND_PURCHASE_BONUS < outlay, "the bonus must not cancel the purchase"
+    assert bonus < outlay, "the bonus must not cancel the purchase"
 
     # Priced down the ladder, so a dearer quadrant is not overpaid for its cost.
     days = [1] * 6
@@ -5530,13 +5945,13 @@ def test_the_purchase_bonus_never_repays_the_whole_outlay():
     for owned in range(len(donor.LAND_PRICES)):
         quadrants = [owned + 1] * 3 + [owned + 2] * 3
         shaped, _, _ = episode_rewards(flat, flat[-1], flat[-1], 0.999, quadrants=quadrants,
-                                       days=days, land_weight=0.0)
+                                       days=days, land_weight=0.0, land_bonus=bonus)
         base, _, _ = episode_rewards(flat, flat[-1], flat[-1], 0.999, quadrants=quadrants,
                                      days=days, land_weight=0.0, land_bonus=0.0)
         paid.append(float((np.asarray(shaped) - np.asarray(base)).sum()))
 
     assert paid == pytest.approx(
-        [LAND_PURCHASE_BONUS * donor.LAND_PRICES[0] / price for price in donor.LAND_PRICES],
+        [bonus * donor.LAND_PRICES[0] / price for price in donor.LAND_PRICES],
         abs=1e-6,
     )
     assert paid[0] > paid[1] > paid[2], "a dearer plot pays less, not more"
@@ -5566,12 +5981,9 @@ def test_the_land_potential_has_no_cycle_to_pump():
 
 
 # --------------------------------------------------------------------------
-# Feasibility masking
-#
-# The measured failure this exists for: on a live run the policy emitted an
-# order on 84% of turns and the simulator accepted 1% of them. It had settled on
-# selling goods it did not own -- SELL is 88 of the 186 actions -- and could not
-# leave, because nothing it could sell would exist until it first bought seed.
+# Feasibility masking. Roughly half the action space is unusable until the farm
+# produces something, and a policy that cannot leave that state emits refused
+# orders forever.
 # --------------------------------------------------------------------------
 
 
@@ -5585,16 +5997,26 @@ def _mask_state(
     field: dict | None = None,
     day: int = 0,
     seeds: dict | None = None,
+    plants: int = 0,
 ):
+    tiles = [
+        [None if x < 5 and y < 5 else "LOCKED" for x in range(10)] for y in range(10)
+    ]
+    # `land_score`'s utilisation factor is `plants / (plants + plantable)`, so a
+    # board with nothing in the ground scores zero however much cash it holds --
+    # which is the whole reason day 0 cannot buy land any more. A case that wants
+    # to probe something *other* than utilisation has to plant first.
+    for index in range(int(plants)):
+        y, x = divmod(index, 5)
+        if y < 5:
+            tiles[y][x] = {"kind": "PLANT", "crop": "WHEAT", "yield_units": 0}
     farm = {
         "money": money,
         "unlocked_quadrants": list(quadrants),
         "hires_today": hires_today,
         # A real grid: the simulator's `_do_buy_land` walks it to unlock tiles,
         # and the ground-truth test probes that function directly.
-        "tiles": [
-            [None if x < 5 and y < 5 else "LOCKED" for x in range(10)] for y in range(10)
-        ],
+        "tiles": tiles,
         "hands": [],
         "farmer": [4, 4],
     }
@@ -5680,12 +6102,22 @@ def test_the_mask_matches_the_simulator_action_by_action():
                     sim._do_hire(probe_farm, probe_private, 10, 1)
                 accepted = len(probe_farm["hands"]) == hands + order.quantity
             elif order.op == "BUY_LAND":
-                # The one deliberate divergence. `_land_is_survivable` masks land
+                # The first deliberate divergence. `_land_is_survivable` masks land
                 # the simulator would happily sell, because affordability alone
                 # offers 1,000 against the 3,000 stake on turn 0 and the measured
                 # result is 190 coins. Asserting parity here would pin the very
                 # behaviour that gate exists to remove, so the row is skipped and
                 # covered by its own tests instead.
+                continue
+            elif order.op == "BUY_SEED":
+                # The second, and the stronger one: seed past the plan's deficit is
+                # not a bad bet, it is a dead coin. `BUY_SEED` is quoted at a
+                # constant and commits into `private["seeds"]`, `SELL` reads
+                # `private["shed"]` only, `planting.py` drops what the tiles cannot
+                # absorb, and held seed liquidates to nothing -- so the simulator
+                # accepting the order says nothing about it being worth taking.
+                # Parity here would pin the over-buying the cap exists to remove.
+                # Covered by the seed-cap tests below.
                 continue
             else:
                 if order.op == "SELL":
@@ -5742,12 +6174,15 @@ def test_the_mask_sees_the_shed_this_turn_will_fill():
 def test_quantity_never_changes_feasibility():
     """Per-unit commits with partial fills: one bit per (op, item), not per row.
 
-    `HIRE` is the one exception and is checked separately below: its cost rises
-    within the order, so the rungs are not interchangeable.
+    `HIRE` and `BUY_SEED` are the two exceptions and are checked separately below.
+    Both spend on the whole quantity rather than filling per unit against stock the
+    agent already holds, so their rungs are not interchangeable: `HIRE` because the
+    fibonacci cost ladder rises within the order, `BUY_SEED` because the emitted
+    order is clamped to the plan's deficit and priced on the clamped quantity.
     """
 
     mask = _mask(money=137.0, shed={"WHEAT": 2})
-    for op in ("SELL", "BUY_SEED", "BUY_PRODUCT", "BUY_ANIMAL"):
+    for op in ("SELL", "BUY_PRODUCT", "BUY_ANIMAL"):
         for item in {order.item for order in ACTIONS if order.op == op}:
             rows = _rows(op, item)
             assert len(set(mask[rows].tolist())) == 1, f"{op} {item} splits on quantity"
@@ -5782,26 +6217,37 @@ def test_buying_needs_money_and_shed_room():
     assert not full[_rows("BUY_PRODUCT")].any()
 
 
-#: A farm that has already satisfied the land gate's readiness tests: mid-season,
-#: seed on hand for every planned tile, cash to spare. Cases that want to probe
-#: something *other* than readiness start from here.
+#: A farm that scores well on every factor `land_score` reads: mid-season, seed on
+#: hand for every planned tile, twenty of its twenty-five tiles already worked, and
+#: cash to spare. Cases that want to probe one factor start from here and spoil it.
+#:
+#: Twenty plants is what makes this state legal at all. Utilisation is
+#: `plants / (plants + plantable)`, so an unplanted farm scores zero at any wealth.
 _READY_FOR_LAND = {
     "day": 5,
+    "plants": 20,
     "seeds": {"MELON": 40, "WHEAT": 40, "CARROT": 40, "TOMATO": 40, "STRAWBERRY": 40},
 }
 
 
 def test_land_runs_out_and_hiring_gets_dearer():
     assert _mask(money=3000.0, quadrants=("NW",), **_READY_FOR_LAND)[_rows("BUY_LAND")].all()
-    # Capped at two extra quadrants, tighter than the simulator's three: the
-    # third costs 4,000 and nothing on record has come close to working two.
-    assert not _mask(money=99_999.0, quadrants=("NW", "NE", "SW"), **_READY_FOR_LAND)[
+    # All three the simulator sells are reachable, not the donor's two. `MAX_EXTRA_LAND
+    # = 2` is read out of a frozen file and its stated reason -- "nothing on record has
+    # come close to working two" -- is false: purchases per buyer reach 1.72-1.81 on
+    # four slots, so the cap binds, and the leaderboard's best own all four quadrants.
+    assert _mask(money=99_999.0, quadrants=("NW", "NE", "SW"), **_READY_FOR_LAND)[
         _rows("BUY_LAND")
-    ].any()
-    # Nothing left to buy at any price.
+    ].all()
+    # Nothing left to buy at any price: four quadrants is the whole board.
     assert not _mask(money=99_999.0, quadrants=("NW", "NE", "SW", "SE"), **_READY_FOR_LAND)[
         _rows("BUY_LAND")
     ].any()
+    # And the third is still a score, not a right: 4,000 coins on a farm that has
+    # stopped working what it owns is refused on utilisation like any other.
+    assert not _mask(
+        money=99_999.0, quadrants=("NW", "NE", "SW"), **{**_READY_FOR_LAND, "plants": 0}
+    )[_rows("BUY_LAND")].any()
     # fib(9) = 55, so nine hands deep the tenth needs 55 coins -- and an eleventh
     # in the same order needs 55 + 89 on top, which 55 does not cover.
     assert not _mask(money=54.0, hires_today=9)[_rows("HIRE")].any()
@@ -5811,7 +6257,7 @@ def test_land_runs_out_and_hiring_gets_dearer():
 
 
 def test_land_is_shut_until_the_farm_can_actually_work_it():
-    """Each readiness test in `_land_is_survivable`, failed one at a time.
+    """Each veto and each factor in `land_score`, spoiled one at a time.
 
     Affordability alone is what produced the measured record: day-0 purchases
     finish on a mean of 190 coins across 2,124 seats, and 49.4% of all accepted
@@ -5821,19 +6267,133 @@ def test_land_is_shut_until_the_farm_can_actually_work_it():
     rows = _rows("BUY_LAND")
     assert _mask(money=3000.0, **_READY_FOR_LAND)[rows].all(), "the ready farm must pass"
 
-    # Day 0: affordable, and the whole of the bankruptcy tail.
+    # Day 0, and it is the *utilisation* factor that refuses it rather than the day
+    # floor: nothing is in the ground on turn 0 at any wealth, which is what stops
+    # the lateness term from making day 0 the best day to expand.
     assert not _mask(money=3000.0, **{**_READY_FOR_LAND, "day": 0})[rows].any()
+    assert not _mask(money=99_999.0, **{**_READY_FOR_LAND, "day": 1, "plants": 0})[rows].any()
 
-    # Too late to pay for itself. Land has no salvage value at the buzzer.
+    # Too late to pay for itself. Land has no salvage value at the buzzer, and the
+    # horizon factor has decayed to nothing well before the twelve-day veto bites.
     assert not _mask(money=3000.0, **{**_READY_FOR_LAND, "day": 19})[rows].any()
+    assert not _mask(money=3000.0, **{**_READY_FOR_LAND, "day": 16})[rows].any()
 
     # Seed the plan still needs. Buying area before seed is how a quadrant ends
     # up with none of its 25 tiles planted.
-    assert not _mask(money=3000.0, day=5, seeds={"MELON": 1})[rows].any()
+    assert not _mask(money=3000.0, day=5, plants=20, seeds={"MELON": 1})[rows].any()
 
-    # Price alone is covered, a day's hiring on top is not.
+    # The wage reserve. This farm works 20 of its 25 tiles on day 5, so
+    # `horizon * worked` is 0.722 * 0.8 = 0.578 and `LAND_BUY_SET_POINT = 0.15`
+    # wants a runway of 0.260 reserves on top of the 1,000 price and the 609
+    # reserve -- 1,767 coins.
+    assert not _mask(money=1760.0, **_READY_FOR_LAND)[rows].any()
+    assert _mask(money=1780.0, **_READY_FOR_LAND)[rows].all()
+    # A wallet that cannot cover the price at all is refused whatever else is true.
     assert not _mask(money=1000.0, **_READY_FOR_LAND)[rows].any()
-    assert _mask(money=1200.0, **_READY_FOR_LAND)[rows].all()
+
+
+def test_utilisation_counts_tiles_and_not_the_plan_it_was_handed():
+    """The hole a traced episode found, on the first run of the heuristic.
+
+    `planting.market_influenced_roles` rewrites every vacant crop role from the
+    seed actually held, so a farm holding seed for three tiles has a plan wanting
+    three tiles. Utilisation read off that plan calls a farm with twenty bare tiles
+    nearly full, and the traced episode duly opened the gate on **day 2 holding
+    3,000 untouched coins** -- the day-0 purchase this score exists to refuse.
+
+    Read off the tiles it cannot be talked into that, whatever the plan says.
+    """
+
+    from agents.dqn_market_free.order_space import land_utilisation
+
+    _, bare, _, _ = _mask_state(day=2, plants=0)
+    _, half, _, _ = _mask_state(day=2, plants=12)
+    _, full, _, _ = _mask_state(day=2, plants=25)
+
+    assert land_utilisation(bare) == 0.0
+    assert land_utilisation(half) == pytest.approx(12 / 25)
+    assert land_utilisation(full) == 1.0
+
+    # Locked ground is not idle ground -- it is not tiles yet, and counting it
+    # would make the second quadrant permanently un-buyable.
+    assert sum(tile == "LOCKED" for row in full["tiles"] for tile in row) == 75
+
+    # A weed is bare ground with extra steps: 25 tiles of weeds is a farm working
+    # none of them, not a farm working all of them.
+    weedy = {
+        **full,
+        "tiles": [
+            [{"kind": "WEED"} if tile is not None and tile != "LOCKED" else tile for tile in row]
+            for row in full["tiles"]
+        ],
+    }
+    assert land_utilisation(weedy) == 0.0
+
+    # And the day-2 state that started this stays shut at every wealth, because a
+    # bare farm's utilisation is zero and the score is a product.
+    assert not _mask(
+        money=99_999.0, day=2, plants=0, seeds={"MELON": 40, "WHEAT": 40}
+    )[_rows("BUY_LAND")].any()
+
+
+def test_the_wage_reserve_prices_the_crew_the_new_tiles_need():
+    """The tile factor, which is the whole reason the reserve is not a constant.
+
+    Hands are wiped nightly, so a day's wage is the whole fibonacci prefix and not
+    the marginal hand. A quadrant doubles the area, which takes `_target_hands` from
+    its floor of 10 to the simulator's cap of 13 and the daily bill from 143 to 609.
+    Reserving against the crew the farm *has* would under-price expansion by 4.3x.
+    """
+
+    from agents.dqn_market_free.order_space import (
+        LAND_RESERVE_DAYS,
+        _daily_wage,
+        land_reserve,
+    )
+
+    obs, farm, private, _ = _mask_state(money=9000.0, **_READY_FOR_LAND)
+    roles = donor._role_plan(obs, farm)
+    target_now = donor._target_hands(obs, farm, private, roles)
+
+    assert target_now == 10
+    assert land_reserve(obs, farm, private, roles) == LAND_RESERVE_DAYS * _daily_wage(13, 1.0)
+    assert land_reserve(obs, farm, private, roles) > LAND_RESERVE_DAYS * _daily_wage(
+        target_now, 1.0
+    )
+
+    # The second quadrant saturates against `MAX_HANDS`, so it costs no more in
+    # wages -- it costs more in price instead, and the runway factor reads both.
+    obs2, farm2, private2, _ = _mask_state(
+        money=9000.0, quadrants=("NW", "NE"), **_READY_FOR_LAND
+    )
+    roles2 = donor._role_plan(obs2, farm2)
+    assert land_reserve(obs2, farm2, private2, roles2) == land_reserve(
+        obs, farm, private, roles
+    )
+
+
+def test_the_land_constants_are_what_the_session_was_run_at():
+    """Pinned by value, because every one of them is a measured trade.
+
+    A run's land behaviour is not comparable across a silent change to any of
+    these, and the sessions doc quotes all four.
+    """
+
+    import agents.dqn_market_free.order_space as order_space_module
+    from agents.dqn_market_free.training import reward as reward_module
+
+    assert order_space_module.LAND_MIN_DAY == 1
+    assert order_space_module.LAND_MIN_DAYS_LEFT == 12
+    assert order_space_module.LAND_RESERVE_DAYS == 1.0
+    assert order_space_module.LAND_BUY_SET_POINT == 0.15
+    assert order_space_module.QUADRANT_TILES == 25
+    # Three, not the donor's two -- see the constant. Four quadrants is the board,
+    # so there is no fourth purchase to allow.
+    assert order_space_module.LAND_MAX_EXTRA == 3
+    assert order_space_module.LAND_MAX_EXTRA == len(donor.LAND_PRICES)
+    # The bonus that existed to tilt the argmax toward a row the argmax no longer
+    # ranks. Retired with the handle, not with the evidence for it.
+    assert reward_module.LAND_PURCHASE_BONUS == 0.0
 
 
 def test_the_land_gate_reads_the_plan_it_is_handed():
@@ -5883,13 +6443,100 @@ def test_the_opening_turn_closes_selling_and_leaves_buying_open():
     """One number for the whole pruning, so a regression is visible."""
 
     mask = _mask()
-    assert int(mask.sum()) == 97
-    # 97 not 98: land is shut on the opening turn now. It was the 1,000-coin
-    # offer against the 3,000 stake, and taking it finished on 190.
+    assert int(mask.sum()) == 67
+    # 67, and the seed cap is the whole of the drop from the old 97. Land is shut
+    # on the opening turn: it was the 1,000-coin offer against the 3,000 stake, and
+    # taking it finished on 190.
     assert not mask[_rows("BUY_LAND")].any()
     assert not mask[_rows("SELL")].any()
-    assert mask[_rows("BUY_SEED")].all()
     assert mask[_rows("HIRE")].all()
+
+    # Seed is no longer all-or-nothing. 22 of 55 rows, and every one of them is a
+    # rung the plan can actually absorb: MELON 10 vacant tiles opens 1..8, WHEAT 4
+    # and CARROT 2 and TOMATO 0 sit at the `SEED_PROBE_UNITS` floor of 4, and
+    # STRAWBERRY's 5 opens 1..4 because the next rung is 6.
+    assert int(mask[_rows("BUY_SEED")].sum()) == 22
+    melon = _rows("BUY_SEED", "MELON")
+    assert [ACTIONS[row].quantity for row in melon if mask[row]] == [1, 2, 3, 4, 6, 8]
+
+
+def test_seed_rows_are_capped_at_what_the_plan_can_plant():
+    """The cap itself: rungs above the deficit are shut, not clamped onto it.
+
+    Clamping would bound the spend just as well but leave every rung above the
+    allowance aliased onto one emitted order, which is eleven rows for one outcome.
+    """
+
+    from agents.dqn_market_free import order_space
+    from agents.dqn_market_free.order_space import feasible_actions, seed_room
+
+    obs, farm, private, field = _mask_state(money=3000.0)
+    roles = donor._role_plan(obs, farm)
+    room = seed_room(obs, farm, private, roles)
+    mask = feasible_actions(obs, farm, private, field, None, roles=roles)
+
+    for crop, rows in order_space._BUY_SEED_ROWS.items():
+        allowance = room.get(crop, 0)
+        for row in rows:
+            expected = ACTIONS[row].quantity <= allowance
+            assert bool(mask[row]) is expected, f"{crop} {ACTIONS[row].quantity}"
+
+
+def test_a_seed_rung_must_be_affordable_at_its_whole_quantity():
+    """The `HIRE` convention, applied to the other op that spends on the quantity.
+
+    Seed is the one buy with no price impact -- `_commit_unit` quotes the constant
+    `CROPS[item]["seed"]` -- so `quantity * price` is exact rather than a model of
+    the market, which is what makes the strict test safe here. Under the old
+    one-unit rule `BUY_SEED MELON 45` was open against 80 coins and the simulator
+    part-filled it by draining the wallet.
+    """
+
+    from agents.dqn_market_free import order_space
+    from agents.dqn_market_free.order_space import feasible_actions
+
+    obs, farm, private, field = _mask_state(money=200.0)
+    roles = donor._role_plan(obs, farm)
+    mask = feasible_actions(obs, farm, private, field, None, roles=roles)
+
+    price = float(donor.CROPS["MELON"]["seed"])  # 80
+    open_rungs = [
+        ACTIONS[row].quantity
+        for row in order_space._BUY_SEED_ROWS["MELON"]
+        if mask[row]
+    ]
+    assert open_rungs == [1, 2], "200 coins buys two melon seeds at 80, not three"
+    assert all(quantity * price <= 200.0 for quantity in open_rungs)
+
+
+def test_the_probe_floor_keeps_a_crop_reachable_once_the_plan_forgets_it():
+    """The lock-in the cap would otherwise ratchet into, and why the floor exists.
+
+    `planting.market_influenced_roles` rewrites vacant crop roles from *held* seed,
+    so a farm hoarding wheat has its melon tiles reassigned to wheat and
+    `donor._seed_needs` then reports no melon demand at all. A cap read only off the
+    plan would shut the melon rows permanently, and the plan follows the inventory,
+    so nothing could ever reopen them -- monoculture with no way back.
+    """
+
+    from agents.dqn_market_free import order_space
+    from agents.dqn_market_free.order_space import feasible_actions, seed_room
+
+    obs, farm, private, field = _mask_state(money=3000.0)
+    private["seeds"] = {"WHEAT": 30}
+    roles = market_influenced_roles(obs, farm, private, donor._role_plan(obs, farm))
+
+    assert donor._seed_needs(obs, farm, private, roles).get("MELON", 0) == 0, (
+        "the plan really has forgotten melon; that is the condition under test"
+    )
+
+    room = seed_room(obs, farm, private, roles)
+    assert room["MELON"] == order_space.SEED_PROBE_UNITS
+    mask = feasible_actions(obs, farm, private, field, None, roles=roles)
+    assert mask[_rows("BUY_SEED", "MELON")].any(), "melon must stay reachable"
+    # And the hoarded crop gets nothing further: 30 held against a plan that wants
+    # fewer is exactly the purchase the cap exists to refuse.
+    assert not mask[_rows("BUY_SEED", "WHEAT")].any()
 
 
 def test_greedy_choice_skips_a_masked_peak():
@@ -5898,7 +6545,9 @@ def test_greedy_choice_skips_a_masked_peak():
     obs, farm, private, field = _mask_state()
     mask = feasible_actions(obs, farm, private, field, None)
     forbidden = _rows("SELL", "WHEAT")[0]
-    allowed = order_index("BUY_SEED", "WHEAT", 6)
+    # Rung 4, not 6: wheat's opening allowance is its 4 vacant tiles, so the seed
+    # cap shuts every rung above that and 6 would be masked for the wrong reason.
+    allowed = order_index("BUY_SEED", "WHEAT", 4)
     assert not mask[forbidden] and mask[allowed]
 
     class PeakedOnForbidden:
@@ -5910,6 +6559,73 @@ def test_greedy_choice_skips_a_masked_peak():
 
     decision = choose_order(np.zeros(STATE_DIM, dtype=np.float32), PeakedOnForbidden(), mask=mask)
     assert decision.chosen == allowed
+
+
+def test_expansion_is_decided_without_asking_the_network():
+    """`BUY_LAND` is not on the head at all, so there is no Q value to overrule.
+
+    v42 asked `Q(BUY_LAND) - Q(NOOP)` and that did not take, because the row it
+    read was dead: `buy_land_rate` ran 0.000-0.050 across all ten slots over batches
+    351-390 against v33's 0.37. A gated row is starved of gradient, so its Q is
+    arbitrary in exactly the states where the gate opens. v43 stopped reading it and
+    v44 stopped carrying it. `should_buy_land` is the whole decision now, and this
+    pins that the head can neither force the purchase nor talk the caller out of it.
+    """
+
+    rival = order_index("BUY_SEED", "WHEAT", 6)
+
+    def net(noop: float = 0.0, best: float = 99.0):
+        def call(_state):
+            scores = np.full(ACTION_COUNT, -5.0, dtype=np.float32)
+            scores[NOOP_INDEX] = noop
+            scores[rival] = best
+            return scores
+
+        return call
+
+    state = np.zeros(STATE_DIM, dtype=np.float32)
+    mask = np.ones(ACTION_COUNT, dtype=np.bool_)
+
+    # The rival scores 99 against everything else at -5, and it still does not get
+    # the turn: the caller said land, so land is what goes on the wire. The row the
+    # learner is credited with is NOOP, because that is what the network contributed.
+    bought = choose_order(state, net(best=99.0), mask, buy_land=True)
+    assert bought.buy_land
+    assert bought.order == LAND_ORDER
+    assert bought.wire() == [["BUY_LAND"]]
+    assert bought.chosen == NOOP_INDEX
+
+    # And with the decision the other way the head is back in charge, whatever it
+    # thinks of doing nothing.
+    declined = choose_order(state, net(noop=1000.0, best=99.0), mask, buy_land=False)
+    assert not declined.buy_land
+    assert declined.chosen == NOOP_INDEX, "NOOP outscores the rival, so NOOP wins"
+    assert choose_order(state, net(best=99.0), mask).chosen == rival
+
+
+def test_the_land_decision_is_a_preference_and_never_touches_the_mask():
+    """Feasibility and preference stay apart, which is what let the row leave.
+
+    `feasible_actions` used to carry the land decision in a mask entry -- a claim
+    about what the simulator would accept, standing in for a claim about what was
+    worth doing. Nothing in the mask knows about land any more, and the mask's width
+    is one column shorter for it.
+    """
+
+    obs, farm, private, field = _mask_state(money=3000.0, **_READY_FOR_LAND)
+    assert should_buy_land(obs, farm, private, config=None)
+
+    mask = feasible_actions(obs, farm, private, field, None)
+    assert mask.shape == (ACTION_COUNT,)
+    assert not [order for order in ACTIONS if order.op == "BUY_LAND"]
+
+    # A wallet that cannot cover the quadrant refuses it before the score is read,
+    # and a board with nothing planted refuses it on `land_utilisation` -- the two
+    # halves of `should_buy_land`, neither of which is a feasibility claim.
+    poor_obs, poor_farm, poor_private, _field = _mask_state(money=10.0, **_READY_FOR_LAND)
+    assert not should_buy_land(poor_obs, poor_farm, poor_private, config=None)
+    bare_obs, bare_farm, bare_private, _field = _mask_state(money=100_000.0)
+    assert not should_buy_land(bare_obs, bare_farm, bare_private, config=None)
 
 
 def test_the_masked_choice_agrees_between_numpy_and_torch():
@@ -6070,7 +6786,7 @@ def test_the_per_action_scale_agrees_between_numpy_and_torch():
 
 
 def test_a_scale_vector_skips_layers_it_does_not_fit():
-    """`noisy_layers = "all"` must not receive the 186-wide action vector."""
+    """`noisy_layers = "all"` must not receive the 199-wide action vector."""
 
     module = net_module.build(noisy="all", sigma0=0.5)
     scale = np.full(ACTION_COUNT, 5.0, dtype=np.float32)
@@ -6095,22 +6811,27 @@ def test_the_sigma_scale_is_never_below_one():
 
 
 def test_the_widening_targets_the_rows_the_run_has_not_sampled():
-    from agents.dqn_market_free.order_space import NOOP_INDEX
+    from agents.dqn_market_free.order_space import NOOP_INDEX, _BUY_LAND_ROW
     from agents.dqn_market_free.training import rare
 
-    land = order_index("BUY_LAND", None, 0)
+    rare_row = order_index("BUY_ANIMAL", "SHEEP", 4)
     chosen = np.full(ACTION_COUNT, 500.0)
-    chosen[land] = 0.0
+    chosen[rare_row] = 0.0
+    chosen[_BUY_LAND_ROW] = 0.0
     opportunities = np.ones(ACTION_COUNT)
     never_feasible = order_index("SELL", "WHEAT", 45)
     opportunities[never_feasible] = 0.0
 
     scale = rare.sigma_scale_vector(chosen, opportunities, gain=1.0, cap=3.0)
-    assert scale[land] > scale[order_index("HIRE", None, 1)]
+    assert scale[rare_row] > scale[order_index("HIRE", None, 1)]
     assert scale[NOOP_INDEX] == 1.0, "extra mass on the collapse attractor"
     assert scale[never_feasible] == 1.0, (
         "a row the mask always refuses would arrive at full width the moment it opens"
     )
+    # The rarest row of all, and since v43 the one noise cannot reach: `land_score`
+    # decides it and `choose_order` never reads the head there, so widening it
+    # spends the whole budget on a column that cannot change a decision.
+    assert scale[_BUY_LAND_ROW] == 1.0
 
 
 def test_the_widening_decays_as_a_row_accumulates_visits():
@@ -6118,14 +6839,14 @@ def test_the_widening_decays_as_a_row_accumulates_visits():
 
     from agents.dqn_market_free.training import rare
 
-    land = order_index("BUY_LAND", None, 0)
+    row = order_index("BUY_ANIMAL", "SHEEP", 4)
     opportunities = np.ones(ACTION_COUNT)
     unsampled = np.full(ACTION_COUNT, 500.0)
-    unsampled[land] = 0.0
+    unsampled[row] = 0.0
     sampled = np.full(ACTION_COUNT, 500.0)
 
-    wide = rare.sigma_scale_vector(unsampled, opportunities, 1.0, 3.0)[land]
-    narrow = rare.sigma_scale_vector(sampled, opportunities, 1.0, 3.0)[land]
+    wide = rare.sigma_scale_vector(unsampled, opportunities, 1.0, 3.0)[row]
+    narrow = rare.sigma_scale_vector(sampled, opportunities, 1.0, 3.0)[row]
     assert wide > narrow >= 1.0
 
 
@@ -6296,11 +7017,9 @@ def test_the_counts_round_trip_and_a_stale_width_is_dropped(tmp_path: Path):
 
 # --- The behaviour archive -------------------------------------------------
 #
-# The mature group used to be a ranking, and a ranking cannot hold a population
-# apart. `logmoney-v26` collapsed from 3.66 distinct crops per seat at generation
-# 4 to 1.29 by generation 15 and locked onto wheat, on *rising* money, so neither
-# the promotion gate nor `_population_score`'s activity discount had anything to
-# object to. These cover the reserved berths that are supposed to survive it.
+# A ranking cannot hold a population apart: the roster converges onto a
+# monoculture on *rising* money, so neither the promotion gate nor the activity
+# discount has anything to object to. These cover the reserved berths.
 
 
 def _archive_members(*rows):
@@ -6371,6 +7090,59 @@ def test_the_archive_holds_one_berth_per_cell_best_first():
 
     assert [member["cell"] for member in marked] == [None, (3, 1), (3, 1), (2, 0)]
     assert [member["reserved"] for member in marked] == [False, True, False, True]
+
+
+def test_the_reserve_marking_applies_the_same_money_floor_as_the_cull():
+    """`_graduate` floors a cell berth; the marking has to floor it identically.
+
+    The two halves of the archive disagreed. `_graduate`'s `kept_by_cell` CTE takes
+    only members with `money >= reserved_min_money`, but `_mark_reserved` tagged the
+    best scorer of every cell regardless, on the reasoning that a live row is a row
+    the cull already accepted. That is true of `kept_by_cell` and false of the group
+    as a whole -- `kept_by_score` keeps a member on rank alone and never consults the
+    floor -- so a bankrupt land-buyer held by score was still tagged `reserved` and
+    drawn by `reseed_source_explorer_share`. The floor is the entire safety argument
+    for reserving a berth at all, and that path went around it.
+
+    Undiscounted money, matching `_graduate`: the activity discount is a ranking
+    device and applying it here would bend the bar against a diversified policy
+    twice.
+    """
+
+    members = _archive_members(
+        ("a", 900.0, 3, 1.0, 3000.0),   # clears the floor, holds (3, 1)
+        ("b", 800.0, 2, 1.0, 400.0),    # day-0 land bankrupt, must not hold (2, 1)
+        ("c", 700.0, 2, 1.0, 1600.0),   # same cell, clears the floor
+    )
+    marked = updater_module._mark_reserved(members, 1500.0)
+
+    assert [member["cell"] for member in marked] == [(3, 1), (2, 1), (2, 1)]
+    # `b` outscores `c` and would have taken the berth unfloored.
+    assert [member["reserved"] for member in marked] == [True, False, True]
+
+    # 0.0 is the unfloored marking, which is what a caller wanting only the ranked
+    # list gets and what every pre-archive test measured.
+    assert [m["reserved"] for m in updater_module._mark_reserved(members)] == [
+        True,
+        True,
+        False,
+    ]
+
+
+def test_an_unmeasured_member_never_holds_a_reserved_berth():
+    """Not recorded is not the same as below the floor, and neither may reserve.
+
+    `_graduate`'s `money >= %s` is NULL-false, so the SQL already declines a member
+    with no fingerprint. The marking has to reach the same answer rather than
+    reading a missing number as zero -- or as passing.
+    """
+
+    members = _archive_members(("a", 900.0, 3, 1.0, 3000.0))
+    members[0]["behavior"] = {"episodes": 50, "distinct_crops": 3, "land_per_episode": 1.0}
+
+    assert updater_module._mark_reserved(members, 1500.0)[0]["reserved"] is False
+    # And with no floor at all, since "unmeasured" is not a money question.
+    assert updater_module._mark_reserved(members, 0.0)[0]["reserved"] is False
 
 
 def test_a_reserved_draw_reaches_what_the_ranking_would_have_culled():
@@ -6775,15 +7547,18 @@ def test_the_count_novelty_cannot_see_an_abandoned_row():
 
     opportunities = np.full(ACTION_COUNT, 900_000.0)
     wheat, melon = 1, 2
-    land = updater_module.LAND_INDEX
+    # v26 measured this shape on `BUY_LAND`, which is pinned to 1.0 since v43 and so
+    # can no longer stand in for a starved row. The starvation is the point here, not
+    # the identity of the row, so the next-rarest one carries it.
+    starved = order_index("BUY_ANIMAL", "SHEEP", 4)
     # Bulk first, so `total` matches the run rather than just the three rows the
     # assertions read, then the three rows on top of it.
     chosen = np.full(ACTION_COUNT, (1_150_400 - 46_588.0) / (ACTION_COUNT - 3))
-    chosen[wheat], chosen[melon], chosen[land] = 44_610.0, 1_917.0, 61.0
+    chosen[wheat], chosen[melon], chosen[starved] = 44_610.0, 1_917.0, 61.0
 
     counted = rare.sigma_scale_vector(chosen, opportunities, gain=1.0, cap=3.0)
     assert counted[melon] < 1.1, "the abandoned crop earns essentially nothing"
-    assert counted[updater_module.LAND_INDEX] < 1.6, "and the never-chosen row misses the cap"
+    assert counted[starved] < 1.6, "and the never-chosen row misses the cap"
 
     rated = rare.sigma_scale_vector(
         chosen, opportunities, gain=0.5, cap=3.0, novelty="rate"
@@ -6791,7 +7566,8 @@ def test_the_count_novelty_cannot_see_an_abandoned_row():
     # The ordering the mechanism was always supposed to produce.
     assert rated[wheat] == 1.0, "the overfitted row is not widened at all"
     assert rated[melon] > 1.5
-    assert rated[updater_module.LAND_INDEX] > rated[melon]
+    assert rated[starved] > rated[melon]
+    assert rated[updater_module.LAND_INDEX] == 1.0, "land is decided, not explored"
 
 
 def test_the_rate_novelty_reads_selection_against_opportunity():
@@ -7045,6 +7821,225 @@ def test_the_lot_potential_telescopes_to_nothing_over_an_episode():
     assert totals[2] < totals[1]
 
 
+def test_the_waste_charge_is_off_without_the_ops_trace():
+    """All-or-nothing, and bit-identical when the caller cannot recover the ops.
+
+    `lots.match` will infer the op from the sign of the wallet move when `ops` is
+    None, and that heuristic opens phantom lots on HIRE, BUY_LAND and BUY_ANIMAL
+    turns. A phantom lot here would be a phantom charge, so the term declines to run
+    rather than falling back -- and a caller stuck on the old stream has to be on
+    *exactly* the old stream, not approximately it.
+    """
+
+    from agents.dqn_market_free.training.reward import episode_rewards
+
+    seeds, standing, stock, money, ops = _lot_trace(
+        [(5, "seed", 1, 80.0), (30, "hire", 0, 40.0)]
+    )
+    without = _lot_reward(seeds, standing, stock, money)
+    zeroed = _lot_reward(
+        seeds, standing, stock, money, ops=ops, waste_weight=0.0, gain_weight=0.0
+    )
+    charged = _lot_reward(seeds, standing, stock, money, ops=ops)
+
+    assert np.array_equal(without, zeroed)
+    assert not np.array_equal(without, charged)
+
+
+def test_a_none_inside_a_supplied_ops_trace_is_not_a_licence_to_guess():
+    """The heuristic is all-or-nothing, keyed on the sequence and not on the entry.
+
+    `collect.finish` builds `ops` as `[None] * len(money)` and fills the turns that
+    carried a decision, so a slot the recorder never resolved arrives as None inside
+    a supplied sequence. Keying the fallback on `op is not None` would reinstate the
+    sign heuristic for exactly those turns -- and a phantom lot does more than
+    mis-label itself, it joins the FIFO queue and absorbs the sale a real seed lot is
+    owed, so the real lot reads as unrecovered and `SEED_WASTE_WEIGHT` bills a
+    purchase that did come back.
+
+    The trace below is the shape that triggers it: a harvest landing on a turn that
+    spent coins on something the market ledger does not model.
+    """
+
+    from agents.dqn_market_free import lots
+
+    turns = 40
+    melon = lots.STOCK_ITEMS.index("MELON")
+    seeds = [[0] * len(lots.CROP_ITEMS) for _ in range(turns)]
+    standing = [[0] * len(lots.CROP_ITEMS) for _ in range(turns)]
+    stock = [[0] * len(lots.STOCK_ITEMS) for _ in range(turns)]
+    money = [3_000.0] * turns
+    ops: list[str | None] = [None] * turns
+
+    # Turn 10: stock arrives (a harvest) while the wallet falls (a hire the recorder
+    # did not resolve). Sign-inferred, that reads as `BUY_PRODUCT` at 50 a unit.
+    for later in range(11, turns):
+        stock[later][melon] += 4
+        money[later] -= 200.0
+
+    supplied = lots.match(seeds, stock, money, ops, standing)
+    assert supplied.lots == [], "a None entry must not open a lot"
+
+    inferred = lots.match(seeds, stock, money, None, standing)
+    assert [lot.bought for lot in inferred.lots] == [True], "the fallback still works"
+
+
+def test_a_wasted_seed_lot_is_charged_its_full_cost_on_the_buy_turn():
+    """The charge is `cost / MONEY_SCALE`, not the `(1 - gamma)` residue.
+
+    Both numbers are real and they answer different questions. The *immediate reward*
+    on the buy turn does net to `-(1 - gamma) * cost / MONEY_SCALE`, because the lot
+    potential paid `+gamma * cost` on the same index. But the potential contributes
+    exactly `-PHI(s)` to `Q(s, a)` for every `a`, so it cancels out of
+    `Q(s, buy) - Q(s, noop)` and offsets nothing the policy actually ranks on. The
+    quantity that ranks is the second assertion: the full 80 coins.
+
+    This test previously read the first number as the term's strength and concluded
+    it "cannot drive the NOOP collapse". At `-0.004` against an `IDLE_PENALTY` of
+    `0.0002` it can, which is what `SEED_GAIN_WEIGHT` is paired with it to prevent
+    -- and measurement then showed the pairing does not close it at equal weights,
+    which is why `SEED_WASTE_WEIGHT` is 0.35. The shape is what this test pins; the
+    tuning belongs to
+    `test_the_seed_charge_is_lighter_than_the_credit_it_is_paired_with`.
+    """
+
+    from agents.dqn_market_free.training.reward import (
+        MONEY_SCALE,
+        SEED_WASTE_WEIGHT,
+        IDLE_PENALTY,
+        episode_rewards,
+    )
+
+    seeds, standing, stock, money, ops = _lot_trace(
+        [(5, "seed", 1, 80.0), (10, "plant", 1, 0.0), (20, "harvest", 4, 0.0)]
+    )
+    shaped = _lot_reward(seeds, standing, stock, money, ops=ops)
+    inert = _lot_reward(
+        seeds, standing, stock, money, lot_weight=0.0, waste_weight=0.0, gain_weight=0.0
+    )
+
+    # The immediate reward on the buy turn: the potential's `+gamma * cost` less the
+    # charge. This is the number that is *not* what the policy ranks on, because the
+    # potential cancels out of every `Q(s, a) - Q(s, a')`.
+    net = float(shaped[5] - inert[5])
+    assert net == pytest.approx((0.999 - SEED_WASTE_WEIGHT) * 80.0 / MONEY_SCALE, abs=1e-7)
+
+    charge = float(shaped[5] - _lot_reward(seeds, standing, stock, money)[5])
+    assert charge == pytest.approx(-SEED_WASTE_WEIGHT * 80.0 / MONEY_SCALE, abs=1e-7)
+    # The size that matters, stated against what it competes with on the buy turn.
+    # Still an order of magnitude past the idle charge at the de-biased weight.
+    assert abs(charge) > 5 * IDLE_PENALTY
+
+
+def test_a_seed_lots_profit_is_credited_where_its_loss_would_be_charged():
+    """`SEED_GAIN_WEIGHT` closes the asymmetry `unrecovered()`'s clamp opens.
+
+    With only the charge, a lot sold at 1.1x cost and one sold at 6x cost score
+    identically -- zero -- so the local optimum is the cheapest seed the policy is
+    sure it can recover rather than the most profitable one it can grow. The credit
+    lands on the same index as the charge and is capped at the lot's own cost, so the
+    pair is bounded by the season's seed spend.
+    """
+
+    from agents.dqn_market_free.training.reward import MONEY_SCALE
+
+    sold = _lot_trace(
+        [
+            (5, "seed", 1, 80.0),
+            (10, "plant", 1, 0.0),
+            (20, "harvest", 6, 0.0),
+            (30, "sell", 6, 1_500.0),
+        ]
+    )
+    credited = _lot_reward(*sold[:4], ops=sold[4])
+    plain = _lot_reward(*sold[:4])
+    moved = np.asarray(credited) - np.asarray(plain)
+
+    # 1,420 coins of profit, capped at the 80 the lot cost. Uncapped this would be
+    # +0.071 -- eighteen times what wasting the same lot charges -- and the linear
+    # coin leg would outweigh the compressive outcome it is meant to sit under.
+    assert float(moved[5]) == pytest.approx(80.0 / MONEY_SCALE, abs=1e-7)
+    assert float(np.abs(np.delete(moved, 5)).max()) == pytest.approx(0.0, abs=1e-7)
+
+
+def test_the_two_lot_legs_are_clamped_per_lot_and_never_netted():
+    """Per lot, both ways, so neither leg can hide behind the other.
+
+    The clamp is what makes these a deterrent and a reward rather than a running
+    P&L: a lot sold at a profit cannot offset a lot that was wasted, because summing
+    first would let an over-buyer hide behind one good sale. It holds in the new
+    direction too -- the credit is capped at each lot's cost before anything is
+    summed, so a single spectacular sale cannot pay for a season of waste.
+
+    Each leg is asserted against its own weight rather than against a bare cost. The
+    clamp is per lot and symmetric; the *weights* are not, because FIFO's allocation
+    across lots is not -- see
+    `test_the_seed_charge_is_lighter_than_the_credit_it_is_paired_with`.
+    """
+
+    from agents.dqn_market_free.training.reward import (
+        MONEY_SCALE,
+        SEED_GAIN_WEIGHT,
+        SEED_WASTE_WEIGHT,
+    )
+
+    # Same trace plus a second lot that is never planted: one credited, one billed.
+    both = _lot_trace(
+        [
+            (5, "seed", 1, 80.0),
+            (10, "plant", 1, 0.0),
+            (20, "harvest", 6, 0.0),
+            (30, "sell", 6, 1_500.0),
+            (40, "seed", 1, 80.0),
+        ]
+    )
+    charged = _lot_reward(*both[:4], ops=both[4])
+    plain = _lot_reward(*both[:4])
+    moved = np.asarray(charged) - np.asarray(plain)
+    assert float(moved[5]) == pytest.approx(SEED_GAIN_WEIGHT * 80.0 / MONEY_SCALE, abs=1e-7)
+    assert float(moved[40]) == pytest.approx(-SEED_WASTE_WEIGHT * 80.0 / MONEY_SCALE, abs=1e-7)
+    # Nothing lands anywhere else: both legs are paid on a buy turn and only there.
+    assert float(np.abs(np.delete(moved, [5, 40])).max()) == pytest.approx(0.0, abs=1e-7)
+    # Equal and opposite *coins* -- one lot's cost each way -- which is the bound the
+    # cap buys. The weights then scale the two sides apart on purpose.
+    assert float(moved[5] / SEED_GAIN_WEIGHT) == pytest.approx(
+        float(-moved[40] / SEED_WASTE_WEIGHT), abs=1e-7
+    )
+
+
+def test_a_bought_product_lot_is_never_charged_as_wasted_seed():
+    """WHEAT is both a crop and a `BUY_PRODUCT` item, and only one of them is seed.
+
+    `LotLedger.seed_lots` excludes bought stock, so the charge means "coins committed
+    to growing something that never came back" rather than any losing trade. Wheat
+    bought off the market to resell is not that, and billing it here would make the
+    constant a general trading tax under a name that says otherwise.
+    """
+
+    from agents.dqn_market_free import lots
+
+    turns = 60
+    wheat = lots.STOCK_ITEMS.index("WHEAT")
+    seeds = [[0] * len(lots.CROP_ITEMS) for _ in range(turns)]
+    standing = [[0] * len(lots.CROP_ITEMS) for _ in range(turns)]
+    stock = [[0] * len(lots.STOCK_ITEMS) for _ in range(turns)]
+    money = [3_000.0] * turns
+    ops: list[str | None] = [None] * turns
+
+    ops[5] = "BUY_PRODUCT"
+    for later in range(6, turns):
+        stock[later][wheat] += 4
+        money[later] -= 200.0
+
+    ledger = lots.match(seeds, stock, money, ops, standing)
+    assert [lot.bought for lot in ledger.lots] == [True]
+    assert ledger.unrecovered() == []
+
+    charged = _lot_reward(seeds, standing, stock, money, ops=ops)
+    plain = _lot_reward(seeds, standing, stock, money)
+    assert np.array_equal(charged, plain)
+
+
 def test_a_lot_that_never_sold_is_still_recorded_as_unrecovered():
     """Unsold stock keeps its cost where it was spent, which is the punishment."""
 
@@ -7084,6 +8079,69 @@ def test_one_seed_lot_absorbs_a_whole_ongoing_harvest():
     # First matched sale, not the last: the holding period is how long the
     # purchase waited to be told anything at all.
     assert summary["seed_holding_turns"] == pytest.approx(23.0)
+
+
+def test_a_lots_room_never_outlives_what_the_crop_can_still_grow():
+    """The ceiling binds every turn, not only once a crop is exhausted.
+
+    Two melon seeds bought and both planted, then one tile harvested at 2 units of
+    a possible 6. The other 4 were never grown, and nothing in `match` can see that
+    -- a poor yield is "stock up by less than the cap", which matches no rule -- so
+    the lot used to keep claiming room for them.
+
+    The exhaustion-only reconcile could not fire here: a plant is still standing, so
+    `seeds or standing` is truthy for the whole trace. That is not a corner case, it
+    is a farm that replants, and measured over 20 stored episodes it left 60.7% of
+    all seed-lot capacity unabsorbed. FIFO then handed the oldest lot every later
+    sale and 83% of lots read fully unrecovered while the season's seeds had
+    returned 2.4x -- which `SEED_WASTE_WEIGHT` bills onto their buy turns.
+
+    The ceiling is `stock + max_yield * (seeds + standing)`, so at this point in the
+    trace the lot may still claim the 2 units in the shed plus 6 for the plant that
+    is still up, and not the 4 that a finished tile will never deliver.
+    """
+
+    from agents.dqn_market_free import lots
+
+    seeds, standing, stock, money, ops = _lot_trace(
+        [(2, "seed", 2, 160.0), (5, "plant", 2, 0.0), (20, "harvest", 2, 0.0)]
+    )
+    ledger = lots.match(seeds, stock, money, ops, standing)
+
+    (lot,) = ledger.lots
+    assert lot.units == 2
+    # 12 without the fix -- `2 seeds * max_yield` and never trimmed.
+    assert lot.room == 2 + 6 * 1
+    # And the exhaustion rule genuinely cannot reach it: the crop is never idle.
+    assert all(row[lots.CROP_ITEMS.index("MELON")] for row in standing[21:])
+
+
+def test_the_seed_charge_is_lighter_than_the_credit_it_is_paired_with():
+    """The per-lot clamp is symmetric; FIFO over fungible units is not.
+
+    `unrecovered()` and `surplus()` are the two halves of one signed per-lot margin
+    clamped to +/- that lot's own cost, which is exactly symmetric for a single lot.
+    It stops being symmetric the moment a season is aggregated, because `match` is
+    FIFO: each sale goes to the oldest lot with room, so on a profitable season the
+    proceeds pile into whichever lots happen to be early, their credit is clipped at
+    `+cost`, and every lot behind them is charged the full `-cost`. The sign of the
+    total then follows an accounting convention rather than the policy.
+
+    Measured over 20 stored episodes at `gain = 1.0`: `waste = 1.0` paid a mean of
+    -0.086 per episode with a worst case of -0.788, against an `outcome` whose whole
+    range on that sample is [-0.92, +0.42]. That is a spend-proportional tax on
+    buying seed, i.e. the NOOP attractor the constant's own docstring warns about.
+    0.35 is where the mean is neutral (-0.010), the tail sits inside the outcome's
+    range (-0.215), and `corr(outcome)` peaks (+0.63).
+
+    So the two are pinned unequal, and this is the test that says why they must be.
+    """
+
+    from agents.dqn_market_free.training import reward
+
+    assert reward.SEED_WASTE_WEIGHT < reward.SEED_GAIN_WEIGHT
+    assert reward.SEED_WASTE_WEIGHT == pytest.approx(0.35)
+    assert reward.SEED_GAIN_WEIGHT == pytest.approx(1.0)
 
 
 def test_a_harvest_landing_on_a_hire_turn_opens_no_lot():
@@ -7198,3 +8256,280 @@ def test_the_lot_holdings_read_the_shed_and_every_hand():
     assert seeds[lots.CROP_ITEMS.index("MELON")] == 2
     assert stock[lots.STOCK_ITEMS.index("MELON")] == 8
     assert stock[lots.STOCK_ITEMS.index("WHEAT")] == 2
+
+
+def _animal_trace(events, turns: int = 560, animal: str = "COW", turns_per_day: int = 24):
+    """Build the traces `lots.match` reads for an animal case.
+
+    `(turn, kind, count, coins)` with `kind` one of `buy`, `place`, `harvest`,
+    `sell`, applied *from* the given turn onward because the traces are levels
+    rather than deltas -- the same shape `_lot_trace` builds for seeds and the
+    same one `Recorder.record_turn` appends.
+
+    `produce_room` is recomputed off `lots.remaining_events` rather than written
+    out by hand, so the fixture cannot state a capacity rule the ledger disagrees
+    with. The crop traces come back empty: an animal case has to leave every seed
+    column untouched or it is testing two things.
+    """
+
+    from agents.dqn_market_free import lots
+
+    index = lots.ANIMAL_ITEMS.index(animal)
+    product = lots.STOCK_ITEMS.index(lots._PRODUCT_FOR_ANIMAL[animal])
+    days = [turn // turns_per_day for turn in range(turns)]
+    seeds = [[0] * len(lots.CROP_ITEMS) for _ in range(turns)]
+    standing = [[0] * len(lots.CROP_ITEMS) for _ in range(turns)]
+    stock = [[0] * len(lots.STOCK_ITEMS) for _ in range(turns)]
+    money = [10_000.0] * turns
+    ops: list[str | None] = [None] * turns
+    unplaced = [0] * turns
+    placed: list[list[int]] = [[] for _ in range(turns)]
+    for turn, kind, count, coins in events:
+        if kind == "buy":
+            ops[turn] = "BUY_ANIMAL"
+        elif kind == "sell":
+            ops[turn] = "SELL"
+        for later in range(turn + 1, turns):
+            if kind == "buy":
+                unplaced[later] += count
+                money[later] -= coins
+            elif kind == "place":
+                unplaced[later] -= count
+                placed[later].extend([days[turn + 1]] * count)
+            elif kind == "harvest":
+                stock[later][product] += count
+            elif kind == "sell":
+                stock[later][product] -= count
+                money[later] += coins
+
+    owned = [[0] * len(lots.ANIMAL_ITEMS) for _ in range(turns)]
+    room = [[0] * len(lots.ANIMAL_ITEMS) for _ in range(turns)]
+    for turn in range(turns):
+        day = days[turn]
+        owned[turn][index] = unplaced[turn] + len(placed[turn])
+        room[turn][index] = unplaced[turn] * lots.unplaced_events(animal, day) + sum(
+            lots.remaining_events(animal, placed_day, day) for placed_day in placed[turn]
+        )
+    return seeds, standing, stock, money, ops, owned, room, days
+
+
+def _animal_reward(trace, **kwargs):
+    from agents.dqn_market_free.training.reward import episode_rewards
+
+    seeds, standing, stock, money, ops, owned, room, days = trace
+    return episode_rewards(
+        money,
+        money[-1],
+        money[-1],
+        0.999,
+        seeds=seeds,
+        standing=standing,
+        stock=stock,
+        ops=ops,
+        owned=owned,
+        produce_room=room,
+        days=days,
+        **kwargs,
+    )[0]
+
+
+def test_an_animals_capacity_is_the_season_it_has_left():
+    """The number every animal constant is sized against.
+
+    A seed lot's capacity is `max_yield`, a constant. An animal has no lifetime
+    cap at all -- `max_held` is what accumulates on the tile awaiting harvest --
+    so what closes the lot is the season ending, and the count depends on the day.
+
+    `LAST_YIELD_DAY` is 29 rather than `TOTAL_DAYS`: production happens in
+    `_end_of_day`, which runs on `(step + 1) % turnsPerDay == 0`, and DONE fires at
+    step 718, so the last boundary is step 695 and its `next_day` is 29. Day 29's
+    own end-of-day never runs. Anchoring on 30 would say a cow bought on day 22 can
+    still milk.
+    """
+
+    from agents.dqn_market_free import lots
+
+    assert lots.LAST_YIELD_DAY == 29
+    # Placed on day zero: the whole season's worth.
+    assert lots.unplaced_events("COW", 0) == 11
+    assert lots.unplaced_events("SHEEP", 0) == 8
+    # The buy deadlines, which `order_space` does not enforce -- a BUY_ANIMAL is
+    # offered on any day the seat has shed room and the cash.
+    assert lots.unplaced_events("COW", 21) == 1
+    assert lots.unplaced_events("COW", 22) == 0
+    assert lots.unplaced_events("SHEEP", 23) == 1
+    assert lots.unplaced_events("SHEEP", 24) == 0
+    # Counted strictly after the sampled day, because the sample is taken before
+    # that turn's action and the day's own end-of-day has not run yet.
+    assert lots.remaining_events("COW", 0, 10) == 9
+
+
+def test_an_animal_lot_is_not_trimmed_on_the_turn_it_was_bought():
+    """Buying and placing are different turns, and `_reconcile` never gives room back.
+
+    `BUY_ANIMAL` puts the animal in the shed; `PICKUP` and `PLACE` are separate unit
+    actions on later turns. A ceiling that counted only placed animals would trim
+    the lot to zero on its own purchase turn and could never restore it, so every
+    animal would read fully unrecovered and the pair would be a pure tax on owning
+    a herd. This is the test that fails first if that regresses.
+    """
+
+    from agents.dqn_market_free import lots
+    from agents.dqn_market_free.training.reward import (
+        ANIMAL_GAIN_WEIGHT,
+        MONEY_SCALE,
+    )
+
+    trace = _animal_trace(
+        [
+            (24, "buy", 1, 400.0),
+            (48, "place", 1, 0.0),
+            (250, "harvest", 4, 0.0),
+            (260, "sell", 4, 600.0),
+        ],
+        turns=300,
+    )
+    seeds, standing, stock, money, ops, owned, room, days = trace
+    ledger = lots.match(
+        seeds, stock, money, ops, standing, owned=owned, produce_room=room, days=days
+    )
+    summary = ledger.summary()
+    assert summary["animal_lots"] == 1.0
+    assert summary["animal_lots_matched"] == 1.0
+    assert summary["animal_spend"] == pytest.approx(400.0)
+    assert summary["animal_proceeds"] == pytest.approx(600.0)
+    # The milk went to the cow that produced it rather than falling through.
+    assert ledger.unattributed_by_item.get("MILK", 0.0) == pytest.approx(0.0)
+
+    moved = _animal_reward(trace) - _animal_reward(
+        trace, animal_waste_weight=0.0, animal_gain_weight=0.0
+    )
+    assert moved[24] == pytest.approx(ANIMAL_GAIN_WEIGHT * 200.0 / MONEY_SCALE, rel=1e-4)
+    assert float(np.sum(np.abs(np.delete(moved, 24)))) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_an_animal_bought_past_its_deadline_is_charged_in_full():
+    """A cow bought after day 21 cannot yield once, and nothing else says so.
+
+    `order_space.feasible_actions` gates BUY_ANIMAL on shed room and cash only, so
+    the action is offered on day 22 exactly as on day 2. The lot opens with no
+    capacity, matches nothing, and takes the whole charge on its buy turn.
+    """
+
+    from agents.dqn_market_free.training.reward import ANIMAL_WASTE_WEIGHT, MONEY_SCALE
+
+    late = 22 * 24
+    trace = _animal_trace([(late, "buy", 1, 400.0)], turns=560)
+    moved = _animal_reward(trace) - _animal_reward(
+        trace, animal_waste_weight=0.0, animal_gain_weight=0.0
+    )
+    assert moved[late] == pytest.approx(
+        -ANIMAL_WASTE_WEIGHT * 400.0 / MONEY_SCALE, rel=1e-4
+    )
+    assert float(np.sum(np.abs(np.delete(moved, late)))) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_two_animal_legs_are_clamped_per_lot_and_never_netted():
+    """A profitable cow and a wasted one do not cancel, and neither exceeds its cost.
+
+    The sibling of the seed version. One cow placed early and milked well, one
+    bought late and never placed: the credit clips at `+cost` and the charge is the
+    full `-cost`, each on its own buy turn. Netting them would let a herd that
+    bought one good animal buy any number of dead ones for free.
+    """
+
+    from agents.dqn_market_free.training.reward import (
+        ANIMAL_GAIN_WEIGHT,
+        ANIMAL_WASTE_WEIGHT,
+        MONEY_SCALE,
+    )
+
+    trace = _animal_trace(
+        [
+            (24, "buy", 1, 400.0),
+            (48, "place", 1, 0.0),
+            (280, "harvest", 6, 0.0),
+            (300, "sell", 6, 1_800.0),
+            (400, "buy", 1, 400.0),
+        ],
+        turns=560,
+    )
+    moved = _animal_reward(trace) - _animal_reward(
+        trace, animal_waste_weight=0.0, animal_gain_weight=0.0
+    )
+    assert moved[24] == pytest.approx(ANIMAL_GAIN_WEIGHT * 400.0 / MONEY_SCALE, rel=1e-4)
+    assert moved[400] == pytest.approx(
+        -ANIMAL_WASTE_WEIGHT * 400.0 / MONEY_SCALE, rel=1e-4
+    )
+    # Equal and opposite in *coins*: one lot's own cost each way.
+    assert moved[24] / ANIMAL_GAIN_WEIGHT == pytest.approx(
+        -moved[400] / ANIMAL_WASTE_WEIGHT, rel=1e-4
+    )
+    rest = np.delete(moved, [24, 400])
+    assert float(np.sum(np.abs(rest))) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_animal_traces_are_optional_and_absent_is_bit_identical():
+    """A caller that cannot recover the trace stays on the old stream exactly.
+
+    `clone.py` reads stored replays, and one written before these traces existed
+    must not silently score a different quantity than the run that produced it.
+    """
+
+    from agents.dqn_market_free.training.reward import episode_rewards
+
+    seeds, standing, stock, money, ops, owned, room, days = _animal_trace(
+        [(24, "buy", 1, 400.0), (48, "place", 1, 0.0)], turns=120
+    )
+
+    def stream(**kwargs):
+        return episode_rewards(
+            money,
+            money[-1],
+            money[-1],
+            0.999,
+            seeds=seeds,
+            standing=standing,
+            stock=stock,
+            ops=ops,
+            **kwargs,
+        )[0]
+
+    without = stream()
+    silenced = stream(
+        owned=owned,
+        produce_room=room,
+        days=days,
+        animal_waste_weight=0.0,
+        animal_gain_weight=0.0,
+    )
+    assert np.array_equal(without, silenced)
+    assert not np.array_equal(
+        without, stream(owned=owned, produce_room=room, days=days)
+    )
+
+
+def test_the_animal_charge_is_lighter_than_the_credit_it_is_paired_with():
+    """The two constants, and the prior they share with the seed pair.
+
+    The levels are a port rather than a new tuning: break-even probability of waste
+    against NOOP is `w_waste / (w_waste + w_gain)`, and the animal pair states the
+    same one the seed pair does. If either moves without the other, the two
+    families stop agreeing about how often a purchase has to work out.
+    """
+
+    from agents.dqn_market_free.training import reward
+
+    assert reward.ANIMAL_WASTE_WEIGHT < reward.ANIMAL_GAIN_WEIGHT
+    assert reward.ANIMAL_WASTE_WEIGHT == 0.25
+    assert reward.ANIMAL_GAIN_WEIGHT == 0.70
+    animal = reward.ANIMAL_WASTE_WEIGHT / (
+        reward.ANIMAL_WASTE_WEIGHT + reward.ANIMAL_GAIN_WEIGHT
+    )
+    seed = reward.SEED_WASTE_WEIGHT / (reward.SEED_WASTE_WEIGHT + reward.SEED_GAIN_WEIGHT)
+    assert animal == pytest.approx(seed, abs=0.01)
+    # A cow's charge is one melon seed's, a size this file already sanctions as
+    # visible against the penalties without displacing `outcome`.
+    assert 400.0 * reward.ANIMAL_WASTE_WEIGHT / reward.MONEY_SCALE == pytest.approx(
+        0.005, rel=1e-6
+    )

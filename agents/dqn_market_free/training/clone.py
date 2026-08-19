@@ -226,11 +226,18 @@ def record_from_replay(
         # never the decision the learner is being trained on.
         ops.append(ACTIONS[action].op)
         seen += len(orders)
-        # Counted in simulator orders, not actions, so the three totals add up
-        # to `orders_seen`: one `HIRE 8` action preserves eight of them.
+        # Counted in simulator orders, not actions, so the four totals add up to
+        # `orders_seen`: one `HIRE 8` action preserves eight of them.
         mapped += len(ACTIONS[action].to_wire())
         unrepresentable += dropped
         over_budget += extra
+        # `land_orders` was unpacked and discarded here while its three siblings
+        # above were accumulated, so `orders_land` reported 0 for every clone ever
+        # taken and the totals came up short by exactly the land rows. `BUY_LAND`
+        # left the action space, so these are neither mapped nor unrepresentable:
+        # the head has no column to carry them and `should_buy_land` owns the
+        # decision instead. They are their own bucket.
+        land_seen += land_orders
 
         roles = donor._role_plan(obs, farm)
         field = donor._unit_actions(obs, configuration, farm, private, roles)

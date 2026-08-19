@@ -13,8 +13,10 @@ import argparse
 import itertools
 import os
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures.process import BrokenProcessPool
+from functools import lru_cache
+from importlib import import_module
 from typing import Any
 
 from sim import registry
@@ -23,10 +25,39 @@ from sim.runner import MatchResult, run_match
 from sim.workers import MAP_TIMEOUT_SECONDS, discard_pool, worker_pool
 
 
-def _job(args: tuple[tuple[str, str], int, dict[str, Any]]) -> MatchResult:
-    """Worker entry point. Specs stay strings so nothing unpicklable crosses over."""
-    specs, seed, config = args
-    return run_match(specs, seed, config)
+@lru_cache(maxsize=None)
+def _resolve_reducer(name: str) -> Callable[[MatchResult, int], Any]:
+    """Import a `module:attribute` reducer, once per worker process.
+
+    Cached because a series is hundreds of matches and the import is the same
+    every time; without this each match re-enters the import machinery.
+    """
+    module_name, separator, attribute = name.partition(":")
+    if not separator:
+        raise ValueError(f"reducer must be 'module:attribute', got {name!r}")
+    return getattr(import_module(module_name), attribute)
+
+
+def _job(
+    args: tuple[tuple[str, str], int, dict[str, Any], str | None, int]
+) -> MatchResult:
+    """Worker entry point. Specs stay strings so nothing unpicklable crosses over.
+
+    `reduce` is a `module:attribute` name for the same reason, and it exists
+    because a `MatchResult` carries the whole replay -- every step's observation
+    for both seats -- back across the pool. A caller that only wants an aggregate
+    off that replay would otherwise pay to pickle megabytes per match, unpickle
+    them into a few hundred thousand dicts, and walk them in the parent, where
+    concurrent callers are serialised by the GIL. Folding here instead keeps the
+    walk in the process that already holds the replay, and returns the aggregate.
+    """
+    specs, seed, config, reduce, seat = args
+    result = run_match(specs, seed, config)
+    if reduce is not None:
+        result.reduction = _resolve_reducer(reduce)(result, seat)
+        # The point of the exercise: this is what was expensive to send.
+        result.replay = None
+    return result
 
 
 def play_series(
@@ -35,13 +66,21 @@ def play_series(
     seeds: Iterable[int],
     config: dict[str, Any],
     jobs: int,
+    reduce: str | None = None,
 ) -> dict[int, tuple[MatchResult, MatchResult]]:
-    """Play every seed in both orientations. Returns {seed: (a_first, b_first)}."""
+    """Play every seed in both orientations. Returns {seed: (a_first, b_first)}.
+
+    `reduce` names a `module:attribute` callable taking `(MatchResult, seat)`.
+    When given, every match is folded to `MatchResult.reduction` in its worker and
+    comes back with `replay` cleared. `seat` is where `a` sat in that orientation
+    -- 0 in the forward match, 1 in the reverse -- so a reducer written for one
+    side of the pairing gets the side it expects without inspecting the specs.
+    """
     seeds = list(seeds)
     tasks = []
     for seed in seeds:
-        tasks.append(((a, b), seed, config))
-        tasks.append(((b, a), seed, config))
+        tasks.append(((a, b), seed, config, reduce, 0))
+        tasks.append(((b, a), seed, config, reduce, 1))
 
     if jobs == 1:
         outcomes = [_job(task) for task in tasks]

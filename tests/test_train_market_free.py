@@ -105,101 +105,32 @@ def test_policy_kinds_do_not_collide_with_the_scaffolded_learner():
 
 
 def test_the_session_and_every_model_name_move_together():
-    """They moved at v23 for the roster, and at v26 and v27 for the reward.
+    """The two names move together, and each for its own trigger.
 
-    They have to. `all_batches`, `_self_play_pool`, `lineage_checkpoint`,
-    `training_models.active_checkpoint_id` and the slot state are every one of
-    them scoped by `model_id`, so ten named slots are ten independent lineages --
-    and any of them inheriting v22's single lineage would start the population
-    with nine cold slots and one carrying the stalled trajectory the population
-    exists to leave. The mature group would then be seeded from exactly that.
+    `SLOT_PREFIX` moves when the **reward** changes, because a stored shaped return
+    is then a different quantity: every episode in the ring is mislabelled and every
+    checkpoint was fitted to the old labels. `all_batches`, `_self_play_pool`,
+    `lineage_checkpoint`, `training_models.active_checkpoint_id` and the slot state
+    are all scoped by `model_id`, so renaming severs all five at once. Reward
+    constants are *not* in `ensure_session`'s digest, so nothing else catches it.
 
-    A reward change is the other trigger, and the stronger one. At v26
-    `OUTCOME_LOG_SCALE` replaced a margin-based outcome with an absolute one; at
-    v27 `INSOLVENCY_GRACE_TURNS` stopped charging the dip between a purchase and
-    its sale. Either way a shaped return is not the same quantity it was: every
-    episode already in the buffer is mislabelled and every checkpoint was fitted
-    to the old labels. Renaming is what severs all four scopes at once.
+    `SESSION_ID` moves on a superset: `ensure_session` digests the league config and
+    this file's `model_config`, so any `FREE_CONFIG` key breaks a resume whether or
+    not the reward moved.
 
-    The earlier rule this replaces still holds for the ordinary case: a name is
-    kept across a change that only moves the behaviour distribution, because v20's
-    batches are the same kind of sample and inheriting them is the buffer working
-    as intended. A reward change forces a new name; so does the roster.
-
-    The session id moves on a superset of that: `ensure_session` digests the league
-    config and this file's `model_config` together, so any `FREE_CONFIG` change
-    raises "run manifest mismatch" on a resume. v27 moves both.
-
-    v28 and v29 moved them for a third reason, weaker than a reward change and
-    still sufficient: `FREE_CONFIG` gained `population_slots` and then
-    `rare_sigma_novelty`, either of which raises "run manifest mismatch" on a
-    resume. The prefix follows so a run is not half count-arm batches and half
-    rate-arm ones in one buffer.
-
-    v30 folds the rate arm together with `LAND_POTENTIAL_WEIGHT`, so it is back to
-    the strong reason: the reward changed, and every earlier episode in the ring
-    would be mislabelled against it.
-
-    v31 is back to the weak one -- `rare_sigma_cap` alone, with the reward
-    untouched, so v30's money series stays directly comparable and is the control.
-    It still has to move, because `ensure_session` digests `FREE_CONFIG` and any key
-    here breaks a resume.
-
-    v32 is the strongest reason yet and it is not a config change at all: the
-    `planting.py` overlay was letting every non-melon seed take a tile the donor
-    had planned for melon, so every batch in every earlier session was collected
-    under a different farm than this one runs. The reward moved with it
-    (`LAND_PURCHASE_BONUS`), so both halves of the rule apply.
-
-    v33 is the strong reason on its own: `LAND_PURCHASE_BONUS` moves 0.02 -> 0.035
-    and nothing else does, so `ensure_session` would have resumed v32 without
-    complaint and left one session holding two reward regimes. Nothing in the
-    digest changed, which is why the rename has to carry it.
-
-    v34 is the first entry where the two names come apart, and that is the rule
-    working rather than an oversight. `opponents` gains the donor, which is a
-    `FREE_CONFIG` key, so `ensure_session` refuses a resume and `SESSION_ID` has to
-    move. The reward is untouched, so v33's episodes are the same quantity under
-    the same shaped return and `SLOT_PREFIX` stays: inheriting that buffer, its
-    self-play pool and its LR state is the point, not a hazard. The assertion below
-    pins both halves so a later change cannot quietly move one without the other.
-
-    v35 is the same shape as v34 and for a duller reason: `CONCURRENCY` is part of
-    `LeagueConfig`, which `ensure_session` digests, so three throughput changes
-    (`gradient_steps_per_batch`, `CONCURRENCY`, `promotion_seeds`) could not land on
-    a session that had already collected a generation. None of them touches the
-    reward, so `SLOT_PREFIX` stays again and v34's lineages carry forward whole.
-
-    v36 brings the two back together on the strong reason. `LOT_CREDIT_WEIGHT`
-    moves a seed lot's realised proceeds to the turn the seed was bought, so a
-    shaped return is not the quantity it was in v33-v35 however unchanged the
-    money is: the same episode now carries its credit on different turns, and a
-    checkpoint fitted to the old placement is fitted to different labels. The
-    reallocation being zero-sum does not rescue the inheritance -- the episode
-    total matching says nothing about the per-transition targets a buffer is
-    sampled for.
-
-    v37 is the same rule at the same strength, and v36 is the reason it is needed
-    so soon. `LOT_POTENTIAL_WEIGHT` replaces `LOT_CREDIT_WEIGHT` outright: the
-    credit is now a potential over held cost basis rather than a reallocation of
-    realised proceeds, so it is not a retune but a different kind of term. v36
-    charged the sale turn what it paid the buy turn, which preserved the episode
-    total and still cost the sale state its whole return-to-go while the buy
-    state recovered only `1 - gamma**D` of it -- a five-to-one sell deterrent at
-    melon's 240-turn cycle. Every v36 episode is labelled against that, so the
-    buffer and the checkpoints sever with the rename.
-
-    v38 is the weak reason again and the names come apart a second time.
-    `opponents` drops the donor and `self_play_ratio` returns to 0.65, both
-    `FREE_CONFIG` keys, so `ensure_session` refuses a resume and `SESSION_ID`
-    moves. The reward is untouched, so `SLOT_PREFIX` stays `lotbasis` and v37's
-    lineages continue -- which is the point rather than a concession: the whole
-    session exists to vary the opponent distribution against everything else held
-    fixed, and a severed buffer would make it vary two things.
+    So the two legitimately come apart -- an opponent-mix change moves the session
+    and keeps the prefix, and inheriting that buffer is the point rather than a
+    hazard. This pins both halves so a later change cannot move one silently.
+    Per-session history is in `docs/dqn_market_free_sessions.md`.
     """
 
-    assert train_market_free.SESSION_ID == "market-free-mirroronly-v38"
-    assert train_market_free.SLOT_PREFIX == "lotbasis"
+    # v43 is the other case: `LAND_PURCHASE_BONUS` goes to 0.0, so the reward moved
+    # and the prefix moves with it. That was structurally impossible until now --
+    # a fresh prefix restarts at batch 0, where the empty `opponents` base reached
+    # the updater with no mix at all and raised. It seeds the quiet network there
+    # instead, so the rule can actually be followed.
+    assert train_market_free.SESSION_ID == "market-free-landheuristic-v43"
+    assert train_market_free.SLOT_PREFIX == "landheur"
     names = [item["name"] for item in train_market_free.TRAINING_AGENTS]
     assert names == [
         f"{train_market_free.SLOT_PREFIX}_{index:02d}"
@@ -225,27 +156,16 @@ def test_the_core_budget_is_concurrency_times_jobs():
     assert config.training_concurrency == train_market_free.CONCURRENCY
     assert train_market_free.FREE_CONFIG["jobs"] == train_market_free.JOBS_PER_LEARNER
 
-    # Mild oversubscription is allowed, and the exact-fit rule this replaces was
-    # sizing against a saturation that never happened: measured on v33, the box ran
-    # 12.7 busy cores of 32 under a 4 x 8 = 32 budget.
-    #
-    # What the old rule was really protecting is still protected, and not by this
-    # assertion: `sim/workers.py` pins `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 1
-    # on every worker, so the "unpinned BLAS workers outnumber the cores" failure
-    # cannot occur regardless of what this product is. Measured 150 threads across
-    # every python process, against the ~1,300 an unpinned cohort would carry.
-    #
-    # The ceiling is 2x rather than unbounded because these are `spawn` pools with
-    # a real per-process memory and startup cost, and past a queue a couple deep
-    # the scheduler stops buying anything.
+    # Mild oversubscription is allowed. What an exact-fit rule would protect is
+    # already protected elsewhere: `sim/workers.py` pins `OMP_NUM_THREADS` and
+    # `MKL_NUM_THREADS` to 1 on every worker, so unpinned BLAS workers cannot
+    # outnumber the cores whatever this product is. The 2x ceiling is because these
+    # are `spawn` pools with a real per-process cost.
     assert train_market_free.CONCURRENCY * train_market_free.JOBS_PER_LEARNER <= 2 * os.cpu_count()
 
-    # The two knobs are waves, not a budget, which is why the product is the wrong
-    # thing to minimise. Ten models over `CONCURRENCY` threads and 16 episodes over
-    # `JOBS_PER_LEARNER` workers are both `list(pool.map(...))` barriers, so the
-    # round costs the product of the two wave counts. 4x8 is 3 x 2 = 6; 5x8 is
-    # 2 x 2 = 4. Every combination that keeps the product under 32 -- 5x6, 10x3 --
-    # is back at 6, which is why staying inside the old rule could not win.
+    # Waves, not a budget, which is why the product is the wrong thing to minimise:
+    # both pools are `list(pool.map(...))` barriers, so a round costs the *product
+    # of the two wave counts*. Every combination fitting the cores exactly is worse.
     model_waves = -(-train_market_free.LEARNERS // train_market_free.CONCURRENCY)
     episode_waves = -(-16 // train_market_free.JOBS_PER_LEARNER)
     assert model_waves * episode_waves <= 4
@@ -257,20 +177,13 @@ def test_the_core_budget_is_concurrency_times_jobs():
 def test_a_benchmark_the_run_never_plays_has_a_way_out_of_the_gate():
     """The invariant `market-free-rare-v20` broke, stated so both fixes satisfy it.
 
-    v20 gated on pilkwang while `opponents` held one seeded-noise agent and
-    nothing else. The learner solved that opponent at generation 6 -- paired margin
-    flat near 5,900, win rate exactly 1.000 for the 55 generations after -- and
-    accumulated 57 consecutive rejections against a benchmark it had never played.
-    `train_dqn.py` recorded the same shape at 17 rejections before it.
+    The failure: gating on a benchmark while `opponents` holds only a weak agent.
+    The learner solves that opponent, wins every pairing, and accumulates dozens of
+    consecutive rejections against a benchmark it has never played.
 
-    Two ways to not be in that state, and either is enough. Play the benchmark, so
-    the rollouts and the gate measure the same distribution; or leave the gate an
-    escape, so a stalled ratchet cannot become a fixed point. v21 tried the first
-    and its own 120 pairings argued against it -- pilkwang at -134,558 and the
-    surrogate at -29,376 are both a saturated -1.0 through the tanh, so they cost
-    22% of collection and returned a constant. v22 takes the second.
-
-    What is not optional is that *one* of them holds. v20 had neither.
+    Two ways out, either sufficient -- play the benchmark, so rollouts and the gate
+    measure the same distribution; or leave the gate an escape, so a stalled ratchet
+    cannot become a fixed point. What is not optional is that *one* of them holds.
     """
 
     config = train_market_free.FREE_CONFIG
@@ -284,9 +197,12 @@ def test_a_benchmark_the_run_never_plays_has_a_way_out_of_the_gate():
     )
     assert plays_the_benchmark or gate_has_an_exit
 
-    # Either way, something in the mix has to carry terminal gradient, and seeded
-    # noise is the only static opponent that does at this strength.
-    assert any("make_seeded_random" in opponent for opponent in opponents)
+    # v41 is the pure-mirror arm, so it is the escape and not the benchmark that
+    # holds. Pinned as the *specific* branch rather than the disjunction above,
+    # because this arm is the one v20's failure was about: nothing in the mix plays
+    # the donor, so a ratchet with no exit would reproduce v20 exactly.
+    assert not plays_the_benchmark
+    assert gate_has_an_exit
 
 
 def test_the_stalled_lineage_is_given_a_reachable_grace_floor():
@@ -380,42 +296,25 @@ def test_the_manifest_stays_the_no_self_play_control():
     assert 0.0 < config["self_play_ratio"] < 1.0
 
 
-def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
-    """The mix is never empty, and the one static opponent is not a wall.
+def test_the_mirror_is_pure_and_its_one_unreachable_batch_is_inherited_past():
+    """No static base at all, and the batch-0 hole that buys.
 
-    Two failures are pinned here at once.
+    v41 is the pure-mirror arm. The old base was a single `seeded_random` entry,
+    which `compose_opponents` solves to `[noise, self, self]` -- a third of every
+    batch against an agent that never emits `SELL`, the only op that credits money,
+    so it finishes on exactly 0 in every episode it has ever played. That is not a
+    weak competitor, it is a free-money episode, and v40:g0002 priced it: identical
+    learner behaviour for 3,312 money against the noise versus 2,432 against a real
+    policy.
 
-    An empty `opponents` is pure mirror play, which only cold-starts when the
-    inherited model already has checkpoints. When it does not, `_self_play_pool`
-    returns nothing, the base is empty, and collection raises "free-market
-    collection needs at least one opponent" on batch 0 -- which is exactly how
-    `market-free-noisy-v6` died on its first round.
-
-    The other failure is what the empty base was avoiding, and v26 removed the
-    mechanism behind it. The reward was `tanh(margin / 10_000)` plus two ~0.002
-    charges, and every scripted *competitor* finishes far enough above a learner
-    at ~0 to saturate it: pilkwang 139k, lucifer19 157k, tetsutani 156k,
-    kaitofukami 159k, `configurable_crop_surrogate` 32k. A constant on every
-    terminal reward cannot change an argmax, so seeded noise was the one static
-    opponent finishing in the learner's own range.
-
-    The outcome is absolute now (`OUTCOME_LOG_SCALE`) and does not read the
-    opponent at all, so no opponent can saturate it and this half of the argument
-    has expired. The first-slot rule is kept on the *other* two grounds, which
-    have not: an empty base cannot cold-start, and the noise slot is what keeps
-    collection in contact with a gate the policy would otherwise never play.
-
-    `train_dqn.py` records the cost of having no static opponent at all: 17
-    consecutive rejections, because promotion is gated on a benchmark the policy
-    never plays. The noise slot is what keeps collection and the gate in contact.
-
-    v21 widens the base past noise alone, and what is pinned here is the part that
-    did not change: the *first* slot -- the one the mirror is composed around and
-    the only one guaranteed present at every batch index -- still has to be the
-    non-saturating opponent. v20 is why the wider base exists at all; it ran the
-    single-noise version to a 1.000 win rate by generation 6 and then learned
-    nothing for 55 generations. See `test_the_gate_benchmark_is_an_opponent_the_
-    run_actually_plays`.
+    What the empty base costs is batch 0. The updater reads `if self_play_after and
+    batch_index >= self_play_after`, and `self_play_after` cannot be 0 because 0 is
+    its disable value -- so batch 0 never consults the pool and the mix is the empty
+    base. That used to raise "free-market collection needs at least one opponent",
+    which made a fresh `SLOT_PREFIX` illegal on a pure-mirror run and so made the
+    reward-regime rule unfollowable. Since v43 the updater seeds the quiet network
+    there instead: one batch against an opponent that emits nothing, which is the
+    same baseline the promotion gate already treats as a real incumbent.
     """
 
     from agents.dqn_market_scorer.training.updater import compose_opponents
@@ -423,15 +322,10 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
     config = train_market_free.FREE_CONFIG
     base = config["opponents"]
 
-    assert base, "an empty base cannot cold-start"
-    assert base[0].startswith("kaggriculture_lab.opponents:make_seeded_random")
-    # Reproducible: the built-in `random` agent builds a fresh unseeded RNG per
-    # call, so two runs of the same seed diverge.
-    assert "seed=" in base[0]
-    # The saturating opponents earn their slots on state coverage, so they must
-    # stay a minority of the static base rather than becoming the anchor.
-    walls = [spec for spec in base if "competitor_" in spec or "surrogate" in spec]
-    assert len(walls) < len(base)
+    assert base == [], "v41 is pure mirror play; a static entry is a distribution change"
+    # The session moves for a clean measurement, the prefix does not -- see above.
+    assert train_market_free.SESSION_ID != f"market-free-{train_market_free.SLOT_PREFIX}-v40"
+    assert train_market_free.MODEL_NAME.startswith(train_market_free.SLOT_PREFIX)
 
     assert config["league_opponents"] is False
     # Must be truthy. The updater reads `if self_play_after and batch_index >=
@@ -441,24 +335,21 @@ def test_the_mirror_cold_starts_behind_a_non_saturating_anchor():
     assert train_market_free.BENCHMARKS == (train_market_free.DONOR,)
     assert not any("surrogate" in spec for spec in config["benchmarks"])
 
-    # Reproduce the updater's own branch. The mix must be non-empty at every
-    # batch index, before and after the mirror joins, and once it joins every
-    # static entry must survive rather than being rounded away -- a base slot that
-    # disappears is an opponent the run believes it is training against and is not.
+    # Reproduce the updater's own branch. With no base the mix is the pool unmixed,
+    # so `self_play_ratio` no longer decides anything -- every episode is a mirror.
+    # Batch 0 is the one index that cannot be served, which is the whole reason the
+    # prefix is inherited rather than fresh.
     pool = [f"self-{index}" for index in range(config["self_play_pool"])]
-    for batch_index, has_pool in ((0, False), (1, False), (20, True), (120, True)):
+    for batch_index, has_pool in ((0, False), (1, True), (20, True), (120, True)):
         opponents = list(base)
         if config["self_play_after"] and batch_index >= config["self_play_after"] and has_pool:
             opponents = compose_opponents(opponents, pool, config["self_play_ratio"])
+        if batch_index == 0:
+            assert not opponents, "batch 0 has no mirror; the updater seeds the quiet net"
+            continue
         assert opponents, f"empty opponent mix at batch {batch_index}"
-        if has_pool:
-            assert opponents[0] == base[0]
-            for spec in base:
-                assert spec in opponents, f"{spec} rounded out of the mix"
-            mirrored = sum(spec.startswith("self-") for spec in opponents)
-            # `self_play_ratio` is what this has to land on, and whole slots only
-            # approximate it -- three static entries at 0.65 give 6 of 9.
-            assert abs(mirrored / len(opponents) - config["self_play_ratio"]) < 0.05
+        assert all(spec.startswith("self-") for spec in opponents)
+        assert set(opponents) == set(pool), "the pool must arrive unmixed and entire"
 
 
 def test_the_runner_declares_the_noise_knobs_it_means_to_change():
