@@ -13,6 +13,8 @@ A session id moves for one of two reasons:
   any key here breaks a resume whether or not the reward moved. The prefix stays
   and the lineages carry forward.
 
+Standings against the public ladder: [dqn_market_free_ladder_standing.md](dqn_market_free_ladder_standing.md)
+
 ## The rule the code comments follow
 
 1. Restates the next line of code -&gt; delete.
@@ -962,3 +964,161 @@ A session id moves for one of two reasons:
   the tiles getting worked, and buyers still finishing below non-buyers. That says
   extra land does not pay inside a 30-day season under a frozen field scheduler,
   and the answer is to mask `BUY_LAND` off entirely.
+
+## The v3c fork is undocumented, and this is where it resumes
+
+`herd-v1`, `refusal-v1`, `sigma-v1`, `credit-v1`, `flow-v1`, `splitcredit-v1`,
+`housing-v1`, `recurrent-v1` and `splitladder-v1` are all league sessions on
+`train_market_free_v2/_v3/_v3b/_v3c.py` and none of them has an entry here.
+Their history lives in trainer header comments, which is exactly what rule 3 at
+the top of this file forbids. Backfilling them is its own job; `cashweight-v1`
+starts the practice again rather than waiting for it.
+
+## v44 -- `market-free-cashherd-v1`
+
+- Changed (strong): `reward.OUTCOME_LOG_SCALE` 5.0 -&gt; 2.5, on the v3c fork. One
+  constant, nothing else in `reward.py`. `SLOT_PREFIX` goes `split` -&gt; `cash` and
+  the ten `splitladder-v1` lineages end here. The ladder demonstration arm is
+  dropped with it, so the roster is uniform.
+- **What `splitladder-v1` proved, which is that the wrong quantity was solved.**
+  At cutoff 120 `unrecovered_seed_share` and `unrecovered_animal_share` read 0.0
+  on nine of ten slots, seed margin +36,934 an episode and animal margin +5,272 --
+  Block F's split-credit objective *met* -- with a best slot on 10,868 money.
+  Decomposing that slot's `own_mean_return` of -0.261: outcome +0.252, the four lot
+  legs +0.155 net, therefore about -0.67 of penalty. `split_02` runs about -1.11.
+  This is v26's "the objective was 98% penalty" unfixed, and the part that binds is
+  the ratio inside the positive half: trading stock pays +0.155 while growing the
+  purse from the 3,000 stake to 10,868 pays +0.252.
+- **The behaviour that ratio buys, against 1,050 mirrored ladder replays.** Per
+  episode-seat we move 218,563 coins of gross revenue against a ladder champion's
+  136,737 and give back 214,104 against its 40,588 -- a 2% net margin against 70%.
+  34.7% of episodes finish under the stake; the ladder's finish under it 0% of the
+  time. Money is under 100 coins on 40.8% of turns. The policy is not failing to
+  trade, it reinvests everything it earns.
+- **The constant was measured, not argued.** `episode_rewards` is a pure function
+  of a trace, so 300 real episodes of `splitladder-v1` (generations &gt;= 8, both
+  seats, median 5,270) were re-scored under candidates before anything was edited.
+  Pearson / Spearman of the discounted return against final money, and the mean
+  return of a season that made money minus one that lost it:
+
+      S      pearson  spearman  win-lose
+      1.0     0.776    0.954     1.413
+      1.5     0.789    0.960     1.186
+      2.0     0.785    0.955     1.017
+      2.5     0.773    0.947     0.891
+      3.0     0.759    0.935     0.795
+      5.0     0.701    0.888     0.568
+
+  **2.5 rather than the 1.5 optimum**, because 1.5 fits the distribution this run
+  happens to produce and that is the failure every earlier value of this constant
+  died of. 56,000 -&gt; 124,000 is worth 0.026 of reward at 1.5, 0.079 at 2.5.
+- **Measured on the same 300 and rejected**: scaling the four lot weights down to
+  put more of the stream on `outcome` buys +0.005 pearson and costs 0.034 of the
+  win/lose separation. The lot legs are the only action-differentiable money term
+  in the stream -- `outcome` is an episode-level scalar, identical for every action
+  at a state, reaching the argmax only through the `n_step` bootstrap -- so
+  shrinking them removes signal. Also rejected as an alignment fix:
+  `INSOLVENCY_GRACE_TURNS` 24 -&gt; 48 lifts the mean return -0.341 -&gt; -0.246 and
+  leaves the correlation flat. It is a level shift and deserves its own session.
+- **Why no demonstration arm.** `splitladder-v1` pinned a 96-episode ladder pack on
+  slots 00-04 and the value function diverged on contact. `max_abs_q` by cutoff,
+  seeded against control:
+
+      cutoff   20     30     60    100    130
+      seeded  0.49  20.82  26.98  21.33  18.35
+      control 0.57   0.50   0.45   0.49   0.60
+
+  Cutoff 30 is the first update carrying `demonstrations`; `mean_loss` steps
+  0.0013 -&gt; 1.194 on the same row and never returns, against control at 0.0005 all
+  session. Every reward term is bounded, so a correct Q is single digits. The cause
+  is the loss and not the pack: `updater._behavior_clone_step` runs `cross_entropy`
+  straight on the Q head's logits, whose optimum is the chosen logit at infinity --
+  `grad_clip_norm` bounds the step, not the fixed point -- for 100 steps a batch
+  against the TD loop's 48, and the target net is then synced to the inflated head.
+  So the seeded-vs-control read is void rather than negative, and no pack should be
+  pinned again until the clone loss is bounded. DQfD's large-margin hinge is the
+  form, and the roadmap already carries it as unbuilt -- filed there as a way to
+  make the clone *stronger*, which the table above inverts.
+- **Two numbers that were being read wrong, both from the arena, 12 seeds, both
+  orientations.** The gate's `b_money_mean` of 123,661 is pilkwang **uncontested**:
+  against a real competitor -- itself -- it makes 69,534 mean and 56,779 median.
+  And our own field path is a second leak independent of the market head: swapping
+  `donor._role_plan` for `herd.field_roles` and keeping the donor's market rules
+  unmodified scores 48,638 and lets pilkwang run to 121,165 at a 0.00 win rate. So
+  the honest reference for a contested episode is 56-70k, not 124k, and
+  `herd.field_roles` + `planting.market_influenced_roles` own part of the gap.
+- Landed with it, both narrowings rather than levers, and both recorded so the
+  session is not read as one change. `order_space.stock_ceiling` shuts every SELL
+  rung above the smallest that clears the shed -- deduplication, since the shed
+  bounds the fill and those rungs are one action spelled several ways, which is the
+  proof `feasible_actions` demands. The cost it removes is on the reward, not the
+  fill: `PendingTurn.apply` quotes at the full quantity, so an oversized rung
+  inflates `expected_delta` and `order_refused` -- a **turn**-level test at
+  `FILL_FRACTION` -- reads a turn whose legs all filled as refused, charging
+  `REJECTED_ORDER_PENALTY` and latching the state feature. 2,113 of 7,910 sell
+  units an episode had no stock behind them. And `updater._large_margin_loss`
+  replaces the clone phase's cross-entropy; inert here at
+  `demonstration_episodes = 0`, landed so the next demonstration arm is readable.
+- **The field overlays, attributed.** `sim.arena`, 12 seeds, both orientations, all
+  four running the donor's market rules so only the role plan differs:
+
+      field role plan              ours   pilkwang   win
+      donor._role_plan only      69,534     69,534   0.42
+      + herd overlay             48,950    121,532   0.00
+      + planting overlay         79,617     83,162   0.54
+      + both (= field_roles)     48,638    121,165   0.00
+
+  `herd.herd_influenced_roles` is the whole leak -- alone it costs 20,584 and stops
+  the seat contesting the market at all. `planting.market_influenced_roles` is the
+  opposite, +10,083 and a winning record against pilkwang. `main.py` runs both, so
+  the fork is paying 20k for the half that loses. Not changed here: it is an
+  inference-path change, the animal lot weights were fitted with the overlay in
+  place, and it deserves its own session.
+- Pass condition: `own_solvent_fraction` mean over 0.50 against the `splitladder-v1`
+  control half's 0.276, and `own_mean_return` crossing zero on a majority of slots,
+  **with `order_diagnostics.trading_rate` held within ~25% of 0.392**. The third
+  clause is the guard that matters. A slot that stops trading converges on the
+  3,000 stake and every trading slot in `splitladder-v1` finishes below it, so
+  silence raises `lr_score` mechanically -- `split_03` is doing exactly that at
+  cutoff 120-130 on a `trading_rate` of 0.017.
+
+## v45 -- the herd overlay's strip, folded into v44
+
+Landed into `market-free-cashherd-v1` rather than run on its own, because it is an
+inference change measured in the arena rather than a training lever that needs a
+league to read it.
+
+- Changed: `herd.herd_influenced_roles` pass two is gone. It stripped every
+  speculative animal role -- a role on a tile with no structure and no animal --
+  which is the donor's four-pasture opening.
+- **Attributed within the overlay before being changed.** `sim.arena`, both
+  orientations, donor market rules on both sides, everything else equal:
+
+      variant                    ours   pilkwang   win   seeds
+      overlay as shipped       50,240    122,515  0.00      24
+      no herd overlay          79,343     79,493  0.56      24
+      pass two off entirely    83,525     86,111  0.35      24
+      pass two payback-gated   83,525     86,111  0.35      24
+      overlay, WARM_SLOTS=2    47,706    117,723  0.00      12
+      overlay, WARM_SLOTS=4    74,105    103,176  0.17      12
+
+  The strip is the whole of the module's cost -- removing it alone beats removing
+  the overlay entirely, because passes one, three and four are worth keeping.
+  `WARM_SLOTS` is not the knob: 2 does nothing and 4 only approximates rebuilding
+  the donor's pastures by a worse route.
+- **The payback gate is bit-identical to deletion**, to the last digit over 48
+  episodes, which is what identified the real reason the strip was redundant:
+  `donor._field_jobs` emits `BUILD_` only at `left >= animal_rule["first"] + 2` and
+  not at all during liquidation, so a speculative role the season cannot pay back
+  produces no job and costs nothing. The strip bought nothing the donor's own build
+  window was not already refusing. Shipped without the gate rather than with a
+  branch that never fires -- rule 2.
+- **Why the original argument failed.** "52% of episodes never buy the animal" was
+  measured on a learner that was not buying animals, and the strip is part of why:
+  it deletes the housing, the housing is what makes a purchase land. Both sides of
+  the fork buy now -- `splitladder-v1` averages 9.7 cows, 7.4 sheep, 8.9 geese an
+  episode. `docs/dqn_market_free_animal_products.md` carries the correction beside
+  its original claim.
+- Not changed: passes one, three and four, `WARM_SLOTS`, `warm_slot_species`, the
+  ten `HERD_VIABILITY_DIM` state columns. The coop the donor's planner cannot reach
+  is still this module's reason to exist.

@@ -4,6 +4,8 @@ What each session changed and measured is in
 [dqn_market_free_sessions.md](dqn_market_free_sessions.md). This file is the
 argument about what to build next.
 
+Standings against the public ladder, and which layer the deficit is in: [dqn_market_free_ladder_standing.md](dqn_market_free_ladder_standing.md)
+
 ## Context
 
 `dqn_market_free` was rewritten at `a1c297e` as a single-action DQN: a 186-wide

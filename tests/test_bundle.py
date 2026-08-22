@@ -26,6 +26,10 @@ REPO = Path(__file__).resolve().parent.parent
 OWNED_AGENTS = [
     "agents/configurable_crop_surrogate/agent.toml",
     "agents/dqn_job_scorer/agent.toml",
+    "agents/dqn_market_free_v2/agent.toml",
+    "agents/dqn_market_free_v3/agent.toml",
+    "agents/dqn_market_free_v3b/agent.toml",
+    "agents/dqn_market_free_v3c/agent.toml",
     "agents/receding_horizon_planner/agent.toml",
 ]
 

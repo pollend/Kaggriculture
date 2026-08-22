@@ -1186,6 +1186,14 @@ def session_learner_roster(connection: Any, session_id: str) -> list[dict[str, A
     they are populated for agents that keep a slot schedule and NULL for those that
     do not. That is deliberate: this is one query for a general shape, not a
     per-agent view, and a model with no schedule simply shows blanks.
+
+    `reference_samples` rides along with `last_money` because the money alone does
+    not say how much to believe it. The ratchet reference is a median over the
+    slot's recent measurements, and one arena series on these families is a draw
+    rather than a number, so a reading standing on two samples and one standing on
+    eleven are not the same evidence. It was two for every promoting slot in
+    `market-free-cashherd-v1` while the window was configured for eleven, and
+    nothing on the page said so.
     """
     return rows(
         connection,
@@ -1217,6 +1225,9 @@ def session_learner_roster(connection: Any, session_id: str) -> list[dict[str, A
                CAST(l.metrics_json ->> 'lr_score' AS DOUBLE PRECISION) AS score,
                CAST(l.gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
                     AS DOUBLE PRECISION) AS last_money,
+               CAST(l.gate_json -> 'benchmark_ratchet' ->> 'reference_samples'
+                    AS INTEGER) AS reference_samples,
+               l.gate_json -> 'benchmark_ratchet' ->> 'reference_kind' AS reference_kind,
                CAST(l.gate_json -> 'hard_viability' -> 'head_to_head' ->> 'trading_rate'
                     AS DOUBLE PRECISION) AS trading_rate,
                CAST(l.gate_json -> 'population' ->> 'release_age' AS INTEGER) AS release_age,

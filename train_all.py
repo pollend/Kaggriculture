@@ -79,6 +79,49 @@ TRAINING_AGENTS = [
         "train": False,
     },
     {
+        # v2 of the free-market learner: the same premise with a sequence of
+        # sub-decisions per turn instead of one order. Trains in
+        # `configs/dqn_market_free_v2_league.toml`; an anchor here.
+        "type": "dqn_market_free_v2",
+        "name": "default",
+        "train": False,
+    },
+    {
+        # v3c is v3b plus block F: what moved the market since last turn, split into
+        # the town's purchase, this agent's own emitted units and the residual --
+        # which is the opponent, the one part of the market that is not observable
+        # at decision time. 280 columns against v3b's 232, and no other difference.
+        # Trains in `configs/dqn_market_free_v3c_league.toml`; an anchor here.
+        "type": "dqn_market_free_v3c",
+        "name": "default",
+        "train": False,
+    },
+    {
+        # v3b is v3 with the three refusal latches of block D put back: the reward
+        # charges `REJECTED_ORDER_PENALTY` on a refused turn and v3's state cannot
+        # see refusal at all, so the policy is fined for a condition it cannot
+        # observe. 232 columns against v3's 229, and no other difference -- which
+        # is what makes the pair an attribution rather than two unrelated runs.
+        # Trains in `configs/dqn_market_free_v3b_league.toml`; an anchor here.
+        "type": "dqn_market_free_v3b",
+        "name": "default",
+        "train": False,
+    },
+    {
+        # v3 adds a per-turn GRU whose latent feeds the action head, and drops the
+        # hand-built history block the recurrence replaces. Its state is a
+        # different width from either predecessor, so it shares no checkpoint with
+        # them. Trains in `configs/dqn_market_free_v3_league.toml`; an anchor here.
+        #
+        # Listed with `train: False` like every other family with a dedicated
+        # runner. `test_training_roster_lists_every_manifest_backed_agent` requires
+        # an entry per manifest, so a new fork that skips this breaks that test
+        # rather than being quietly left out of the all-agents league.
+        "type": "dqn_market_free_v3",
+        "name": "default",
+        "train": False,
+    },
+    {
         "type": "sp_psro_job_scorer",
         "name": "default",
         "train": False,

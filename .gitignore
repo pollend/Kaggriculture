@@ -16,3 +16,4 @@ agents/dqn_market_free/dqn_market_free_submission.tgz
 *.duckdb
 *.joblib
 .kaggriculture/
+data/

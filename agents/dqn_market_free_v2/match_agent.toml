@@ -1,0 +1,34 @@
+family_id = "dqn_market_free_v2_match_policy"
+name = "Market Free Match Policy"
+entry_point = "agents.dqn_market_free_v2.match_agent:make_agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_market_free_v2.main:evaluate_episode"
+
+# Training-only: rollout episodes are recorded as league pairings under this
+# identity so they are queryable like any match. It imports `training/`, so it
+# is never bundled for submission.
+#
+# `evaluation.py` and `diagnostics.py` are listed because `episode_evaluator`
+# above resolves through `main.__getattr__`, which imports `evaluation`, which
+# imports `diagnostics`. Neither is reachable from `match_agent:make_agent`, so
+# a fingerprint taken from the entry point alone would miss both.
+#
+# `training/reward.py` is listed because `training/collect.py` imports it: the
+# recorded reward stream is part of what this identity produced, so a change to
+# MONEY_SCALE or `potential()` has to mint a new revision rather than reuse one.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_market_free_v2/__init__.py",
+  "agents/dqn_market_free_v2/diagnostics.py",
+  "agents/dqn_market_free_v2/donor.py",
+  "agents/dqn_market_free_v2/evaluation.py",
+  "agents/dqn_market_free_v2/match_agent.py",
+  "agents/dqn_market_free_v2/main.py",
+  "agents/dqn_market_free_v2/market_state.py",
+  "agents/dqn_market_free_v2/order_space.py",
+  "agents/dqn_market_free_v2/planting.py",
+  "agents/dqn_market_free_v2/policy.py",
+  "agents/dqn_market_free_v2/training/__init__.py",
+  "agents/dqn_market_free_v2/training/collect.py",
+  "agents/dqn_market_free_v2/training/reward.py",
+]

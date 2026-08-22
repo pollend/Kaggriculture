@@ -1,0 +1,36 @@
+dqn_market_free_v3
+===============
+
+This agent contains third-party code redistributed under the Apache License,
+Version 2.0. The full license text is in LICENSE-pilkwang.
+
+Third-party component
+---------------------
+
+  Work:      Kaggriculture: Structured Economic Policy
+  Author:    Pilkwang Kim
+  Kaggle:    pilkwang/kaggriculture-structured-economic-policy
+  Source:    https://www.kaggle.com/code/pilkwang/kaggriculture-structured-economic-policy
+  License:   Apache-2.0
+
+  File:      donor.py
+  Origin:    agents/dqn_market_scorer/donor.py
+  upstream
+  sha256:    407b2fa7725f976df88995751ab17386aad0ce75c2cfa89df274561bc11289fa
+  derivative
+  sha256:    a8da70675b6d5f02372f24ee37f8c832fafb0ca74351add28bbcaab06f661d91
+  notebook
+  sha256:    12c25351a5319bb7b8e185563f03ffd45e34727a843ed39f7bfde24d32e887b0
+
+Statement of modification
+-------------------------
+
+  donor.py IS A MODIFIED DERIVATIVE of the work named above. It is inlined
+  byte-for-byte from dqn_market_scorer so this agent can bundle its frozen field
+  policy without importing another agent. The derivative adds bounded Q-network
+  guidance to _role_plan: animal_gate may block new herd roles and seed_scale
+  may reduce new crop roles. Existing plants and animals remain assigned so
+  learned choices cannot suppress their field care. This agent invokes the
+  default guidance and does not invoke the donor's market planner.
+
+  Every other file in this directory is original work of this repository.

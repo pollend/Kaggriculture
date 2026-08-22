@@ -1,0 +1,40 @@
+family_id = "dqn_market_free_v3b_match_policy"
+name = "Market Free Match Policy"
+entry_point = "agents.dqn_market_free_v3b.match_agent:make_agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_market_free_v3b.main:evaluate_episode"
+
+# Training-only: rollout episodes are recorded as league pairings under this
+# identity so they are queryable like any match. It imports `training/`, so it
+# is never bundled for submission.
+#
+# `evaluation.py` and `diagnostics.py` are listed because `episode_evaluator`
+# above resolves through `main.__getattr__`, which imports `evaluation`, which
+# imports `diagnostics`. Neither is reachable from `match_agent:make_agent`, so
+# a fingerprint taken from the entry point alone would miss both.
+#
+# `training/reward.py` is listed because `training/collect.py` imports it: the
+# recorded reward stream is part of what this identity produced, so a change to
+# MONEY_SCALE or `potential()` has to mint a new revision rather than reuse one.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_market_free_v3b/__init__.py",
+  "agents/dqn_market_free_v3b/diagnostics.py",
+  "agents/dqn_market_free_v3b/donor.py",
+  "agents/dqn_market_free_v3b/evaluation.py",
+  # `main.py` imports `field_roles` from here, and `diagnostics.py` imports
+  # `lots`. Both were missing, so a change to the herd composer or the lot
+  # matcher did not mint a new revision and rollouts from before and after it
+  # shared one identity.
+  "agents/dqn_market_free_v3b/herd.py",
+  "agents/dqn_market_free_v3b/lots.py",
+  "agents/dqn_market_free_v3b/match_agent.py",
+  "agents/dqn_market_free_v3b/main.py",
+  "agents/dqn_market_free_v3b/market_state.py",
+  "agents/dqn_market_free_v3b/order_space.py",
+  "agents/dqn_market_free_v3b/planting.py",
+  "agents/dqn_market_free_v3b/policy.py",
+  "agents/dqn_market_free_v3b/training/__init__.py",
+  "agents/dqn_market_free_v3b/training/collect.py",
+  "agents/dqn_market_free_v3b/training/reward.py",
+]

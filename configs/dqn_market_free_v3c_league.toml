@@ -1,0 +1,41 @@
+[league]
+league = "dqn_market_free_v3c"
+name = "dqn-market-free-v3c"
+
+# Trainer-only, same shape as the market scorer league: the trainer collects its
+# own full-length episodes, so there is no breedable population, no anchor
+# pairings and no hall of fame.
+manifest = "agents/dqn_market_free_v3c/agent.toml"
+anchor_manifests = []
+training_manifests = ["agents/dqn_market_free_v3c/agent.toml"]
+
+pairing_mode = "trainer_only"
+population_size = 0
+# Moves in lockstep with the manifest's `min_new_batches`: `batches_per_round` is
+# 1, so this many rounds is exactly one update per learner slot, and a generation
+# is exactly one turn of the graduation clock. Setting one without the other
+# either starves the update or collects rounds that produce nothing.
+#
+# Halved from 20 because 20 was buying wall clock rather than learning. The
+# optimizer budget is `gradient_steps_per_batch * batches_per_update`
+# (`updater.py`), so gradient steps track the data consumed and a shorter
+# generation trains just as hard per episode -- it only runs the promotion gate
+# twice as often. Against that: at 320 episodes into a 400-episode buffer nearly
+# all of replay was being replaced every update, with only `reservoir_fraction`
+# carrying any history, so 160 is the better sampling for an off-policy learner
+# rather than the worse.
+#
+# What it does cost, stated plainly: the plateau detector counts *updates*, and
+# `lr_plateau_min_delta` needs a 5% improvement to reset the stall. Less training
+# between measurements makes consecutive scores more alike, so stalls accumulate
+# faster and a slot reaches its LR cut on about half the training it used to.
+# That is the same graduation event fired on less evidence. 10 rather than 5 or 1
+# because the gate is a fixed cost per update and below about five rounds a
+# generation is mostly gate.
+rounds_per_generation = 10
+hall_of_fame_rounds = 0
+episode_steps = 720
+seed = 2718
+jobs = 0
+tau = 0.5
+candidate_pool = 2

@@ -6,9 +6,13 @@ about what to build next is in
 [dqn_market_free_roadmap.md](dqn_market_free_roadmap.md). This file is one
 specific unbuilt thing, written up while the evidence was in front of us.
 
-Status: **not started.** Session `market-free-landheuristic-v43` was mid-flight
-(generation 17, batch ~176) when this was written, so every league number below
-is a snapshot of a live run and will have moved.
+Status: **items 1, 2 and 4 built in `dqn_market_free_v2`**, session
+`market-free-herd-v1`; item 3 is the measurement that follows and has not run yet.
+See "What was built" at the end. Session `market-free-landheuristic-v43` was
+mid-flight (generation 17, batch ~176) when the rest of this was written, so every
+league number below is a snapshot of a live run and will have moved.
+
+Where this sits against the ladder overall: [dqn_market_free_ladder_standing.md](dqn_market_free_ladder_standing.md)
 
 ## The finding
 
@@ -213,3 +217,80 @@ benchmark mean 8,177, benchmark median 2,508, `unrecovered_animal_share` 0.55.
 Adding animals to a policy that cannot manage them is how that failure mode is
 produced, so item 1 landing before item 2 is the point, not an ordering
 preference.
+
+## The decay curve, which the aggregates hid
+
+Counted off v1's own rollout traces
+(`artifacts/dqn_market_free/dqn_market_free/landheur_0*/episode_traces/**/*.npz`),
+60 episodes sampled per generation, `order_chosen` in the `BUY_ANIMAL` columns
+177-185 and the `SELL` columns 56-88:
+
+| gen | GOOSE buys /ep | COW | SHEEP | SELL EGG | SELL MILK | turns GOOSE unmasked /ep |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 10.33 | 3.53 | 7.77 | 3.77 | 0.82 | 162 |
+| 5 | 2.68 | 4.23 | 3.10 | 2.25 | 1.50 | 379 |
+| 13 | 0.22 | 3.83 | 0.28 | 0.00 | 6.95 | 480 |
+| 27 | 0.20 | 7.22 | 1.37 | 0.13 | 14.02 | 502 |
+| 42 | 0.00 | 9.12 | 0.67 | 0.00 | 14.43 | 503 |
+| 53 | 0.05 | 8.37 | 1.02 | 0.00 | 10.15 | 511 |
+
+Two things in that table change the plan above.
+
+**It is not an exploration failure.** The goose column is open ~500 turns an
+episode the whole way, and generation 1 bought geese ten times an episode. The
+policy found the action and priced it out. Demonstrations and exploration bonuses
+are answers to a question this is not asking, which is why item 3 stayed an
+if-then.
+
+**The aggregates could not see it.** Over the same span
+`gate_json.challenger_benchmarks[0].behavior.animal_spend` rises from 160 to 6,100
+coins an episode and `unrecovered_animal_share` sits between 0.1 and 0.4. A growing
+herd, spending well. There is no species split in that structure, so a monoculture
+and a balanced herd are the same row.
+
+## What was built
+
+In `dqn_market_free_v2`, session `market-free-herd-v1` (a new session: the state
+vector widened and `policy.load` refuses the old width).
+
+1. **`herd.py` owns every animal role.** `herd_influenced_roles` replaces
+   `goose_influenced_roles` and applies one rule to all three species: a structure
+   exists for an animal that was bought, plus exactly one warm slot ahead of demand
+   so the *first* purchase of any species lands the next turn rather than three
+   turns later. `field_roles` is the single composer, shared by `main.py`,
+   `training/clone.py` and `order_space`'s fallbacks, so no two callers can
+   reconstruct a different board. Measured on a zero-animal episode: 4 pastures
+   before, 1 after.
+
+   **Superseded, and the "4 before, 1 after" was the cost rather than the win.**
+   The strip that produced it is gone as of `market-free-cashherd-v1`. It deleted
+   the housing that makes a purchase land, and the waste it was bought against --
+   a `BUILD_` for a herd that never arrives -- was already refused by
+   `donor._field_jobs`, which emits the job only at `left >= first + 2` and never
+   during liquidation. Over 24 seeds in both orientations with the donor's market
+   rules on both sides: 50,240 with the strip against 83,525 without, and pilkwang
+   held to 86,111 instead of running to 122,515. The 52% statistic behind it was
+   measured on a learner that was not buying animals, which is circular. Passes
+   one, three and four -- the coop the donor cannot reach, the warm slot, the
+   species pricing -- are untouched and are still what this file is about.
+2. **The warm slot's species is priced over the whole herd's remaining output**, so
+   MILK walks down its own `linear 1.60` curve as cows are added while EGG's `log
+   0.20` barely moves. One cow scores above one goose; the second goose beats the
+   second cow.
+3. **Ten new state columns** (`market_state.HERD_VIABILITY_DIM`): the goose
+   affordability column that block C never had, per-species unplaced holdings, and
+   per-species remaining yield events and gross-per-coin. The last two are the
+   quantities `ANIMAL_WASTE_WEIGHT` charges on, which the state did not carry at all.
+4. **The sell ladder is depth-capped** (`order_space.MAX_SELL_SLIPPAGE = 0.15`),
+   which is item 4 above. Rungs whose last unit fills more than 15% below the quote
+   are shut on the v2 path -- WHEAT and EGG keep the whole ladder, WOOL and MILK do
+   not. It passes the mask's proof rule by aliasing, not by measurement: the
+   simulator prices each unit off the running inventory, so four small orders and
+   one large one reach the same fills. The cap reprices itself off the inventory its
+   own sales made, so the cumulative crash is the same arithmetic.
+5. **The species split exists in the database now**: `animals_<species>_per_episode`,
+   `animal_lots_<species>` and `animal_margin_<species>` in the gate's behaviour
+   block. The check at the top of this file no longer needs a trace scrape.
+
+Not built, deliberately: demonstrations, an exploration bonus on the animal columns,
+and any change to the opponent pool. The payoff moved; measure before bootstrapping.

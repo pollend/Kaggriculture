@@ -6,4 +6,7 @@ required = false
 tool_timeout_sec = 30
 default_tools_approval_mode = "auto"
 
+[mcp_servers.kaggriculture_progress.tools.query_database]
+approval_mode = "approve"
+
 # END KAGGRICULTURE DASHBOARD MCP (managed)

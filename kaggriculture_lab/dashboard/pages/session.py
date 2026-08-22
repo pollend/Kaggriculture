@@ -88,24 +88,51 @@ def _roster_row(row: dict[str, Any]) -> str:
         if row["in_pool"]
         else '<span class="muted">—</span>'
     )
+    # The money is a median over however many measurements the slot has taken
+    # since its reseed, and two of them is not eleven of them. Printed with the
+    # number rather than beside it, because a reader comparing two slots is
+    # comparing two different amounts of evidence and nothing else on the row
+    # says so.
+    #
+    # Zero is not "no samples" but the state before the window can run at all --
+    # `released_measurement`, the incumbent's single stored draw -- and saying "0
+    # samples" for the one reading standing on the least evidence is the wrong way
+    # round.
+    samples = row.get("reference_samples")
+    money_cell = _number(money, 1)
+    if samples is not None:
+        count = int(samples)
+        evidence = "single draw" if count < 2 else f"{count} samples"
+        money_cell += f'<br><small class="muted">{evidence}</small>'
     return (
         f'<tr><td><a href="{_escape(_id_path("models", row["model_id"]))}">'
         f'<code>{_escape(str(row["model_id"]).split("@")[-1])}</code></a></td>'
         f'<td><b>#{row["reseed_index"] if row["reseed_index"] is not None else "—"}</b></td>'
         f'<td>{schedule}</td>'
         f'<td>{latest - attempted:,} / {minimum:,}</td>'
-        f'<td>{_number(money, 1)}</td>'
+        f'<td>{money_cell}</td>'
         f'<td>{_percent(rate)}{mode}</td>'
         f'<td>{release}</td><td>{pool}</td></tr>'
     )
 
 
-def _head_to_head_section(rows: list[dict[str, Any]]) -> str:
+def _head_to_head_section(rows: list[dict[str, Any]], trainer_only: bool = False) -> str:
     """Which family each family actually loses to.
 
     Rendered per focal family as a diverging bar rather than as a full
     family-by-family heatmap: the matrix is antisymmetric, so the heatmap would
     say everything twice, and a bar has a zero line a reader can trust.
+
+    Under `trainer_only` the same bars mean something else entirely and are
+    relabelled rather than hidden. There is no league opponent in that mode: every
+    pairing is one learner against mirrors of its own checkpoints, drawn from a pool
+    `_self_play_pool` deliberately does not filter on `promoted`, because release is
+    gated and the behaviour distribution is not. So the margin is self-referential,
+    and it is largest when the slot is doing worst -- a slot whose gate rejects
+    everything mirrors nothing but its own rejects. `cashherd_02` posted +18,148 at a
+    0.96 win rate against three checkpoints its own gate had refused. Left as a
+    quality ranking that reads as the best slot in the session; it was the most
+    stuck. The number to rank on is the benchmark money in Models below.
     """
     if not rows:
         return ""
@@ -134,6 +161,18 @@ def _head_to_head_section(rows: list[dict[str, Any]]) -> str:
         panels.append(f'<div class="panel"><h3>{_escape(family)}</h3>{chart}</div>')
     if not panels:
         return ""
+    if trainer_only:
+        return (
+            "<h2>Rollout matchups</h2>"
+            '<p class="muted">Mean seat-cancelled margin against each mirror family, over '
+            "complete generations; the count in brackets is pairings played. "
+            "<b>Not a quality ranking.</b> This session pairs each learner against "
+            "mirrors of its own checkpoints, promoted or not, so the margin is measured "
+            "against the slot itself: a slot whose gate rejects everything mirrors its "
+            "own rejects and posts a large positive margin for being stuck. Rank on the "
+            "benchmark money under Models instead.</p>"
+            f'{"".join(panels)}'
+        )
     return (
         "<h2>Head to head</h2>"
         '<p class="muted">Mean seat-cancelled margin against each opponent family, over '
@@ -168,7 +207,7 @@ def render(data: dict[str, Any]) -> str:
         f'<td>{_escape(row["completed_at"] or row["created_at"])}</td></tr>'
         for row in generations
     )
-    head_to_head = _head_to_head_section(data["head_to_head"])
+    head_to_head = _head_to_head_section(data["head_to_head"], trainer_only)
     model_rows = "".join(_roster_row(row) for row in data["roster"])
     # Without this the session page carries no training information at all: the
     # models that produced every checkpoint in it were reachable only over MCP.

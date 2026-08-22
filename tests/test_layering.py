@@ -41,9 +41,18 @@ INFRA_ALLOWED_DIRS = ("training",)
 # Its submission path is self-contained: the donor and market-state encoder are
 # copied locally and parity-tested, while training reuses device, replay-reward,
 # progress, and arena-gate machinery that is never bundled.
+#
+# Every fork of that family inherits the relationship, and each one has to be
+# listed: `v2` was not, so this test failed from the day that fork landed until
+# `v3` went looking for the same allowance. A fork is a new `owner` string, and
+# nothing derives one entry from another.
 AGENT_EXTENSIONS = {
     ("sp_psro_job_scorer", "dqn_job_scorer"),
     ("dqn_market_free", "dqn_market_scorer"),
+    ("dqn_market_free_v2", "dqn_market_scorer"),
+    ("dqn_market_free_v3", "dqn_market_scorer"),
+    ("dqn_market_free_v3b", "dqn_market_scorer"),
+    ("dqn_market_free_v3c", "dqn_market_scorer"),
 }
 
 

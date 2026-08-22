@@ -172,6 +172,74 @@ def test_session_page_counts_rounds_for_a_trainer_only_session():
     assert "Pairings recorded" in document
 
 
+def test_head_to_head_is_relabelled_when_the_opponent_is_the_slot_itself():
+    """A trainer-only session has no league opponent, so the bars are not a ranking.
+
+    Every pairing is one learner against mirrors of its own checkpoints, and
+    `_self_play_pool` deliberately does not filter those on `promoted`. The margin
+    is therefore largest when the slot is doing worst: `market-free-cashherd-v1`
+    ran `cashherd_02` at +18,148 and a 0.96 win rate against three checkpoints its
+    own gate had refused, and the page presented that as the session's best record.
+    """
+
+    rows = [
+        {"me": "learner", "opponent": "mirror", "opponent_name": "mirror",
+         "pairings": 160, "mean_margin": 18148.0},
+        {"me": "learner", "opponent": "learner", "opponent_name": "learner",
+         "pairings": 160, "mean_margin": 0.0},
+    ]
+
+    self_play = session_page._head_to_head_section(rows, True)
+    assert "Rollout matchups" in self_play
+    assert "Not a quality ranking" in self_play
+    assert "mirrors of its own checkpoints" in self_play
+    assert "<h2>Head to head</h2>" not in self_play
+    # Relabelled, never hidden -- the bars are still the record that was played.
+    assert "<svg" in self_play
+
+    league = session_page._head_to_head_section(rows, False)
+    assert "<h2>Head to head</h2>" in league
+    assert "Not a quality ranking" not in league
+    # The default is the league reading, so no caller is silently switched over.
+    assert session_page._head_to_head_section(rows) == league
+
+
+def test_roster_prints_how_many_samples_the_money_stands_on():
+    """Two measurements and eleven are not the same evidence, and only one row says so.
+
+    The ratchet reference is a median over the slot's recent benchmark draws, and one
+    arena series on these families is a draw rather than a number. `market-free-
+    cashherd-v1` was configured for a window of eleven and ran every *promoting* slot
+    at two, which is invisible if the page prints only the median.
+    """
+
+    row = {
+        "model_id": "family.role@cashherd_03",
+        "reseed_index": 0,
+        "stage": "steady",
+        "decay_steps": 0,
+        "stall_updates": 1,
+        "updates_since_reseed": 4,
+        "latest_batch_seq": 50,
+        "last_attempted_batch_seq": 40,
+        "min_new_batches": 10,
+        "trading_rate": 0.4,
+        "last_money": 1750.93,
+        "reference_samples": 2,
+        "active_checkpoint_id": "abc123",
+        "promotions": 4,
+        "in_pool": False,
+        "pool_score": None,
+    }
+
+    assert "2 samples" in session_page._roster_row(row)
+    # A trainer that records no ratchet leaves the column blank rather than "0".
+    assert "samples" not in session_page._roster_row({**row, "reference_samples": None})
+    # And zero means the window has not run yet -- the incumbent's single stored
+    # draw -- which is the least evidence on the page, not the absence of a reading.
+    assert "single draw" in session_page._roster_row({**row, "reference_samples": 0})
+
+
 def test_session_page_draws_the_rating_trend_when_there_is_one():
     document = session_page.render(
         _session_data(
