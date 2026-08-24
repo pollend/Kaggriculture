@@ -142,6 +142,87 @@ def test_dqn_export_requires_confirmation_and_copies_active_artifact(
     assert output.read_bytes() == source.read_bytes()
 
 
+def test_dqn_export_best_copies_highest_benchmark_checkpoint(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    database = postgres_database(tmp_path, "export-best")
+    assert dqn_cli([
+        "model", "status", "--database-url", database.url,
+    ]) == 0
+    capsys.readouterr()
+
+    low_source = tmp_path / "checkpoint-low.npz"
+    high_source = tmp_path / "checkpoint-high.npz"
+    low_source.write_bytes(b"latest accepted weights")
+    high_source.write_bytes(b"best benchmark weights")
+    with ExperimentStore(database) as store:
+        store.connection.execute(
+            """
+            INSERT INTO model_updates (
+                update_id, model_id, cutoff_batch_seq, new_batch_count,
+                dataset_sha256, status
+            ) VALUES
+                ('update-low', 'dqn_job_scorer.adaptive_hybrid_q_v2', 20, 20,
+                 'dataset-low', 'PROMOTED'),
+                ('update-high', 'dqn_job_scorer.adaptive_hybrid_q_v2', 10, 10,
+                 'dataset-high', 'REJECTED')
+            """
+        )
+        store.connection.execute(
+            """
+            INSERT INTO model_training_checkpoints (
+                checkpoint_id, model_id, update_id, trainer_artifact_path,
+                inference_artifact_path, artifact_sha256, dataset_sha256,
+                metrics_json, gate_json, promoted
+            ) VALUES
+                ('checkpoint-low', 'dqn_job_scorer.adaptive_hybrid_q_v2',
+                 'update-low', %s, %s, 'artifact-low', 'dataset-low', '{}',
+                 '{"passed": true, "benchmark_score": {"candidate_money": 1200.0}}',
+                 true),
+                ('checkpoint-high', 'dqn_job_scorer.adaptive_hybrid_q_v2',
+                 'update-high', %s, %s, 'artifact-high', 'dataset-high', '{}',
+                 '{"passed": false, "benchmark_score": {"candidate_money": 9000.0}}',
+                 false)
+            """,
+            [str(low_source), str(low_source), str(high_source), str(high_source)],
+        )
+        store.connection.execute(
+            """
+            UPDATE model_updates
+            SET candidate_checkpoint_id = replace(update_id, 'update', 'checkpoint')
+            """
+        )
+        store.connection.execute(
+            """
+            UPDATE training_models SET active_checkpoint_id = 'checkpoint-low'
+            WHERE model_id = 'dqn_job_scorer.adaptive_hybrid_q_v2'
+            """
+        )
+
+    output = tmp_path / "released-best.npz"
+    arguments = [
+        "model",
+        "export-best",
+        "--database-url",
+        database.url,
+        "--output",
+        str(output),
+    ]
+    with pytest.raises(ValueError, match="confirm-release"):
+        dqn_cli(arguments)
+    assert not output.exists()
+
+    assert dqn_cli([*arguments, "--confirm-release"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "checkpoint_id": "checkpoint-high",
+        "metric": "benchmark-money",
+        "output": str(output),
+        "score": 9000.0,
+    }
+    assert output.read_bytes() == high_source.read_bytes()
+
+
 def test_export_rejects_active_checkpoint_that_failed_release_gate(tmp_path: Path):
     from kaggriculture_lab.model_admin import export_active_model
 

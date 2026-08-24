@@ -14,7 +14,7 @@ mechanisms cover different halves of it:
   demonstrations, which *are* solvent by construction -- but only while something
   is pinned, and on the live run nothing is, so the share silently resolves to
   zero.
-* `priority_alpha` ranks the agent's *own* episodes by shaped return, with the
+* `priority_alpha` ranks the agent's *own* episodes by terminal money, with the
   importance-sampling correction prioritisation obliges. Self-imitation: the best
   episodes the policy has produced are the only positive signal when there is no
   demonstrator.
@@ -43,13 +43,17 @@ DEFAULT_CAPACITY = 400
 #: from BUY_SEED to the harvest that pays for it.
 DEFAULT_N_STEP = 24
 DEFAULT_RESERVOIR_FRACTION = 0.35
-#: Rank exponent for the return-weighted draw over own episodes. 0.0 is the uniform
+#: Rank exponent for the final-money-weighted draw over own episodes. 0.0 is the uniform
 #: draw, byte for byte down to the bit-generator state, so a caller that does not
 #: ask for prioritisation keeps exactly what it had. The live value is in
 #: `agent.toml` rather than in the runner, whose overrides `ensure_session` digests.
 DEFAULT_PRIORITY_ALPHA = 0.0
 #: Importance-sampling exponent. Fixed, never annealed -- see `_own_priorities`.
 DEFAULT_PRIORITY_BETA = 0.5
+#: Generation aggregate weighting is off by default so direct `ReplayBuffer` users
+#: keep the old all-ones weights unless the manifest opts in through the updater.
+DEFAULT_GENERATION_WEIGHT_POWER = 0.0
+DEFAULT_GENERATION_WEIGHT_FLOOR = 0.35
 
 
 #: Turns of no-grad rollout ahead of the training window, and turns the gradient
@@ -206,7 +210,7 @@ class OrderBatch:
     #: multiplying by a zero discount yields nan, not zero, and one nan takes the
     #: whole batch down through the backward pass.
     next_mask: np.ndarray
-    #: float32 [B]. Importance-sampling correction for the return-weighted draw,
+    #: float32 [B]. Importance-sampling correction for the final-money-weighted draw,
     #: normalised so the largest is exactly 1.0. Every weight is therefore <= 1, so
     #: the reweighting can only shrink a gradient -- which matters because
     #: `clip_grad_norm_` clips the batch norm and cannot see one row inflating
@@ -242,6 +246,8 @@ class ReplayBuffer:
         reservoir_fraction: float = DEFAULT_RESERVOIR_FRACTION,
         priority_alpha: float = DEFAULT_PRIORITY_ALPHA,
         priority_beta: float = DEFAULT_PRIORITY_BETA,
+        generation_weight_power: float = DEFAULT_GENERATION_WEIGHT_POWER,
+        generation_weight_floor: float = DEFAULT_GENERATION_WEIGHT_FLOOR,
     ):
         if not 0.0 <= reservoir_fraction < 1.0:
             raise ValueError("reservoir_fraction must be in [0, 1)")
@@ -249,6 +255,10 @@ class ReplayBuffer:
             raise ValueError("priority_alpha must be non-negative")
         if not 0.0 <= priority_beta <= 1.0:
             raise ValueError("priority_beta must be in [0, 1]")
+        if generation_weight_power < 0.0:
+            raise ValueError("generation_weight_power must be non-negative")
+        if not 0.0 <= generation_weight_floor <= 1.0:
+            raise ValueError("generation_weight_floor must be in [0, 1]")
         self.capacity = capacity
         self.gamma = gamma
         self.n_step = n_step
@@ -261,7 +271,9 @@ class ReplayBuffer:
         self.rng = np.random.default_rng(seed)
         self.priority_alpha = float(priority_alpha)
         self.priority_beta = float(priority_beta)
-        #: Memoised `(pool, returns, probabilities, weights)`, or None when the
+        self.generation_weight_power = float(generation_weight_power)
+        self.generation_weight_floor = float(generation_weight_floor)
+        #: Memoised `(pool, scores, probabilities, weights)`, or None when the
         #: own-episode pool has changed since it was built. Explicitly a dirty
         #: flag rather than a length key: at steady state the FIFO length is
         #: constant and `_offer_to_reservoir` replaces a reservoir slot *in
@@ -381,19 +393,19 @@ class ReplayBuffer:
     def _own_priorities(
         self,
     ) -> tuple[list[EpisodeRecord], np.ndarray, np.ndarray, np.ndarray]:
-        """The own-episode pool, its returns, its sampling law, and the IS weights.
+        """The own-episode pool, its scores, its sampling law, and the IS weights.
 
-        Self-imitation: drawing the agent's own best episodes more often is the only
-        positive signal available with no demonstrator pinned.
+        Self-imitation: drawing the agent's own best-finishing episodes more often
+        is the only positive signal available with no demonstrator pinned.
 
         Four properties worth keeping:
 
-        * **Rank-based, not proportional**, because the shaped return is *signed* --
-          `return ** alpha` is undefined on most of the buffer. Shifting by the
-          minimum makes one episode's priority depend on the worst episode currently
-          held; clamping at zero deletes the reservoir segment, which is the
-          anti-forgetting mechanism. A rank is invariant to all of it.
-        * **Static priorities.** A return is fixed when `Recorder.finish` writes it
+        * **Rank-based, not proportional**, because the score is a scale, not a
+          probability mass. Shifting by the minimum makes one episode's priority
+          depend on the worst episode currently held; clamping at zero deletes the
+          reservoir segment, which is the anti-forgetting mechanism. A rank is
+          invariant to all of it.
+        * **Static priorities.** Final money is fixed when `Recorder.finish` writes it
           and is never a TD error, so there is nothing to update in place and no
           sum-tree: the whole distribution is one vector rebuilt when the pool moves.
         * **Episode weighting is transition weighting here**, because the horizon is
@@ -415,17 +427,17 @@ class ReplayBuffer:
             return self._priorities
         pool = self._sampleable(self.recent + self.reservoir)
         count = len(pool)
-        returns = np.asarray(
-            [float(record.reward.sum()) for record in pool], dtype=np.float64
+        scores = np.asarray(
+            [float(record.money[-1]) for record in pool], dtype=np.float64
         )
         if count == 0 or self.priority_alpha <= 0.0:
             probabilities = np.full(count, 1.0 / count) if count else np.zeros(0)
             weights = np.ones(count, dtype=np.float32)
         else:
-            # Stable, so equal returns rank by position in the pool and two runs
+            # Stable, so equal scores rank by position in the pool and two runs
             # over the same buffer draw the same episodes. `argsort` defaults to
             # quicksort, which is not stable.
-            order = np.argsort(-returns, kind="stable")
+            order = np.argsort(-scores, kind="stable")
             rank = np.empty(count, dtype=np.float64)
             rank[order] = np.arange(1, count + 1, dtype=np.float64)
             priority = rank ** (-self.priority_alpha)
@@ -438,41 +450,62 @@ class ReplayBuffer:
             # instead would let a rarely-drawn episode enlarge the effective
             # learning rate on the step it lands.
             weights = (weights / weights.max()).astype(np.float32)
-        self._priorities = (pool, returns, probabilities, weights)
+        self._priorities = (pool, scores, probabilities, weights)
         return self._priorities
 
     def priority_stats(self) -> dict[str, float | None]:
-        """What the return weighting is actually doing to the draw.
+        """What the final-money weighting is actually doing to the draw.
 
-        `sampled_mean_return` is exact rather than empirical: it is the mean
-        return under the sampling law, which is what the draw converges to over
+        `sampled_mean_priority_money` is exact rather than empirical: it is the mean
+        terminal money under the sampling law, which is what the draw converges to over
         the couple of thousand minibatches an update takes. Equal to
-        `own_mean_return` means `priority_alpha` is doing nothing, and that is
+        `own_mean_priority_money` means `priority_alpha` is doing nothing, and that is
         the reading to watch for -- the mechanism this one supplements went inert
         without moving a single number anyone was looking at.
         """
 
-        pool, returns, probabilities, weights = self._own_priorities()
+        pool, scores, probabilities, weights = self._own_priorities()
         if not pool:
             return dict.fromkeys(
                 (
                     "own_mean_return",
                     "sampled_mean_return",
                     "own_max_return",
+                    "own_mean_priority_money",
+                    "sampled_mean_priority_money",
+                    "own_max_priority_money",
                     "priority_top_decile_share",
                     "min_importance_weight",
+                    "own_mean_generation_weight",
+                    "sampled_mean_generation_weight",
+                    "min_generation_weight",
+                    "max_generation_weight",
                 )
             )
+        returns = np.asarray(
+            [float(record.reward.sum()) for record in pool], dtype=np.float64
+        )
+        generation_weights = np.asarray(
+            [float(getattr(record, "episode_weight", 1.0)) for record in pool],
+            dtype=np.float64,
+        )
         decile = max(1, len(pool) // 10)
         return {
             "own_mean_return": float(returns.mean()),
             "sampled_mean_return": float(probabilities @ returns),
             "own_max_return": float(returns.max()),
+            "own_mean_priority_money": float(scores.mean()),
+            "sampled_mean_priority_money": float(probabilities @ scores),
+            "own_max_priority_money": float(scores.max()),
             # Share of the draw the best 10% of episodes take. 0.1 is uniform.
             "priority_top_decile_share": float(
                 np.sort(probabilities)[::-1][:decile].sum()
             ),
             "min_importance_weight": float(weights.min()),
+            "own_mean_generation_weight": float(generation_weights.mean()),
+            "sampled_mean_generation_weight": float(probabilities @ generation_weights),
+            "min_generation_weight": float(generation_weights.min()),
+            "max_generation_weight": float(generation_weights.max()),
         }
 
     def sample(
@@ -486,17 +519,17 @@ class ReplayBuffer:
 
         The demonstration share is drawn uniformly; asking for it when nothing is
         pinned is not an error, the batch simply comes entirely from self-play. The
-        own share is ranked by return when `priority_alpha` is positive, with the
+        own share is ranked by final money when `priority_alpha` is positive, with the
         matching correction in `weight`.
 
         `prioritized=False` forces the uniform draw whatever the configuration. The
         flip-rate probe needs it: it measures the states the actor really visits, so
-        a return-weighted draw would resolve the controller against a distribution
+        a final-money-weighted draw would resolve the controller against a distribution
         no actor ever sees -- silently, since the probe reports a plausible number
         either way.
         """
 
-        own, _returns, own_probabilities, own_weights = self._own_priorities()
+        own, _scores, own_probabilities, own_weights = self._own_priorities()
         demos = self._sampleable(self.pinned)
         if not own and not demos:
             raise ValueError("free-market replay has no recorded decisions")
@@ -555,6 +588,7 @@ class ReplayBuffer:
 
         for row, (pool, pick) in enumerate(picks):
             record = pool[pick]
+            weight[row] *= float(getattr(record, "episode_weight", 1.0))
             decision = int(self.rng.integers(0, record.decisions))
             state[row] = record.order_state[decision]
             chosen[row] = int(record.order_chosen[decision])
@@ -662,7 +696,7 @@ class ReplayBuffer:
                 "state was written for"
             )
 
-        own, _returns, own_probabilities, own_weights = self._own_priorities()
+        own, _scores, own_probabilities, own_weights = self._own_priorities()
         own = self._sampleable_sequences(own, train)
         demos = self._sampleable_sequences(self.pinned, train)
         if not own and not demos:
@@ -725,6 +759,7 @@ class ReplayBuffer:
 
         for row, (pool, pick) in enumerate(picks):
             record = pool[pick]
+            weight[row] *= float(getattr(record, "episode_weight", 1.0))
             turns = record.steps
             first = _turn_first(record)
             returns, discounts = self._nstep(record)

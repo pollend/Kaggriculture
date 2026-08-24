@@ -198,12 +198,10 @@ def record_from_replay(
     chosen_rows: list[int] = []
     step_rows: list[int] = []
     mask_rows: list[np.ndarray] = []
-    #: Per-turn, for the reward stream: what the turn's orders were quoted at, and
-    #: the orders themselves. `PendingTurn` computes both while walking the turn, so
-    #: a cloned episode reaches `episode_rewards` carrying exactly what a live one
-    #: does -- which is what keeps the two the same kind of sample.
+    #: Per-turn, for the reward stream. `PendingTurn` computes these while walking
+    #: the turn, so a cloned episode reaches `episode_rewards` carrying exactly what a
+    #: live one does -- which is what keeps the two the same kind of sample.
     events: list[list] = []
-    expected: list[float] = []
     configuration = replay.get("configuration")
 
     seen = mapped = unrepresentable = masked_infeasible = land_seen = 0
@@ -395,7 +393,6 @@ def record_from_replay(
             history.record_decision(ACTIONS[action])
             pending.apply(ACTIONS[action])
         events.append(list(pending.events))
-        expected.append(pending.expected_delta)
         last_turn = pending
         turn_index += 1
 
@@ -437,10 +434,11 @@ def record_from_replay(
         final_money,
         gamma,
         emitted,
-        expected=expected,
         seeds=seeds,
         standing=standing,
         stock=stock,
+        owned=owned,
+        basis_required=True,
     )
 
     # Same phase check `Recorder.finish` makes, and for the same reason: the walk

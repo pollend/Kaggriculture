@@ -102,6 +102,12 @@ class EpisodeRecord:
     #: fails on it the way it already fails on a state width.
     hidden_stride: np.ndarray
 
+    #: Ephemeral training-only multiplier. Not serialized in `EPISODE_ARRAY_FIELDS`:
+    #: it is derived from the batch/generation metadata of the session currently
+    #: being loaded, so old artifacts remain byte-compatible and a different run can
+    #: choose a different weighting law without rewriting rollout files.
+    episode_weight: float = 1.0
+
     @property
     def steps(self) -> int:
         return self.reward.shape[0]
@@ -410,12 +416,6 @@ class Recorder:
     produce_room: list[list[int]] = field(default_factory=list)
     order_steps: list[int] = field(default_factory=list)
     decisions: list[OrderDecision] = field(default_factory=list)
-    #: What the turn's whole order list was quoted at, one per turn, indexed like
-    #: `money`. v1 inferred refusal from the sign of the money delta, which cannot
-    #: read a turn holding both a buy and a sell -- and every turn can hold both
-    #: now. `PendingTurn` already priced each order as it queued it, so the compare
-    #: is against a number rather than a heuristic. See `reward.order_refused`.
-    expected_deltas: list[float] = field(default_factory=list)
     #: Per-turn order events from `PendingTurn.events`, indexed like `money`.
     events: list[list] = field(default_factory=list)
     #: The GRU's input each turn and the hidden state it was fed, both indexed
@@ -434,7 +434,6 @@ class Recorder:
         self.produce_room.clear()
         self.order_steps.clear()
         self.decisions.clear()
-        self.expected_deltas.clear()
         self.events.clear()
         self.turn_inputs.clear()
         self.turn_hiddens.clear()
@@ -485,21 +484,10 @@ class Recorder:
         """The turn's queued orders, as `(op, item, quantity, cash)`.
 
         `lots.match` splits a turn back into its orders with these. One call per
-        turn, from the agent, alongside `record_expected_delta`.
+        turn, from the agent, alongside `record_turn`.
         """
 
         self.events.append(list(events))
-
-    def record_expected_delta(self, expected: float) -> None:
-        """The wallet change this turn's whole order list was quoted at.
-
-        One call per turn, from the agent, after the order loop has closed and
-        before `record_turn`. Indexed like `money` for the same reason
-        `record_decision` is: the reward stream is built from that list, and a turn
-        the agent skipped contributes no reward and no entry here either.
-        """
-
-        self.expected_deltas.append(float(expected))
 
     def record_turn(self, *, money: float, obs: Any, farm: dict, private: dict) -> None:
         self.money.append(float(money))
@@ -566,10 +554,11 @@ class Recorder:
             final_money,
             gamma,
             emitted,
-            expected=self.expected_deltas or None,
             seeds=self.seeds,
             standing=self.standing,
             stock=self.stock,
+            owned=self.owned,
+            basis_required=True,
         )
 
         # One turn row per reward slot, or the recurrence is out of phase with the

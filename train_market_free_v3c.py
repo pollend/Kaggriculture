@@ -388,7 +388,212 @@ SYNC_ENVIRONMENT = True
 # clause unchanged from block G: `order_diagnostics.trading_rate` held near 0.6, so
 # that the drop in charges is not collected by going quiet.
 # ---------------------------------------------------------------------------
-SESSION_ID = "market-free-quote-v1"
+# Continued as `market-free-scale-v1`, which moves two things and stops the fork's
+# one-change-a-session rule only because both are the same measurement.
+#
+# `MONEY_SCALE` 100,000 -> 250,000. The old value was fitted to a single ladder
+# number, `99,038 / 100,000 = 0.99`, which is the median of the demonstration set
+# sitting exactly on `SmoothL1`'s beta rather than under it. Over the 321 stored
+# `ladder-001` seasons the final-money distribution is median 85,867, p99 149,431,
+# max 155,637 -- so at 100,000 the top decile of *demonstrated* play trains in the
+# linear regime where a 5-unit and a 50-unit TD error give the same gradient, and
+# pilkwang's 131,000 was outside the quadratic zone before this fork could reach
+# it. At 250,000 the whole distribution fits: 0.34, 0.60, 0.62. The per-step bound
+# moves with it -- largest single wallet move 14,513 coins over the demonstrations
+# and 27,670 over 1,920 stored `networth_*` rollout episodes, so 0.06 and 0.11 here
+# against 0.15 and 0.28 before.
+#
+# `IDLE_PENALTY` and `REJECTED_ORDER_PENALTY` are divided by the same 2.5. They are
+# absolute reward units and do not scale with the delta, so leaving them would make
+# them 2.5x heavier against money -- and against a policy finishing on 2,185 coins
+# (0.022 here) the anti-idle term already outweighs the profit signal, which is the
+# shape `wire_orders_per_decision` 2.6 with 33% of stock spend rotting looks like.
+# Held at 20 and 100 coins, every ratio their docstrings argue for unchanged.
+#
+# `batch_size` 32 -> 128, `gradient_steps_per_batch` left at 48. `updater.py`'s
+# reduction means a step's gradient is the mean of `batch_size` per-chunk scalars,
+# so the batch is the count of independent directions and the step count is not.
+# The previous block fixed 8 -> 32; 32 is still an eighth of v2's 256, and v2 is
+# the only lineage in this family whose benchmark money ever climbed. `learning_rate`
+# 3e-4 -> 7.5e-4 is not a third hike: the 2.5x smaller reward is a 2.5x smaller
+# gradient at every step, and this restores the parameter movement per update the
+# rate comment already sized.
+#
+# Cost, from 970 completed updates: an update is ~375s of which `train_seconds` is
+# ~124, so 4x the training puts an update near 750s. Half the updates an hour.
+#
+# `SLOT_PREFIX` moves. Both the reward scale and the two charges changed, so every
+# stored `quote_*` shaped return, lineage checkpoint, self-play pool entry and
+# mature member holds a quantity this session does not pay.
+#
+# Pass condition, unchanged in kind from `quote-v1` because it is the read that was
+# wrong for twenty updates: the gate's own `benchmark_ratchet.candidate_money` --
+# money against pilkwang, not the mirror -- above `quote-v1`'s at matched batch,
+# and above `networth-v1`'s (2,021 at 40, 2,423 at 80, 3,920 at 120, 2,185 at 200).
+# Second clause on the batch change specifically: `mean_grad_norm` off the 0.017-0.06
+# floor the last two forks read against an inert `grad_clip_norm` of 5.0, and
+# `max_abs_q` off 0.6 toward v2's 1.0-2.3. Guard clause unchanged:
+# `order_diagnostics.trading_rate` held near 0.6, so that a lighter idle charge is
+# not collected by going quiet.
+#
+# ---------------------------------------------------------------------------
+# idle-v1: the idle charge was the objective, so it was cut 10x. The refusal charge
+# goes with it for a different reason -- it is measurably nothing.
+#
+# `scale-v1` answered its own pass condition and a larger question with it. Across
+# 25 updates none of the ten slots promoted once, and every rejection was
+# `benchmark_ratchet` rather than `hard_viability`: candidate money 177 to 4,316
+# against pilkwang's 115,000 to 141,000, so `opponent_money_ratio` (0.05, needing
+# ~6,300) and `max_money_deficit` (100,000) failed on every row while `min_money`
+# passed. The gate was unreachable, and the reason is upstream of the gate.
+#
+# **`scale-v1` was rebased mid-run and its generations are not one experiment.** The
+# uncommitted edit to `reward.py` -- `IDLE_PENALTY` 8e-5 -> 8e-6 and
+# `REJECTED_ORDER_PENALTY` deleted -- was on disk while `scale-v1` was collecting, and
+# its workers picked it up between g0002 (trace dir written 11:33) and g0003 (12:18).
+# Recovered from the traces, not from any log: the median shaping delta on turns with
+# no non-NOOP row tracks `-IDLE_PENALTY * falloff * MONEY_SCALE`, and it reads 8.5e-5
+# through g0002 and ~1.2e-5 from g0003 on, on both `scale_00` and `scale_05`, with the
+# falloff structure flattening at the same generation. `quote-v1` and `networth-v1`
+# probe clean at 2.1e-4 across every generation they ran.
+#
+# So g0000-g0002 are `scale-v1` as declared and g0003+ are `idle-v1`'s objective on
+# `scale-v1`'s checkpoints, buffers and self-play pool. Anything read across the
+# boundary -- `own_mean_return`, the reservoir half of `own_mean_final_money`, the
+# plateau median, every `scale_*` mature member from g0003 on -- mixes two objectives.
+#
+# `own_mean_return` -- the quantity the network actually fits -- is negative in every
+# update of both halves, while the money term it telescopes to spans -0.007 to +0.018.
+# Where the difference goes, decomposed per episode over every stored `episode_traces`
+# npz. `drain` is `sum(raw_reward) - sum(reward)`, everything the shaping takes off
+# the money term; `idle` recomputes `IDLE_PENALTY * falloff` from `order_chosen` /
+# `order_step` on turns carrying no non-NOOP row:
+#
+#     slot / regime                 eps   final$   money   shaped   drain    idle  share  resid
+#     networth_00  2e-4, bug      3,360    9,688  +0.0669  -0.4413  0.5082  0.0371   7.3% 0.4711
+#     networth_05                 3,360    4,690  +0.0169  -0.4509  0.4678  0.0433   9.3% 0.4245
+#     quote_00     2e-4, fixed      512    5,496  +0.0250  -0.0322  0.0572  0.0411  71.9% 0.0161
+#     quote_05                       496    7,685  +0.0469  -0.0392  0.0861  0.0458  53.2% 0.0403
+#     scale_00     8e-5, g0-g2      480    4,317  +0.0053  -0.0174  0.0227  0.0160  70.5% 0.0067
+#     scale_05                       480    7,262  +0.0171  -0.0091  0.0261  0.0193  73.8% 0.0069
+#     scale_00     8e-6, g3+        912    2,206  -0.0032  -0.0116  0.0084  0.0019  22.5% 0.0065
+#     scale_05                       912    3,552  +0.0022  -0.0045  0.0067  0.0025  37.5% 0.0042
+#
+# `shaped` is negative on every slot of every run and every regime while `money` is
+# positive on all but one. Under `scale-v1`'s declared constants the idle charge is
+# 70-74% of the whole drain: the objective was anti-idle with money as noise on top,
+# which is what a policy that grosses 80,900 coins of seed proceeds an episode and
+# finishes on 1,400 looks like from the inside. `networth-v1` is the contrast -- 7-28x
+# its money term with idle under a tenth of it, which is `REJECTED_ORDER_PENALTY`
+# under the unit bug `quote-v1` fixed, charged on ~61% of turns. Two runs, two
+# different terms, one shape.
+#
+# `idle` is an upper bound and `resid` a lower one: the reconstruction reads
+# `chosen != 0` and misses the `buy_land` turns `collect.finish` also marks emitted,
+# so it scores some trading turns as idle.
+#
+# `IDLE_PENALTY` 0.00008 -> 0.000008. The previous move held every ratio fixed by
+# construction and so changed nothing; the ratio was the bug. It was sized as 7% of a
+# ladder-grade season and this policy plays a season 30x smaller, where it is 240%.
+# Two orderings it inverted: a fully idle season cost 0.0288 against 0.012 for losing
+# the entire stake, so bankruptcy was cheaper than sitting still, and
+# `own_solvent_fraction` measured 0.013-0.29, so most idling was an empty wallet
+# rather than a choice worth pricing.
+#
+# `REJECTED_ORDER_PENALTY` is deleted, not re-scaled, and **not for the reason the
+# first draft of this block gave.** That draft said the charge fired on ~3.4% of
+# turns, nine times the 0.37% the simulator actually refuses (`scale_00` batch 20:
+# 138,470 emitting, 137,619 effective, of 230,080). That 3.4% was a subtraction:
+# penalty mass 0.021-0.028 minus an idle mass "of about 0.011 at the measured 38% idle
+# rate", with `own_order_diagnostics.emitted_rate` read as the emitting fraction of
+# turns. Per turn off the traces the emitting fraction is 0.484-0.592 under the
+# declared constants, so idle is 41-52% and the idle mass ~1.5x what the subtraction
+# allowed, which caps the charge at 2.3-2.4% of turns rather than 3.4%.
+#
+# The rebase settles it properly. Deleting the charge at g0003 is a controlled removal
+# of that term, and `resid` -- the quantity the 3.4% was inferred from -- does not
+# move across it: 0.0067 -> 0.0065 on `scale_00`, 0.0069 -> 0.0042 on `scale_05`. A
+# term that survives its own deletion was never that term. The residual is the
+# `(1 - gamma)` basis holding drag in `reward.net_worth_delta`. So the charge is
+# deleted because it is ~0, which is also why deleting it moved no number this run
+# reads. The `expected` argument goes with it, along with the recorder and clone
+# plumbing that fed it. Whether `sell_rung` really does inflate `expected_delta` is an
+# `order_space` question this measurement does not settle.
+#
+# The refusal state block stays. Nothing about it depended on the charge, and
+# dropping it would move `MARKET_STATE_DIM` and invalidate every checkpoint.
+#
+# `SLOT_PREFIX` moves. Both per-turn charges changed, so every stored `scale_*`
+# shaped return, lineage checkpoint, self-play pool entry and mature member holds a
+# quantity this session does not pay -- and the sharp version of that rule applies
+# here more than anywhere: a mature member fitted while the objective was anti-idle
+# re-enters as a reseed ancestor and a mirror opponent carrying exactly the behaviour
+# that objective bought.
+#
+# Pass condition, same read as `scale-v1` because it is still the right one: the
+# gate's own `benchmark_ratchet.candidate_money` above `scale-v1`'s at matched batch
+# (1,980 / 3,236 / 4,316 at 10, then 995-3,541 at 20). The specific claim this makes
+# is that `own_mean_return` turns positive for a slot that is making money, so read
+# it beside `own_mean_final_money` and reject the change if the two still disagree in
+# sign. **That clause is withdrawn: it asks a question the quantity cannot answer.**
+# `reward.net_worth_delta`'s basis half is potential-based shaping, so the undiscounted
+# sum `own_mean_return` reports carries `basis[0] + (1 - gamma) * sum(basis[1:-1])`
+# whatever the policy does. Recovered by inverting the stream over 960 episodes a side,
+# that is 0.0033-0.0058 an episode, exactly proportional to held basis (`scale_00`
+# holds 1,999 coins and pays 0.00575; `scale_05` holds 1,132 and pays 0.00325, both
+# 1.77x). A slot making money while holding stock reads negative there by construction,
+# and the g0003+ rebase shows precisely that: idle falls to 0.0019-0.0025 as intended
+# and the sign does not move.
+#
+# So the pass condition is `benchmark_ratchet.candidate_money` and nothing else, with
+# `own_mean_final_money` -- or equivalently the sum of `raw_reward`, which telescopes
+# to `(final_money - stake) / MONEY_SCALE` exactly -- as the supporting read.
+# `own_mean_return` is reportable but not gradeable until it is decomposed.
+#
+# Two follow-ups this measurement opens, neither blocking this session:
+#
+#   * `own_mean_raw_return` is worth adding beside `own_mean_return` in
+#     `updater._records_diagnostics`. `EpisodeRecord.raw_reward` is already stored and
+#     already summed for `own_mean_final_money`; naming the reward-unit version means
+#     the shaped and unshaped returns can be diffed in SQL, which is how the g0003
+#     rebase would have been caught the same day.
+#   * `basis[0]` averages 199 coins with a standard deviation of 1,204, because a
+#     minority of episodes open with thousands of coins of stock already held while
+#     `money[0]` is 3,000 on every one. That is the recorder's first turn not always
+#     being the season's first, and it injects a per-episode nuisance the size of the
+#     money term into every shaped return. Worth a look in `collect.Recorder` before
+#     anyone grades a slot on shaped returns again.
+#
+# Guard clause, tightened because a 10x lighter idle charge is exactly what would buy
+# silence: `order_diagnostics.trading_rate` held near 0.6 and
+# `own_orders_per_decision` not below `scale-v1`'s 0.44 floor.
+# ---------------------------------------------------------------------------
+# v2 rather than a resume of `market-free-weighted-v1`. That run promoted nothing
+# in twelve generations: it started after the uncommitted
+# `benchmark_min_opponent_money_ratio` / `benchmark_max_money_deficit` hunk, whose
+# two checks armed against pilkwang's *uncontested* 131k and so could not be
+# cleared by a family that earns ~2-3k contested. With the gate never releasing a
+# checkpoint there was also nothing to restore when `max_abs_q` inflated from 0.3
+# to 60 on six of ten slots and took slot 02 from 32,353 to 3,507 at a fixed
+# learning rate. The impossible benchmark checks are not part of this config, and
+# the optimizer falls back to the manifest's conservative values until the new
+# namespace proves it can promote. The batches are not comparable and both the
+# session id and slot prefix have to move.
+#
+# v3 moves again because the promotion gate changed after `weighted2` had already
+# collected and partly evaluated g0002. The reward and replay data are compatible,
+# but the release decision is not: `weighted2_*` carries active checkpoints and
+# rejection state produced under the stricter lot-quality gate. A fresh key gives
+# the simplified old-style gate a clean read.
+#
+# v4 moved off `weighted3` because that session had stored the strict online gate
+# in its manifest and had already rejected checkpoints under it.
+#
+# v5 moves again because the policy changed one more time: online promotion is now
+# an activity gate, and lineage resumes from the best promoted benchmark-money
+# checkpoint instead of following rejected checkpoints forward. The stored v4 model
+# ids encode the old always-promote/export-best experiment.
+SESSION_ID = "market-free-weighted-v5"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free_v3c"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_v3c_league.toml")
 MANIFEST = Path("agents/dqn_market_free_v3c/agent.toml")
@@ -401,14 +606,36 @@ LEARNERS = 10
 # severs all four at once -- which is required whenever the reward changes,
 # because a stored shaped return is then a different quantity.
 #
-# Moved off "networth" with `SESSION_ID`. No constant moved this time, but the
+# Moved off "networth" with `SESSION_ID`. No constant moved that time, but the
 # quantity did: `REJECTED_ORDER_PENALTY` was charged on 50.1% of turns against a
 # simulator refusal rate of 0.3%, so every stored `networth_*` return is the shaped
-# stream minus about 0.36 of tax that this session does not levy. The sharp reason
+# stream minus about 0.36 of tax that session did not levy. The sharp reason
 # applies as it did off "cashherd" -- a mature member fitted while half its turns
 # were taxed re-enters as a reseed ancestor and a mirror opponent carrying the
 # behaviour that tax bought, which was to stop emitting priced orders.
-SLOT_PREFIX = "quote"
+#
+# Moved off "quote" for the plain version of the same rule: `MONEY_SCALE` and both
+# per-turn charges moved, so a stored `quote_*` shaped return is 2.5x a quantity
+# this session pays and its Q head is fitted to that scale.
+#
+# Moved off "scale" for the sharp version. `REJECTED_ORDER_PENALTY` is gone and
+# `IDLE_PENALTY` is 10x lighter, so a stored `scale_*` return carries 0.021-0.028 of
+# tax this session does not levy -- which was most of what those Q heads were fitted
+# to. Reseeding from them would import the behaviour that tax bought.
+#
+# Moved off "weighted" because `market-free-weighted-v1` never released a checkpoint.
+# Its `weighted_*` model ids now hold rejected update state, self-play pools and
+# buffers collected under a gate/optimizer regime this run is explicitly leaving.
+#
+# Moved off "weighted2" because its promotion state straddles the old strict gate
+# and the simplified old-style gate. Keep the diagnostic comparison clean.
+#
+# Moved off "weighted3" with `SESSION_ID`; active checkpoints from that run encode
+# a reject/ratchet policy this run no longer uses.
+#
+# Moved off "weighted4" with v5; the online gate and lineage parent policy both
+# changed, so rejected idle checkpoints from v4 must not become ancestors here.
+SLOT_PREFIX = "weighted5"
 MODEL_NAME = f"{SLOT_PREFIX}_00"
 
 # How many learners run their round hooks and their update at once, and how wide
@@ -593,31 +820,11 @@ FREE_CONFIG = {
     # [1.0, 0.61, 0.37, 0.23, 0.138, 0.084, 0.051, 0.031], so rungs 5-8 carry a
     # sigma scale under 0.14. The ladder is the attenuator, not the pair count.
     "rare_sigma_pairs": 4,
-    # Re-applied from config each update, and under the population it is the
-    # schedule's *peak*: a slot warms up to it from zero after a reseed and halves
-    # away from it on every plateau.
-    #
-    # 3e-4. The sweep the previous comment left open, run on the baseline it asked
-    # to wait for: `market-free-refusal-v1` gave the geometry 17 generations, and
-    # `mean_grad_norm` across them read **0.017** with `max_grad_norm` at 0.16
-    # against a `grad_clip_norm` of 5.0. The clip is not merely un-binding, it is
-    # inert by two orders of magnitude, which is the headroom that comment
-    # predicted.
-    #
-    # What the starved run showed downstream of that: `max_abs_q` 0.6 and
-    # `mean_abs_q` 0.05 against v2's 1.0-2.3 and 0.11, and `sigma_mean_0` drifting
-    # only 0.0442 -> 0.0412 across the whole run. Sigma is a trained parameter, so
-    # a head whose weights do not grow keeps `sigma_ratio_0` at 12 where v2 sat at
-    # 1.9, and `noisy_argmax_flip_rate` at 0.42 where v2 sat at 0.30. The rate is
-    # what binds, and it binds on the exploration arm as much as on the head.
-    #
-    # The "do not pay twice" rule the previous comment set is respected, not
-    # broken: steps go *down* 4x (192 -> 48) as the batch goes up 4x, so parameter
-    # movement per update is ~0.75x what it was even at 3x the rate. This buys
-    # better-estimated directions, not more of them.
-    "learning_rate": 3e-4,
-    # v3's chunk geometry, restated here for the same reason the learning rate is:
-    # this file decides what the run is. `burn_in_turns` must stay a multiple of
+    # Deliberately inherit the manifest learning rate. `market-free-weighted-v1`
+    # promoted nothing and showed Q-scale inflation, so this recovery run should
+    # prove it can release before reintroducing a higher peak rate.
+    # v3's chunk geometry, restated here because this file decides what the run is.
+    # `burn_in_turns` must stay a multiple of
     # `collect.HIDDEN_STRIDE` or `sample_sequences` refuses the draw outright.
     # Reversed, because the accounting above measured a quantity the loss throws
     # away. `updater.py:3633-3643` reduces in three levels:
@@ -647,22 +854,31 @@ FREE_CONFIG = {
     #
     # `burn_in_turns` and `train_turns` stay untouched here. The chunk *shape* is
     # gated on the inert-GRU test, not on this change.
-    "batch_size": 32,
+    #
+    # **128, up from 32, and the step count does not move with it.** The reduction
+    # above is the whole argument and it has not changed: a step's gradient is the
+    # mean of `batch_size` per-chunk scalars, so `batch_size` *is* the count of
+    # independent directions and `gradient_steps_per_batch` is not. The previous
+    # comment measured the run at 8 against v2's 256 and fixed it to 32. That is
+    # still an eighth of v2, on the one quantity that survives the reduction, and
+    # v2 is the only lineage in this family whose benchmark money has ever climbed
+    # (3,000 -> 13,229 over 33 updates against this fork's flat 4,053 -> 2,185 over
+    # 20). 128 is half of v2's 256 rather than all of it because the cost is paid
+    # in wall clock: over 970 completed updates an update is ~375s of which
+    # `train_seconds` is ~124, so 4x the training is ~500s and an update lands near
+    # 750s. Half the updates an hour, for 4x the directions in each.
+    #
+    # The step count is deliberately left at 48. Raising both is the "do not pay
+    # twice" violation the paragraph above names, and steps were already traded
+    # away 192 -> 48 to buy this exact quantity once.
+    "batch_size": 128,
     "burn_in_turns": 20,
     "train_turns": 40,
     "gradient_steps_per_batch": 48,
-    # Scaled with `gradient_steps_per_batch` to hold two syncs an update, which is
-    # the invariant v2 and credit-v1 both ran at -- v2 at 2000 against ~4,000 steps
-    # an update, credit-v1 at 250 against ~480. An update here is now 480 steps
-    # (48 x `min_new_batches` 10), so 240.
-    #
-    # This is the coupling the manifest comment at `agent.toml:198-201` calls "the
-    # single easiest value to leave stale across the fork, and nothing would report
-    # it: a target that lags four updates just looks like a harder target". Left at
-    # 960 alongside the step cut it would have been exactly that -- one sync every
-    # two updates, a target net lagging half the data it is bootstrapping against.
-    # It moves with the step count or not at all.
-    "target_sync": 240,
+    # Deliberately inherit the manifest target sync. The faster 480-step sync used
+    # by `market-free-weighted-v1` let the bootstrap target chase the online net
+    # while `max_abs_q` inflated, so the recovery run starts with the conservative
+    # lag documented in `agent.toml`.
     "grad_clip_norm": 5.0,
     # Moves back down with the peak. 1e-5 against a peak of 1e-4 needs two decays at
     # the manifest's 0.25, which at `lr_plateau_patience = 4` is twelve updates and
@@ -692,11 +908,9 @@ FREE_CONFIG = {
     # pool and not just a display shelf. Only 4 of the previous run's 21 members
     # clear 4,000, which is the point -- the two that work score 9,166 and 8,357.
     "mature_reserved_min_money": 4000.0,
-    # Safe now that `lr_score_signal` is "rollout": the detector reads the ring
-    # the slot just trained on, so a snapback moves it rather than pinning it.
-    # Buys the case with no other answer -- a diverged slot has nothing to climb
-    # back to, and `lr_best_decay` only unsticks a detector still improving.
-    "resume_reset_after_rejections": 2,
+    # Activity-gated lineage ignores rejected checkpoints, so there is no separate
+    # rejection-streak snapback to apply.
+    "resume_reset_after_rejections": 0,
 }
 
 # No demonstration arm this session. `splitladder-v1` ran a five-and-five ladder

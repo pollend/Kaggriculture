@@ -41,7 +41,10 @@ from agents.dqn_market_free_v3c.order_space import (
     Order,
     PendingTurn,
     feasible_actions,
+    land_expansion_pressure,
+    land_score,
     sell_depth_cap,
+    should_buy_land,
 )
 from agents.dqn_market_free_v3c.policy import (
     _LAYER_KEY,
@@ -54,6 +57,143 @@ from agents.dqn_market_free_v3c.training import network as net_module
 from tests.test_dqn_market_free import _mask_state
 
 STATE_DIM = MARKET_STATE_DIM
+
+
+def test_activity_gate_lineage_resumes_from_best_promoted_benchmark_checkpoint(tmp_path):
+    from agents.dqn_market_free_v3c.training import updater as updater_module
+
+    low_trainer = tmp_path / "low.pt"
+    low_inference = tmp_path / "low.npz"
+    high_trainer = tmp_path / "high.pt"
+    high_inference = tmp_path / "high.npz"
+    for path in [low_trainer, low_inference, high_trainer, high_inference]:
+        path.write_bytes(b"weights")
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            assert "benchmark_score" in sql
+            assert "benchmark_ratchet" in sql
+            assert "AND promoted" in sql
+            assert "ORDER BY score DESC" in sql
+            assert parameters == ["model"]
+            return [
+                ("high", str(high_trainer), str(high_inference), 9000.0),
+                ("low", str(low_trainer), str(low_inference), 1200.0),
+            ]
+
+        def fetchone(self, sql, parameters):
+            raise AssertionError("best-benchmark lineage should not use fallback")
+
+    context = SimpleNamespace(
+        model_id="model",
+        config={
+            "promotion_rule": "activity_gate",
+            "benchmarks": [
+                "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+            ],
+        },
+        active_checkpoint=SimpleNamespace(checkpoint_id="low"),
+    )
+
+    checkpoint = updater_module.lineage_checkpoint(context, Reader())
+
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_id == "high"
+    assert checkpoint.trainer_artifact_path == high_trainer
+    assert checkpoint.inference_artifact_path == high_inference
+    assert checkpoint.released is False
+
+
+def test_activity_gate_lineage_skips_missing_best_artifacts(tmp_path):
+    from agents.dqn_market_free_v3c.training import updater as updater_module
+
+    kept_trainer = tmp_path / "kept.pt"
+    kept_inference = tmp_path / "kept.npz"
+    kept_trainer.write_bytes(b"weights")
+    kept_inference.write_bytes(b"weights")
+
+    class Reader:
+        def fetchall(self, sql, parameters):
+            return [
+                ("missing", str(tmp_path / "missing.pt"), str(tmp_path / "missing.npz"), 9000.0),
+                ("kept", str(kept_trainer), str(kept_inference), 5000.0),
+            ]
+
+        def fetchone(self, sql, parameters):
+            raise AssertionError("second-best existing checkpoint should avoid fallback")
+
+    context = SimpleNamespace(
+        model_id="model",
+        config={
+            "promotion_rule": "activity_gate",
+            "benchmarks": [
+                "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+            ],
+        },
+        active_checkpoint=SimpleNamespace(checkpoint_id="kept"),
+    )
+
+    checkpoint = updater_module.lineage_checkpoint(context, Reader())
+
+    assert checkpoint is not None
+    assert checkpoint.checkpoint_id == "kept"
+    assert checkpoint.released is True
+
+
+def test_non_activity_gate_lineage_keeps_shared_newest_checkpoint_policy(monkeypatch):
+    from agents.dqn_market_free_v3c.training import updater as updater_module
+
+    calls = []
+    expected = object()
+
+    def fake_newest(context, reader):
+        calls.append((context, reader))
+        return expected
+
+    monkeypatch.setattr(updater_module, "_newest_lineage_checkpoint", fake_newest)
+    context = SimpleNamespace(
+        model_id="model",
+        config={"promotion_rule": "legacy"},
+        active_checkpoint=None,
+    )
+    reader = object()
+
+    assert updater_module.lineage_checkpoint(context, reader) is expected
+    assert calls == [(context, reader)]
+
+
+def test_best_promoted_benchmark_score_reads_new_and_legacy_gate_keys():
+    from agents.dqn_market_free_v3c.training.updater import _best_promoted_benchmark_score
+
+    class Reader:
+        def fetchone(self, sql, parameters):
+            assert "benchmark_score" in sql
+            assert "benchmark_ratchet" in sql
+            assert "AND promoted" in sql
+            assert parameters == ["model"]
+            return (6025.83, "checkpoint-best")
+
+    assert _best_promoted_benchmark_score(Reader(), "model") == (
+        6025.83,
+        "checkpoint-best",
+    )
+
+
+def test_activation_reasons_block_non_idle_benchmark_regressions():
+    from agents.dqn_market_free_v3c.training.updater import _activation_reasons
+
+    assert _activation_reasons(
+        activity_passed=True, candidate_money=5000.0, best_money=6000.0
+    ) == ["below_best_promoted_benchmark_money"]
+    assert (
+        _activation_reasons(
+            activity_passed=True, candidate_money=6000.0, best_money=6000.0
+        )
+        == []
+    )
+    assert _activation_reasons(
+        activity_passed=False, candidate_money=7000.0, best_money=6000.0
+    ) == ["activity_gate_failed"]
 
 
 def _module(seed: int = 0, noisy: str = "none", **fill) -> net_module.OrderQModule:
@@ -385,6 +525,31 @@ def test_a_quiet_start_is_silent_but_not_inert():
     # ...and so is the recurrence.
     assert not net_module.has_inert_recurrence(network)
     assert net_module.has_inert_recurrence(OrderQNetwork.zeros())
+
+
+def test_a_noisy_initial_network_keeps_sigma_after_save(tmp_path):
+    """A noisy run's first checkpoint must not silently become deterministic."""
+
+    from agents.dqn_market_free_v3c.training.updater import initial_network
+
+    network = initial_network(
+        {
+            "seed": 5,
+            "noisy": True,
+            "noisy_layers": "head",
+            "noisy_sigma0": 0.5,
+        }
+    )
+    assert network.is_noisy
+    assert [pair is not None for pair in network.sigma] == [False, False, True]
+
+    path = tmp_path / "initial.npz"
+    network.save(path)
+    loaded = OrderQNetwork.load(path)
+    assert loaded.is_noisy
+    assert [pair is not None for pair in loaded.sigma] == [False, False, True]
+    assert np.allclose(loaded.layers[-1][0], 0.0)
+    assert np.allclose(loaded.layers[-1][1], 0.0)
 
 
 def test_an_all_zero_network_stays_silent_for_the_whole_episode():
@@ -733,6 +898,42 @@ def test_buying_land_widens_the_animal_rows():
     assert animal_room(obs, wide, private)["COW"] > animal_room(obs, farm, private)["COW"]
 
 
+def test_land_pressure_reads_the_plan_not_just_the_board():
+    """A full farm is not automatically a farm that needs more ground."""
+
+    stocked = {
+        "MELON": 40,
+        "WHEAT": 40,
+        "CARROT": 40,
+        "TOMATO": 40,
+        "STRAWBERRY": 40,
+    }
+    obs, farm, private, _ = _mask_state(
+        money=100_000.0, day=5, plants=25, seeds=stocked
+    )
+    roles = herd.field_roles(obs, farm, private)
+    thin_roles = {(0, 0): ("CROP", "WHEAT"), (1, 0): ("CROP", "WHEAT")}
+
+    assert land_expansion_pressure(obs, farm, roles) == 1.0
+    assert land_expansion_pressure(obs, farm, thin_roles) == pytest.approx(2 / 25)
+    assert land_score(obs, farm, private, farm["money"], 0, thin_roles) < 0.15
+    assert not should_buy_land(obs, farm, private, thin_roles)
+    assert should_buy_land(obs, farm, private, roles)
+
+
+def test_land_pressure_counts_animal_space_as_productive_demand():
+    """Animal roles do not consume seed, but they still make acreage scarce."""
+
+    obs, farm, private, _ = _mask_state(money=100_000.0, day=5, plants=0)
+    animal_roles = {
+        (0, 0): ("ANIMAL", "COW"),
+        (1, 0): ("ANIMAL", "SHEEP"),
+        (2, 0): ("ANIMAL", "GOOSE"),
+    }
+
+    assert land_expansion_pressure(obs, farm, animal_roles) == pytest.approx(3 / 25)
+
+
 def test_thin_markets_lose_the_rungs_that_crater_them():
     """WOOL and MILK are the thinnest markets in the game; WHEAT and EGG are not."""
 
@@ -835,6 +1036,116 @@ def _buffer(count: int = 8, **kwargs):
     buffer = ReplayBuffer(capacity=64, n_step=24, seed=1, **kwargs)
     buffer.add([_episode(seed=index) for index in range(count)])
     return buffer
+
+
+def _priority_episode(
+    index: int,
+    final_money: float,
+    episode_return: float,
+    turns: int = 48,
+):
+    from agents.dqn_market_free_v3c.training.collect import HIDDEN_STRIDE, EpisodeRecord
+
+    rng = np.random.default_rng(index)
+    stored = int(np.ceil(turns / HIDDEN_STRIDE))
+    return EpisodeRecord(
+        reward=np.full(turns, episode_return / turns, dtype=np.float32),
+        raw_reward=np.zeros(turns, dtype=np.float32),
+        money=np.asarray([*np.zeros(turns), final_money], dtype=np.float32),
+        order_state=rng.standard_normal((turns, STATE_DIM)).astype(np.float32),
+        order_chosen=np.full(turns, index, dtype=np.int16),
+        order_step=np.arange(turns, dtype=np.int16),
+        order_mask=np.ones((turns, ACTION_COUNT), dtype=np.bool_),
+        turn_state=rng.standard_normal((turns, STATE_DIM)).astype(np.float32),
+        turn_hidden=rng.standard_normal((stored, HIDDEN_SIZE)).astype(np.float16),
+        hidden_stride=np.asarray([HIDDEN_STRIDE], dtype=np.int16),
+    )
+
+
+def test_priority_draw_ranks_episodes_by_final_money_not_shaped_return():
+    from agents.dqn_market_free_v3c.training.replay import ReplayBuffer
+
+    final_money = [500.0, 1_500.0, 3_000.0, 6_000.0, 12_000.0]
+    # Deliberately anti-correlated with final money. If the sampler still reads
+    # shaped return, this test flips.
+    returns = [5.0, 2.0, 0.0, -1.0, -4.0]
+    buffer = ReplayBuffer(capacity=16, seed=4, n_step=2, priority_alpha=0.7)
+    buffer.add(
+        [
+            _priority_episode(index, money, ret)
+            for index, (money, ret) in enumerate(zip(final_money, returns))
+        ]
+    )
+
+    _pool, scores, probabilities, weights = buffer._own_priorities()
+    by_money = np.argsort(scores)
+    assert (np.diff(probabilities[by_money]) > 0.0).all()
+    assert weights.max() == pytest.approx(1.0)
+
+    stats = buffer.priority_stats()
+    assert stats["sampled_mean_priority_money"] > stats["own_mean_priority_money"]
+    assert stats["sampled_mean_return"] < stats["own_mean_return"]
+
+    drawn = np.concatenate([buffer.sample(128).chosen for _ in range(20)])
+    empirical = float(np.mean([final_money[int(index)] for index in drawn]))
+    assert empirical == pytest.approx(stats["sampled_mean_priority_money"], abs=500.0)
+    assert empirical > float(np.mean(final_money))
+
+
+def test_generation_weight_scales_chunk_loss_without_reward_scaling():
+    from agents.dqn_market_free_v3c.training.replay import ReplayBuffer
+
+    record = _episode(seed=5)
+    record.episode_weight = 0.4
+    buffer = ReplayBuffer(capacity=4, seed=2, n_step=2)
+    buffer.add([record])
+
+    batch = buffer.sample_sequences(3, burn_in=20, train=40)
+
+    assert batch.weight.tolist() == pytest.approx([0.4, 0.4, 0.4])
+
+
+def test_fill_buffer_weights_records_by_generation_final_money(tmp_path):
+    from agents.dqn_market_free_v3c.training.collect import save_episode_batch
+    from agents.dqn_market_free_v3c.training.replay import ReplayBuffer
+    from agents.dqn_market_free_v3c.training.updater import SOURCE_KIND, fill_buffer
+
+    weak_path = tmp_path / "weak.npz"
+    strong_path = tmp_path / "strong.npz"
+    save_episode_batch([_episode(seed=6)], weak_path)
+    save_episode_batch([_episode(seed=7)], strong_path)
+    batches = [
+        SimpleNamespace(
+            source_kind=SOURCE_KIND,
+            artifact_path=weak_path,
+            artifact_sha256=None,
+            sample_count=1,
+            metadata={"generation_id": "g0001", "mean_final_money": 1_000.0},
+        ),
+        SimpleNamespace(
+            source_kind=SOURCE_KIND,
+            artifact_path=strong_path,
+            artifact_sha256=None,
+            sample_count=1,
+            metadata={"generation_id": "g0002", "mean_final_money": 9_000.0},
+        ),
+    ]
+    buffer = ReplayBuffer(
+        capacity=4,
+        seed=0,
+        generation_weight_power=0.5,
+        generation_weight_floor=0.35,
+    )
+
+    skipped = fill_buffer(buffer, batches)
+
+    assert skipped == 0
+    assert [record.episode_weight for record in buffer.recent] == pytest.approx(
+        [0.35, 1.0]
+    )
+    stats = buffer.priority_stats()
+    assert stats["min_generation_weight"] == pytest.approx(0.35)
+    assert stats["max_generation_weight"] == pytest.approx(1.0)
 
 
 def test_a_chunk_bootstraps_the_turn_n_step_ahead_and_never_clamps():
@@ -1187,6 +1498,62 @@ def test_the_mask_prices_a_product_buy_the_way_pending_turn_does():
             )[-1]
         )
         assert mask_cost == pytest.approx(pending.purchase_cost(item, quantity))
+
+
+def test_product_buys_are_capped_by_remaining_shed_capacity():
+    """The turn model must not store units the simulator will discard."""
+
+    from agents.dqn_market_free_v3c.order_space import (
+        _BUY_PRODUCT_ROWS,
+        _ROW_QUANTITY,
+        Order,
+        PendingTurn,
+        feasible_actions,
+    )
+    from tests.test_dqn_market_free import _mask_state
+
+    obs, farm, private, field = _mask_state(
+        money=5000.0, shed={"MELON": donor.SHED_CAPACITY - 1}
+    )
+    pending = PendingTurn(obs, farm, private, field, None)
+    rows = _BUY_PRODUCT_ROWS["WHEAT"]
+    mask = feasible_actions(obs, farm, private, field, None, pending=pending)
+    assert _ROW_QUANTITY[rows][mask[rows]].tolist() == [1]
+
+    pending.apply(Order("BUY_PRODUCT", "WHEAT", 45))
+    assert pending.occupancy == donor.SHED_CAPACITY
+    assert pending.shed["WHEAT"] == 1
+    assert pending.events[-1][2] == 1
+
+
+def test_sell_accounting_commits_only_stock_the_shed_holds():
+    from agents.dqn_market_free_v3c.order_space import Order, PendingTurn
+    from tests.test_dqn_market_free import _mask_state
+
+    obs, farm, private, field = _mask_state(money=3000.0, shed={"WHEAT": 1})
+    pending = PendingTurn(obs, farm, private, field, None)
+    start_inventory = pending.market_inventory.get("WHEAT", donor.MARKET_I0)
+
+    pending.apply(Order("SELL", "WHEAT", 45))
+
+    assert pending.shed["WHEAT"] == 0
+    assert pending.occupancy == 0
+    assert pending.events[-1][2] == 1
+    assert pending.market_inventory["WHEAT"] == start_inventory + 1
+
+
+def test_floor_price_sales_do_not_advance_pending_market_inventory():
+    from agents.dqn_market_free_v3c.order_space import Order, PendingTurn
+    from tests.test_dqn_market_free import _mask_state
+
+    obs, farm, private, field = _mask_state(money=3000.0, shed={"WHEAT": 1})
+    obs["market"]["inventory"]["WHEAT"] = 10_000_000_000_000
+    pending = PendingTurn(obs, farm, private, field, None)
+
+    pending.apply(Order("SELL", "WHEAT", 1))
+
+    assert pending.events[-1] == ("SELL", "WHEAT", 1, 1.0)
+    assert pending.market_inventory["WHEAT"] == 10_000_000_000_000
 
 
 # --------------------------------------------------------------------------
@@ -1766,11 +2133,20 @@ def test_batch_lot_keys_are_exactly_what_the_collector_writes():
     """Every lifted key has to exist in batch metadata or it silently never appears.
 
     The aggregator omits a column no batch carried, so a typo here is invisible at
-    runtime -- the metric would simply never show up. This pins the names against
-    the `BehaviorCounts` export the collector builds its metadata from.
+    runtime -- the metric would simply never show up.
+
+    **Batch metadata has two sources, not one.** Most columns come from the
+    `BehaviorCounts` export the collector builds from the rollout replays, but the
+    per-record counters -- `wash_turns`, `lagged_wash_turns` -- are summed off
+    `EpisodeRecord` in `updater.py` and never pass through `BehaviorCounts` at all.
+    Pinning against the export alone failed `lagged_wash_turns`, a column that has
+    been written on every batch since it landed (409.6 on `networth_01`'s last
+    update). Both surfaces are checked, which still catches the typo this test
+    exists for: a misspelling matches neither.
     """
 
     from agents.dqn_market_free_v3c.diagnostics import BehaviorCounts
+    from agents.dqn_market_free_v3c.training.collect import EpisodeRecord
     from agents.dqn_market_free_v3c.training.updater import _BATCH_LOT_KEYS
 
     exported = BehaviorCounts().as_dict()
@@ -1778,6 +2154,7 @@ def test_batch_lot_keys_are_exactly_what_the_collector_writes():
     available = set(exported) | {
         key[: -len("_per_episode")] for key in exported if key.endswith("_per_episode")
     }
+    available |= {name for name in dir(EpisodeRecord) if not name.startswith("_")}
     missing = sorted(key for key in _BATCH_LOT_KEYS if key not in available)
     assert not missing, f"lifted keys the collector never writes: {missing}"
 
@@ -1846,9 +2223,10 @@ def test_a_refusal_run_moves_the_block_and_a_fill_clears_it():
     """The latches are integrators, which is the whole argument for the columns.
 
     A GRU can be asked to learn a 24-turn price difference; asking it to hold a
-    running count of consecutive refusals across 720 ticks is the case
-    recurrences are worst at, and `training/reward.py` charges
-    `REJECTED_ORDER_PENALTY` against exactly this condition.
+    running count of consecutive refusals across 720 ticks is the case recurrences
+    are worst at. Nothing charges for a refusal any more, but the columns were never
+    load-bearing for the charge: without them no policy defined on the state can tell
+    it has entered a refusal loop, so none can climb out.
     """
 
     from agents.dqn_market_free_v3c.market_state import MarketHistory
@@ -2339,6 +2717,17 @@ def _lot_traces(turns: int, seed_counts=None, stock_counts=None, held_from: int 
     return seeds, standing, stock
 
 
+def _animal_traces(turns: int, animal_counts=None, held_from: int = 0):
+    from agents.dqn_market_free_v3c import lots
+
+    animals = len(lots.ANIMAL_ITEMS)
+    owned = []
+    for turn in range(turns):
+        owns = turn >= held_from
+        owned.append(list(animal_counts) if owns and animal_counts else [0] * animals)
+    return owned
+
+
 def test_the_stream_telescopes_to_the_money_the_season_ends_with():
     """The whole objective, and the reason there is no terminal term.
 
@@ -2402,6 +2791,58 @@ def test_a_purchase_is_not_a_loss():
     assert float(held.sum()) == pytest.approx(float(cash.sum()), abs=1e-6)
 
 
+def test_an_animal_purchase_is_not_a_loss_until_it_fails_to_pay_back():
+    """Animal basis closes the long credit gap between purchase and production."""
+
+    from agents.dqn_market_free_v3c.training import reward as reward_module
+    from agents.dqn_market_free_v3c.training.reward import episode_rewards
+
+    counts = [0] * len(reward_module._ANIMAL_BASIS)
+    counts[0] = 1
+    spend = sum(n * price for n, price in zip(counts, reward_module._ANIMAL_BASIS))
+
+    turns = 100
+    final = 3_000.0 - spend
+    money = [3_000.0] * 10 + [final] * (turns - 10)
+    seeds, standing, stock = _lot_traces(turns)
+    owned = _animal_traces(turns, counts, held_from=10)
+
+    held, _, _ = episode_rewards(
+        money,
+        final,
+        1.0,
+        seeds=seeds,
+        standing=standing,
+        stock=stock,
+        owned=owned,
+    )
+    cash, _, _ = episode_rewards(money, final, 1.0)
+
+    buy = 9
+    assert float(cash[buy]) == pytest.approx(-spend / reward_module.MONEY_SCALE)
+    assert float(held[buy]) == pytest.approx(0.0, abs=1e-6)
+    assert float(held[-1]) == pytest.approx(-spend / reward_module.MONEY_SCALE)
+    assert float(held.sum()) == pytest.approx(float(cash.sum()), abs=1e-6)
+
+
+def test_training_reward_requires_animal_basis_trace():
+    from agents.dqn_market_free_v3c.training.reward import episode_rewards
+
+    money, final = _flat_season(3_000.0)
+    seeds, standing, stock = _lot_traces(len(money))
+
+    with pytest.raises(ValueError, match="owned"):
+        episode_rewards(
+            money,
+            final,
+            1.0,
+            seeds=seeds,
+            standing=standing,
+            stock=stock,
+            basis_required=True,
+        )
+
+
 def test_an_idle_season_is_worth_only_the_idle_charge():
     """The NOOP guard, restated against a linear objective.
 
@@ -2429,28 +2870,28 @@ def test_an_idle_season_is_worth_only_the_idle_charge():
     assert float(charged.sum()) > -0.1, "and stays well inside a season's range"
 
 
-def test_a_filled_turn_quoted_in_coins_is_not_charged_as_refused():
-    """The units on `order_refused`'s two arguments, which drifted apart once.
+def test_a_refused_turn_is_priced_only_by_the_coins_it_moved():
+    """`REJECTED_ORDER_PENALTY` is gone, and nothing replaced it.
 
-    `expected` is `PendingTurn.expected_delta` in coins; `raw` inside
-    `episode_rewards` is already divided by `MONEY_SCALE`. Compared as they arrive,
-    `|delta| < FILL_FRACTION * |quoted|` holds for every quote above a hundredth of a
-    coin, so a turn whose orders all filled is charged as refused. Measured on
-    `market-free-networth-v1` at generation 19 that was 50.1% of turns against a
-    simulator refusal rate of 0.3%, and -0.36 an episode against a season's cash
-    return of +0.16.
+    The charge existed to stop `IDLE_PENALTY` making junk beat silence, and it cost
+    far more than the hole it plugged. On `market-free-scale-v1` the simulator refused
+    0.37% of emitting turns -- 138,470 emitting against 137,619 effective of 230,080
+    decisions on `scale_00` batch 20 -- while the charge fired on about 3.4%.
 
-    The state side cannot catch it: `market_state` calls `order_refused` with no
-    quote and a delta in coins, so the `refusal` feature stayed on the true 0.3%
-    while the reward charged half the season -- exactly the drift the function's own
-    docstring exists to prevent.
+    The cause was a unit mismatch the state side could not catch. `expected` is
+    `PendingTurn.expected_delta` in coins while `raw` is already divided by
+    `MONEY_SCALE`, and on top of that an over-sized sell rung inflates the quote, so
+    `|delta| < FILL_FRACTION * |quoted|` read turns whose legs all filled as refused.
+    `market_state` calls `order_refused` with no quote and a delta in coins, so the
+    `refusal` feature stayed on the true rate while the reward charged the inflated
+    one -- exactly the drift the function's own docstring exists to prevent, and one
+    more reason the fix is to drop the charge rather than to re-scale it.
+
+    A refused turn is now scored as the objective scores it: by the coins it moved,
+    which is none.
     """
 
-    from agents.dqn_market_free_v3c.training.reward import (
-        MONEY_SCALE,
-        REJECTED_ORDER_PENALTY,
-        episode_rewards,
-    )
+    from agents.dqn_market_free_v3c.training.reward import MONEY_SCALE, episode_rewards
 
     turns = 100
     # A season that buys 80 coins of seed on every turn and ends holding the cash it
@@ -2462,36 +2903,93 @@ def test_a_filled_turn_quoted_in_coins_is_not_charged_as_refused():
     emitted = [True] * turns
     quoted = [-80.0] * turns
 
-    filled, _, _ = episode_rewards(
-        money, final, 1.0, emitted, expected=quoted, idle_penalty=0.0, **kwargs
-    )
+    filled, _, _ = episode_rewards(money, final, 1.0, emitted, idle_penalty=0.0, **kwargs)
     assert float(filled.sum()) == pytest.approx(
         (final - 3_000.0) / MONEY_SCALE, abs=1e-6
     ), "a turn that moved the coins it quoted is not a refusal"
 
-    # And the charge still lands where it belongs: a turn that quoted 80 coins and
-    # moved none of them.
+    # And a season that emitted on every turn and had every order refused. It moved
+    # no coins, so it scores zero -- not zero minus a charge.
     stalled = [3_000.0] * turns
     refused, _, _ = episode_rewards(
-        stalled, 3_000.0, 1.0, emitted, expected=quoted, idle_penalty=0.0, **kwargs
+        stalled, 3_000.0, 1.0, emitted, idle_penalty=0.0, **kwargs
     )
-    assert float(refused.sum()) == pytest.approx(
-        -REJECTED_ORDER_PENALTY * turns, abs=1e-6
+    assert float(refused.sum()) == pytest.approx(0.0, abs=1e-6)
+
+    # The quote argument is gone with the charge, so a caller cannot revive the unit
+    # mismatch by passing coins where reward units were expected.
+    with pytest.raises(TypeError):
+        episode_rewards(stalled, 3_000.0, 1.0, emitted, expected=quoted, **kwargs)
+
+
+def test_the_idle_charge_stays_below_the_money_it_competes_with():
+    """Why `IDLE_PENALTY` is 0.000008 and not 0.00008.
+
+    The constant was sized as 7% of a ladder-grade season, 99,038 coins. Across all
+    30 `market-free-scale-v1` updates `own_mean_return` was negative in every one
+    while the money term it telescopes to was mostly positive: penalty mass ran 0.021
+    to 0.028 against a money term spanning -0.007 to +0.018, so the objective the
+    network fitted was between 1.2x and 10x anti-idle.
+
+    Two orderings have to hold, and both failed at the old value. A fully idle season
+    must cost less than losing the stake -- otherwise bankruptcy is cheaper than
+    sitting still -- and it must cost less than the money a real season earns.
+    """
+
+    from agents.dqn_market_free_v3c.training.reward import (
+        IDLE_PENALTY,
+        MONEY_SCALE,
+        episode_rewards,
     )
+
+    money, final = _flat_season(3_000.0)
+    seeds, standing, stock = _lot_traces(len(money))
+    idle, _, _ = episode_rewards(
+        money,
+        final,
+        0.999,
+        [False] * len(money),
+        seeds=seeds,
+        standing=standing,
+        stock=stock,
+    )
+    idle_season = -float(idle.sum())
+
+    # Losing the whole 3,000 stake. At 0.00008 the idle season cost 0.0288 against
+    # this 0.012 and the ordering was inverted.
+    bankruptcy = 3_000.0 / MONEY_SCALE
+    assert idle_season < bankruptcy, "idling must not cost more than going broke"
+
+    # The best money term measured on `market-free-scale-v1`, `scale_05` batch 20 at
+    # 7,576 coins. The charge has to be the smaller term against the policy in front
+    # of us, not against a season it has never played.
+    assert idle_season < (7_576.0 - 3_000.0) / MONEY_SCALE
+
+    # And it is still a price, not a rounding error: 2 coins a turn at t=0.
+    assert IDLE_PENALTY * MONEY_SCALE == pytest.approx(2.0, abs=1e-9)
 
 
 def test_the_shaped_stream_ranks_a_winning_season_over_a_losing_one():
-    """End to end through `episode_rewards`, which is what the network fits."""
+    """End to end through `episode_rewards`, which is what the network fits.
 
-    from agents.dqn_market_free_v3c.training.reward import episode_rewards
+    Stated in coins against `MONEY_SCALE` rather than in bare reward units. What the
+    stream promises is that it telescopes to `final - stake`, so the separation is
+    the 123,000 coins between the two seasons whatever the scale is; pinning 1.0 and
+    1.2 instead pinned `MONEY_SCALE` at 100,000, which is a different claim and one
+    `test_a_full_season_stays_in_the_huber_quadratic_zone` already owns.
+    """
+
+    from agents.dqn_market_free_v3c.training.reward import MONEY_SCALE, episode_rewards
 
     kept, final_kept = _flat_season(124_000.0)
     lost, final_lost = _flat_season(1_000.0)
     won, _, _ = episode_rewards(kept, final_kept, 0.999)
     lose, _, _ = episode_rewards(lost, final_lost, 0.999)
-    assert float(won.sum()) > 1.0
+    assert float(won.sum()) == pytest.approx(121_000.0 / MONEY_SCALE, rel=1e-4)
     assert float(lose.sum()) < 0.0
-    assert float(won.sum()) - float(lose.sum()) > 1.2
+    assert float(won.sum()) - float(lose.sum()) == pytest.approx(
+        123_000.0 / MONEY_SCALE, rel=1e-4
+    )
 
 
 def test_holding_the_basis_costs_a_little_and_selling_early_is_not_free():
@@ -2599,6 +3097,99 @@ def test_the_clone_margin_is_sized_inside_the_reward_range():
     from agents.dqn_market_free_v3c.training.updater import BEHAVIOR_CLONE_MARGIN
 
     assert 0.0 < BEHAVIOR_CLONE_MARGIN < 1.0
+
+
+def test_order_viability_records_behavior_without_gating_on_it():
+    from agents.dqn_market_free_v3c.training.updater import _order_viability
+
+    result = {
+        "pairs": 100,
+        "errors": {},
+        "order_diagnostics": {
+            "decisions": 72000,
+            "orders": 72000,
+            "trading_rate": 0.5,
+        },
+        "behavior": {
+            "seed_lots": 100,
+            "seed_lots_matched_share": 0.01,
+            "animal_lots": 20,
+            "animal_lots_matched_share": 0.05,
+            "unrecovered_animal_share": 0.95,
+        },
+    }
+
+    gate = _order_viability(result, {}, require_activity=True)
+
+    assert gate["passed"]
+    assert gate["checks"]["min_orders_per_decision"]
+    assert "productive_lots" not in gate["checks"]
+    assert "seed_lot_match" not in gate["checks"]
+    assert "animal_lot_match" not in gate["checks"]
+    assert "animal_recovery" not in gate["checks"]
+
+
+def test_order_viability_reports_refused_order_rate_without_gating_on_it():
+    from agents.dqn_market_free_v3c.training.updater import _order_viability
+
+    result = {
+        "pairs": 100,
+        "errors": {},
+        "order_diagnostics": {
+            "decisions": 72000,
+            "orders": 72000,
+            "trading_rate": 0.10,
+            "rejected_order_rate": 0.20,
+        },
+    }
+
+    gate = _order_viability(result, {}, require_activity=True)
+
+    assert gate["passed"]
+    assert gate["checks"]["min_orders_per_decision"]
+    assert "max_rejected_order_rate" not in gate["checks"]
+    assert gate["rejected_order_rate"] == pytest.approx(0.20)
+
+
+def test_order_viability_keeps_activity_as_the_only_order_gate():
+    from agents.dqn_market_free_v3c.training.updater import _order_viability
+
+    result = {
+        "pairs": 100,
+        "errors": {},
+        "order_diagnostics": {
+            "decisions": 72000,
+            "orders": 72000,
+            "trading_rate": 0.10,
+            "rejected_order_rate": 0.01,
+        },
+    }
+
+    gate = _order_viability(result, {}, require_activity=True)
+
+    assert gate["passed"]
+    assert gate["checks"]["min_orders_per_decision"]
+    assert "max_rejected_order_rate" not in gate["checks"]
+
+
+def test_order_viability_rejects_idle_benchmark_results():
+    from agents.dqn_market_free_v3c.training.updater import _order_viability
+
+    result = {
+        "pairs": 100,
+        "errors": {},
+        "order_diagnostics": {
+            "decisions": 72000,
+            "orders": 0,
+            "trading_rate": 0.0,
+        },
+    }
+
+    gate = _order_viability(result, {}, require_activity=True)
+
+    assert not gate["passed"]
+    assert not gate["checks"]["min_orders_per_decision"]
+    assert gate["trading_rate"] == 0.0
 
 
 # --------------------------------------------------------------------------

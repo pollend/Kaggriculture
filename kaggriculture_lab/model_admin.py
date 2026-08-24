@@ -143,13 +143,81 @@ def export_active_model(
     if gate.get("passed") is not True:
         raise ValueError(f"active checkpoint has not passed its release gate: {model_id}")
     source = Path(str(row[0]))
+    _copy_inference_artifact(source, output)
+    return Path(output)
+
+
+_BEST_CHECKPOINT_SCORE_SQL = {
+    "benchmark-money": (
+        "COALESCE("
+        "CAST(mtc.gate_json -> 'benchmark_score' ->> 'candidate_money' "
+        "AS DOUBLE PRECISION), "
+        "CAST(mtc.gate_json -> 'benchmark_ratchet' ->> 'candidate_money' "
+        "AS DOUBLE PRECISION))"
+    ),
+    "recent-mean-final-money": (
+        "CAST(mtc.metrics_json ->> 'recent_mean_final_money' AS DOUBLE PRECISION)"
+    ),
+}
+
+
+def export_best_model(
+    manifest_path: str | Path,
+    database: str | DatabaseTarget,
+    output: str | Path,
+    *,
+    confirm_release: bool,
+    name: str = DEFAULT_AGENT_NAME,
+    metric: str = "benchmark-money",
+) -> dict[str, object]:
+    """Copy the highest-scoring completed checkpoint into a release path."""
+
+    if not confirm_release:
+        raise ValueError("export-best is a release action; pass --confirm-release after reviewing the run")
+    score_sql = _BEST_CHECKPOINT_SCORE_SQL.get(metric)
+    if score_sql is None:
+        raise ValueError(
+            f"metric must be one of {sorted(_BEST_CHECKPOINT_SCORE_SQL)}: {metric}"
+        )
+    with ExperimentStore(database) as store:
+        manifest = _register_manifest(store, manifest_path, name)
+        model_id = _single_model_id(manifest, name)
+        row = store.connection.execute(
+            f"""
+            SELECT checkpoint_id, inference_artifact_path, score
+            FROM (
+                SELECT mtc.checkpoint_id, mtc.inference_artifact_path,
+                       mu.cutoff_batch_seq, mtc.created_at, {score_sql} AS score
+                FROM model_training_checkpoints mtc
+                JOIN model_updates mu ON mu.update_id = mtc.update_id
+                WHERE mtc.model_id = %s
+                  AND mu.status IN ('PROMOTED', 'REJECTED')
+            ) ranked
+            WHERE score IS NOT NULL
+            ORDER BY score DESC, cutoff_batch_seq DESC, created_at DESC
+            LIMIT 1
+            """,
+            [model_id],
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"model has no completed checkpoints with {metric}: {model_id}")
+    source = Path(str(row[1]))
+    _copy_inference_artifact(source, output)
+    return {
+        "checkpoint_id": str(row[0]),
+        "metric": metric,
+        "output": str(Path(output)),
+        "score": float(row[2]),
+    }
+
+
+def _copy_inference_artifact(source: Path, output: str | Path) -> None:
     if not source.is_file():
-        raise FileNotFoundError(f"active inference artifact is missing: {source}")
+        raise FileNotFoundError(f"inference artifact is missing: {source}")
     destination = Path(output)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if source.resolve() != destination.resolve():
         shutil.copyfile(source, destination)
-    return destination
 
 
 def add_model_commands(
@@ -190,6 +258,24 @@ def add_model_commands(
         export.add_argument("--confirm-release", action="store_true")
         export.set_defaults(
             func=_cmd_export_active,
+            model_manifest=str(manifest_path),
+        )
+
+        export_best = actions.add_parser(
+            "export-best",
+            help="copy the highest-scoring completed inference artifact for release",
+        )
+        export_best.add_argument("--name", default=DEFAULT_AGENT_NAME)
+        export_best.add_argument("--output", required=True)
+        export_best.add_argument(
+            "--metric",
+            choices=sorted(_BEST_CHECKPOINT_SCORE_SQL),
+            default="benchmark-money",
+        )
+        _add_database_options(export_best)
+        export_best.add_argument("--confirm-release", action="store_true")
+        export_best.set_defaults(
+            func=_cmd_export_best,
             model_manifest=str(manifest_path),
         )
 
@@ -234,4 +320,17 @@ def _cmd_export_active(args: argparse.Namespace) -> int:
         name=args.name,
     )
     print(output)
+    return 0
+
+
+def _cmd_export_best(args: argparse.Namespace) -> int:
+    result = export_best_model(
+        args.model_manifest,
+        _target(args),
+        args.output,
+        confirm_release=args.confirm_release,
+        name=args.name,
+        metric=args.metric,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
     return 0

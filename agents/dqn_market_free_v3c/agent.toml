@@ -44,7 +44,7 @@ model_id = "dqn_market_free_v3c.raw_order_q_v1"
 trainer = "agents.dqn_market_free_v3c.train:trainer"
 # Equals `rounds_per_generation` at `batches_per_round = 1`, which is what makes a
 # generation exactly one update per slot.
-min_new_batches = 10
+min_new_batches = 20
 
 [models.config]
 batches_per_round = 1
@@ -83,13 +83,12 @@ gamma = 0.999
 # zero silently. `priority_alpha` is the half that works with no demonstrator.
 demo_fraction = 0.25
 
-# Rank exponent for the return-weighted draw over the agent's own episodes.
+# Rank exponent for the final-money-weighted draw over the agent's own episodes.
 # 0.0 is the uniform draw, byte for byte.
 #
-# Rank-based, not proportional, because the shaped return is *signed*: no exponent
-# of it is defined. Shifting by the buffer minimum would make one episode's
-# priority depend on the worst episode held; clamping at zero would delete the
-# reservoir segment.
+# Rank-based, not proportional, so shifting by the buffer minimum cannot make one
+# episode's priority depend on the worst episode held, and clamping cannot delete
+# the reservoir segment.
 priority_alpha = 0.7
 
 # Importance-sampling exponent, fixed, with no anneal. An anneal keys off
@@ -101,6 +100,14 @@ priority_alpha = 0.7
 # the weighted gradient equals the uniform one, so prioritisation buys only
 # variance. Beta is the bias dial.
 priority_beta = 0.5
+
+# Aggregate generation weighting, applied to the per-chunk loss after replay has
+# already ranked own episodes by final money. The best generation in the loaded
+# buffer trains at 1.0; weaker generations are downweighted by
+# `(generation_mean_final_money / best_generation_mean_final_money) ** power`,
+# floored so a bad generation still contributes coverage.
+generation_weight_power = 0.5
+generation_weight_floor = 0.35
 
 # --- Recurrent state (R2D2) ---------------------------------------------------
 #
@@ -185,8 +192,8 @@ grad_clip_norm = 5.0
 # so the *independent* content of a step is far smaller than the row count says.
 # Below about 16 the step is dominated by which handful of episodes was drawn.
 batch_size = 32
-# Replay ratio. Down from 400 because a step is fifteen times wider: 48 x 10
-# batches x ~3,840 rows is ~1.84M rows an update against v2's ~1.02M, and the
+# Replay ratio. Down from 400 because a step is fifteen times wider: 48 x 20
+# batches x ~3,840 rows is ~3.69M rows an update against v2's ~1.02M, and the
 # sequence machinery costs about 1.5x per gradient-carrying decision -- so learning
 # goes from ~1.6% of a generation's wall clock to ~4.3% and the arena is still
 # ~93%. Watch for buffer over-fitting -- `mean_abs_q` climbing while `mean_loss`
@@ -196,11 +203,13 @@ gradient_steps_per_batch = 48
 # not a confident number.
 learning_rate = 0.0002
 weight_decay = 0.0
-# Two syncs an update, as in v2 -- but an update is ~480 gradient steps now rather
-# than ~4,000, so v2's 2000 would sync the target once every four updates. This is
-# the single easiest value to leave stale across the fork, and nothing would report
-# it: a target that lags four updates just looks like a harder target.
-target_sync = 250
+# One sync every two updates. Two syncs an update -- 480 against ~960 gradient
+# steps -- let the bootstrap target chase the online net, and `mean_loss` cannot
+# see that: the residual is measured against a target that moved, so a
+# self-consistent inflation is a zero-loss fit. `market-free-weighted-v1` took
+# `max_abs_q` from 0.3 to 60 on six of ten slots at a true return scale of
+# 0.003-0.10, and the reported loss stayed at 2e-5 throughout.
+target_sync = 1920
 # Both learning rates are re-applied from config on resume, so a mid-run change
 # takes effect. The Adam moments survive unless this is set; set it when the run is
 # deliberately leaving a regime behind.
@@ -217,7 +226,12 @@ reset_optimizer_moments = false
 
 # Below this rate the slot is finished. Must be strictly under `learning_rate` or a
 # slot graduates before it has trained. 0.0 switches the mechanism off entirely.
-lr_graduate_cut = 0.00002
+#
+# Two decay steps rather than three. At `0.00002` a slot that had genuinely
+# collapsed still owed `0.25^3`, which is three full `lr_plateau_patience` cycles
+# -- about twelve updates of rollout collected by a policy already known to be
+# broken -- before `_graduates` would hand it back to the mature group.
+lr_graduate_cut = 0.0001
 
 # Updates climbing linearly from zero to `learning_rate` after a reseed. Zero on
 # the first update is the point: that buffer was collected by the reseeded policy
@@ -472,130 +486,39 @@ demonstration_source = "league"
 # dial rather than a rebuild. Ignored by the league source.
 demonstration_pack = ""
 
-# "benchmark_ratchet", "always", "significant" (lower CI bound above zero) or
-# "point_estimate" (margin above zero). The last two read the paired head-to-head
-# against the released incumbent, which is exactly why neither is used: that
-# incumbent is the previous update, so the reference moves with the candidate and a
-# run can walk itself down while every step reads as an improvement.
-#
-# The ratchet anchors on the candidate's own money in the index-0 benchmark series
-# -- an absolute floor plus non-regression against the incumbent's *recorded* score
-# for the same opponent, which costs no extra arena time.
-#
-# Nothing here gates *training*: `lineage_checkpoint` takes the newest checkpoint
-# promoted or not, and `_self_play_pool` does not filter on `promoted`. A rejection
-# withholds the release only.
-promotion_rule = "benchmark_ratchet"
+# Single release rule for this family. A checkpoint must complete the benchmark,
+# clear the activity floor, and match or beat this slot's best promoted benchmark
+# money before it becomes active. Lower-scoring non-idle checkpoints are still
+# recorded as candidates, but they do not replace the parent.
+promotion_rule = "activity_gate"
 
-# The arena is ~96% of an update's wall clock, and these two seat-swapped across
-# ten slots outnumber collection. None of those episodes land in the `episodes`
-# table, so dashboard counts understate the real load.
-#
-# `eval_seeds` stays high because the ratchet reads it and the arena is the noisy
-# signal; the release thresholds are 0.9 and 0.8 ratios, well inside its band.
+# The benchmark arena is the one expensive online measurement left. None of these
+# episodes land in the `episodes` table, so dashboard counts understate the load.
 eval_seeds = 100
-# Cut hardest: under `benchmark_ratchet` the paired significance test these seeds
-# pay for is computed and never consulted by `promote`. What survives of the
-# head-to-head is threshold tests against the incumbent's own seat, which need no
-# paired design.
-promotion_seeds = 30
 promotion_seed_base = 1000000
-promotion_seed_stride = 10000
-# Pins the benchmark seed window while the head-to-head window keeps rotating. The
-# two want opposite things: the head-to-head runs both policies inside one update,
-# so rotating stops it reading one fixed hundred seeds forever, while the ratchet
-# compares against a score recorded twenty batches ago and rotating makes those
-# unpaired.
+# Pin the benchmark seed window so repeated checkpoint scores are comparable.
 benchmark_seed_stride = 0
 
-# The fixed-reference release bar, read off the candidate's own benchmark money.
-# Absolute, so a chain of individually-small regressions cannot walk the release
-# down: one third of the 3,000 stake.
-benchmark_release_min_money = 1000.0
-# The same bar for the first release only -- a foothold, not a good policy. Below
-# it there is no incumbent, which is the state both anti-stall mechanisms are inert
-# in, so this decides whether a cold start can ever get out. The bar comes down on
-# money, where the traders are, and stays up on
-# `viability_min_orders_per_decision`, where the hoarders are: pool rank is money,
-# so an admitted hoarder becomes every slot's reseed ancestor.
-benchmark_cold_start_min_money = 600.0
-# Non-regression against the incumbent's recorded benchmark money. Not 1.0: a gate
-# admitting no measurement noise eventually admits nothing.
-benchmark_money_ratchet = 0.9
-# How many measurements that reference is a median over. Ratcheting one draw
-# against another is not just weak but biased -- the stored reference is whatever
-# was lucky enough to promote, so every release re-aims the bar at a higher quantile
-# of unchanged noise. The window covers the incumbent's draw plus every candidate
-# measured since, which are repeated samples of one quantity.
-#
-# Gives up: a lineage decaying slowly and uniformly drags its own window down and
-# the ratchet follows rather than catches. Bounded by the absolute floor and hard
-# viability.
+# Still used by the learner plateau score when `lr_score_signal = "benchmark"`;
+# with the activity gate it is a smoothing window, not a promotion ratchet.
 benchmark_reference_window = 11
-# After this many consecutive rejections the *absolute floor* stands down to
-# `benchmark_grace_min_money` and the ratchet alone decides. Bounds how long this
-# gate can block, and only this one -- hard viability fails independently and has
-# its own hatch. It drops the floor rather than the relative term because the floor
-# is the unreachable half: a lineage can sit far below an absolute bar without
-# having regressed against its own reference.
-promotion_ratchet_grace_after_rejections = 4
-# The floor once grace is in force. Unset means `benchmark_cold_start_min_money`.
-# Set 0.0 on a run being deliberately unstuck.
-# benchmark_grace_min_money = 750.0
 
-# Hard viability. A candidate must not improve its margin by bankrupting itself or
-# by refusing to trade. Money floors are relative to the incumbent's own seat in the
-# same paired head-to-head, so they compare like with like. No upper limit:
-# over-trading surfaces as lost money, which these already measure.
-viability_min_mean_money_ratio = 0.80
-viability_min_median_money_ratio = 0.75
-# Catches the other attractor -- a policy that never trades keeps its money and
-# clears both floors above.
-#
-# Read from `trading_rate`, which counts decisions the simulator acted on, not
-# emitted orders: `HIRE n` is one decision whose wire form is n rows, and a policy
-# repeating a refused order reports activity it does not have. Applied
-# unconditionally to the benchmark, and to the head-to-head only after a release --
-# the cold-start opponent is the quiet baseline, which offers no counterparty.
+# Catches the attractor this gate exists for: a policy that refuses to trade can
+# keep cash while teaching the next generation to do less. Read from
+# `trading_rate`, which counts decisions the simulator acted on, not emitted rows:
+# `HIRE n` is one decision whose wire form is n rows, and a policy repeating a
+# refused order reports activity it does not have.
 viability_min_orders_per_decision = 0.02
-# The same failure caught again inside the mature pool, which the floor above cannot
-# reach: pool rank is money, money rewards idleness here, so a hoarder that got a
-# release would enter at the top, never be culled, and become both reseed source and
-# mirror opponent for every slot. The floor above is a binary at 0.02 -- it
-# separates "never acts" from "acts", not "trades" from "hoards".
-#
-# This discounts a graduating checkpoint's pool score by its recorded trading rate,
-# ramping to this reference and saturating above it. A ramp rather than a second
-# threshold, which would only move the same cliff. 0 ranks on raw money.
-population_activity_reference = 0.10
-# What the money floors measure against before any release. The incumbent's seat is
-# then the quiet baseline, which never trades and keeps the full 3,000 stake, so
-# `0.80 *` a perfect stake asks a candidate to trade for a season and lose nothing.
-# 1500 puts the floors at 1,200 mean / 1,125 median: survivable, still fatal to
-# bankruptcy.
-viability_cold_start_reference_money = 1500.0
-# The hatch for when that is still not survivable, on the same rejection streak the
-# ratchet's grace reads. Moves the cold-start reference and nothing else -- both
-# ratios still bind, the activity floor is untouched, and it applies only while
-# nothing has been released. Matches
-# `promotion_ratchet_grace_after_rejections` so both hatches open together, since
-# the run cannot tell which gate is holding it.
-viability_grace_after_rejections = 4
-# The cold-start reference once viability grace is in force. Unset means
-# `benchmark_cold_start_min_money`. Set it explicitly to hold the two apart: they
-# mean the same thing only while a first release and a survivable season are the
-# same bar, and nothing enforces that.
-# viability_grace_cold_start_reference_money = 750.0
 
-# Training and collection follow the newest checkpoint on the lineage, promoted or
-# not; release is gated, the behaviour distribution is not. Snap back to the
-# released checkpoint after this many consecutive rejections so a diverged
-# trajectory is not carried forward forever. 0 disables it.
-#
-# Safe alongside the population only because `lr_score_signal` is "rollout". While
-# the detector read the incumbent's arena score, a snapback restored the very score
-# it was reading, pinning `lr_best_score` so the slot never reached its cut.
-resume_reset_after_rejections = 2
+# Pool ranking still discounts money by recorded activity so a barely-active high
+# cash checkpoint does not become the dominant reseed ancestor. This is a rank
+# adjustment, not a second promotion gate.
+population_activity_reference = 0.10
+
+# Activity-gated lineage already ignores rejected idle checkpoints and resumes
+# from the best promoted benchmark score, so the old rejection-streak snapback is
+# disabled.
+resume_reset_after_rejections = 0
 
 # Self-play against this model's own recent checkpoints, mixed into `opponents` at
 # `self_play_ratio`. The pool follows the lineage rather than the release, for the

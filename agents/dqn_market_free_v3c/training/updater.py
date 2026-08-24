@@ -68,6 +68,8 @@ from agents.dqn_market_free_v3c.training.collect import (
 )
 from agents.dqn_market_free_v3c.training.replay import (
     DEFAULT_CAPACITY,
+    DEFAULT_GENERATION_WEIGHT_FLOOR,
+    DEFAULT_GENERATION_WEIGHT_POWER,
     DEFAULT_N_STEP,
     DEFAULT_PRIORITY_ALPHA,
     DEFAULT_PRIORITY_BETA,
@@ -79,14 +81,14 @@ from agents.dqn_market_scorer.training.progress import _opponent_policy, _policy
 
 # Action-agnostic machinery, shared on purpose. See the module docstring.
 from agents.dqn_market_scorer.training.updater import (
+    LineageCheckpoint,
     _benchmark_kind,
     _file_digest,
     _reject_degenerate,
     compose_opponents,
     configured_benchmarks,
     league_opponents,
-    lineage_checkpoint,
-    policy_improvement,
+    lineage_checkpoint as _newest_lineage_checkpoint,
     rejections_since_promotion,
     rotate_opponents,
 )
@@ -109,19 +111,21 @@ LOGGER = logging.getLogger(__name__)
 # `_single_threaded_workers` got when it moved to `sim.workers`.
 LEARNER_MANIFEST = "agents/dqn_market_free_v3c/match_agent.toml"
 SOURCE_KIND = "free_market_rollout"
-_PROMOTION_RULES = {"significant", "point_estimate", "always", "benchmark_ratchet"}
+_PROMOTION_RULES = {"activity_gate"}
 #: Which measurement the learner slot's plateau detector reads. See `_slot_score`.
 _SCORE_SIGNALS = {"rollout", "benchmark"}
 
 VIABILITY_DEFAULTS = {
-    "viability_min_mean_money_ratio": 0.80,
-    "viability_min_median_money_ratio": 0.75,
+    "viability_min_mean_money_ratio": 0.60,
+    "viability_min_median_money_ratio": 0.55,
     # The gate's other half: a policy that never trades keeps its money perfectly,
     # so the floors above wave the NOOP attractor through. Applied only once there
     # is a released incumbent -- a cold start is legitimately near-silent.
     "viability_min_orders_per_decision": 0.02,
+    "generation_weight_power": DEFAULT_GENERATION_WEIGHT_POWER,
+    "generation_weight_floor": DEFAULT_GENERATION_WEIGHT_FLOOR,
     # What the money floors measure against before any release. Not the quiet
-    # baseline's seat: it keeps the full stake, so `0.80 *` it asks a candidate to
+    # baseline's seat: it keeps the full stake, so even a loose ratio asks a candidate to
     # trade for a season and lose nothing.
     "viability_cold_start_reference_money": 1500.0,
     # The cold-start floors' own escape hatch, separate from the ratchet's because
@@ -130,8 +134,8 @@ VIABILITY_DEFAULTS = {
     "viability_grace_after_rejections": 0,
     # The cold-start reference under that grace; unset means
     # `benchmark_cold_start_min_money`. Only the *reference* moves -- both ratios
-    # still bind and the activity floor is untouched, or this becomes
-    # `promotion_rule = "always"` for any slot that has rejected enough times.
+    # still bind and the activity floor is untouched, or this becomes an implicit
+    # unconditional pass for any slot that has rejected enough times.
     "viability_grace_cold_start_reference_money": None,
     # The fixed-reference release bar. Absolute, because everything else in this
     # gate is relative to the previous update and therefore drifts.
@@ -144,9 +148,10 @@ VIABILITY_DEFAULTS = {
     # absolute is what a stalled run cannot clear -- a lineage can sit far below a
     # fixed bar while never having regressed against its own recorded reference.
     "benchmark_grace_min_money": None,
-    # Non-regression against the incumbent's *recorded* benchmark money. Not 1.0: a
-    # gate admitting no noise eventually admits nothing.
-    "benchmark_money_ratchet": 0.9,
+    # Non-regression against the incumbent's *recorded* benchmark money. This is a
+    # drift guard rather than a hill-climber; the arena is noisy enough that a
+    # stricter bar rejects viable candidates while training is still exploratory.
+    "benchmark_money_ratchet": 0.70,
     # How many measurements the ratchet reference is a median over. 1 is the single
     # stored draw. Above 1 because ratcheting one draw against another is not just
     # weak but biased: the stored reference is whatever was lucky enough to promote,
@@ -226,6 +231,107 @@ def _benchmark_money(gate: dict[str, Any] | None, opponent: str) -> float | None
     if result is None or result.get("errors") or result.get("a_money_mean") is None:
         return None
     return float(result["a_money_mean"])
+
+
+def _best_promoted_benchmark_score(reader, model_id: str) -> tuple[float | None, str | None]:
+    """Best promoted benchmark score already recorded for this model slot."""
+
+    row = reader.fetchone(
+        """
+        SELECT COALESCE(
+                   CAST(gate_json -> 'benchmark_score' ->> 'candidate_money'
+                        AS DOUBLE PRECISION),
+                   CAST(gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
+                        AS DOUBLE PRECISION)
+               ) AS score,
+               checkpoint_id
+        FROM model_training_checkpoints
+        WHERE model_id = %s
+          AND promoted
+          AND COALESCE(
+              gate_json -> 'benchmark_score' ->> 'candidate_money',
+              gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
+          ) IS NOT NULL
+        ORDER BY score DESC, created_at DESC, checkpoint_id DESC
+        LIMIT 1
+        """,
+        [model_id],
+    )
+    if row is None:
+        return None, None
+    return float(row[0]), str(row[1])
+
+
+def _activation_reasons(
+    *, activity_passed: bool, candidate_money: float | None, best_money: float | None
+) -> list[str]:
+    """Why a candidate should not replace the active checkpoint."""
+
+    reasons: list[str] = []
+    if not activity_passed:
+        reasons.append("activity_gate_failed")
+    if candidate_money is None:
+        reasons.append("missing_benchmark_score")
+    elif best_money is not None and float(candidate_money) < best_money:
+        reasons.append("below_best_promoted_benchmark_money")
+    return reasons
+
+
+def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
+    """Checkpoint that collection and training should continue from.
+
+    The shared scorer lineage follows the newest checkpoint, promoted or not. That
+    is correct when the release gate can reject and hold an incumbent, but it is
+    the wrong rule for this family's simplified activity gate: rejected idle
+    checkpoints are exactly the policies we do not want to carry forward. In that
+    mode, use the best promoted benchmark score for the slot and leave release
+    selection to the same metric.
+
+    Other promotion rules keep the shared behavior, including the reset-to-release
+    hatch after consecutive rejections.
+    """
+
+    if str(getattr(context, "config", {}).get("promotion_rule", "")) != "activity_gate":
+        return _newest_lineage_checkpoint(context, reader)
+
+    benchmarks = configured_benchmarks(context.config)
+    if not benchmarks:
+        return None
+    rows = reader.fetchall(
+        """
+        SELECT checkpoint_id, trainer_artifact_path, inference_artifact_path,
+               COALESCE(
+                   CAST(gate_json -> 'benchmark_score' ->> 'candidate_money'
+                        AS DOUBLE PRECISION),
+                   CAST(gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
+                        AS DOUBLE PRECISION)
+               ) AS score
+        FROM model_training_checkpoints
+        WHERE model_id = %s
+          AND promoted
+          AND COALESCE(
+              gate_json -> 'benchmark_score' ->> 'candidate_money',
+              gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
+          ) IS NOT NULL
+        ORDER BY score DESC, created_at DESC, checkpoint_id DESC
+        LIMIT 20
+        """,
+        [context.model_id],
+    )
+    active = context.active_checkpoint
+    for row in rows or []:
+        trainer_path = Path(str(row[1]))
+        inference_path = Path(str(row[2]))
+        if not trainer_path.is_file() or not inference_path.is_file():
+            continue
+        checkpoint_id = str(row[0])
+        return LineageCheckpoint(
+            checkpoint_id,
+            trainer_path,
+            inference_path,
+            released=active is not None and checkpoint_id == active.checkpoint_id,
+        )
+    return None
 
 
 def _weights_spec(weights_path: Path | str) -> str:
@@ -335,7 +441,24 @@ def initial_network(config: dict[str, Any]) -> OrderQNetwork:
     NOOP forever while reporting a healthy falling loss.
     """
 
-    return OrderQNetwork.quiet_start(seed=int(config.get("seed", 0)))
+    network = OrderQNetwork.quiet_start(seed=int(config.get("seed", 0)))
+    noisy = _noisy(config)
+    if not noisy.enabled:
+        return network
+
+    last = len(network.layers) - 1
+    sigma = [
+        (
+            (
+                np.full(weight.shape, noisy.sigma0 / np.sqrt(weight.shape[0]), dtype=np.float32),
+                np.full(bias.shape, noisy.sigma0 / np.sqrt(weight.shape[0]), dtype=np.float32),
+            )
+            if noisy.build_kind == "all" or index == last
+            else None
+        )
+        for index, (weight, bias) in enumerate(network.layers)
+    ]
+    return OrderQNetwork(network.layers, sigma, gru=network.gru)
 
 
 def _quiet_opponent(context, config: dict[str, Any]) -> str:
@@ -583,8 +706,9 @@ def _order_viability(
     recomputing it from the counts -- a recomputation naming a key the payload does
     not carry reads 0.0 for every real arena and fails the floor unconditionally.
 
-    No upper limit: over-trading can only show up as lost money, which the floors in
-    `_arena_viability` already measure.
+    Lot quality and refused-order rates are recorded by arena diagnostics, but
+    promotion follows the older gate shape: survival plus activity, with benchmark
+    money carrying the quality signal.
     """
 
     diagnostics = dict(result.get("order_diagnostics") or {})
@@ -600,6 +724,7 @@ def _order_viability(
         and all(checks.values()),
         "checks": checks,
         "trading_rate": trading_rate,
+        "rejected_order_rate": float(diagnostics.get("rejected_order_rate", 0.0)),
         "wire_orders_per_decision": int(diagnostics.get("orders", 0)) / decisions,
         "min_orders_per_decision_required": bool(require_activity and minimum_activity > 0.0),
     }
@@ -975,6 +1100,7 @@ def _benchmark_ratchet(
         floor = _limit(config, floor_name)
     ratchet = _limit(config, "benchmark_money_ratchet")
     candidate = None if result is None else float(result.get("a_money_mean", 0.0))
+    opponent_money = None if result is None else float(result.get("b_money_mean", 0.0))
     # The incumbent's own draw is one of the samples, not a separate authority --
     # it is the same measurement on the same benchmark, and singling it out is
     # exactly the selection bias the window exists to remove.
@@ -997,6 +1123,7 @@ def _benchmark_ratchet(
         "checks": checks,
         "opponent": None if result is None else result.get("opponent"),
         "candidate_money": candidate,
+        "opponent_money": opponent_money,
         "reference_money": reference_used,
         # The single stored draw, kept beside the statistic actually used so a
         # rejection can be read against both without a second query.
@@ -2827,6 +2954,33 @@ def fill_buffer(buffer: ReplayBuffer, batches) -> int:
         batch for batch in batches if batch.source_kind == SOURCE_KIND and batch.artifact_path
     ]
     counts = [max(0, int(batch.sample_count)) for batch in rollouts]
+    generation_money: dict[str, tuple[float, int]] = {}
+    if buffer.generation_weight_power > 0.0:
+        for batch, count in zip(rollouts, counts):
+            metadata = getattr(batch, "metadata", None)
+            if not isinstance(metadata, dict) or count <= 0:
+                continue
+            generation = metadata.get("generation_id")
+            mean = metadata.get("mean_final_money")
+            if generation is None or mean is None:
+                continue
+            try:
+                value = float(mean)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value):
+                continue
+            key = str(generation)
+            total, samples = generation_money.get(key, (0.0, 0))
+            generation_money[key] = (total + value * count, samples + count)
+    generation_scores = {
+        key: total / samples
+        for key, (total, samples) in generation_money.items()
+        if samples > 0
+    }
+    best_generation_score = max(
+        (max(0.0, value) for value in generation_scores.values()), default=0.0
+    )
     recent_ids, reservoir_ids, evicted_seen = buffer.plan_intake(counts)
     wanted = set(recent_ids) | set(reservoir_ids)
 
@@ -2843,10 +2997,30 @@ def fill_buffer(buffer: ReplayBuffer, batches) -> int:
         if batch.artifact_sha256 and _file_digest(path) != batch.artifact_sha256:
             raise ValueError(f"rollout artifact digest mismatch: {path}")
         records = load_episode_batch(path)
+        metadata = getattr(batch, "metadata", None)
+        generation = (
+            str(metadata.get("generation_id"))
+            if isinstance(metadata, dict) and metadata.get("generation_id") is not None
+            else None
+        )
+        episode_weight = 1.0
+        if (
+            buffer.generation_weight_power > 0.0
+            and generation is not None
+            and best_generation_score > 0.0
+            and generation in generation_scores
+        ):
+            ratio = max(0.0, generation_scores[generation]) / best_generation_score
+            episode_weight = max(
+                buffer.generation_weight_floor,
+                min(1.0, ratio ** buffer.generation_weight_power),
+            )
         for key in owned:
             index = key - first
             if index < len(records):
-                records_by_id[key] = records[index]
+                record = records[index]
+                record.episode_weight = episode_weight
+                records_by_id[key] = record
     buffer.load_planned(recent_ids, reservoir_ids, evicted_seen, records_by_id)
     return skipped_evicted
 
@@ -3348,6 +3522,12 @@ class FreeMarketUpdater:
             ),
             priority_alpha=float(config.get("priority_alpha", DEFAULT_PRIORITY_ALPHA)),
             priority_beta=float(config.get("priority_beta", DEFAULT_PRIORITY_BETA)),
+            generation_weight_power=float(
+                config.get("generation_weight_power", DEFAULT_GENERATION_WEIGHT_POWER)
+            ),
+            generation_weight_floor=float(
+                config.get("generation_weight_floor", DEFAULT_GENERATION_WEIGHT_FLOOR)
+            ),
         )
 
         # Where this learner slot is in its cycle, and whether the last update
@@ -3369,7 +3549,7 @@ class FreeMarketUpdater:
         # Falling through to `initial_network` here is what the first version did,
         # and it cost a whole update per slot three ways over: the cold start was
         # trained on episodes collected from the adopted policy, the silent network
-        # was exported and paid a full `eval_seeds + promotion_seeds` arena, and the
+        # was exported and paid a full benchmark arena, and the
         # adoption was then deferred to a *second* update that `_slot_state` also
         # ran at a learning rate of exactly zero.
         warm_network_path, warm_sidecar_path = warm_start_paths(context.artifacts)
@@ -3563,7 +3743,7 @@ class FreeMarketUpdater:
             raise ValueError(f"free-market training requires at least {warmup} replay episodes")
 
         # `reduction="none"`: every row carries its own importance-sampling
-        # weight from the return-weighted draw, and a mean taken inside the loss
+        # weight from the final-money-weighted draw, and a mean taken inside the loss
         # would average them away before they could apply.
         loss_fn = nn.SmoothL1Loss(reduction="none")
         # Chunks now, not rows. 32 chunks x 40 turns x ~3 decisions is ~3,840
@@ -3824,7 +4004,7 @@ class FreeMarketUpdater:
         flip_to_order: float | None = None
         if noisy.enabled and len(buffer.episodes):
             # Unprioritised on purpose. This probe resolves sigma against the
-            # states the actor actually visits, and a return-weighted draw would
+            # states the actor actually visits, and a final-money-weighted draw would
             # resolve the controller against a distribution no actor ever sees --
             # invisibly, since the flip rate comes back plausible either way.
             probe = buffer.sample_sequences(
@@ -3920,312 +4100,102 @@ class FreeMarketUpdater:
         exported.save(inference_path)
 
         eval_seeds = int(config.get("eval_seeds", 40))
-        promotion_seeds = int(config.get("promotion_seeds", 60))
         seed_base = int(config.get("promotion_seed_base", 1_000_000))
-        seed_stride = int(config.get("promotion_seed_stride", 10_000))
-        seed_start = seed_base + context.cutoff_batch_seq * seed_stride
-        # The benchmark window is pinned separately, because the head-to-head and
-        # the benchmark want opposite things from it. The head-to-head compares
-        # two policies inside one update, so rotating its seeds each update stops
-        # the gate being read off one fixed hundred seeds forever. The benchmark
-        # compares *this* update against one recorded twenty batches ago, and a
-        # rotating window makes those two numbers unpaired -- a stride of 0 makes
-        # `benchmark_money_ratchet` a like-for-like comparison.
-        #
-        # Nothing is lost to overfitting: the benchmark opponent is fixed, never
-        # appears in `opponents`, and arena evaluation draws no noise
-        # (`_weights_spec` passes only `weights`, and `noise_cadence` defaults to
-        # "none" precisely so the gate path is deterministic).
-        benchmark_seed_stride = int(config.get("benchmark_seed_stride", seed_stride))
+        benchmark_seed_stride = int(config.get("benchmark_seed_stride", 0))
         benchmark_seed_start = seed_base + context.cutoff_batch_seq * benchmark_seed_stride
         jobs = int(config.get("jobs", 1))
 
-        # Three arena series an update, not five. The incumbent is not replayed
-        # against the benchmarks: `_released_benchmark_money` reads the score it
-        # already recorded when it was itself a candidate, which is what makes
-        # the fixed-reference ratchet below cost one row rather than most of the
-        # evaluation wall clock.
+        # One arena answers both questions this gate still asks: did the candidate
+        # complete a benchmark, and did it trade at all? Money is recorded here for
+        # offline selection, not for online rejection.
         benchmarks = configured_benchmarks(config)
-        challenger_benchmarks = [
-            _arena_evaluate(inference_path, benchmark, eval_seeds, jobs, benchmark_seed_start)
-            for benchmark in benchmarks
-        ]
+        benchmark = benchmarks[0] if benchmarks else None
+        challenger_benchmarks = (
+            [_arena_evaluate(inference_path, benchmark, eval_seeds, jobs, benchmark_seed_start)]
+            if benchmark is not None
+            else []
+        )
         for result in challenger_benchmarks:
             _reject_degenerate(result, "benchmark")
 
-        promotion_rule = str(config.get("promotion_rule", "significant"))
+        promotion_rule = str(config.get("promotion_rule", "activity_gate"))
         if promotion_rule not in _PROMOTION_RULES:
             raise ValueError(
                 f"promotion_rule must be one of {sorted(_PROMOTION_RULES)}: {promotion_rule}"
             )
 
-        # The quiet network is a real incumbent, not an absence of one. Without
-        # this baseline the first trained checkpoint would promote merely for
-        # completing evaluation, which is how an over-ordering bankruptcy policy
-        # once displaced the much safer cold start.
         active = context.active_checkpoint
-        baseline_path = context.artifacts / "viability_baselines" / "quiet.npz"
-        baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        initial_network(config).save(baseline_path)
-        incumbent_path = (
-            Path(active.inference_artifact_path) if active is not None else baseline_path
-        )
-        incumbent_spec = _weights_spec(incumbent_path)
-        head_to_head = _arena_evaluate(
-            inference_path, incumbent_spec, promotion_seeds, jobs, seed_start
-        )
-        # A zero-width paired margin against a *released* incumbent is a harness
-        # fault -- a dropped `?weights=`, a missing checkpoint -- and must fail
-        # loudly. Against the quiet baseline it is not: the baseline emits nothing,
-        # so a candidate that collapsed to NOOP genuinely plays every paired seed
-        # identically, and that belongs in the gate as a rejection rather than as an
-        # ERROR discarding the diagnostics that show the collapse.
-        #
-        # But a zero margin does not *imply* the collapse. Round-trip trades are
-        # cash-neutral against an unchanged market, so a candidate can trade all
-        # season against a counterparty offering nothing and end where it started.
-        # So read the collapse off the candidate's own activity in that match. A
-        # genuine NOOP policy reads 0.0 and is still rejected, which is the case
-        # this exists for.
-        degenerate_head_to_head = False
-        try:
-            _reject_degenerate(head_to_head, "head-to-head")
-        except RuntimeError:
-            if active is not None:
-                raise
-            degenerate_head_to_head = _collapsed_against_baseline(head_to_head, config)
-
-        # The money floors measure against the incumbent's own seat in this same
-        # paired series -- except on a cold start, where that seat is the quiet
-        # baseline, which never trades and so keeps its full stake on every seed.
-        # `0.80 *` a perfect stake is a bar no policy that trades for a season can
-        # clear, so a fixed cold-start reference is what makes the *first* release
-        # reachable; from the second onward the real seat takes over.
-        #
-        # That fixed reference is itself escapable, and only on a cold start. Once
-        # `active is not None` the reference is a real opponent's seat in this same
-        # paired series, which is the comparison worth keeping strict -- standing it
-        # down would let a run walk itself down through exactly the drift
-        # `_benchmark_ratchet` refuses. The synthetic bar has no such standing: it is
-        # a number this config picked, and a slot converging on it from below across
-        # every update it has ever run is being held by the number rather than by its
-        # own decay. See `viability_grace_after_rejections`.
-        head_viability_grace = False
-        if active is not None:
-            head_reference_kind = "incumbent_seat"
-            head_reference = {
-                "a_money_mean": head_to_head["b_money_mean"],
-                "a_money_median": head_to_head["b_money_median"],
+        benchmark_result = challenger_benchmarks[0] if challenger_benchmarks else None
+        activity = (
+            _order_viability(benchmark_result, config, require_activity=True)
+            if benchmark_result is not None
+            else {
+                "passed": False,
+                "checks": {},
+                "trading_rate": 0.0,
+                "rejected_order_rate": 0.0,
+                "wire_orders_per_decision": 0.0,
+                "min_orders_per_decision_required": True,
             }
-        else:
-            viability_grace_limit = int(config.get("viability_grace_after_rejections", 0))
-            head_viability_grace = (
-                viability_grace_limit > 0 and rejection_streak >= viability_grace_limit
+        )
+        benchmark_score = {
+            "opponent": benchmark,
+            "candidate_money": _benchmark_money(
+                {"challenger_benchmarks": challenger_benchmarks}, benchmark
             )
-            if head_viability_grace:
-                # `None` means "the ratchet's own first-release foothold", so a
-                # config that sets the streak limit and nothing else lands on a
-                # number it already declares rather than on a second new one.
-                configured = config.get(
-                    "viability_grace_cold_start_reference_money",
-                    VIABILITY_DEFAULTS["viability_grace_cold_start_reference_money"],
-                )
-                cold_start_reference = (
-                    _limit(config, "benchmark_cold_start_min_money")
-                    if configured is None
-                    else float(configured)
-                )
-                head_reference_kind = "cold_start_grace"
-            else:
-                cold_start_reference = _limit(config, "viability_cold_start_reference_money")
-                head_reference_kind = "cold_start_fixed"
-            head_reference = {
-                "a_money_mean": cold_start_reference,
-                "a_money_median": cold_start_reference,
-            }
-        # The activity floor binds unconditionally on the *benchmark* arena, and on
-        # the head-to-head only once there is a released incumbent to play. Both
-        # halves are load-bearing:
-        #
-        #   * The benchmark half stops a candidate that never trades becoming the
-        #     incumbent everything afterwards is measured against. With no incumbent
-        #     the head-to-head is against a policy that reliably bankrupts, so a
-        #     pure-NOOP candidate keeps its stake, wins outright and passes hard
-        #     viability. It reads 0.0 against the benchmark, where this catches it.
-        #   * On the cold-start head-to-head the floor measures nothing: the quiet
-        #     baseline offers no counterparty, so an order has nothing to fill
-        #     against. Binding it there rejected slots that were trading fine
-        #     against the benchmark and left the mature group empty.
-        #
-        # With no benchmark configured there is no other arena to carry it, so the
-        # head-to-head keeps the floor rather than dropping it silently.
-        require_head_activity = active is not None or not challenger_benchmarks
-        head_viability = _arena_viability(
-            head_to_head,
-            head_reference,
-            config,
-            require_activity=require_head_activity,
-            reference_kind=head_reference_kind,
-            grace=head_viability_grace,
-        )
-        benchmark_viability = [
-            _order_viability(result, config, require_activity=True)
-            for result in challenger_benchmarks
-        ]
-        hard_viability_passed = head_viability["passed"] and all(
-            item["passed"] for item in benchmark_viability
-        )
-
-        # `policy_improvement` falls through to the `significant` branch for any
-        # name it does not know, so `benchmark_ratchet` would silently mean
-        # `significant` if it were passed straight in. Mapped explicitly. Under
-        # the ratchet this number is recorded and never consulted by `promote`:
-        # the incumbent it measures against is the previous update, so it drifts
-        # with the candidate by construction -- `falloff_v1` scored 0.29, 0.00,
-        # 0.16, 1.00, 0.00, 0.38, 0.59, 0.94 on it while its benchmark money fell
-        # from 2,979 to 107.
-        head_reference_rule = (
-            "point_estimate" if promotion_rule == "benchmark_ratchet" else promotion_rule
-        )
-        head_to_head_ok = policy_improvement(head_to_head, head_reference_rule)
-
-        benchmark_reference, benchmark_reference_id = (
-            _released_benchmark_money(reader, active, benchmarks[0]) if benchmarks else (None, None)
-        )
-        # A ratchet that can never be released is how a gated run freezes:
-        # `simple_v2` ran 33 updates promoting none, `falloff_v1` 57. After this
-        # many consecutive rejections the absolute floor drops to
-        # `benchmark_grace_min_money` and the non-regression check alone decides;
-        # see `_benchmark_ratchet` for why it is that term and not the other.
-        #
-        # This is only reachable because `rejections_since_promotion` counts
-        # through a *held* lineage reset. It did not, and the streak read 0 on all
-        # 55 held updates of `market-free-rare-v20`, so the hatch below could never
-        # open on the one run that needed it.
-        grace_limit = int(config.get("promotion_ratchet_grace_after_rejections", 0))
-        ratchet_grace = grace_limit > 0 and rejection_streak >= grace_limit
-        benchmark_ratchet = _benchmark_ratchet(
-            challenger_benchmarks[0] if challenger_benchmarks else None,
-            benchmark_reference,
-            benchmark_reference_id,
-            config,
-            grace=ratchet_grace,
-            reference_samples=_benchmark_reference_window(
-                reader,
-                context.model_id,
-                active,
-                benchmarks[0],
-                int(_limit(config, "benchmark_reference_window")),
-                slot.batch_floor,
-            )
-            if benchmarks
+            if benchmark is not None
             else None,
+            "seed_start": benchmark_seed_start,
+            "seeds": eval_seeds,
+        }
+        rejection_reasons: list[str] = []
+        if benchmark_result is None:
+            rejection_reasons.append("missing_benchmark")
+        elif benchmark_result.get("errors"):
+            rejection_reasons.append("benchmark_errors")
+        elif int(benchmark_result.get("pairs", 0)) <= 0:
+            rejection_reasons.append("no_benchmark_pairs")
+        if not activity["passed"]:
+            rejection_reasons.append("idle_or_invalid_activity")
+        activity_passed = not rejection_reasons
+        best_money, best_checkpoint_id = _best_promoted_benchmark_score(
+            reader, context.model_id
         )
-        # Three rules, and the middle arm is the live one for this family.
-        #
-        # Nothing here gates *training*: `lineage_checkpoint` takes the newest
-        # checkpoint promoted or not, `_self_play_pool` deliberately does not
-        # filter on `promoted`, and every update writes a checkpoint row
-        # regardless -- so a rejection withholds the release and nothing else.
-        # What it withholds is `export-active` and the head-to-head incumbent,
-        # and withholding the second is most of the point: an unreleased
-        # regression stops becoming the thing the next update is measured
-        # against.
-        #
-        # Two guards above are *not* part of this and must keep raising:
-        # `_reject_inert_network` on an all-zero exported trunk, and
-        # `_reject_degenerate` on a zero-width interval. Both signal a harness or
-        # export fault rather than a weak candidate, and both fail silently in the
-        # other direction -- an inert export would release as a healthy policy.
-        promote = (
-            promotion_rule == "always"
-            or (
-                promotion_rule == "benchmark_ratchet"
-                and hard_viability_passed
-                and not degenerate_head_to_head
-                and benchmark_ratchet["passed"]
-            )
-            or (
-                promotion_rule in {"significant", "point_estimate"}
-                and hard_viability_passed
-                and head_to_head_ok
-                and not degenerate_head_to_head
-            )
+        candidate_money = benchmark_score.get("candidate_money")
+        activation_reasons = _activation_reasons(
+            activity_passed=activity_passed,
+            candidate_money=candidate_money,
+            best_money=best_money,
         )
+        activate = not activation_reasons
         gate: dict[str, Any] = {
-            "kind": (
-                "unconditional_release"
-                if promotion_rule == "always"
-                else "benchmark_ratchet_and_hard_viability"
-                if promotion_rule == "benchmark_ratchet"
-                else f"{promotion_rule}_incumbent_improvement_and_hard_viability"
-            ),
+            "kind": "activity_best_gate",
             "policy_kinds": POLICY_KINDS,
             "promotion_rule": promotion_rule,
-            "seed_start": seed_start,
             "benchmark_seed_start": benchmark_seed_start,
-            "benchmark_ratchet": benchmark_ratchet,
+            "benchmark_score": benchmark_score,
+            "activation": {
+                "passed": activate,
+                "candidate_money": candidate_money,
+                "best_promoted_money": best_money,
+                "best_promoted_checkpoint_id": best_checkpoint_id,
+                "reasons": activation_reasons,
+            },
             "challenger_benchmarks": challenger_benchmarks,
             "resumed_from_checkpoint_id": resumed_from,
             "rejection_streak": rejection_streak,
             "lineage_reset": lineage_reset,
-            "initial_baseline": str(baseline_path),
             "incumbent_checkpoint_id": active.checkpoint_id if active is not None else None,
-            "head_to_head": head_to_head,
-            # True when the candidate played the quiet baseline to an identically
-            # zero margin, i.e. it emits nothing either. A rejection, not a fault.
-            "degenerate_head_to_head": degenerate_head_to_head,
-            "head_to_head_significantly_better": head_to_head_ok,
-            "hard_viability": {
-                "passed": hard_viability_passed,
-                "head_to_head": head_viability,
-                "benchmarks": dict(zip(benchmarks, benchmark_viability)),
-                # Skip the keys whose default is `None`, which means "fall back to
-                # another key" rather than a number -- `_limit` would `float(None)`
-                # and take the whole update down with a TypeError. Both such keys
-                # resolve through their own branch and both record what they
-                # resolved to where they are used, so nothing is lost here.
-                #
-                # `benchmark_grace_min_money` survived this for as long as it did
-                # only because `FREE_CONFIG` happens to set it; a config that left
-                # it unset would have hit exactly the same crash.
-                "limits": {
-                    name: _limit(config, name)
-                    for name in VIABILITY_DEFAULTS
-                    if config.get(name, VIABILITY_DEFAULTS[name]) is not None
-                },
+            "activity": {
+                **activity,
+                "min_trading_rate": _limit(config, "viability_min_orders_per_decision"),
+                "reasons": rejection_reasons,
             },
-            "passed": promote,
+            "passed": activate,
         }
-        # A recorded evaluation says whether that arena would let the candidate
-        # through, so it has to follow the same rule the promotion did. Under the
-        # ratchet the head-to-head no longer carries an improvement term -- it
-        # contributes viability and the degeneracy check -- and the index-0
-        # benchmark carries the release decision, so it reports the ratchet
-        # rather than its activity floor alone.
-        ratchet_rule = promotion_rule == "benchmark_ratchet"
-        evaluations: list[ModelEvaluation] = [
-            ModelEvaluation(
-                "incumbent_head_to_head",
-                head_to_head,
-                (ratchet_rule or head_to_head_ok)
-                and not degenerate_head_to_head
-                and head_viability["passed"],
-                active.checkpoint_id if active is not None else None,
-            )
-        ]
-        evaluations.extend(
-            ModelEvaluation(
-                _benchmark_kind(index),
-                challenger,
-                benchmark_ratchet["passed"]
-                if ratchet_rule and index == 0
-                else viability["passed"],
-            )
-            for index, (challenger, viability) in enumerate(
-                zip(challenger_benchmarks, benchmark_viability)
-            )
-        )
+        evaluations: list[ModelEvaluation] = []
+        if benchmark_result is not None:
+            evaluations.append(ModelEvaluation(_benchmark_kind(0), benchmark_result, activate))
 
         own = [record for record in buffer.recent + buffer.reservoir if record.decisions]
         own_diagnostics = _records_diagnostics(own)
@@ -4255,8 +4225,10 @@ class FreeMarketUpdater:
             # draw was actually built with and not what was asked for.
             "priority_alpha": buffer.priority_alpha,
             "priority_beta": buffer.priority_beta,
-            # The health check is one line: `sampled_mean_return` strictly above
-            # `own_mean_return`, with `mean_weight_effective_fraction` above
+            "generation_weight_power": buffer.generation_weight_power,
+            "generation_weight_floor": buffer.generation_weight_floor,
+            # The health check is one line: `sampled_mean_priority_money` strictly
+            # above `own_mean_priority_money`, with `mean_weight_effective_fraction` above
             # ~0.8. Equal means alpha is inert, which is exactly how
             # `demo_fraction` failed -- it moved no number, so nobody noticed.
             # A collapsing ESS means alpha is too high and the batch has become a
@@ -4434,7 +4406,7 @@ class FreeMarketUpdater:
             reader,
             context.model_id,
             benchmarks[0] if benchmarks else None,
-            benchmark_ratchet.get("candidate_money"),
+            benchmark_score.get("candidate_money"),
             int(_limit(config, "benchmark_reference_window")),
             slot.batch_floor,
             signal=slot_spec.score_signal,
@@ -4485,14 +4457,12 @@ class FreeMarketUpdater:
             population["release_age"] = release_age
             population["entry_after"] = entry_after
             if eligible:
-                # The windowed median the ratchet already computed for this
-                # incumbent, so the score a member carries is on the same footing
-                # as the number the gate refused to let it regress from -- and it
-                # costs no arena time, which is the whole reason the ratchet reads
-                # a recorded measurement rather than replaying the incumbent.
-                score = benchmark_ratchet.get("reference_money")
-                if score is None:
-                    score = benchmark_ratchet.get("released_money")
+                # The active checkpoint's benchmark money was recorded when that
+                # checkpoint was evaluated as a candidate, so pool entry still costs
+                # no arena time now that the online ratchet is gone.
+                score, _ = _released_benchmark_money(
+                    reader, active, benchmarks[0] if benchmarks else ""
+                )
                 if score is None:
                     score = slot.best_score
                 # Discounted by the incumbent's own recorded activity before it
@@ -4500,11 +4470,8 @@ class FreeMarketUpdater:
                 # `ORDER BY score DESC`, so ranking on money alone lets a policy
                 # that never trades enter at the top and be reseeded from.
                 #
-                # Only the pool rank is discounted. `benchmark_ratchet` itself is
-                # untouched -- it is the gate's own comparison and the ratchet
-                # reference the next update is measured against, and bending that
-                # here would change what the gate means as a side effect of
-                # changing what the population prefers.
+                # Only the pool rank is discounted. The release/export score stays
+                # as raw benchmark money so the diagnostic read remains direct.
                 scored = _population_score(
                     score,
                     _released_trading_rate(
@@ -4731,6 +4698,6 @@ class FreeMarketUpdater:
             combined_digest,
             metrics,
             gate,
-            promote,
+            activate,
             tuple(evaluations),
         )
