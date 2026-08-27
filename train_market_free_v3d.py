@@ -751,7 +751,7 @@ SYNC_ENVIRONMENT = True
 # `own_below_stake_fraction` and `own_median_final_money`, because
 # `own_solvent_fraction` is `money[-1] > 10_000` -- a high-performer bar, not
 # solvency -- and nothing measured actual bankruptcy at all.
-SESSION_ID = "market-free-ruin-v1"
+SESSION_ID = "market-free-ruin-v2"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free_v3d"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_v3d_league.toml")
 MANIFEST = Path("agents/dqn_market_free_v3d/agent.toml")
@@ -890,7 +890,7 @@ LEARNERS = 1
 # Moved to "crop2" with crop-v2: the animal potential makes a stored return a
 # different quantity, and crop-v1's members and mirror pool were fitted to the bare
 # cash stream. Reward-grade sever, by the rule at the top of this file.
-SLOT_PREFIX = "ruin"
+SLOT_PREFIX = "ruin2"
 MODEL_NAME = f"{SLOT_PREFIX}_00"
 
 # How many learners run their round hooks and their update at once, and how wide

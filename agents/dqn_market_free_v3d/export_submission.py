@@ -19,6 +19,7 @@ network rather than a strong donor. So the file is required here and only here.
 
 from __future__ import annotations
 
+import ast
 import os
 import shutil
 import tarfile
@@ -36,6 +37,69 @@ SUBMISSION_DIR = AGENT_DIR / "submission"
 #: by hand every time. The tarball's contents are identical either way.
 ARCHIVE_PATH = AGENT_DIR / "dqn_market_free_v3d_submission.tar.gz"
 WEIGHTS = Path("agents/dqn_market_free_v3d/weights.npz")
+PACKAGE = "agents.dqn_market_free_v3d"
+
+
+def _module_scope_imports(tree: ast.AST):
+    """Import nodes that run at import time, skipping function bodies.
+
+    A deferred import inside a function is a different failure: `main.__getattr__`
+    resolves `evaluate_episode` lazily, so a missing module there breaks the
+    lab-side evaluator hook rather than the Kaggle inference path, and several
+    shipped agents rely on that being optional. Module-scope imports have no such
+    escape -- they run on `import main` and take the whole submission with them.
+    """
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        else:
+            yield from _module_scope_imports(node)
+
+
+def _reachable_modules(entry: str = "main") -> set[str]:
+    """Every module in this package reachable by import from ``entry``.
+
+    Walks the AST rather than importing: the exporter has to run in a checkout
+    where `torch` may be absent, and importing `main` would drag the whole
+    inference stack in.
+
+    Both import spellings this package uses are followed --
+    ``from agents.dqn_market_free_v3d import labor`` and
+    ``from agents.dqn_market_free_v3d.labor import ...``.
+
+    Module-scope only. A deferred import inside a function is how
+    `main.__getattr__` reaches the evaluator hook, which Kaggle never calls, and
+    treating that as required would reject manifests that are correct for a
+    submission.
+    """
+
+    seen: set[str] = set()
+    stack = [entry]
+    while stack:
+        module = stack.pop()
+        if module in seen:
+            continue
+        seen.add(module)
+        source = AGENT_DIR / f"{module}.py"
+        if not source.is_file():
+            continue
+        for node in _module_scope_imports(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if base == PACKAGE:
+                    stack.extend(alias.name for alias in node.names)
+                elif base.startswith(f"{PACKAGE}."):
+                    stack.append(base.split(".")[-1])
+            elif isinstance(node, ast.Import):
+                stack.extend(
+                    alias.name.split(".")[-1]
+                    for alias in node.names
+                    if alias.name.startswith(f"{PACKAGE}.")
+                )
+    return {module for module in seen if (AGENT_DIR / f"{module}.py").is_file()}
 
 
 def _manifest() -> dict[str, Any]:
@@ -64,6 +128,23 @@ def _inference_files(manifest: dict[str, Any]) -> tuple[Path, ...]:
     package_main = Path("agents/dqn_market_free_v3d/main.py")
     if package_main not in declared:
         raise ValueError(f"agent.toml must include {package_main.as_posix()}")
+
+    # The reverse of the existence check above, and the one that actually bites.
+    # A missing *declared* file fails the build; an undeclared *reachable* one
+    # built a bundle that looked fine and raised `ImportError` on Kaggle's first
+    # turn. `labor.py` shipped that way -- imported at module scope by both
+    # `market_state.py` and `order_space.py`, listed nowhere.
+    undeclared = sorted(
+        f"agents/dqn_market_free_v3d/{module}.py"
+        for module in _reachable_modules()
+        if Path(f"agents/dqn_market_free_v3d/{module}.py") not in declared
+    )
+    if undeclared:
+        joined = ", ".join(undeclared)
+        raise ValueError(
+            f"agent.toml omits modules the package imports: {joined}. "
+            "A submission built without them raises ImportError on Kaggle."
+        )
 
     if not (REPO_ROOT / WEIGHTS).is_file():
         raise FileNotFoundError(

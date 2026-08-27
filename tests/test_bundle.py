@@ -8,6 +8,7 @@ repo off `sys.path` is the only check that actually proves it.
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 import tarfile
@@ -30,6 +31,7 @@ OWNED_AGENTS = [
     "agents/dqn_market_free_v3/agent.toml",
     "agents/dqn_market_free_v3b/agent.toml",
     "agents/dqn_market_free_v3c/agent.toml",
+    "agents/dqn_market_free_v3d/agent.toml",
     "agents/receding_horizon_planner/agent.toml",
 ]
 
@@ -97,6 +99,91 @@ def test_manifest_code_paths_all_exist(manifest_path):
     manifest = AgentManifest.load(manifest_path)
     missing = [path for path in manifest.code_paths if not (REPO / path).is_file()]
     assert not missing, f"{manifest_path} lists files that do not exist: {missing}"
+
+
+def _module_scope_imports(tree: ast.AST):
+    """Import nodes that run at import time, skipping function bodies.
+
+    A deferred import inside a function is a different failure: `main.__getattr__`
+    resolves `evaluate_episode` lazily, so a missing module there breaks the
+    lab-side evaluator hook rather than the Kaggle inference path, and several
+    shipped agents rely on that being optional. Module-scope imports have no such
+    escape -- they run on `import main` and take the whole submission with them.
+    """
+
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            yield node
+        else:
+            yield from _module_scope_imports(node)
+
+
+def _reachable(package_dir: Path, package: str, entry: str = "main") -> set[str]:
+    """Modules in `package_dir` reachable by *module-scope* import from `entry`.
+
+    Parsed rather than imported so this holds for agents whose inference stack is
+    not installed in the test environment.
+    """
+
+    seen: set[str] = set()
+    stack = [entry]
+    while stack:
+        module = stack.pop()
+        if module in seen:
+            continue
+        seen.add(module)
+        source = package_dir / f"{module}.py"
+        if not source.is_file():
+            continue
+        for node in _module_scope_imports(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                if base == package:
+                    stack.extend(alias.name for alias in node.names)
+                elif base.startswith(f"{package}."):
+                    stack.append(base.split(".")[-1])
+            elif isinstance(node, ast.Import):
+                stack.extend(
+                    alias.name.split(".")[-1]
+                    for alias in node.names
+                    if alias.name.startswith(f"{package}.")
+                )
+    return {module for module in seen if (package_dir / f"{module}.py").is_file()}
+
+
+@pytest.mark.parametrize("manifest_path", OWNED_AGENTS)
+def test_manifest_declares_every_module_the_package_imports(manifest_path):
+    """The reverse of the check above, and the one that actually reached Kaggle.
+
+    A declared-but-missing file fails the build loudly. An undeclared but
+    *imported* module builds a bundle that looks complete and raises `ImportError`
+    on the first turn -- which is how `dqn_market_free_v3d` shipped without
+    `labor.py`, imported at module scope by both `market_state.py` and
+    `order_space.py`.
+
+    `test_bundle_imports_and_plays_standalone` catches this only for modules the
+    happy path touches; this catches it for every module-scope import.
+
+    Deferred imports are deliberately out of scope -- `configurable_crop_surrogate`,
+    `dqn_job_scorer`, `dqn_market_free_v2` and `receding_horizon_planner` all reach
+    `evaluation.py`/`lots.py` only through `main.__getattr__`, which Kaggle never
+    calls. That is a real gap for a bundled league anchor whose evaluator runs, but
+    it is not what breaks a submission.
+    """
+
+    package_dir = REPO / Path(manifest_path).parent
+    package = ".".join(Path(manifest_path).parent.parts)
+    declared = set(AgentManifest.load(manifest_path).code_paths)
+    undeclared = sorted(
+        f"{Path(manifest_path).parent.as_posix()}/{module}.py"
+        for module in _reachable(package_dir, package)
+        if f"{Path(manifest_path).parent.as_posix()}/{module}.py" not in declared
+    )
+    assert not undeclared, (
+        f"{manifest_path} omits modules the package imports: {undeclared}"
+    )
 
 
 def test_bundle_excludes_training_code(tmp_path):

@@ -108,6 +108,7 @@ from agents.dqn_market_scorer.training.updater import (
     configured_benchmarks,
     league_opponents,
     rejections_since_promotion,
+    reset_since_promotion,
     rotate_opponents,
 )
 from agents.dqn_market_scorer.training.updater import (
@@ -468,6 +469,41 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
         """,
         [context.model_id],
     )
+    # The streak, and the escape it gates.
+    #
+    # This branch used to build its `LineageCheckpoint` without either field, so
+    # `rejection_streak` sat at the dataclass default of 0 forever and
+    # `resume_reset_after_rejections` could never fire. `market-free-ruin-v1` is what
+    # that costs: it promoted a 27,987 spike at batch 60 and then rejected updates
+    # 80/100/120/140, every one of them resuming the identical checkpoint and
+    # discarding its 960 gradient steps, with batch 140 scoring 24,969 and missing the
+    # bar by 219 coins. Four updates of nothing, and the counter that exists to catch
+    # it read 0 the whole way.
+    #
+    # `held` first, for the reason `rejections_since_promotion` documents: a held
+    # update writes `lineage_reset` itself, so the ordinary cutoff lands on the held
+    # update and the streak reads 0 for as long as the hold lasts.
+    limit = int(getattr(context, "config", {}).get("resume_reset_after_rejections", 0))
+    streak = 0
+    if limit > 0:
+        held = reset_since_promotion(reader, context.model_id)
+        streak = rejections_since_promotion(reader, context.model_id, held=held)
+    # Tripping the limit hands the resume to the newest checkpoint rather than the
+    # best promoted one -- which is to say, this source falls back to
+    # `lineage_source = "latest"` until something promotes again.
+    #
+    # Not a wipe. The scorer's snapback returns the *release* and holds there, which
+    # is the right escape when the lineage has drifted away from a good checkpoint.
+    # Here the lineage is already pinned to the best promoted checkpoint by
+    # construction, so holding it there is the trap, not the exit. The thing this run
+    # cannot do is move, and the newest checkpoint is the only resume that lets it.
+    # Cold-starting instead would discard the whole training history to escape a bar
+    # the run is within 1% of clearing.
+        if streak >= limit:
+            escaped = _newest_lineage_checkpoint(context, reader)
+            if escaped is not None:
+                return replace(escaped, rejection_streak=streak, reset=True)
+
     active = context.active_checkpoint
     for row in rows or []:
         trainer_path = Path(str(row[1]))
@@ -480,6 +516,7 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
             trainer_path,
             inference_path,
             released=active is not None and checkpoint_id == active.checkpoint_id,
+            rejection_streak=streak,
         )
     return None
 

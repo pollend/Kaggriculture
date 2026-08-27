@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Single-player demonstration arm. GENERATED -- do not edit.
 
-Rebuild with `python scripts/regenerate_solo_driver.py` after editing
-`train_market_free_v3d.py`. The A/B is the pinned pack and nothing else.
+Rebuild with `python scripts/regenerate_driver_arms.py`. The A/B against the blended
+driver is the pinned pack and nothing else.
 
 `demonstration_episodes` is left at the blended arm's value on purpose. The packs are
 different sizes -- `ladder-top25-296` holds 525 seats from 98 players, `kawashigi-296`

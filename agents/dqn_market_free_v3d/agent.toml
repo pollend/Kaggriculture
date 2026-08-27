@@ -25,6 +25,13 @@ code_paths = [
   "agents/dqn_market_free_v3d/donor.py",
   "agents/dqn_market_free_v3d/herd.py",
   "agents/dqn_market_free_v3d/LICENSE-pilkwang",
+  # `market_state.py` and `order_space.py` both import it at module scope, so it
+  # is on the plain inference path -- not a diagnostics-only dependency like
+  # `lots.py` below. It was added to the package without being declared here, and
+  # the exporter only checked that declared files *exist*, never that reachable
+  # ones are declared, so every build since shipped a bundle that raised
+  # `ImportError: cannot import name 'labor'` on Kaggle's first turn.
+  "agents/dqn_market_free_v3d/labor.py",
   # Listed because `diagnostics.py` imports it at module scope, and
   # `episode_evaluator` above resolves through `main.__getattr__` into
   # `evaluation` and then `diagnostics`. Without it a bundled anchor that calls
