@@ -3,7 +3,12 @@
 A sample is one turn-level decision `(episode, decision)`. Unlike the scorer's
 day-scale market MDP this one is turn-scale: a raw order is filled at this
 turn's quote and is gone, so the reward window between consecutive decisions is
-a single turn and the n-step horizon counts turns directly.
+a single turn and the n-step horizon counts turns directly. `record.reward[t]` is
+the turn's cash delta over `MONEY_SCALE` (`reward.py`); the closing decision of a
+turn takes the discounted `n_step`-turn sum of it and bootstraps from the first
+decision of the turn `n_step` ahead, so the Bellman backup connects turns again.
+The sub-decisions *inside* a turn bootstrap from the next sub-decision, against the
+same latent, at discount 1.
 
 The problem this buffer solves is that solvent trajectories are rare: an
 unweighted draw over self-collected data is almost entirely episodes that ended
@@ -480,12 +485,30 @@ class ReplayBuffer:
                     "sampled_mean_generation_weight",
                     "min_generation_weight",
                     "max_generation_weight",
+                    "own_mean_terminal_quality_weight",
+                    "sampled_mean_terminal_quality_weight",
+                    "min_terminal_quality_weight",
+                    "max_terminal_quality_weight",
+                    "own_mean_episode_weight",
+                    "sampled_mean_episode_weight",
+                    "min_episode_weight",
+                    "max_episode_weight",
                 )
             )
+        # A sum over turns: `reward[t]` is the turn's cash delta over `MONEY_SCALE`
+        # (`reward.py`), so the sum telescopes to the season's profit.
         returns = np.asarray(
             [float(record.reward.sum()) for record in pool], dtype=np.float64
         )
         generation_weights = np.asarray(
+            [float(getattr(record, "generation_weight", 1.0)) for record in pool],
+            dtype=np.float64,
+        )
+        terminal_weights = np.asarray(
+            [float(getattr(record, "terminal_quality_weight", 1.0)) for record in pool],
+            dtype=np.float64,
+        )
+        episode_weights = np.asarray(
             [float(getattr(record, "episode_weight", 1.0)) for record in pool],
             dtype=np.float64,
         )
@@ -506,6 +529,14 @@ class ReplayBuffer:
             "sampled_mean_generation_weight": float(probabilities @ generation_weights),
             "min_generation_weight": float(generation_weights.min()),
             "max_generation_weight": float(generation_weights.max()),
+            "own_mean_terminal_quality_weight": float(terminal_weights.mean()),
+            "sampled_mean_terminal_quality_weight": float(probabilities @ terminal_weights),
+            "min_terminal_quality_weight": float(terminal_weights.min()),
+            "max_terminal_quality_weight": float(terminal_weights.max()),
+            "own_mean_episode_weight": float(episode_weights.mean()),
+            "sampled_mean_episode_weight": float(probabilities @ episode_weights),
+            "min_episode_weight": float(episode_weights.min()),
+            "max_episode_weight": float(episode_weights.max()),
         }
 
     def sample(

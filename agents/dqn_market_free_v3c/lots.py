@@ -1,10 +1,9 @@
 """FIFO lot matching: which purchase paid for which sale, and how long it took.
 
-**Measurement only.** `reward.py` needs no attribution at all: it pays the delta of
-money plus held cost basis, and a basis is a sum over what is held rather than a
-question about which purchase paid for which sale. Six reward legs used to read this
-ledger -- `SEED_WASTE_WEIGHT` and its five siblings, each a per-lot reconstruction of
-coins the stream dropped before the delta was paid -- and they are gone. What the
+**Measurement only.** `reward.py` needs no attribution at all: the label is the
+reward-to-go of the cash trace, a pure function of `money` and `final_money`. Six
+reward legs used to read this ledger -- a seed-waste charge and its five siblings,
+each a per-lot reconstruction of coins the stream dropped -- and they are gone. What the
 matching still answers is every column an update logs: `seed_holding_turns`,
 `seed_margin`, `unrecovered_seed_share`, `stock_resale_share` and the rest, which are
 now how a run *checks* the reward rather than an input to it.
@@ -281,9 +280,9 @@ class Sample(NamedTuple):
     `clone._episode_record` and `diagnostics._lot_use` each used to open-code this,
     and they had already drifted: `collect` fell back to `turn // TURNS_PER_DAY` for
     a missing `day` while `clone` fell back to 0, which reads as "the whole season is
-    still ahead" and feeds `reward.land_potential`'s remaining-usage term. A cloned
-    episode and a self-collected one are only the same kind of sample if the trace is
-    built the same way, so there is one builder.
+    still ahead". A cloned episode and a self-collected one are only the same kind
+    of sample if the trace is built the same way, so there is one builder. (The
+    reward no longer reads any of it; `diagnostics` is the remaining consumer.)
     """
 
     quadrants: int
@@ -416,10 +415,10 @@ class LotLedger:
     def unrecovered(self) -> list[tuple[int, float]]:
         """`(buy_turn, coins)` for every seed lot whose cost did not come back.
 
-        One definition of "unrecovered", read by both `summary`'s
-        `unrecovered_seed_share` and `reward.SEED_WASTE_WEIGHT`. The diagnostic and
-        the reward have to describe the same matching or a run reads one attribution
-        and trains on another.
+        One definition of "unrecovered", read by `summary`'s
+        `unrecovered_seed_share`. It was once also the reward's seed-waste charge;
+        the reward is a pure function of the money trace now, and this is
+        descriptive only.
 
         Clamped at zero per lot, so a lot sold above cost contributes nothing rather
         than offsetting a lot that was wasted -- the charge is a deterrent on waste,
@@ -431,10 +430,9 @@ class LotLedger:
     def surplus(self) -> list[tuple[int, float]]:
         """`(buy_turn, coins)` for every seed lot that came back above its cost.
 
-        The mirror of `unrecovered()`, read by `summary`'s `recovered_seed_surplus`
-        and by `reward.SEED_GAIN_WEIGHT`. It exists because `unrecovered()` clamps at
-        zero per lot, so on its own it scores a lot sold at 1.1x cost and one sold at
-        6x cost identically: the reward could see a seed's loss and never its profit.
+        The mirror of `unrecovered()`, read by `summary`'s `recovered_seed_surplus`.
+        It exists because `unrecovered()` clamps at zero per lot, so on its own it
+        scores a lot sold at 1.1x cost and one sold at 6x cost identically.
 
         **Capped at the lot's own cost**, which is what keeps the pair symmetric --
         the worst a lot can do to its buy turn is `-cost` and the best is `+cost`, so
@@ -460,8 +458,7 @@ class LotLedger:
     def animal_unrecovered(self) -> list[tuple[int, float]]:
         """`(buy_turn, coins)` for every animal whose cost did not come back.
 
-        The animal half of `unrecovered()`, read by `reward.ANIMAL_WASTE_WEIGHT`, and
-        clamped per lot for the same reason. What it catches that the seed version
+        The animal half of `unrecovered()`, clamped per lot for the same reason. What it catches that the seed version
         cannot: an animal bought and never placed, and an animal bought after its
         deadline -- day 21 for a cow, day 23 for a sheep -- both of which are
         unpriced today and neither of which the action space forbids.
@@ -929,8 +926,8 @@ def match(
             # 20 stored episodes, 60.7% of seed-lot yield capacity was never
             # absorbed, so the season's first lots held room for units nobody grew
             # and FIFO handed them every later sale. 83% of lots then read fully
-            # unrecovered while the seeds had in aggregate returned 2.4x, which
-            # `reward.SEED_WASTE_WEIGHT` bills as a charge on their buy turns.
+            # unrecovered while the seeds had in aggregate returned 2.4x, which the
+            # seed-waste reward term of the day billed as a charge on their buy turns.
             #
             # A ceiling rather than an estimate, so it can only ever remove a claim
             # that was already impossible: what a crop can still yield is bounded by
@@ -988,8 +985,9 @@ def _is_bought_stock(
     this turn's entry is set. Keying on `op is not None` instead would silently
     reinstate the heuristic for any turn a supplied sequence left None -- and a
     phantom lot does more than mis-label itself: it joins the FIFO queue and absorbs
-    sales a real seed lot is owed, so the real lot reads as unrecovered and
-    `reward.SEED_WASTE_WEIGHT` bills a purchase that did come back.
+    sales a real seed lot is owed, so the real lot reads as unrecovered -- and,
+    under the retired seed-waste reward term, was billed for a purchase that did
+    come back.
     """
 
     if have_ops:

@@ -112,9 +112,8 @@ class BehaviorCounts:
     land_episodes: int = 0
 
     # Seed lots, from `lots.py`. `seeds` above says what was bought; these say
-    # whether it came back and how long it took, which is the only way to tell
-    # the held-basis half of the reward moving purchases *earlier* from it simply
-    # buying more.
+    # whether it came back and how long it took, which is the only way to tell a
+    # policy buying *earlier* from one simply buying more.
 
     #: Purchase lots opened, and how many of them ever saw a matched sale.
     seed_lots: int = 0
@@ -130,15 +129,16 @@ class BehaviorCounts:
     #: zero per lot, which is why it is not just `spend - proceeds`: a lot sold above
     #: cost does not offset a lot that was wasted.
     #:
-    #: **Descriptive since the reward became a net-worth delta.** `SEED_WASTE_WEIGHT`
-    #: used to charge exactly this back onto each buy turn. Nothing pays it now -- the
-    #: delta prices the seed where the coins moved -- so this and its mirror are how a
-    #: run checks whether that was enough, not what the policy is fitted to.
+    #: **Descriptive.** A seed-waste reward term used to charge exactly this back
+    #: onto each buy turn. Nothing pays it now -- the reward is the reward-to-go of
+    #: the cash trace, which prices the seed where the coins moved -- so this and
+    #: its mirror are how a run checks whether that was enough, not what the policy
+    #: is fitted to.
     seed_waste_cost: float = 0.0
     #: Realised profit on seed lots, the mirror of the above and capped at each lot's
     #: own cost. Not `seed_margin` clamped upward: the cap is what made the retired
-    #: reward pair bounded by the seed spend, and keeping it here keeps the two
-    #: columns comparable across the change.
+    #: reward pair bounded by the seed spend, and keeping it keeps the two columns
+    #: comparable across the change.
     seed_gain_credit: float = 0.0
 
     # Animal lots, the same six columns for a bought cow or sheep. Kept apart from
@@ -163,8 +163,8 @@ class BehaviorCounts:
     #: Unrecovered cost and realised profit on bought animals, clamped and capped per
     #: lot exactly as the seed pair is, and descriptive for the same reason. The two
     #: to watch against each other: a herd that never gets placed shows the first
-    #: climbing with the second flat -- and an animal is the purchase the reward
-    #: cushions least, since `_UNIT_BASIS` is zero for MILK, WOOL and EGG.
+    #: climbing with the second flat -- and an animal is the purchase whose cost
+    #: comes back slowest, since it pays only through MILK, WOOL and EGG.
     animal_waste_cost: float = 0.0
     animal_gain_credit: float = 0.0
     #: The same three coin columns split by species, so a species that is bought and
@@ -179,7 +179,8 @@ class BehaviorCounts:
     # above for the reason they are kept apart from each other: this is not capital
     # committed to growing or milking anything, it is inventory bought to resell, and
     # summing it into `seed_spend` is exactly the mislabelling `_Lot.bought` exists to
-    # prevent. It was in no column at all until `reward.STOCK_LOSS_WEIGHT` landed.
+    # prevent. It was in no column at all until the bought-stock reward pair landed,
+    # and it outlived that pair.
 
     stock_lots: int = 0
     stock_spend: float = 0.0
@@ -501,10 +502,9 @@ def _market_op(step: Any, seat: int) -> str | None:
 def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
     """Seed lots matched to the sales that paid for them, from one seat's replay.
 
-    The ledger itself lives in `lots.py` and is shared with the reward
-    path on purpose: the columns here have to describe the same matching the
-    reward acted on, or a run could be reading one attribution and training on
-    another.
+    The ledger itself lives in `lots.py`. It used to be shared with the reward
+    path; the reward reads the money trace alone now, so these columns are the
+    only place the matching is consumed.
 
     The trace is built from steps `0 .. n-2`, which is the pre-action sample for
     each recorded decision -- the same convention `clone.py` uses to rebuild a
@@ -527,9 +527,9 @@ def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
         observation = _seat_observation(steps[index], seat)
         view = lots.seat_view(observation, seat)
         farm, private = view if view is not None else ({}, {})
-        # The same builder `collect.Recorder.record_turn` and `clone` use, so the
-        # column here describes the trace the reward acted on rather than a
-        # look-alike. The holdings and animal traces are wanted; the quadrant count
+        # The one `lots.sample` builder, now read here alone -- the collector and
+        # the clone stopped tracing lots when the reward stopped reading them. The
+        # holdings and animal traces are wanted; the quadrant count
         # rides along and is discarded, while the day is kept because an animal lot's
         # capacity is a deadline rather than a fixed yield.
         held = lots.sample(observation, farm, private, index)
@@ -544,10 +544,10 @@ def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
         # is stored on the following step. `lots.match` needs it to tell a
         # BUY_PRODUCT from a harvest that happened to land on a spending turn.
         #
-        # The *wire* op, deliberately unlike the reward path, which records
+        # The *wire* op, deliberately unlike the learner's record, which stores
         # `ACTIONS[chosen].op`. The two differ only when an order the action space
         # cannot represent was played: this column describes what the seat did, the
-        # reward describes what the learner chose.
+        # record describes what the learner chose.
         ops.append(_market_op(steps[index + 1], seat))
 
     ledger = lots.match(
@@ -578,9 +578,8 @@ def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
             sum(lot.first_sale_turn - lot.buy_turn for lot in matched)
         ),
         # The coins the two non-invariant lot legs actually moved on buy turns this
-        # episode, read off the same `unrecovered()` and `surplus()` the reward
-        # consumes. Both sides have to be visible or a run cannot tell a working
-        # pair from one where only the charge ever fires.
+        # episode, off `unrecovered()` and `surplus()`. Both sides are kept visible
+        # so a run can tell purchases that came back from purchases that did not.
         "seed_waste_cost": float(summary["unrecovered_seed_cost"]),
         "seed_gain_credit": float(summary["recovered_seed_surplus"]),
         "animal_lots": int(summary["animal_lots"]),
@@ -612,12 +611,10 @@ def _lot_use(replay: dict[str, Any], seat: int) -> dict[str, Any]:
         "stock_proceeds": float(summary["stock_proceeds"]),
         # The realised round trip on its own: proceeds against the cost of the units
         # that actually left through a SELL. `stock_margin` would mix that with stock
-        # bought and then eaten or spread, which is a different decision and the one
-        # the reward pair deliberately does not price.
+        # bought and then eaten or spread, which is a different decision.
         "stock_resale_margin": float(summary["stock_resale_margin"]),
-        # The coins the two bought-stock legs moved, read off the same `stock_loss()`
-        # and `stock_gain()` the reward consumes -- the pairing every other leg here
-        # keeps, so a run can tell a working pair from one where only the charge fires.
+        # The coins the two bought-stock legs moved, off `stock_loss()` and
+        # `stock_gain()` -- the pairing every other leg here keeps.
         "stock_waste_cost": float(sum(coins for _, coins in ledger.stock_loss())),
         "stock_gain_credit": float(sum(coins for _, coins in ledger.stock_gain())),
         # Summed, not shared: `BehaviorCounts` folds across episodes, so the share has

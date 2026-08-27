@@ -497,7 +497,7 @@ def has_inert_recurrence(network: OrderQNetwork) -> bool:
     This is *not* the NOOP collapse, and it must not be treated as one. Such a
     network trades perfectly well -- the head reads the raw decision state
     directly -- and trains normally. It is the other silent failure: v3 shipped, v2
-    delivered, `h` pinned at zero for the whole episode, 128 of the head's 357
+    delivered, `h` pinned at zero for the whole episode, 128 of the head's 408
     input columns dead, and no metric saying so.
 
     Deliberately not raised on by `updater._reject_inert_network`, unlike

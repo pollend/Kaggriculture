@@ -74,8 +74,22 @@ class MatchPolicyAgent:
         final = steps[-1]
         obs = final[seat].observation
         farms = obs.get("farms", []) or []
+        # Through the observation's own `player` index, the way `main.py` read every
+        # `money[t]` (`farms[player]`) and the way `clone.record_from_replay` reads
+        # its terminal farm. The two have agreed in every replay seen so far; if
+        # they ever differ, `final_money` off `farms[seat]` would sit in the
+        # numerator of all T reward-to-go labels of a season it did not belong to.
+        # Not `or seat`: seat 1 reading `player: 0` is the disagreement itself, and
+        # 0 is falsy.
+        declared = obs.get("player", seat)
+        try:
+            player = int(seat if declared is None else declared)
+        except (TypeError, ValueError):
+            player = seat
+        if not 0 <= player < len(farms):
+            player = seat
         record = self.recorder.finish(
-            float(farms[seat].get("money", 0.0)),
+            float(farms[player].get("money", 0.0)),
             self.gamma,
         )
         self.trace_path.parent.mkdir(parents=True, exist_ok=True)

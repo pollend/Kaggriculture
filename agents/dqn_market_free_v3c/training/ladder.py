@@ -49,6 +49,7 @@ from agents.dqn_market_free_v3c.training.collect import (
     load_episode_batch,
     save_episode_batch,
 )
+from agents.dqn_market_free_v3c.training.reward import relabel
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ROOT = REPO_ROOT / "data" / "kaggle_episodes"
@@ -355,10 +356,60 @@ def pack_stats(pack: Path | str, limit: int | None = None) -> CloneStats:
     payload = json.loads((Path(pack) / SIDECAR).read_text())
     if limit is None:
         return _from_dict(payload.get("stats") or {})
+    provenance = payload.get("provenance") or []
+    chosen = limit if isinstance(limit, (list, tuple, set)) else range(min(limit, len(provenance)))
     totals = CloneStats()
-    for item in (payload.get("provenance") or [])[:limit]:
-        totals = _merge(totals, _from_dict(item.get("stats") or {}))
+    for index in chosen:
+        if 0 <= int(index) < len(provenance):
+            totals = _merge(totals, _from_dict(provenance[int(index)].get("stats") or {}))
     return totals
+
+
+def stratified_indices(provenance: list[dict[str, Any]], limit: int) -> list[int]:
+    """`limit` record indices spread across competitors, best seat of each first.
+
+    Round-robin over players rather than the head of the money order, and that is the
+    whole point. The pack is built in descending ladder order and `ladder-001`'s head
+    is half two players -- 34 of the first 128 seats are one competitor and 30 another
+    -- so the clone was fitting a blend weighted by who happened to rank highest, and
+    two players supplied 50% of every pinned batch.
+
+    A blend is still what it fits; the round-robin only makes it an even one. Where two
+    competitors disagree at a state, no single action satisfies the large-margin hinge,
+    and the loss floors at the margin no matter how the seats were chosen. What this
+    buys is coverage: `limit` seats now reach as many distinct strategies as the pack
+    holds before any player contributes a second.
+
+    Ties inside a player break on money, so a player's best season is taken first.
+    """
+
+    by_player: dict[str, list[int]] = {}
+    for index, item in enumerate(provenance):
+        by_player.setdefault(str(item.get("name") or ""), []).append(index)
+    for indices in by_player.values():
+        indices.sort(
+            key=lambda index: -float(provenance[index].get("final_money") or 0.0)
+        )
+    # Players in descending order of their best seat, so a short `limit` still takes
+    # the strongest strategies rather than whichever name sorts first.
+    order = sorted(
+        by_player,
+        key=lambda name: -float(provenance[by_player[name][0]].get("final_money") or 0.0),
+    )
+    chosen: list[int] = []
+    depth = 0
+    while len(chosen) < limit:
+        added = False
+        for name in order:
+            if depth < len(by_player[name]):
+                chosen.append(by_player[name][depth])
+                added = True
+                if len(chosen) >= limit:
+                    break
+        if not added:
+            break
+        depth += 1
+    return chosen
 
 
 def load_ladder_demonstrations(
@@ -366,6 +417,7 @@ def load_ladder_demonstrations(
     *,
     gru: GruCell,
     limit: int = 96,
+    stratified: bool = True,
 ) -> tuple[list[EpisodeRecord], CloneStats]:
     """Read a pack and re-roll its hidden states under `gru`.
 
@@ -382,16 +434,52 @@ def load_ladder_demonstrations(
     directory = Path(pack)
     if not directory.is_dir():
         raise FileNotFoundError(f"demonstration pack {directory} is not a directory")
+
+    # Which records to take. `stratified` spreads them over competitors; the head of
+    # the ladder order is the fallback for a pack whose sidecar carries no names.
+    #
+    # Relabelled on the way in, for the same reason the hidden state is re-rolled:
+    # a shard stores whatever `reward.py` said when the pack was built, and the
+    # pack outlives that. `ladder-001` carried the old shaped stream at
+    # `MONEY_SCALE = 20_000` into a session training on flat terminal labels at
+    # 250_000 -- a quarter of every TD batch fitted to a different objective at a
+    # 12.5x scale gap, and no metric said so.
+    wanted: set[int] | None = None
+    picked: list[int] = []
+    if stratified:
+        payload = json.loads((directory / SIDECAR).read_text())
+        provenance = payload.get("provenance") or []
+        if provenance and any(item.get("name") for item in provenance):
+            picked = stratified_indices(provenance, limit)
+            wanted = set(picked)
+
     records: list[EpisodeRecord] = []
-    # Shards are written in descending ladder order, so taking the head of the
-    # first shards is taking the best-ranked episodes rather than an arbitrary
-    # subset -- which is what makes `demonstration_episodes` a meaningful dial
-    # against a pack built once at a larger limit.
-    for shard in sorted(directory.glob("part-*.npz")):
-        for record in load_episode_batch(shard):
-            records.append(rehidden(record, gru))
-            if len(records) >= limit:
-                return records, pack_stats(directory, len(records))
+    if wanted is None:
+        # Shards are written in descending ladder order, so taking the head of the
+        # first shards is taking the best-ranked episodes rather than an arbitrary
+        # subset -- which is what makes `demonstration_episodes` a meaningful dial
+        # against a pack built once at a larger limit.
+        for shard in sorted(directory.glob("part-*.npz")):
+            for record in load_episode_batch(shard):
+                records.append(rehidden(relabel(record), gru))
+                if len(records) >= limit:
+                    return records, pack_stats(directory, len(records))
+    else:
+        # Provenance is written in shard order, so a record index is a position in the
+        # concatenation of the shards. Only the wanted ones are re-hidden, which is the
+        # expensive half -- a GRU roll over every turn of every episode.
+        by_index: dict[int, EpisodeRecord] = {}
+        cursor = 0
+        for shard in sorted(directory.glob("part-*.npz")):
+            for record in load_episode_batch(shard):
+                if cursor in wanted:
+                    by_index[cursor] = rehidden(relabel(record), gru)
+                cursor += 1
+            if len(by_index) >= len(wanted):
+                break
+        records = [by_index[index] for index in picked if index in by_index]
+        if records:
+            return records, pack_stats(directory, [index for index in picked if index in by_index])
     if not records:
         raise ValueError(f"demonstration pack {directory} holds no episodes")
     return records, pack_stats(directory, len(records))

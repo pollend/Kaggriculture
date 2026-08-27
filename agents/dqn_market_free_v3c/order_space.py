@@ -899,9 +899,10 @@ class PendingTurn:
 
     `expected_delta` is the sum of those quotes, signed. It is an estimate, not a
     promise: orders interleave with the opponent's, so a price we quoted may be
-    taken first. `training/reward.py` compares it against the realised delta to tell
-    a refused order from a filled one, which is a strictly better test than v1's
-    money-delta sign -- that one cannot read a turn holding both a buy and a sell.
+    taken first. `market_state.order_refused` compares it against the realised
+    delta to tell a refused order from a filled one, which is a strictly better test
+    than v1's money-delta sign -- that one cannot read a turn holding both a buy and
+    a sell. The reward no longer reads it.
     """
 
     __slots__ = (
@@ -1335,10 +1336,10 @@ def feasible_actions(
     #
     # v2 converged on precisely that: 47% of its turns were
     # `BUY_PRODUCT WHEAT 45 | SELL WHEAT 45` five times over, filling the whole wire
-    # for no P&L. It was the reward-optimal move, because the wash is free, it
-    # counts as "not idle" so it dodges `IDLE_PENALTY`, and `order_refused`'s
-    # zero-quote branch exempted it from `REJECTED_ORDER_PENALTY`. It strictly
-    # dominated NOOP.
+    # for no P&L. It was the reward-optimal move under the shaped reward of the
+    # day: the wash is free, it counted as "not idle" so it dodged the idle
+    # penalty, and `order_refused`'s zero-quote branch exempted it from the
+    # rejected-order charge. It strictly dominated NOOP. (Both charges are gone.)
     #
     # Shut structurally rather than priced. A penalty has to be tuned against the
     # behaviour it suppresses and can be learned around at the margin; a mask

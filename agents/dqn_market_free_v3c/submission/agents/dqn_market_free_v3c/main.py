@@ -234,8 +234,8 @@ class MarketFreeAgent:
             #   * after `history.observe`, so the turn's money has already settled
             #     last turn's order;
             #   * before the decision loop, so every sub-decision of this turn
-            #     scores against the same latent -- the turn is the unit reward is
-            #     paid on and the unit `n_step` counts;
+            #     scores against the same latent -- the turn is the unit the
+            #     reward-to-go is indexed by;
             #   * on the untouched `obs/farm/private`, not on `pending.view`, so the
             #     recurrence sees the turn as it opened rather than as its own
             #     queued orders left it.
@@ -271,9 +271,13 @@ class MarketFreeAgent:
             # -- and the turn is the unit the reward is paid on.
             self._sample_noise(step, turns_per_day)
 
-            # Land first and off the head, exactly as in v1 (see `LAND_BUY_SET_POINT`),
-            # but it now costs one wire slot instead of the whole turn, so the rest of
-            # the loop still gets to trade -- against a wallet the quadrant has left.
+            # Land decided first and off the head, exactly as in v1 (see
+            # `LAND_BUY_SET_POINT`), but *emitted* last -- see the append below the
+            # decision loop. It costs one wire slot instead of the whole turn, so the
+            # rest of the loop still gets to trade against a wallet the quadrant has
+            # left, and that is still true with the emission moved: `commit_land`
+            # takes the price out of `pending` here, where the decision is made,
+            # rather than where the row reaches the wire.
             # It is not a recorded decision here, which is the one place v2 departs
             # from v1's bookkeeping rather than extending it. v1 had to store a row
             # for the land turn -- NOOP against the real state -- because the turn
@@ -281,8 +285,8 @@ class MarketFreeAgent:
             # own rows carry `pending.land` in block E, so the network sees the
             # quadrant in the state it is actually credited with, and no row has to
             # be minted for a choice the network did not make.
-            if should_buy_land(obs, farm, private, roles, configuration):
-                orders += LAND_ORDER.to_wire()
+            buy_land = should_buy_land(obs, farm, private, roles, configuration)
+            if buy_land:
                 pending.commit_land()
                 self.history.record_decision(LAND_ORDER)
 
@@ -361,8 +365,26 @@ class MarketFreeAgent:
                 # is what `record_decision` keeps, so every accepted order pushes.
                 self.history.record_decision(decision.order)
 
+            # Emitted after the head's rows so the simulator resolves this turn's
+            # SELLs before the quadrant's debit. The wire is applied in list order,
+            # so land placed first could only ever be funded by money already banked
+            # -- and `should_buy_land` prices the purchase against `liquid_cash`,
+            # which counts the shed the head is *about to* sell. Placing the row
+            # first while testing it against that number is the one combination that
+            # gets the order rejected by the simulator rather than by the gate.
+            #
+            # `pending.money` is the guard on the other half of that bargain, and it
+            # is not optional. `liquid_cash` assumes the shed gets sold; the head is
+            # under no obligation to sell it, and when it does not, the gate has
+            # bought a quadrant with money that never arrived. Because `commit_land`
+            # already took the price out above, the projected end-of-turn wallet
+            # going negative is exactly the case where the sells did not cover it --
+            # measured at 1.0 rejected emission per episode without this test, each
+            # one burning a market slot out of ten for an order that cannot resolve.
+            if buy_land and pending.money >= 0.0:
+                orders += LAND_ORDER.to_wire()
+
             if self.recorder is not None:
-                self.recorder.record_expected_delta(pending.expected_delta)
                 self.recorder.record_events(pending.events)
 
             # Block E of the *next* turn's recurrent input. Set last, after the

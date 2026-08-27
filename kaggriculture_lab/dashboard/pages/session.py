@@ -71,12 +71,21 @@ def _roster_row(row: dict[str, Any]) -> str:
         mode = " idle" if (money or 0) > 1500 else " broke"
     else:
         mode = ""
-    schedule = (
-        f'{_escape(row["stage"] or "—")}'
-        f'<br><small>decay {row["decay_steps"] if row["decay_steps"] is not None else "—"}'
-        f' · stall {row["stall_updates"] if row["stall_updates"] is not None else "—"}'
-        f' · +{row["updates_since_reseed"] if row["updates_since_reseed"] is not None else "—"}</small>'
-    )
+    # Two schedules render here. The learning-rate ladder prints its stage and
+    # counters; a member pool has no ladder, so it prints the lineage the position
+    # is currently carrying and how many members the slot holds.
+    if row.get("members"):
+        schedule = (
+            f'<code>{_escape(row["stage"] or "—")}</code>'
+            f'<br><small>{row["members"]} members</small>'
+        )
+    else:
+        schedule = (
+            f'{_escape(row["stage"] or "—")}'
+            f'<br><small>decay {row["decay_steps"] if row["decay_steps"] is not None else "—"}'
+            f' · stall {row["stall_updates"] if row["stall_updates"] is not None else "—"}'
+            f' · +{row["updates_since_reseed"] if row["updates_since_reseed"] is not None else "—"}</small>'
+        )
     release = (
         f'<small>{_escape(row["active_checkpoint_id"])}</small>'
         f'<br><small class="muted">{int(row["promotions"] or 0)} promoted</small>'

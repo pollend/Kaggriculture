@@ -27,8 +27,8 @@ that is genuinely a judgement about a trajectory.
 weight in v3: the three refusal latches (`refusal_block`), the per-turn trade flow
 deque and the per-turn tally of own emitted units (both block F). Its four
 original deques -- prices, inventory, money, opponent money -- are still filled by
-`observe` and still read by nobody; `features` is the v2 block D and no caller
-survives. Delete both at the next fork rather than carrying them.
+`observe` and still read by nobody. `features`, the v2 block D, is gone; the
+deques can go with it at the next fork.
 
 `donor.py` is a byte-identical vendored copy and is never edited. Where its helper
 is wrong for the installed engine, or scalar where a vector is needed, the
@@ -194,8 +194,8 @@ HEADROOM_BANDS: tuple[float, ...] = (0.9, 0.75)
 #: the cash reaches* for every crop seed and both buyable products, and priced it for
 #: the cow and the sheep only, so the one animal the donor's planner never houses was
 #: also the one animal the network could not see the price of. The other three
-#: triples are the quantities `ANIMAL_WASTE_WEIGHT` charges on and the state did not
-#: carry at all: what is bought and still homeless, how many production events a
+#: triples are the quantities the retired animal-waste reward term charged on, and
+#: the state did not carry at all: what is bought and still homeless, how many production events a
 #: purchase made *today* can still deliver before the season ends, and what those
 #: events are worth against the purchase price at the market's own depth.
 #:
@@ -644,7 +644,7 @@ class MarketHistory:
                 {item: stock[item] - previous[item] + drain[item] for item in PRODUCTS}
             )
         self._step = int(obs.get("step", 0) or 0)
-        self._shops = tuple(((obs.get("town", {}) or {}).get("unlocked_shops", []) or ()))
+        self._shops = tuple((obs.get("town", {}) or {}).get("unlocked_shops", []) or ())
 
         self._prices.append(
             {item: float(prices.get(item, np.nan) or np.nan) for item in PRODUCTS}
@@ -675,57 +675,6 @@ class MarketHistory:
     @property
     def ready(self) -> bool:
         return len(self._money) > self.lag
-
-    def features(self, obs) -> list[float]:
-        """The history block. Zero-filled until a full lag is buffered.
-
-        Zero rather than a "no data" flag: a zero delta is what a still market
-        looks like, and the first day of an episode is a still market by
-        construction -- nothing has been sold into it yet.
-        """
-
-        values = [0.0] * 20
-        if self.ready:
-            old_prices, new_prices = self._prices[0], self._prices[-1]
-            old_inventory, new_inventory = self._inventory[0], self._inventory[-1]
-            deltas: list[float] = []
-            for item in PRODUCTS:
-                base = float(donor._market_parameters(obs, item)[0])
-                previous = old_prices.get(item)
-                current = new_prices.get(item)
-                if previous is None or current is None or np.isnan(previous) or np.isnan(current):
-                    deltas.append(0.0)
-                else:
-                    deltas.append((current - previous) / max(1.0, base))
-            values = deltas
-            values += [
-                (new_inventory[item] - old_inventory[item]) / 1000.0 for item in PRODUCTS
-            ]
-            # Clipped, because a coin-scaled delta is unbounded and the opponent's
-            # leg is where that bites: training opponents hold 0-3,000 and the
-            # promotion benchmark ~142,000, so an unclipped opponent delta is a
-            # feature the network only ever meets at evaluation time. Both legs
-            # symmetrically, so the own leg cannot become the same problem in
-            # reverse if the policy ever gets rich.
-            values += [
-                float(np.clip((self._money[-1] - self._money[0]) / 10_000.0, -1.0, 1.0)),
-                float(
-                    np.clip(
-                        (self._opponent_money[-1] - self._opponent_money[0]) / 10_000.0,
-                        -1.0,
-                        1.0,
-                    )
-                ),
-            ]
-
-        last = self.last_op or "NOOP"
-        values += [1.0 if last == name else 0.0 for name in ORDER_OPERATIONS]
-        values += [
-            1.0 if self.last_filled else 0.0,
-            min(self.turns_since_fill, 4 * self.lag) / float(4 * self.lag),
-            min(self.consecutive_refusals, 8) / 8.0,
-        ]
-        return values
 
 
 def _opponent_money(obs) -> float:

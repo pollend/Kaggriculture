@@ -24,7 +24,7 @@ A healthy run sits between them with `solvent_episodes` climbing off zero.
            metadata_json ->> 'solvent_episodes'    AS solvent,
            metadata_json ->> 'decisions_per_turn'   AS per_turn
     FROM training_batches
-    WHERE model_id = 'dqn_market_free_v3c.raw_order_q_v1@herd_00'
+    WHERE model_id = 'dqn_market_free_v3c.raw_order_q_v1@rewardtogo_00'
     ORDER BY batch_seq;
 
 What each session changed and measured: `docs/dqn_market_free_sessions.md`.
@@ -217,9 +217,10 @@ SYNC_ENVIRONMENT = True
 # `EpisodeRecord`s under *this* fork's encoder and this fork's reward, which is why
 # the pack is rebuilt here rather than borrowed from v3b.
 #
-# Half the roster pins 96 of them; see `SEEDED_SLOTS`. `demo_fraction` stays at the
-# manifest's 0.25, so a seeded slot draws a quarter of every TD minibatch from the
-# ladder and runs a 100%-ladder behavior-clone phase on top of it.
+# Half the roster pinned 96 of them under a `SEEDED_SLOTS` split that no longer
+# exists; today every slot pins 128 (`demonstration_episodes` in `FREE_CONFIG`).
+# `demo_fraction` stays at the manifest's 0.25, so a slot draws a quarter of every
+# TD minibatch from the ladder and runs a ladder behavior-clone phase on top.
 #
 # `SLOT_PREFIX` does **not** move. The split-credit reward, the mask and the network
 # are all unchanged, so `split_*`'s batches, lineage and mature members are the
@@ -291,9 +292,10 @@ SYNC_ENVIRONMENT = True
 # an episode had no stock behind them.
 #
 # Also landing: `updater._large_margin_loss` replaces the clone phase's
-# cross-entropy. Inert this session -- `demonstration_episodes` is 0 roster-wide,
-# so the phase never runs -- and landed now so the next demonstration arm is
-# readable rather than reproducing the divergence table above.
+# cross-entropy. Inert in that session -- `demonstration_episodes` was 0
+# roster-wide, so the phase never ran -- and landed then so the next demonstration
+# arm would be readable rather than reproducing the divergence table above. It is
+# the loss the ladder pack trains under today.
 #
 # `v2`, and the `cash_*` prefix with it: `cashweight-v1` had collected 30 batches of
 # generation-zero warmup before the two narrowings below landed, and warmup or not
@@ -365,14 +367,17 @@ SYNC_ENVIRONMENT = True
 # the drift `order_refused`'s docstring exists to prevent, and half a season of
 # per-turn charge the network had no feature to predict.
 #
-# The bug is `expected`-path-wide and reaches v2, v3 and v3b unchanged. It is fixed
-# here only: `market-free-herd-v1` is still collecting, `reward.py` is not in
-# `ensure_session`'s digest, and editing it under a running session would silently
-# rebase the one lineage whose benchmark money is climbing (6,199 -> 14,158 over
-# batches 40-280) onto a different objective mid-run. Why v2 tolerated it: its
-# `tanh` outcome term paid on the order of 1.0, so -0.36 was a tax. v3c deleted that
-# term and put `MONEY_SCALE` up 5x, which left a linear +0.155 with the same tax
-# against it.
+# The bug is `expected`-path-wide and reaches v2, v3 and v3b unchanged. It was fixed
+# here only: `market-free-herd-v1` was still collecting, `reward.py` is not in
+# `ensure_session`'s digest (it *is* in `match_agent.toml`'s `code_paths`, which
+# mints a new revision per episode -- a label, not a guard; nothing halts), and
+# editing it under a running session would silently rebase the one lineage whose
+# benchmark money was climbing (6,199 -> 14,158 over batches 40-280) onto a
+# different objective mid-run. Why v2 tolerated it: its `tanh` outcome term paid
+# on the order of 1.0, so -0.36 was a tax. v3c deleted that term and put
+# `MONEY_SCALE` up 5x, which left a linear +0.155 with the same tax against it.
+# (Historical: none of `order_refused`, `REJECTED_ORDER_PENALTY`, `FILL_FRACTION`
+# or `IDLE_PENALTY` reach the reward any more, and `MONEY_SCALE` is 25,000 now.)
 #
 # `SLOT_PREFIX` moves. The charge landed on half of every stored episode's turns, so
 # every `networth_*` buffer, lineage checkpoint, self-play pool entry and mature
@@ -589,18 +594,144 @@ SYNC_ENVIRONMENT = True
 # v4 moved off `weighted3` because that session had stored the strict online gate
 # in its manifest and had already rejected checkpoints under it.
 #
-# v5 moves again because the policy changed one more time: online promotion is now
-# an activity gate, and lineage resumes from the best promoted benchmark-money
-# checkpoint instead of following rejected checkpoints forward. The stored v4 model
-# ids encode the old always-promote/export-best experiment.
-SESSION_ID = "market-free-weighted-v5"
+# terminal-v1 moves again because the reward target changed from a shaped per-turn
+# stream to final-profit Monte Carlo labels backfilled across each episode. Stored
+# weighted5 returns, replay priorities, Q scales, and active checkpoints are fitted
+# to a different target and must not be mixed into this run.
+#
+# terminal-mix-v1 rerolls from terminal-v1 because the collection curriculum changes:
+# terminal-v1's empty base made the self-play pool the whole opponent distribution
+# once it existed. That can overfit the family to its own checkpoints, so this run
+# restores the fixed donor as a base opponent and lowers the requested self-play
+# share.
+#
+# terminal-selfplay-ladder-v1 rerolls from terminal-mix-v1 to separate the two
+# anti-overfit signals: rollout collection is pure family self-play, while the
+# outside-policy anchor enters only through pinned Kaggle ladder recordings.
+#
+# terminal-selfplay-ladder-clean-v1 rerolls because terminal-selfplay-ladder-v1
+# was flat for three generations (see `model_updates` for the run):
+#
+#   * 2 of 26 post-warm-start updates promoted; the rest rejected
+#     `below_best_promoted_benchmark_money`, and lineage resumed from the best
+#     *promoted* checkpoint -- so every update retrained the warm-start weights
+#     and threw the result away. -> `lineage_source = "latest"`.
+#   * The label was `(final - money[0])` copied to every turn: one number per
+#     season, no credit inside it, a 0.02-wide band at `MONEY_SCALE` 250k.
+#     -> reward-to-go `(final - money[t]) / 25_000` in `reward.py`.
+#   * `_terminal_quality_weight` put 0.10 on the 81% of own episodes that ended
+#     insolvent -- the negative examples. -> `terminal_quality_weighting = False`.
+#   * `ladder-001` stored the old shaped stream at scale 20k; 25% of every batch.
+#     -> relabelled on load from the money trace.
+#   * `max_abs_q` 22-51 on three slots from a noisy target max over eleven
+#     intra-turn rows. -> target noise off for the bootstrap, value clamp.
+#   * Rollouts were 100% greedy-mirror; the gate was 100% pilkwang, win rate 0.00.
+#     -> pilkwang back in the mix at half the pairs (since reverted: the
+#        shipped config is `opponents = []`, pure mirror self-play).
+#
+# rewardtogo-v1 rerolls the key off terminal-selfplay-ladder-clean-v1 rather than
+# changing anything: `clean-v1` was already registered in `training_sessions` and
+# had collected a generation under a roster of `terminalselfclean_*` slots before
+# this driver was settled. Resuming it would put this run's generations beside
+# batches whose provenance nobody here can vouch for, and `ensure_session` cannot
+# tell the two apart -- its digest covers `LeagueConfig` and `TRAINING_AGENTS`, not
+# who launched them or what was on disk at the time.
+#
+# Named for the change that defines the run rather than for the curriculum, which
+# is the honest label: every fix above is downstream of the label moving from one
+# season-constant number to a per-turn reward-to-go.
+# rewardtogo-v2 is the same experiment as v1 under a fresh key. `ensure_session`
+# digests `LeagueConfig` plus `TRAINING_AGENTS` and refuses a resume whose digest
+# moved ("run manifest mismatch"), and v1 was registered at 04:45 UTC with
+# `reset_optimizer_moments: true` on all ten slots. The review pass that followed
+# set it False -- the prefix is fresh, so there are no inherited Adam moments to
+# drop, and True re-read every update would reset the moments on every update
+# rather than once. That one key is the entire digest difference; every other
+# value in the stored manifest matches what is below.
+#
+# So: a new key rather than a resume. Reverting the key to match the stored
+# manifest would be resuming into the bug the review pass fixed.
+# members-v1 replaces the learner pool with per-slot member pools. Each slot now
+# carries 5 independent lineages, round-robins them through the generation's 20
+# rounds (4 batches each), and prunes to the best 5 of its own 10 checkpoints from
+# this generation and the previous one.
+#
+# What it replaces and why: `rewardtogo-v2` gave every slot one lineage, so a
+# lineage that broke took the slot with it. Slot 09 diverged (`max_abs_q` 81.8) and
+# sat at 3,000 benchmark money for sixteen generations while slot 07 reached 13,661.
+# Reseeding existed but fired only when the LR ladder decayed past `lr_graduate_cut`,
+# which a slot that never improves never trips. Both the ladder and the shared
+# mature archive are deleted; the prune replaces them.
+# Moved off "members-v1" with the cut from ten slots to five. Forced, not chosen:
+# the run manifest `ensure_session` digests is the `training_agents` list, one
+# entry per slot, so dropping five entries changes the digest and v1 will not
+# resume. Entries 00-04 are byte-identical across the change -- same seeds, same
+# `model_config` -- so the only thing v2 records differently is that the other
+# five are gone. The alternative was rewriting v1's stored manifest in place,
+# which would have left the session row claiming settings its first two hours did
+# not run under.
+# Moved off "members-v2" with the member budget fix. Forced again -- `members_per_slot`
+# and `buffer_episodes` are both `[models.config]`, so the run manifest digest moves
+# and v2 will not resume -- but this one would be right regardless of the digest,
+# for the reason below `SLOT_PREFIX`.
+#
+# Moved off "top25b" to isolate what actually stopped the roster collapse.
+#
+# `market-free-top25-v1` lost every slot at its first prune: at `cutoff_batch_seq = 30`
+# all five forked from the *same* lineage `dae925496076fa89`, and
+# `own_mean_final_money` fell from 3,248-3,947 to 31-88. That checkpoint is still in
+# the pool -- `members_08`, `member_rank_score` exactly 3000.0, `member_rank_active`
+# null -- and it was admitted because `cross_slot_reseed_min_score` was 3,000, which is
+# the stake, compared with `>=`.
+#
+# top25b changed *two* things at once and observed one outcome. It raised the floor to
+# 6,000, and `admit_foreign` separately gained a strict comparison and an
+# `active is True` requirement. No forks happened, and that was read as the code fix
+# working -- but the raised floor alone would also have produced it, so neither claim
+# is supported.
+#
+# This run puts the floor back to 3,000 and keeps today's `admit_foreign`. The whole
+# head of the foreign pool is inert policies scoring exactly 3,000 with `active` null,
+# so the outcome is categorical rather than a noisy scalar and the reseeded per-slot
+# seeds do not confound it: if no slot adopts one, the code gates are sufficient and
+# the floor is belt-and-braces. If a slot does, the floor was carrying it.
+SESSION_ID = "market-free-top25d-v1"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free_v3c"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_v3c_league.toml")
 MANIFEST = Path("agents/dqn_market_free_v3c/agent.toml")
 
-# Ten concurrent learner slots under one declared model, which the harness
-# namespaces as `dqn_market_free_v3c.raw_order_q_v1@herd_00` and so on.
-LEARNERS = 10
+# Five concurrent learner slots under one declared model, which the harness
+# namespaces as `dqn_market_free_v3c.raw_order_q_v1@members_00` and so on.
+#
+# Ten until members-v1. The cut is the member pool paying for itself: slot count
+# bought exactly one thing, an independent replicate to hedge a lineage that
+# breaks, and `members_per_slot = 5` now buys that *inside* a slot at a fifth of
+# the cost -- a broken lineage loses one member for one generation instead of a
+# whole slot for the whole run. `rewardtogo-v2` is the case for it: slots 01 and
+# 09 diverged (`max_abs_q` 56.0 and 81.8) and finished at 2,230 and 2,176 recent
+# mean money against a ~4,900 median, so a fifth of that run's budget produced
+# nothing the prune would not have caught by generation two.
+#
+# What the cut does *not* buy is memory. Peak resident is set by `CONCURRENCY`,
+# which is unchanged -- five slots are live either way, each holding
+# `members_per_slot` x `buffer_episodes` -- so this is a wall-clock change only.
+# What it buys is the second wave: at `CONCURRENCY = 5` ten slots is 2 x 5 and
+# five is one full wave with no tail, which halves the generation. Measured
+# warmup rounds, which is the clean comparison because generation 0 runs no gate
+# arena either way: members-v1 at ten slots took ~50s a round, members-v2 at five
+# takes a steady 23-24s, so a 20-round generation goes ~17min -> ~8min. Once the
+# mirror pool exists the rounds roughly double, to 42-43s at five slots, and a
+# generation settles at ~17min: ~14min of rounds against ~3min of gate arena.
+# The rounds dominate, not the gate -- so the halving is a rounds effect and it
+# holds past warmup rather than being washed out by a fixed arena cost.
+#
+# Slot diversity is not a reason to keep ten, because there is no cross-slot
+# channel to lose. `_self_play_pool` is "promoted checkpoints of *this* model"
+# and the mature backfill reads the slot's own members table -- the shared
+# archive went away with reseeding -- so a slot's mirror pool is unchanged by how
+# many siblings it has. The slots are independent replicates, and ten of them
+# only ran the same experiment twice per wall-clock hour.
+LEARNERS = 5
 # Named for the reward it was fitted to. `_self_play_pool`, `lineage_checkpoint`,
 # `all_batches` and the slot LR state are all scoped by `model_id`, so renaming
 # severs all four at once -- which is required whenever the reward changes,
@@ -633,16 +764,77 @@ LEARNERS = 10
 # Moved off "weighted3" with `SESSION_ID`; active checkpoints from that run encode
 # a reject/ratchet policy this run no longer uses.
 #
-# Moved off "weighted4" with v5; the online gate and lineage parent policy both
-# changed, so rejected idle checkpoints from v4 must not become ancestors here.
-SLOT_PREFIX = "weighted5"
+# Moved off "weighted5" with terminal-v1; reward records now carry final-profit
+# Monte Carlo labels rather than a shaped net-worth stream.
+#
+# Moved off "terminal" with terminal-mix-v1; the self-play pool and lineage state
+# from a pure mirror curriculum should not become this mixed curriculum's starting
+# point.
+#
+# Moved off "terminalmix" with terminal-selfplay-ladder-v1; the rollout mix and
+# pinned replay source both changed, so this run should not inherit terminalmix's
+# lineage, self-play pool, or LR state.
+#
+# Moved off "terminalselfladder" with terminal-selfplay-ladder-clean-v1:
+# `MONEY_SCALE` moved 250k -> 25k and the label moved from a flat terminal profit
+# to reward-to-go, so a stored `terminalselfladder_*` return is a different
+# quantity at a tenth of the scale and its Q head is fitted to that.
+#
+# Moved off "terminalselfclean" with rewardtogo-v1. No constant moved this time:
+# ten `terminalselfclean_*` models already exist with a batch history this driver
+# did not write, and `_self_play_pool`, `lineage_checkpoint`, `all_batches` and the
+# slot LR state are all scoped by `model_id`. Reusing the prefix would hand this
+# run four inherited states at once, which is the same failure a reward change
+# causes and is severed the same way.
+# Deliberately *not* moved with the session key. The convention here is that
+# `SLOT_PREFIX` moves when a reward constant moves, because a stored return is
+# then a different quantity -- and nothing about the label changed between v1 and
+# v2. Keeping it inherits v1's 105 collected batches (0 updates, 0 checkpoints, so
+# no lineage, LR or mirror-pool state comes with them), and `fill_buffer`
+# relabels every record from its money trace on load, so they carry this session's
+# objective whatever they were written with.
+# Moved with the session: a slot's artifacts now hold a `members/` table, and a
+# `rewardtogo_*` root has none. Reusing the prefix would hand the first prune a
+# roster of checkpoints carrying no `member_lineage_id` at all.
+#
+# Deliberately *not* moved with the session key for v2, by the convention above:
+# the slot count is not a reward constant, so a stored return is the same
+# quantity it was. Keeping it inherits v1's 12 batches on each of slots 00-04,
+# and inherits nothing else -- v1 was stopped in generation 0 with 0 updates and
+# 0 checkpoints, so there is no lineage, LR or mirror-pool state to come with
+# them. Slots 05-09 keep their 12 batches too; nothing drives or reads them now,
+# and no query is scoped by `declared_model_id`, so they are inert rather than a
+# pool the surviving five can draw from.
+# Moved to "fed" with members-v3, and this one is a reward-grade sever even though
+# no reward constant moved. What a slot inherits through the prefix is its member
+# roster and its mirror pool, and members-v2's are inert: `trading_rate` 0.016
+# against the gate's 0.02 floor, 8 of 105 updates clearing it. Keeping the prefix
+# would hand the first prune a roster of policies the new activity tier is built to
+# rank last, and `self_play_latest_backfill` would seed the mirror pool with the
+# same ones -- the learner would train against opponents that do nothing, which is
+# the loop being fixed. The 12-batch inheritance argument that kept the prefix from
+# rewardtogo does not apply: `fill_buffer` relabels a stored record from its money
+# trace, but nothing relabels a checkpoint's behaviour.
+# The prefix moves with `SESSION_ID` as always, and note what that costs: the stored
+# per-slot seed is `sha256(agent_type \0 slot_name)` (`identity.training_instance_seed`,
+# applied at `storage.py:142`), so renaming the prefix reseeds every slot. That is
+# forced by starting a new session, not an independent variable -- but it does mean no
+# two sessions on this fork ever share a seed, and a single-generation difference
+# between two of them is never attributable to config alone.
+#
+# It also means `TRAINING_AGENTS`' `"seed": 2718 + 1009 * index` below is dead: it
+# lands in `instance.model_config`, and `register_training_agent` overwrites it with
+# the derived seed whenever the instance name is not the default.
+SLOT_PREFIX = "top25d"
 MODEL_NAME = f"{SLOT_PREFIX}_00"
 
 # How many learners run their round hooks and their update at once, and how wide
 # each one's rollout pool is. The product is the core budget, so these two belong
 # together. `training_concurrency` is a `ThreadPoolExecutor` width over *models*
-# consumed by `list(pool.map(...))`, so it is a hard barrier: ten models over
-# five threads is 2 x 5 with no half-empty tail.
+# consumed by `list(pool.map(...))`, so it is a hard barrier and a half-empty
+# tail is paid for in full. It equals `LEARNERS` from members-v1 on: five models
+# over five threads is one wave with no tail. It was ten over five before, which
+# is 2 x 5 -- also tail-free, but two waves to a round.
 CONCURRENCY = 5
 JOBS_PER_LEARNER = 8
 
@@ -659,18 +851,10 @@ FREE_CONFIG = {
     "benchmarks": list(BENCHMARKS),
     "episode_steps": 720,
     "jobs": JOBS_PER_LEARNER,
-    # Read only by `_reseed_source`'s whole-roster spread, which needs to know
-    # which ordinals are the tail. Declared rather than derived because a slot is
-    # a separate process that never sees the others.
-    "population_slots": LEARNERS,
-    # The floor grace falls back to. Zero does not stand the gate down:
-    # `no_regression` still measures against the incumbent's recorded reference,
-    # and hard viability never stands down at all.
-    "benchmark_grace_min_money": 0.0,
-    # Doubled from v2's 400, back toward v1's 1200.
+    # 400. Went to 800 once and came back; the history is below.
     #
     # Prioritisation is *episode*-level -- `_own_priorities` ranks whole episodes by
-    # shaped return -- so this is the size of the ranked pool, not just a memory
+    # terminal money -- so this is the size of the ranked pool, not just a memory
     # dial. v1 ranked over 1200 trajectories and v2 over 400, and the comment that
     # sat here was copied from v1 without being updated. In rows v2 was not short
     # (its episodes held ~5.7x more decisions), but almost all of that excess was
@@ -680,33 +864,27 @@ FREE_CONFIG = {
     # "come back down if it is heading past ~4 GB", and `buffer_megabytes` across
     # generations 13-18 of `market-free-refusal-v1` read ~3.0 GB mean against a
     # **4.47 GB max**. The prediction was right -- a trained policy trades more and
-    # the record grew -- so this is that comment being obeyed, not overruled. At ten
-    # slots it is also ~15-22 GB resident across a concurrency of five.
+    # the record grew -- so this is that comment being obeyed, not overruled. It is
+    # also ~15-22 GB resident, which is a `CONCURRENCY` cost and not a `LEARNERS`
+    # one: only the live wave's slots hold buffers, so cutting to five slots left
+    # this figure where it was.
     #
     # The trajectory-diversity argument above is not lost to the cut, because
-    # `batch_size` is now 32 rather than 8: the sampler draws four times as many
-    # distinct episodes per gradient step, so the ranked pool is consumed far more
-    # thoroughly at 400 than it ever was at 800. Staleness improves too -- at 160
+    # `batch_size` is now 128 rather than 8: the sampler draws sixteen times as
+    # many distinct episodes per gradient step, so the ranked pool is consumed far
+    # more thoroughly at 400 than it ever was at 800. Staleness improves too -- at 160
     # new episodes a generation, 800 held five generations of off-policy data.
+    # Per *member*, not per slot. Each member collects `member_batches` x
+    # `episodes_per_batch` = 10 x 16 = 160 episodes a generation, so 400 is 2.5
+    # generations of its own history -- the same staleness ratio the slot-wide
+    # 400 gave when one slot was one lineage. members-v2/v3 overrode this to 160,
+    # which is exactly one generation of history, the regime `agent.toml` records
+    # as the failure; the manifest's 400 is the value, restated here only because
+    # this dict is what `ensure_session` digests.
     "buffer_episodes": 400,
-    # No static base. `compose_opponents` returns the mirror pool unmixed when the
-    # base is empty, which is how the updater spells pure self-play, and the check
-    # for an empty mix sits *after* the pool has been consulted so this is a
-    # supported configuration rather than a hole. Safe on a fresh prefix too since
-    # v43: batch 0 has no pool to consult and the updater now seeds the quiet
-    # network there instead of raising; see `SLOT_PREFIX`.
-    #
-    # Kept empty deliberately, and the cost is known rather than assumed. v2's
-    # `market-free-herd-v1` ran 34 generations this way and the two money series
-    # came apart over batches 190-330: rollout money rose 16,899 -> 19,373 while
-    # the benchmark median the gate reads went 12,105 -> 11,651. A mirror-only
-    # curriculum buys skill against copies of yourself. v3 keeps it anyway -- the
-    # recurrence is the variable under test, and adding a donor to collection at
-    # the same time would leave any change unattributable between the two.
-    #
-    # So watch for the same divergence rather than assuming it is gone: benchmark
-    # median flat while `own_mean_final_money` climbs is the signature, and the
-    # fix when it appears is a donor entry here.
+    # Pure self-play rollout collection. The outside-policy anchor stays in the
+    # pinned Kaggle ladder demonstrations below; the live rollout opponent pool is
+    # this family only.
     "opponents": [],
     # The league population is this same family, and `league_opponents` excludes
     # it by construction, so leaving this on would only re-add anchors.
@@ -717,21 +895,71 @@ FREE_CONFIG = {
     # generation 0 is noise-only warmup whatever this says.
     "self_play_after": 1,
     "self_play_pool": 5,
-    # `compose_opponents` solves `slots / (len(base) + slots)` in whole slots, so
-    # against a one-entry base 0.65 yields [noise, self, self]. Moves with the base
-    # size or the mix is neither of the things it was designed to be.
+    # With `lineage_source = "latest"` the trained lineage moves past the release
+    # every update; a mirror pool of promoted checkpoints alone would be a frozen
+    # copy the learner has already left. Newest checkpoints top the pool up.
+    "self_play_latest_backfill": True,
+    "self_play_ratio": 1.0,
+    # Pinned Kaggle ladder recordings are the outside-policy anchor for this run.
     #
-    # Inert as configured: `opponents` above is empty, so there is nothing to mix
-    # against and collection is 100% mirror rather than 65%. Left at 0.65 so the
-    # value means something the moment a base entry is added.
-    "self_play_ratio": 0.65,
-    # No demonstrations on any slot. The pilkwang donor was the family worth
-    # cloning and it has zero rows in `episode_players` -- it only appears as a
-    # promotion-gate benchmark, and those matches are not persisted as league
-    # episodes -- so the league source has nothing to offer here. v3b's
-    # `market-free-ladder-v1` is testing whether the Kaggle ladder mirror does;
-    # that is a separate variable and this arm does not carry it.
-    "demonstration_episodes": 0,
+    # `ladder-top25-001`, not `ladder-001`. The old pack's `min_final_money = 50_000`
+    # was not a filter: a survey of all 2,100 mirrored seats puts the 25th percentile
+    # at 75,335 and the median at 97,728, so 50k admitted 95% of the mirror and the
+    # quality bar did no work. Its 128 pinned seats then came off the ladder-rank head
+    # and reached 12 players, 34 of them one competitor -- the clone was fitting a
+    # blend weighted by who ranked highest.
+    #
+    # The new pack is the top quarter by seat money (>= 118,418): 525 seats, 98
+    # distinct players, median 134,255, ~0.998 mapped order coverage.
+    # `ladder.stratified_indices` then round-robins the pinned 128 across players, so
+    # they reach all 98 at no more than two seats each, at a 144,246 median -- against
+    # the old head's 27 players, 42 from one, at 89,168.
+    #
+    # The clone loss is the bounded large-margin hinge, not the old cross-entropy that
+    # inflated Q values. It still fits a blend: where two competitors disagree at a
+    # state no single action clears the margin, and even sampling makes that blend
+    # unweighted rather than making it a single policy.
+    "demonstration_source": "ladder",
+    "demonstration_pack": str(ARTIFACTS / "demonstrations" / "ladder-top25-001"),
+    "demonstration_episodes": 128,
+    "demo_fraction": 0.25,
+    "behavior_clone_steps_per_update": 12,
+    # Benchmark, not "rollout": the rollout arm reads `recent_mean_final_money`,
+    # the *incumbent's* collection money while it filled this candidate's buffer.
+    # It grades the parent, not the candidate.
+    "promotion_score_signal": "benchmark",
+    # Cross-slot rescue, which the manifest leaves off. `market-free-rewardtogo-v2`
+    # is the case: at generation 16 its ten independent slots ran from 2,086 to 18,298
+    # rollout money with no channel between them, and `nstep-v1` reproduced the same
+    # shape at five. A slot whose own members are all more than 25% behind the roster's
+    # best may import that checkpoint. `max_adopt` defaults to `members_per_slot - 1`,
+    # leaving each slot one lineage of its own.
+    #
+    # The floor is 6,000, not the 3,000 `top25-v1` ran. 3,000 is the *stake*, which is
+    # exactly what a policy that never trades scores -- and with the comparison at
+    # `>=` that run imported such a checkpoint into position 0 of all five slots, each
+    # of which then collected at 0.11 orders per decision. The floor is now twice the
+    # stake, the comparison is strict, and `admit_foreign` additionally requires the
+    # checkpoint to have measured *active* in its rank arena.
+    "cross_slot_reseed": True,
+    # 3,000 deliberately, against the manifest's 6,000: this run exists to find out
+    # whether `admit_foreign`'s strict comparison and `active is True` gate refuse the
+    # stake-scoring checkpoints on their own. Do not copy this value forward.
+    "cross_slot_reseed_min_score": 3000.0,
+    "cross_slot_reseed_margin": 0.25,
+    # Promotion decides what is released; the lineage trains on regardless.
+    # Root cause one of the flat run. No reject-streak snapback: under member
+    # pools a lineage that stops earning its place is pruned, not walked back
+    # (`updater._member_checkpoint`), so `resume_reset_after_rejections` is inert
+    # and stays at the manifest's 0.
+    "lineage_source": "latest",
+    # The bar is the best of the last six releases, and a candidate inside the
+    # arena's own confidence interval of it promotes. A strict all-time ratchet
+    # against a 100-seed arena rejected the same policy measured twice.
+    "promotion_reference_window": 6,
+    "promotion_tolerance_ci": True,
+    # Insolvent seasons train at full weight. See `agent.toml`.
+    "terminal_quality_weighting": False,
     # NoisyNet takes over exploration. Epsilon stays declared at 0.0 rather than
     # being removed, because it is part of the policy identity string.
     "noisy": True,
@@ -744,8 +972,10 @@ FREE_CONFIG = {
     "noisy_cadence": "episode",
     # Control sigma on the flip-to-order rate, not the argmax flip rate: on a
     # NOOP-collapsed policy every action is near-tied, so the argmax rate reads as
-    # exploring and throttles every actor. Setting this ignores
-    # `noisy_flip_rate_target`, which is zeroed below so the config says so.
+    # exploring and throttles every actor. Setting this makes the argmax-flip
+    # target (`noisy_flip_rate_target`, unset here and in the manifest) ignored;
+    # the manifest zeroes *this* key, so the override is what turns the controller
+    # on.
     "noisy_order_rate_target": 0.05,
     # 0.25, not 0.0. The old comment here said "no floor" because a floor had been
     # a binding constraint -- slots sat on it exploring two to four times harder
@@ -815,14 +1045,20 @@ FREE_CONFIG = {
     # High enough that nothing saturates, so the ordering across rare rows is what
     # the novelty statistic says it is. Not a lever on the crop distribution --
     # none of the crop rows are clamped at either setting.
-    "rare_sigma_cap": 6.0,
-    # 4 of 8. Raising it is nearly worthless: `actor_sigma_scales` runs
+    # 3.0 from 6.0, two pairs from four. The learner seat made 4.5k a season on
+    # weights the greedy mirror made 11.2k on, with the sigma controller already
+    # pinned at its floor on half the slots -- the widened rare rows on half the
+    # batch were what bankrupted the collection policy.
+    "rare_sigma_cap": 3.0,
+    # 2 of 8, down from 4 (see `rare_sigma_cap` above). Raising it is nearly
+    # worthless anyway: `actor_sigma_scales` runs
     # [1.0, 0.61, 0.37, 0.23, 0.138, 0.084, 0.051, 0.031], so rungs 5-8 carry a
     # sigma scale under 0.14. The ladder is the attenuator, not the pair count.
-    "rare_sigma_pairs": 4,
-    # Deliberately inherit the manifest learning rate. `market-free-weighted-v1`
-    # promoted nothing and showed Q-scale inflation, so this recovery run should
-    # prove it can release before reintroducing a higher peak rate.
+    "rare_sigma_pairs": 2,
+    # `learning_rate` is deliberately *not* overridden: the manifest's 2e-4 stands.
+    # `market-free-weighted-v1` promoted nothing and showed Q-scale inflation at a
+    # higher peak, and nothing since has earned it back.
+    #
     # v3's chunk geometry, restated here because this file decides what the run is.
     # `burn_in_turns` must stay a multiple of
     # `collect.HIDDEN_STRIDE` or `sample_sequences` refuses the draw outright.
@@ -875,47 +1111,25 @@ FREE_CONFIG = {
     "burn_in_turns": 20,
     "train_turns": 40,
     "gradient_steps_per_batch": 48,
-    # Deliberately inherit the manifest target sync. The faster 480-step sync used
-    # by `market-free-weighted-v1` let the bootstrap target chase the online net
-    # while `max_abs_q` inflated, so the recovery run starts with the conservative
-    # lag documented in `agent.toml`.
+    # `target_sync` is deliberately *not* overridden: the manifest's 1920 stands.
+    # The faster 480-step sync `market-free-weighted-v1` used let the bootstrap
+    # target chase the online net while `max_abs_q` inflated.
     "grad_clip_norm": 5.0,
-    # Moves back down with the peak. 1e-5 against a peak of 1e-4 needs two decays at
-    # the manifest's 0.25, which at `lr_plateau_patience = 4` is twelve updates and
-    # so twelve generations here -- the same ladder v2 walked. Moves with the peak
-    # to hold that 1:10 ratio: left at 1e-5 against the 3e-4 peak above it would be
-    # 1:30, three decays rather than two, and a slot would run a third of a ladder
-    # further before graduating.
-    "lr_graduate_cut": 3e-5,
-    # Two, not three. A slot gets ~17 updates in a session and the first update of
-    # every warmup trains at a rate of exactly zero -- generation 1 of
-    # `market-free-refusal-v1` records `lr` = 0 -- so at three the warmup was
-    # spending a sixth of a slot's life, and repeating it after every reseed.
-    "lr_warmup_updates": 2,
-    # Six, for the same arithmetic. At ten, a slot could not graduate until update
-    # ten of about seventeen, so the back half of the ladder never ran: eight of ten
-    # slots finished the session at `lr_reseed_index` 1 despite rejection streaks of
-    # 12-15.
-    "lr_min_updates_before_graduation": 6,
-    # Five, up from the manifest's two. Two updates is not enough evidence to
-    # graduate a checkpoint into an archive that `self_play_ratio = 0.65` makes the
-    # *opponent pool*: `market-free-refusal-v1` admitted members scoring 811 and 451
-    # that buy 546 and 237 cows an episode, and then trained against them. Archive
-    # mean was 2,346 against a best of 9,166.
-    "population_entry_updates": 5,
-    # 4,000, up from the 1,500 default. `reseed_source_explorer_share = 0.25` draws a
-    # quarter of reseeds from the reserved berths, so the reserve is an ancestor
-    # pool and not just a display shelf. Only 4 of the previous run's 21 members
-    # clear 4,000, which is the point -- the two that work score 9,166 and 8,357.
-    "mature_reserved_min_money": 4000.0,
-    # Activity-gated lineage ignores rejected checkpoints, so there is no separate
-    # rejection-streak snapback to apply.
-    "resume_reset_after_rejections": 0,
+    # False. The prefix is fresh, so there are no inherited Adam moments to drop;
+    # True here would reset them on *every* update, since the key is re-read each
+    # time. Set True for exactly one generation if a slot ever resumes trainer
+    # state fitted to a different label scale.
+    "reset_optimizer_moments": False,
 }
 
-# No demonstration arm this session. `splitladder-v1` ran a five-and-five ladder
-# split and the read came back void rather than negative: the seeded half's value
-# function diverged on contact with the pack. `max_abs_q` by cutoff, seeded against
+# Demonstrations: every slot pins the `ladder-001` pack (128 episodes, a quarter
+# of each TD batch, twelve large-margin clone steps an update), relabelled from
+# its money trace on load so it carries the current reward. The history of how
+# that became safe to do:
+#
+# `splitladder-v1` ran a five-and-five ladder split and the read came back void
+# rather than negative: the seeded half's value function diverged on contact with
+# the pack. `max_abs_q` by cutoff, seeded against
 # control, from `model_updates.metrics_json`:
 #
 #     cutoff   20     30     60    100    130
@@ -924,9 +1138,9 @@ FREE_CONFIG = {
 #
 # Cutoff 30 is the first update carrying `demonstrations`. `mean_loss` steps
 # 0.0013 -> 1.194 on the same row and never comes back, against control slots at
-# 0.0005 for the whole session. Every term in `reward.py` is bounded -- `outcome` is
-# a tanh -- so a correct Q sits in single digits and 20 to 27 is a diverged head,
-# not a scale.
+# 0.0005 for the whole session. Every term in that era's `reward.py` was bounded --
+# `outcome` was a tanh -- so a correct Q sat in single digits and 20 to 27 was a
+# diverged head, not a scale.
 #
 # The cause is the loss, not the data, so it would have reproduced on any pack:
 # `updater._behavior_clone_step` runs `cross_entropy` directly on the Q head's
@@ -938,23 +1152,19 @@ FREE_CONFIG = {
 # `relu(max_a[Q(s,a) + margin * (a != a_E)] - Q(s,a_E))`, exactly zero once the
 # demonstrated action leads -- and the roadmap already carries it as unbuilt work
 # under "Out of scope, worth recording", where it is filed as a way to make the
-# clone *stronger*. The measurement above says the opposite: it is already strong
-# enough to set the head's scale and the TD loop spends the rest of the session
-# pulling back. Same prescription either way; build it before any pack is pinned
-# again.
-#
-# So `LADDER_DEMOS` and `SEEDED_SLOTS` are gone rather than swapped for a donor
-# pack. Two reasons and either would do: this session moves the reward and a
-# demonstration arm would be a second variable, and there is no readable
-# demonstration arm to run until the clone loss is bounded.
+# clone *stronger*. The measurement above said the opposite: it was already strong
+# enough to set the head's scale and the TD loop spent the rest of the session
+# pulling back. The hinge is built (`updater._large_margin_loss`), and the pack is
+# pinned again under it.
 
-# The roster is uniform -- one reward, no demonstrations -- and the archive handles
-# retention, with `rare_sigma_gain` handling generation on every slot.
+# The roster is uniform -- one reward, one pack on every slot -- and the archive
+# handles retention, with `rare_sigma_gain` handling generation on every slot.
 # `LeagueConfig.validate` requires exactly one `primary` per agent type, so slot 0
 # carries it -- deliberately not re-derived from scores, which would make every
 # query resolving it non-reproducible. Distinct seeds are the only other thing
-# separating the slots at the start; what diverges them afterwards is which mature
-# member each is reseeded from and which weights the perturbation redrew.
+# separating the slots at the start; what diverges them afterwards is the member
+# prune inside each slot (`training/members.py`), which keeps the top-ranked
+# lineages and forks duplicates.
 TRAINING_AGENTS = [
     {
         "type": "dqn_market_free_v3c",

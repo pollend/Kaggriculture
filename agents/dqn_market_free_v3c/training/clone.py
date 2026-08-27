@@ -181,13 +181,6 @@ def record_from_replay(
         return None, CloneStats()
 
     money: list[float] = []
-    quadrants: list[int] = []
-    days: list[int] = []
-    seeds: list[list[int]] = []
-    standing: list[list[int]] = []
-    stock: list[list[int]] = []
-    owned: list[list[int]] = []
-    produce_room: list[list[int]] = []
     ops: list[str | None] = []
     # Accumulated rather than preallocated: a v2 turn holds one decision per order
     # plus a terminator, so the row count is a property of the demonstrator's
@@ -243,21 +236,10 @@ def record_from_replay(
             continue
         farm, private = view
 
-        # Every trace off one `lots.sample`, appended in lockstep with `money` so a
-        # cloned episode and a self-collected one carry the same trace on the same
-        # index. `collect.Recorder.record_turn` is the other half of this, and it is
-        # now literally the same builder -- the two hand-written copies had already
-        # drifted on the `day` fallback. `standing` comes off `farm["tiles"]` rather
-        # than `private`, which is what makes it recoverable from a stored replay.
-        held = lots.sample(obs, farm, private, len(money))
+        # Cash as the turn opened -- the observation the demonstrator answered,
+        # never the one its orders produced. `collect.Recorder.record_turn` reads
+        # the same quantity at the same point; the reward is a pure function of it.
         money.append(float(farm.get("money", 0) or 0))
-        quadrants.append(held.quadrants)
-        days.append(held.day)
-        seeds.append(held.seeds)
-        standing.append(held.standing)
-        stock.append(held.stock)
-        owned.append(held.owned)
-        produce_room.append(held.produce_room)
         history.observe(obs, farm)
 
         orders = (current.get("action") or {}).get("market") or []
@@ -333,8 +315,8 @@ def record_from_replay(
         # used to be a flat `[*actions, 0]`, which minted a terminator on every
         # turn: a decision the demonstrator never made, in a state where NOOP was
         # not necessarily what it would have chosen, and -- worse -- one extra row,
-        # which slides every later `order_step` and every n-step window built off
-        # it. Two turns in a 720-turn episode were enough to do it.
+        # which slides every later `order_step` off the turn its reward-to-go
+        # belongs to. Two turns in a 720-turn episode were enough to do it.
         #
         # The three stopping conditions below are `main.py`'s, in its order: the
         # iteration cap, the slot test before the row is recorded, and the break
@@ -374,7 +356,7 @@ def record_from_replay(
             # The simulator accepted this order, so it is feasible by demonstration
             # whatever the model says. Forced rather than dropped, because the learner
             # depends on a stored action being allowed by its stored mask -- otherwise
-            # the clone's cross-entropy target lands on a masked class and the TD gather
+            # the clone's large-margin target lands on a masked class and the TD gather
             # on an action the argmax can never reach. Counted, since the count measures
             # how over-restrictive the mask is against an agent that really farms.
             if not mask[action]:
@@ -423,34 +405,18 @@ def record_from_replay(
     order_step = np.asarray(step_rows, dtype=np.int16)
     order_mask = np.asarray(mask_rows, dtype=np.bool_)
 
-    # Per *turn*, not per decision: `emitted` indexes the reward stream, and a turn
-    # counts as having traded if any of its sub-decisions did.
-    emitted = [False] * len(money)
-    for choice, step in zip(chosen_rows, step_rows):
-        if choice and step < len(emitted):
-            emitted[step] = True
-    shaped, raw, money_array = episode_rewards(
-        money,
-        final_money,
-        gamma,
-        emitted,
-        seeds=seeds,
-        standing=standing,
-        stock=stock,
-        owned=owned,
-        basis_required=True,
-    )
+    target, raw, money_array = episode_rewards(money, final_money, gamma)
 
     # Same phase check `Recorder.finish` makes, and for the same reason: the walk
     # above `continue`s past a malformed seat view, so a turn that contributed no
     # reward slot must have contributed no tick either.
-    if len(turn_inputs) != len(shaped):
+    if len(turn_inputs) != len(target):
         raise ValueError(
-            f"clone walked {len(turn_inputs)} turns for {len(shaped)} reward steps; "
+            f"clone walked {len(turn_inputs)} turns for {len(target)} reward steps; "
             "the GRU tick and the money trace are out of phase"
         )
     record = EpisodeRecord(
-        reward=shaped.astype(np.float32),
+        reward=target.astype(np.float32),
         raw_reward=raw.astype(np.float32),
         money=money_array,
         order_state=order_state,

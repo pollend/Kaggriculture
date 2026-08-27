@@ -23,14 +23,12 @@ from urllib.parse import urlencode
 
 import numpy as np
 
-from agents.dqn_market_free_v3c import lots
 from agents.dqn_market_free_v3c.diagnostics import OrderDiagnostics, diagnose_order_lists
 from agents.dqn_market_free_v3c.market_state import MARKET_STATE_DIM as STATE_DIM
 from agents.dqn_market_free_v3c.market_state import ORDER_LOOP_CAP
 from agents.dqn_market_free_v3c.order_space import (
     ACTION_COUNT,
     ACTIONS,
-    LAND_ORDER,
     OrderDecision,
 )
 from agents.dqn_market_free_v3c.policy import HIDDEN_SIZE as GRU_HIDDEN
@@ -59,7 +57,7 @@ LAGGED_WASH_WINDOW = 24
 class EpisodeRecord:
     """One episode: the per-turn reward stream and the per-turn order decisions."""
 
-    reward: np.ndarray  # float32 [T]    shaped, ready for training
+    reward: np.ndarray  # float32 [T]    reward-to-go, the training target
     raw_reward: np.ndarray  # float32 [T]    unshaped money delta, for diagnostics
     money: np.ndarray  # float32 [T+1]
     order_state: np.ndarray  # float32 [D, STATE_DIM]
@@ -103,10 +101,16 @@ class EpisodeRecord:
     hidden_stride: np.ndarray
 
     #: Ephemeral training-only multiplier. Not serialized in `EPISODE_ARRAY_FIELDS`:
-    #: it is derived from the batch/generation metadata of the session currently
-    #: being loaded, so old artifacts remain byte-compatible and a different run can
-    #: choose a different weighting law without rewriting rollout files.
+    #: it is derived from the batch/generation metadata and terminal money of the
+    #: session currently being loaded, so old artifacts remain byte-compatible and
+    #: a different run can choose a different weighting law without rewriting
+    #: rollout files.
     episode_weight: float = 1.0
+    #: The two factors multiplied into `episode_weight`, recorded separately so
+    #: diagnostics can distinguish old-generation discounting from terminal-quality
+    #: discounting.
+    generation_weight: float = 1.0
+    terminal_quality_weight: float = 1.0
 
     @property
     def steps(self) -> int:
@@ -393,27 +397,12 @@ def load_episode_batch(path: str | Path) -> list[EpisodeRecord]:
 class Recorder:
     """Accumulates one episode of decisions as the agent makes them."""
 
+    #: Cash as each turn opened, indexed by turn. The reward is a pure function of
+    #: this list and `final_money` (`reward.episode_rewards`), and `order_step` is
+    #: a compacted index into it. The lot traces that used to ride beside it fed a
+    #: potential-shaped reward that no longer exists; `diagnostics` rebuilds lot
+    #: use from the replay instead.
     money: list[float] = field(default_factory=list)
-    # The land potential's two inputs, indexed exactly like `money` because the
-    # reward stream is built from that list and `order_step` is a compacted index
-    # into it. Kept as parallel lists rather than folded into one tuple list so a
-    # trace that goes missing fails at `episode_rewards`' length check rather
-    # than silently pairing a quadrant count with the wrong day.
-    quadrants: list[int] = field(default_factory=list)
-    days: list[int] = field(default_factory=list)
-    # The lot potential's three inputs, counts rather than dicts over
-    # `lots.CROP_ITEMS` and `lots.STOCK_ITEMS`. `standing` is the one not in
-    # `private`: without the tile count `PHI` falls on the turn the agent plants,
-    # charging for the action the term exists to make cheaper.
-    seeds: list[list[int]] = field(default_factory=list)
-    standing: list[list[int]] = field(default_factory=list)
-    stock: list[list[int]] = field(default_factory=list)
-    # The animal legs' two inputs, over `lots.ANIMAL_ITEMS`. `owned` counts an animal
-    # wherever it is, because all three places are one purchase; `produce_room` is what
-    # the season can still get out of the herd, which is what bounds an animal lot
-    # where `max_yield` bounds a seed one.
-    owned: list[list[int]] = field(default_factory=list)
-    produce_room: list[list[int]] = field(default_factory=list)
     order_steps: list[int] = field(default_factory=list)
     decisions: list[OrderDecision] = field(default_factory=list)
     #: Per-turn order events from `PendingTurn.events`, indexed like `money`.
@@ -425,13 +414,6 @@ class Recorder:
 
     def reset(self) -> None:
         self.money.clear()
-        self.quadrants.clear()
-        self.days.clear()
-        self.seeds.clear()
-        self.standing.clear()
-        self.stock.clear()
-        self.owned.clear()
-        self.produce_room.clear()
         self.order_steps.clear()
         self.decisions.clear()
         self.events.clear()
@@ -444,10 +426,10 @@ class Recorder:
         The simulator's turn number is deliberately **not** what lands in
         `order_step`. The reward stream is built from `self.money`, and the agent
         skips both on a malformed observation, so a turn the simulator counted may
-        contribute no reward. Indexing by simulator step then slides every later
-        decision's n-step window forward *silently*, because `replay.sample` clamps
-        with `min(end_step, record.steps)`. `clone.py` records the same compacted
-        index; the two record kinds share one buffer and must agree on it.
+        contribute no reward. Indexing by simulator step would then pay every later
+        decision the reward-to-go of the wrong turn, silently. `clone.py` records
+        the same compacted index; the two record kinds share one buffer and must
+        agree on it.
 
         `record_decision` runs before `record_turn`, so `len(self.money)` is exactly
         the slot this turn's reward will take.
@@ -490,20 +472,12 @@ class Recorder:
         self.events.append(list(events))
 
     def record_turn(self, *, money: float, obs: Any, farm: dict, private: dict) -> None:
+        """Record the cash the turn opened on. `obs`/`farm`/`private` are accepted
+        for the caller's sake and unread: the lot traces they fed went with the
+        potential-shaped reward."""
+
+        del obs, farm, private
         self.money.append(float(money))
-        # Every trace comes off one `lots.sample`, shared with `clone` and
-        # `diagnostics`: a cloned episode and a self-collected one are only the same
-        # kind of sample if the trace is built the same way, and the three copies this
-        # replaced had already drifted on the `day` fallback.
-        turn = len(self.money) - 1
-        held = lots.sample(obs if isinstance(obs, dict) else {}, farm, private, turn)
-        self.quadrants.append(held.quadrants)
-        self.days.append(held.day)
-        self.seeds.append(held.seeds)
-        self.standing.append(held.standing)
-        self.stock.append(held.stock)
-        self.owned.append(held.owned)
-        self.produce_room.append(held.produce_room)
 
     def finish(self, final_money: float, gamma: float) -> EpisodeRecord:
         steps = len(self.money)
@@ -512,61 +486,25 @@ class Recorder:
         if not self.decisions:
             raise ValueError("recorder captured no order decisions")
 
-        # Which turns put an order on the wire, indexed the same way the reward
-        # stream is. A turn that emitted one and moved no money had it refused.
-        emitted = [False] * len(self.money)
-        # The op each turn chose, indexed the same way. The reward no longer reads it
-        # -- `diagnostics` does, to tell a BUY_PRODUCT from a harvest that landed on a
-        # spending turn -- and `ACTIONS[chosen].op` rather than the wire row is the
-        # *mapped* action the learner actually saw, which is what `clone` records too.
-        ops: list[str | None] = [None] * len(self.money)
         #: Sub-decisions the turn took, terminator included. The health diagnostic
         #: that separates v2's two new failure modes -- instant STOP at 1.0, slot
         #: stuffing at the cap -- and it is free here.
         turn_decisions = [0] * len(self.money)
-        for step, decision in zip(self.order_steps, self.decisions):
-            if not 0 <= step < len(emitted):
-                continue
-            turn_decisions[step] += 1
-            # `buy_land`, not just `chosen`. A land turn puts `[["BUY_LAND"]]` on the
-            # wire while `chosen` stays NOOP, because `OrderDecision` splits the two
-            # so the learner is credited with the row it actually contributed --
-            # which, for a decision `should_buy_land` made without consulting the
-            # network, is nothing. `emitted` is not credit: it is whether an order
-            # went out. Reading `chosen` alone charged `IDLE_PENALTY` on every turn
-            # the agent spent a quadrant's price, and told `order_refused` to skip a
-            # turn that did emit.
-            if decision.chosen or decision.buy_land:
-                emitted[step] = True
-            # The wire op on a land turn, for the same reason. `lots.match` reads this
-            # only through `_is_bought_stock`'s `op == "BUY_PRODUCT"` test, so the
-            # label cannot open or close a lot either way -- but a turn that moved a
-            # quadrant's price is not a NOOP, and the trace should not say it was.
-            op = LAND_ORDER.op if decision.buy_land else ACTIONS[int(decision.chosen)].op
-            # The terminator does not overwrite the op the turn actually traded on:
-            # every v2 turn ends on a NOOP, so keeping it here would label every
-            # trading turn a NOOP and blind every lot diagnostic to all of them.
-            if op != "NOOP" or ops[step] is None:
-                ops[step] = op
+        for step in self.order_steps:
+            if 0 <= step < len(turn_decisions):
+                turn_decisions[step] += 1
 
-        shaped, raw, money = episode_rewards(
-            self.money,
-            final_money,
-            gamma,
-            emitted,
-            seeds=self.seeds,
-            standing=self.standing,
-            stock=self.stock,
-            owned=self.owned,
-            basis_required=True,
-        )
+        # Reward-to-go off the money trace alone. Which turns emitted, which op they
+        # chose and what lots they held used to be inputs here; `diagnostics`
+        # recovers all of that from the replay, and the reward reads none of it.
+        target, raw, money = episode_rewards(self.money, final_money, gamma)
 
         # One turn row per reward slot, or the recurrence is out of phase with the
         # reward stream and every chunk drawn from this episode trains a hidden
         # state against the wrong turn's return. A hard failure, not a warning:
         # the same class of error `episode_rewards`' own length check already
         # refuses, and nothing downstream can detect it.
-        turns = len(shaped)
+        turns = len(target)
         if len(self.turn_inputs) != turns or len(self.turn_hiddens) != turns:
             raise ValueError(
                 f"recorder holds {len(self.turn_inputs)} turn inputs and "
@@ -597,7 +535,7 @@ class Recorder:
                 order_mask[index] = decision.mask
 
         return EpisodeRecord(
-            reward=shaped.astype(np.float32),
+            reward=target.astype(np.float32),
             raw_reward=raw.astype(np.float32),
             money=money,
             order_state=order_state,
@@ -658,8 +596,9 @@ def learner_spec(
     *policy identity*, and folding a per-episode trace into it would mint one agent
     revision per episode.
 
-    `gamma` is in the identity, although only `Recorder.finish` reads it, because a
-    run that relabels its rewards is worth telling apart from one that does not.
+    `gamma` is in the identity although nothing reads it any more -- the label is
+    an undiscounted reward-to-go -- because it always was, and dropping it would
+    re-key every stored revision.
     """
 
     query: dict[str, Any] = {

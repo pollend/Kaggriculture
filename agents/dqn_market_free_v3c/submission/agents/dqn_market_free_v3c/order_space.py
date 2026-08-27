@@ -533,8 +533,9 @@ LAND_RESERVE_DAYS = 1.0
 #:
 #:     horizon = clip((days_left - LAND_MIN_DAYS_LEFT) / (TOTAL_DAYS - LAND_MIN_DAYS_LEFT), 0, 1)
 #:     worked  = land_utilisation(farm)
+#:     pressure = land_expansion_pressure(obs, farm, roles)
 #:     runway  = clip((money - price - reserve) / reserve, 0, 1)
-#:     score   = horizon * worked * runway
+#:     score   = horizon * worked * pressure * runway
 #:
 #: Land is decided by that score and the network is not consulted for it at all --
 #: which is why, since v44, there is no `BUY_LAND` column on the head to consult.
@@ -646,6 +647,48 @@ def land_utilisation(farm: dict) -> float:
     return worked / max(1, worked + idle)
 
 
+def land_expansion_pressure(obs: dict, farm: dict, roles: dict) -> float:
+    """Share of unlocked tiles the current field plan has a productive claim on.
+
+    `land_utilisation` says whether the ground already owned is physically worked.
+    This says whether the *plan* is space-constrained. A board can be full of live
+    crops and still not need the next quadrant if the role map has contracted; it
+    can also have a few empty tiles and still be ready if the plan has seed-covered
+    roles waiting to fill them. The seed-covered part is enforced by `land_score`'s
+    `_seed_needs` veto; this helper deliberately measures only planned tile demand.
+    """
+
+    day = int(obs.get("day", 0) or 0)
+    tiles = farm.get("tiles", []) or []
+    unlocked = 0
+    for row in tiles:
+        for tile in row:
+            if tile != "LOCKED":
+                unlocked += 1
+    if unlocked <= 0:
+        return 0.0
+
+    demanded: set[tuple[int, int]] = set()
+    for position, role in (roles or {}).items():
+        if not isinstance(position, tuple) or len(position) != 2:
+            continue
+        x, y = position
+        if not 0 <= y < len(tiles):
+            continue
+        row = tiles[y] or []
+        if not 0 <= x < len(row) or row[x] == "LOCKED":
+            continue
+        kind, item = role
+        if kind == "ANIMAL":
+            demanded.add((x, y))
+        elif kind == "CROP" and (
+            isinstance(row[x], dict) and row[x].get("kind") == "PLANT"
+            or day <= int(donor.CROPS.get(item, {}).get("last_plant", -1))
+        ):
+            demanded.add((x, y))
+    return min(1.0, len(demanded) / max(1, unlocked))
+
+
 def land_score(
     obs: dict,
     farm: dict,
@@ -664,20 +707,19 @@ def land_score(
     new tiles** -- the money bought area the farm had neither the seed nor the hands
     to use.
 
-    Three vetoes and three factors. The vetoes are the old readiness test:
+    Three vetoes and four factors. The vetoes are the old readiness test:
 
     * mid-season, with `LAND_MIN_DAYS_LEFT` still to run and fewer than
       `LAND_MAX_EXTRA` quadrants already bought;
     * the seed already held covers every vacant crop role the plan wants filled, so
       the new tiles are not competing for seed the old ones still need.
 
-    The factors are lateness, utilisation and runway, multiplied so that any one of
-    them at zero refuses the purchase on its own. `worked` and the seed veto are
-    complementary rather than redundant: the veto catches a farm whose *plan* is
-    short of seed, and `worked` catches bare ground however the plan describes it.
-    They are also read off different things on purpose -- the veto off the effective
-    roles, utilisation off the tiles -- see `land_utilisation` for the measurement
-    that forced the split.
+    The factors are lateness, utilisation, expansion pressure and runway,
+    multiplied so that any one of them at zero refuses the purchase on its own.
+    `worked`, `pressure` and the seed veto are complementary rather than redundant:
+    the veto catches a farm whose *plan* is short of seed, `worked` catches bare
+    ground however the plan describes it, and `pressure` catches a plan that is not
+    actually constrained by the current acreage.
 
     Watch `land_tiles_planted_per_purchase` against `buy_land_rate` and
     `land_gate_open_rate`. A rate near zero with the gate open is impossible now --
@@ -716,12 +758,56 @@ def land_score(
     horizon = min(1.0, max(0.0, (days_left - LAND_MIN_DAYS_LEFT) / span))
 
     worked = land_utilisation(farm)
+    pressure = land_expansion_pressure(obs, farm, roles)
 
     reserve = land_reserve(obs, farm, private, roles, config)
     price = float(donor.LAND_PRICES[extra])
     runway = min(1.0, max(0.0, (float(money) - price - reserve) / max(1.0, reserve)))
 
-    return horizon * worked * runway
+    return horizon * worked * pressure * runway
+
+
+def liquid_cash(obs: dict, farm: dict, private: dict) -> float:
+    """Wallet plus what the shed would fetch if this turn sold it.
+
+    The wallet alone is the wrong quantity to price a quadrant against, because the
+    simulator applies a turn's market orders *in list order* and a SELL earlier in
+    the list funds a BUY_LAND later in it. Measured over 1,050 Kaggle episodes and
+    4,464 accepted purchases: 72.6% are preceded by a SELL in the same turn, the
+    median first quadrant is bought holding 1,034 coins against a 1,000 price, and
+    **47.2% of first quadrants are outright unaffordable on the pre-turn wallet**.
+    Reading `farm["money"]` refused every one of them.
+
+    Priced at the current inventory rather than walking each unit forward, which is
+    what `PendingTurn.sale_proceeds` does for an order actually being placed. The
+    walk is the exact number and this is deliberately not it: a sale depresses its
+    own price, so the flat quote is an over-estimate of a large shed's worth, and the
+    cost of being wrong here is one turn's delay on a purchase the score still has to
+    justify. What it buys is O(items) instead of O(units) on a gate that runs every
+    turn -- a full shed is 100 units, and `main.py`'s encoder budget has no room for
+    another per-unit walk.
+
+    Seed is excluded because the simulator will not buy it back at any price; only
+    `private["shed"]` is sellable. Livestock is excluded for the same reason and is
+    the sharper edge: `donor.ANIMALS` lives in the shed alongside produce but carries
+    no `donor.MARKET` row, so pricing the shed indiscriminately raises `KeyError` on
+    the first sheep. `donor.MARKET` *is* the sellable set -- keying off it rather than
+    off the shed is what makes that structural instead of a guard.
+    """
+
+    money = float(farm.get("money", 0) or 0)
+    shed = (private or {}).get("shed", {}) or {}
+    if not shed:
+        return money
+    inventories = (obs.get("market", {}) or {}).get("inventory", {}) or {}
+    for item, count in shed.items():
+        held = int(count or 0)
+        if held <= 0 or item not in donor.MARKET:
+            continue
+        raw = inventories.get(item)
+        inventory = donor.MARKET_I0 if raw is None else int(raw)
+        money += held * float(donor._price_at(item, inventory, obs))
+    return money
 
 
 def should_buy_land(
@@ -736,6 +822,13 @@ def should_buy_land(
     Affordability first, because `land_score`'s runway term needs a price to be
     quoted against and there is none once the board is sold out.
 
+    Both the affordability test and the runway factor read `liquid_cash` rather than
+    the wallet, and they read the same number deliberately: the two used to disagree
+    about what "can afford" meant, and the runway term was the stricter of them by an
+    order of magnitude. `main.py` emits `LAND_ORDER` after the head's rows so the wire
+    matches what this function assumed -- moving the emission without moving this
+    read, or the reverse, puts them back out of step.
+
     This is the only decision in this module the network has no vote in, and it
     deliberately does not go through the mask: a mask entry is a claim about what the
     simulator would accept, and this is a claim about what is worth doing. Keeping
@@ -743,7 +836,7 @@ def should_buy_land(
     decision leaving with it.
     """
 
-    money = float(farm.get("money", 0) or 0)
+    money = liquid_cash(obs, farm, private)
     extra = max(0, len(farm.get("unlocked_quadrants", ["NW"]) or ["NW"]) - 1)
     if extra >= len(donor.LAND_PRICES) or money < float(donor.LAND_PRICES[extra]):
         return False
@@ -806,9 +899,10 @@ class PendingTurn:
 
     `expected_delta` is the sum of those quotes, signed. It is an estimate, not a
     promise: orders interleave with the opponent's, so a price we quoted may be
-    taken first. `training/reward.py` compares it against the realised delta to tell
-    a refused order from a filled one, which is a strictly better test than v1's
-    money-delta sign -- that one cannot read a turn holding both a buy and a sell.
+    taken first. `market_state.order_refused` compares it against the realised
+    delta to tell a refused order from a filled one, which is a strictly better test
+    than v1's money-delta sign -- that one cannot read a turn holding both a buy and
+    a sell. The reward no longer reads it.
     """
 
     __slots__ = (
@@ -908,6 +1002,19 @@ class PendingTurn:
             sum(donor._price_at(item, inventory + offset, self.obs) for offset in range(quantity))
         )
 
+    def _commit_sale(self, item: str, quantity: int) -> tuple[int, float, int]:
+        inventory = self._inventory(item)
+        proceeds = 0.0
+        committed = 0
+        for _ in range(max(0, int(quantity))):
+            price = float(donor._price_at(item, inventory, self.obs))
+            proceeds += price
+            committed += 1
+            # Floor-price sales pay, but they do not add supply in the simulator.
+            if price > 1.0:
+                inventory += 1
+        return committed, proceeds, inventory
+
     def purchase_cost(self, item: str, quantity: int) -> float:
         inventory = self._inventory(item)
         return float(
@@ -994,14 +1101,20 @@ class PendingTurn:
         quantity = max(0, int(order.quantity))
         item = str(order.item) if order.item is not None else None
         if order.op == "SELL" and item is not None:
-            proceeds = self.sale_proceeds(item, quantity)
+            quantity = min(quantity, max(0, int(self.shed.get(item, 0) or 0)))
+            if quantity <= 0:
+                return
+            quantity, proceeds, inventory = self._commit_sale(item, quantity)
             self.money += proceeds
             self.expected_delta += proceeds
             self.shed[item] = max(0, int(self.shed.get(item, 0) or 0) - quantity)
             self.occupancy = max(0, self.occupancy - quantity)
-            self.market_inventory[item] = self._inventory(item) + quantity
+            self.market_inventory[item] = inventory
             self.events.append((order.op, item, quantity, proceeds))
         elif order.op == "BUY_PRODUCT" and item is not None:
+            quantity = min(quantity, max(0, self.capacity - self.occupancy))
+            if quantity <= 0:
+                return
             cost = self.purchase_cost(item, quantity)
             self.money -= cost
             self.expected_delta -= cost
@@ -1018,6 +1131,13 @@ class PendingTurn:
             self.seeds_bought[item] = int(self.seeds_bought.get(item, 0) or 0) + quantity
             self.events.append((order.op, item, quantity, -cost))
         elif order.op == "BUY_ANIMAL" and item is not None:
+            quantity = min(
+                quantity,
+                max(0, self.capacity - self.occupancy),
+                max(0, int(self.animal_room.get(item, 0) or 0)),
+            )
+            if quantity <= 0:
+                return
             cost = float(donor.ANIMALS[item]["cost"]) * quantity
             self.money -= cost
             self.expected_delta -= cost
@@ -1062,14 +1182,16 @@ def stock_ceiling(held: int, ladder: tuple[int, ...] = QUANTITIES) -> int:
     function's own contract asks for, rather than a measurement that the big rungs
     are usually a bad idea.
 
-    It is not cosmetic, and the cost is on the reward rather than on the fill.
+    It is not cosmetic, and the cost was on the reward rather than on the fill.
     `PendingTurn.apply` quotes the order at its full quantity, so an over-sized rung
     inflates `expected_delta`; `market_state.order_refused` then tests the **whole
     turn** against `FILL_FRACTION` of that quote and reads a turn whose legs all
-    filled as refused -- charging `REJECTED_ORDER_PENALTY` and latching the
-    `order_refused` state feature on a turn that traded fine. Measured on
-    `market-free-splitladder-v1`, 2,113 of 7,910 sell units offered per episode had
-    no stock behind them.
+    filled as refused. Measured on `market-free-splitladder-v1`, 2,113 of 7,910 sell
+    units offered per episode had no stock behind them, which on
+    `market-free-scale-v1` came to `REJECTED_ORDER_PENALTY` firing on nine times the
+    simulator's true refusal rate. That charge is gone (see `training/reward.py`);
+    capping the rung here is still worth it, because the inflated quote also latches
+    the `order_refused` state feature on a turn that traded fine.
 
     Returns the top rung when `held` runs past the ladder, which is the ordinary
     case for a full shed.
@@ -1214,10 +1336,10 @@ def feasible_actions(
     #
     # v2 converged on precisely that: 47% of its turns were
     # `BUY_PRODUCT WHEAT 45 | SELL WHEAT 45` five times over, filling the whole wire
-    # for no P&L. It was the reward-optimal move, because the wash is free, it
-    # counts as "not idle" so it dodges `IDLE_PENALTY`, and `order_refused`'s
-    # zero-quote branch exempted it from `REJECTED_ORDER_PENALTY`. It strictly
-    # dominated NOOP.
+    # for no P&L. It was the reward-optimal move under the shaped reward of the
+    # day: the wash is free, it counted as "not idle" so it dodged the idle
+    # penalty, and `order_refused`'s zero-quote branch exempted it from the
+    # rejected-order charge. It strictly dominated NOOP. (Both charges are gone.)
     #
     # Shut structurally rather than priced. A penalty has to be tuned against the
     # behaviour it suppresses and can be learned around at the margin; a mask
@@ -1329,7 +1451,8 @@ def feasible_actions(
             # `PendingTurn.purchase_cost` term for term so the mask and the wallet
             # accounting cannot disagree about the price of the same order.
             cost = np.cumsum(unit_prices)
-            mask[rows] = cost[quantities - 1] <= spendable
+            room = max(0, capacity - occupancy)
+            mask[rows] = (quantities <= room) & (cost[quantities - 1] <= spendable)
 
     # Seed rows open only where the plan has a deficit to fill, and only at rungs the
     # wallet covers *after* `choose_order` clamps them. Both halves are load-bearing:
@@ -1375,7 +1498,7 @@ def feasible_actions(
             # one emitted order, which is row-count bias rather than relief from
             # it. A species past its last productive day drops out of `stalls`
             # entirely and takes its whole ladder with it.
-            stall = int(stalls.get(animal, 0))
+            stall = min(int(stalls.get(animal, 0)), max(0, capacity - occupancy))
             if stall <= 0:
                 continue
             # Per rung, as `BUY_PRODUCT` and `BUY_SEED` already are. This was the

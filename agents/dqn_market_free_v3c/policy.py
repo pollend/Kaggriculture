@@ -41,7 +41,7 @@ from agents.dqn_market_free_v3c.market_state import MARKET_STATE_DIM as STATE_DI
 from agents.dqn_market_free_v3c.order_space import ACTION_COUNT
 
 #: The action head's trunk, unchanged from v2 -- deliberately, so that every
-#: sizing intuition, `has_inert_hidden_trunk`, and `reseed.perturb`'s head arm
+#: sizing intuition and `has_inert_hidden_trunk`'s head arm
 #: port across the fork without re-derivation. Only its *input* width changed.
 HIDDEN = (128, 128)
 
@@ -54,7 +54,7 @@ HIDDEN_SIZE = 128
 GATES = 3
 
 #: What the head actually takes: the decision state with the turn's latent
-#: concatenated on. 360 against v3's 357.
+#: concatenated on: 280 + 128 = 408 (v3b was 360, v3 357).
 HEAD_IN = STATE_DIM + HIDDEN_SIZE
 
 WEIGHTS_PATH = Path(__file__).resolve().parent / "weights.npz"
@@ -97,7 +97,7 @@ class GruCell:
         only structural guard against the NOOP collapse. With the GRU in the list,
         a `quiet_start` -- random GRU, zeroed head trunk -- would be waved through
         by the very check that exists to catch it.
-      * `training/reseed.perturb` derives its redraw bound as
+      * the retired `reseed.perturb` derived its redraw bound as
         `1/sqrt(weight.shape[0])`, which is wrong for every GRU tensor: torch uses
         one `stdv` keyed on the *hidden* size for all four, including `wx`, whose
         fan-in is the state width.
@@ -266,10 +266,10 @@ class OrderQNetwork:
     def tick(self, turn_features: np.ndarray) -> np.ndarray:
         """Advance the recurrence by one *turn*, and return the new hidden state.
 
-        Once per turn, never once per sub-decision. The turn is the unit reward is
-        paid on and the unit `n_step` counts, and ticking per decision would make
-        the sequence length a function of how chatty the policy currently is -- the
-        same trap `replay.sample`'s `order_step` search was written to avoid.
+        Once per turn, never once per sub-decision. The turn is the unit the
+        reward-to-go is indexed by, and ticking per decision would make the
+        sequence length a function of how chatty the policy currently is -- the
+        same trap `order_step`'s compacted turn index was written to avoid.
         """
 
         if self.gru is None:
@@ -379,7 +379,7 @@ class OrderQNetwork:
         bound is keyed on the *hidden* size even though `wx`'s fan-in is
         `state_dim`. That is torch's rule (`RNNCellBase.reset_parameters` uses one
         `stdv` for every parameter), and matching it is what lets
-        `training/reseed.perturb` redraw a GRU entry at the scale it was born at.
+        the retired `reseed.perturb` redraw a GRU entry at its birth scale.
         """
 
         bound = float(1.0 / np.sqrt(hidden_size))

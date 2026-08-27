@@ -44,13 +44,35 @@ policy can never create or consume are excluded, because they are not exploratio
 Everything state-dependent — affordability, sale sizing, land timing, the feed
 floor, terminal liquidation — is left for the network.
 
-**One order per turn, 720 decisions an episode.** The earlier design factored the
-action into ten independent slots over a shared candidate grid with total Q as
-the sum; the TD target only ever saw that sum, so no slot got its own credit,
-every slot's argmax picked the same order, and one good buy became a tenfold
-spend. Measured over fourteen updates, every candidate produced that way finished
-a 3,000-coin season near zero. A single order per turn makes it an ordinary
-Q(s, a) again, and turn-scale decisions supply the throughput.
+**One order per decision, up to eleven decisions a turn.** The earlier design
+factored the action into ten independent slots over a shared candidate grid with
+total Q as the sum; the TD target only ever saw that sum, so no slot got its own
+credit, every slot's argmax picked the same order, and one good buy became a
+tenfold spend. Measured over fourteen updates, every candidate produced that way
+finished a 3,000-coin season near zero. Now a turn is a short chain of ordinary
+Q(s, a) picks -- order, order, ..., STOP -- each scored on its own, with the wire
+filled by however many the policy chose to queue.
+
+## The objective
+
+`training/reward.py` labels every turn with its **cash delta**:
+
+```
+reward[t] = (money[t + 1] - money[t]) / MONEY_SCALE        # MONEY_SCALE = 25_000
+```
+
+`money[t]` is the cash the turn opened on, so an outlay at turn `t` is charged to
+turn `t` and a sale is credited on the turn it lands. No shaping: no idle penalty,
+no inventory basis, no refusal charge. Replay turns the stream into an
+`n_step = 24`-turn return (one in-game day) discounted by `gamma`, and the decision
+that closes a turn bootstraps from the first decision of the turn `n_step` ahead;
+the sub-decisions *inside* a turn bootstrap from the next sub-decision against the
+same latent. The `members-v2` run tried the undiscounted reward-to-go
+`(final_money - money[t])` as a Monte Carlo label with no cross-turn bootstrap and
+every member finished insolvent: the closing row's label did not depend on which
+action closed the turn, so nothing inside a turn had an ordering signal. A stored
+artifact or demonstration pack is relabelled from its money trace on load, so an
+edit to the label reaches everything the buffer holds.
 
 The state schema is the scorer's (`market_state.py`): prices, market inventory,
 the shed, the herd, and the donor's own planning state — its seed deficit, animal
@@ -76,7 +98,7 @@ Three things about the shape are load-bearing:
 - **The GRU ticks once per turn, not once per sub-decision.** A turn holds up to
   eleven orders, so a per-decision tick would make the sequence 8,000 steps long
   and its length a function of how much the policy currently trades. The turn is
-  also the unit reward is paid on and the unit `n_step` counts.
+  also the unit the reward-to-go is indexed by.
 - **The head reads the raw decision state as well as the latent.** That is what
   keeps the cold start gradable without routing the argument through the GRU
   (see `OrderQNetwork.quiet_start`), and what lets the intra-turn block reach the
@@ -128,10 +150,10 @@ pass rather than repeating it is worth 30% of episode wall clock.
 
 Training is R2D2: the collector stores the hidden state every
 `collect.HIDDEN_STRIDE` turns, replay draws a contiguous chunk of
-`burn_in + train + n_step` turns, a no-grad burn-in refreshes the stale stored
-state, and the gradient flows over the training window only. `training/replay.py`
-carries the chunk geometry and why the tail exists; `training/network.py` carries
-why the recurrence is never noisy and why that decides the TD step's ordering.
+`burn_in + train` turns, a no-grad burn-in refreshes the stale stored state, and
+the gradient flows over the training window only. `training/replay.py` carries the
+chunk geometry; `training/network.py` carries why the recurrence is never noisy and
+why that decides the TD step's ordering.
 
 The numpy mirror in `policy.py` is the half that ships. A recurrence that
 disagrees with its torch twin compounds over 720 ticks rather than costing one
@@ -155,33 +177,43 @@ an error. Watch them per batch in `metadata_json` and per update in
 | `orders_per_decision` → 0 | the NOOP collapse: it stopped trading |
 | `mean_final_money` → 0 | the bankruptcy collapse: it traded itself broke |
 
-`agent.toml` gates both on release: money floors relative to the incumbent's own
-seat in the same paired head-to-head, plus
-`viability_min_orders_per_decision`, applied only once a checkpoint exists
-because the cold start is silent by design. `diagnostics.py` and
-`training/collect.py` record what separates the two from a healthy run.
+The release gate (`promotion_rule = "activity_gate"`) asks two things of a
+candidate: that it trades at all -- `viability_min_orders_per_decision` over a
+100-seed, both-seats arena against pilkwang -- and that its mean money in that
+arena is not below the best of the slot's last `promotion_reference_window`
+releases, less the arena's own confidence half-width when `promotion_tolerance_ci`
+is on. Promotion decides what is *released*; each member trains on from its own
+checkpoint (`training/members.py`) whether or not it promoted, and the self-play
+mirror pool tops up from the slot's newest checkpoints
+(`self_play_latest_backfill`). `diagnostics.py` and `training/collect.py` record
+what separates the two collapses from a healthy run.
 
 ## Training
 
 ```bash
-python train_market_free_v3.py
-python -m agents.dqn_market_free_v3c.cli model status --name recur_00
+python train_market_free_v3c.py
+python -m agents.dqn_market_free_v3c.cli model status --name nstep_00
 ```
 
-`recur_00` is one of the ten named learner slots (`recur_00` .. `recur_09`,
-`SLOT_PREFIX` in `train_market_free_v3.py`), each owning the effective model ID
-`dqn_market_free_v3c.raw_order_q_v1@recur_NN`. The v3 roster runs
-`demonstration_episodes = 0`, so every slot is the reward-only arm: no pilkwang
-demonstrations are pinned and no behaviour-clone phase runs. Turning them on pins
-solvent pilkwang episodes and clones their order choices before the Double-DQN
-fine-tuning.
+`nstep_00` is one of the five named learner slots (`nstep_00` .. `nstep_04`,
+`SLOT_PREFIX` / `LEARNERS` in `train_market_free_v3c.py`), each owning the
+effective model ID `dqn_market_free_v3c.raw_order_q_v1@nstep_NN`. A slot holds
+`members_per_slot` independent lineages; the generation's rounds round-robin
+between them, each member trains only on the batches its own lineage collected,
+and the generation hook (`updater.FreeMarketSelector`, `training/members.py`)
+ranks this and the previous generation's checkpoints on a cheap arena and keeps
+the top `members_per_slot`, forking duplicates. The manifest is the reward-only
+control (`demonstration_episodes = 0`); the driver pins the `ladder-001` Kaggle
+pack on every slot (128 episodes, a quarter of each TD batch, twelve large-margin
+clone steps an update) and rolls out pure self-play against the mirror pool. Collection is the noisy `match_agent.py`
+wrapper; the gate arena and the export are the greedy `main.py` entry point.
 
 Nothing writes `weights.npz` on its own. After reviewing a passed release gate,
 export explicitly:
 
 ```bash
 python -m agents.dqn_market_free_v3c.cli model export-active \
-  --name recur_00 --output agents/dqn_market_free_v3c/weights.npz \
+  --name nstep_00 --output agents/dqn_market_free_v3c/weights.npz \
   --confirm-release
 ```
 

@@ -666,6 +666,108 @@ def head_to_head_by_family(connection: Any, session_id: str) -> list[dict[str, A
     )
 
 
+def session_family_trend(connection: Any, session_id: str) -> list[dict[str, Any]]:
+    """Money and behaviour per generation, split by family. Never pooled.
+
+    Both seats of a free-market episode are stored in `episode_players`, and they
+    are not the same agent: the learner runs `match_agent:make_agent` and is filed
+    under the `_match_policy` family, while the seat it plays is a mirror, a prior
+    session's checkpoint, or a viability baseline. Averaging the two produces a
+    number that moves when the *opponent* changes and reads as if the learner did.
+
+    That is not hypothetical. `market-free-rewardtogo-v2` g0 pooled to 5,210 and
+    `market-free-top25b-v1` g0 to 2,658, which was read as the second run starting
+    half as strong. Split by family the learner seats are 3,306 and 3,755 -- the
+    later run is *ahead* -- and the whole gap is the opponent seat, 7,114 against
+    1,561, because rewardtogo drew 47% of g0 against trained checkpoints imported
+    from other sessions and top25b drew 50% against `viability_baselines/quiet`.
+
+    Read this with `session_opponent_pool`: a family's money is only comparable
+    across sessions when the pool it was measured against is too.
+    """
+    return rows(
+        connection,
+        """
+        SELECT g.generation_index, g.generation_id, g.status,
+               ar.family_id,
+               coalesce(af.name, ar.family_id, ep.strategy_id) AS display_name,
+               count(*) AS episodes,
+               avg(ep.final_money) AS mean_money,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY ep.final_money) AS median_money,
+               avg(ep.money_difference) AS mean_margin,
+               avg(ep.win) AS win_rate,
+               avg(ep.productive_action_percentage) AS productive,
+               avg(ep.movement_percentage) AS movement,
+               avg(ep.idle_percentage) AS idle,
+               avg(ep.plants_lost_inferred) AS plants_lost
+        FROM generations g
+        JOIN league_pairings lp USING (generation_id)
+        JOIN pairing_episodes pe USING (pairing_id)
+        JOIN episodes e USING (match_id)
+        JOIN episode_players ep USING (match_id)
+        LEFT JOIN agent_revisions ar ON ar.revision_id = ep.strategy_id
+        LEFT JOIN agent_families af USING (family_id)
+        WHERE g.session_id = %s AND NOT e.failed
+        GROUP BY g.generation_index, g.generation_id, g.status, ar.family_id, display_name
+        ORDER BY g.generation_index, ar.family_id
+        """,
+        [session_id],
+    )
+
+
+def session_opponent_pool(connection: Any, session_id: str) -> list[dict[str, Any]]:
+    """What actually filled each seat, per generation, by weights artifact.
+
+    `agent_revisions` records that a seat was a `training_opponent`; it does not
+    record *which* opponent, because every mirror in a session shares that role and
+    its params. The only place the distinction survives is the seat spec, whose
+    `weights=` query parameter is the artifact path -- so the slot that minted the
+    checkpoint and the kind of artifact it is (`checkpoints`, `members`,
+    `rollout_policies`, `viability_baselines`) are recovered from there.
+
+    That distinction is the difference between a comparable run and an
+    incomparable one. A `slot` outside this session's `SLOT_PREFIX` is an import
+    from an earlier run, and a generation with imports in it is not measuring the
+    same thing as one played purely against the session's own mirrors.
+
+    `chr(37) || '2F'` rather than a literal `%2F`: the spec is URL-encoded and a
+    bare `%` in the statement is a psycopg placeholder.
+    """
+    return rows(
+        connection,
+        """
+        WITH seats AS (
+            SELECT g.generation_index,
+                   s.seat,
+                   replace(s.spec, chr(37) || '2F', '/') AS spec
+            FROM generations g
+            JOIN league_pairings lp USING (generation_id)
+            JOIN pairing_episodes pe USING (pairing_id)
+            JOIN episodes e USING (match_id)
+            CROSS JOIN LATERAL (
+                VALUES (0, e.seat0_spec::text), (1, e.seat1_spec::text)
+            ) AS s(seat, spec)
+            WHERE g.session_id = %s AND NOT e.failed
+        )
+        SELECT generation_index,
+               split_part(spec, '?', 1) AS entrypoint,
+               substring(
+                   spec from
+                   '/([^/]+)/(?:checkpoints|members|rollout_policies|viability_baselines)/'
+               ) AS slot,
+               substring(
+                   spec from
+                   '/(checkpoints|members|rollout_policies|viability_baselines)/'
+               ) AS artifact_kind,
+               count(*) AS seats
+        FROM seats
+        GROUP BY generation_index, entrypoint, slot, artifact_kind
+        ORDER BY generation_index, seats DESC, slot
+        """,
+        [session_id],
+    )
+
+
 def failure_summary(connection: Any, session_id: str) -> dict[str, list[dict[str, Any]]]:
     """Every recorded failure in one session, grouped by what actually went wrong.
 
@@ -1217,19 +1319,54 @@ def session_learner_roster(connection: Any, session_id: str) -> list[dict[str, A
                tm.active_checkpoint_id, tm.last_attempted_batch_seq,
                tm.min_new_batches, coalesce(b.latest_batch_seq, 0) AS latest_batch_seq,
                l.status AS last_status, l.cutoff_batch_seq, l.started_at AS last_update_at,
-               CAST(l.metrics_json ->> 'lr_reseed_index' AS INTEGER) AS reseed_index,
+               -- Two shapes write these. `lr_*` is the learning-rate ladder, which
+               -- families still carrying the learner pool emit; `member` is the
+               -- per-slot member pool that replaced it in v3c, where a slot holds
+               -- several lineages and prunes them each generation. Coalesced so one
+               -- roster query serves both rather than rendering a blank column for
+               -- whichever family it was not written for.
+               COALESCE(
+                   CAST(l.metrics_json ->> 'lr_reseed_index' AS INTEGER),
+                   CAST(l.metrics_json -> 'member' ->> 'position' AS INTEGER)
+               ) AS reseed_index,
                CAST(l.metrics_json ->> 'lr_updates_since_reseed' AS INTEGER) AS updates_since_reseed,
                CAST(l.metrics_json ->> 'lr_decay_steps' AS INTEGER) AS decay_steps,
                CAST(l.metrics_json ->> 'lr_stall_updates' AS INTEGER) AS stall_updates,
-               l.metrics_json ->> 'lr_stage' AS stage,
-               CAST(l.metrics_json ->> 'lr_score' AS DOUBLE PRECISION) AS score,
-               CAST(l.gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
-                    AS DOUBLE PRECISION) AS last_money,
+               COALESCE(
+                   l.metrics_json ->> 'lr_stage',
+                   left(l.metrics_json -> 'member' ->> 'lineage_id', 8)
+               ) AS stage,
+               COALESCE(
+                   CAST(l.metrics_json ->> 'lr_score' AS DOUBLE PRECISION),
+                   CAST(l.metrics_json -> 'member' ->> 'rank_score' AS DOUBLE PRECISION)
+               ) AS score,
+               CAST(l.metrics_json -> 'member' ->> 'members' AS INTEGER) AS members,
+               -- Two gate shapes write these, and reading only the older one
+               -- rendered the whole roster blank for any family on the newer.
+               -- `benchmark_ratchet`/`hard_viability` are the ratchet gate;
+               -- `benchmark_score`/`activity` are `activity_best_gate`, which is
+               -- what `dqn_market_free_v3c` has written since it forked.
+               -- `model_admin._BEST_CHECKPOINT_SCORE_SQL` already coalesces the
+               -- money the same way; this is the dashboard catching up.
+               COALESCE(
+                   CAST(l.gate_json -> 'benchmark_score' ->> 'candidate_money'
+                        AS DOUBLE PRECISION),
+                   CAST(l.gate_json -> 'benchmark_ratchet' ->> 'candidate_money'
+                        AS DOUBLE PRECISION)
+               ) AS last_money,
+               -- Deliberately not coalesced: the activity gate takes one arena
+               -- per checkpoint, so it has no window of measurements to count.
+               -- Mapping `benchmark_score.seeds` here would print "100 samples"
+               -- for what the page means by a single draw.
                CAST(l.gate_json -> 'benchmark_ratchet' ->> 'reference_samples'
                     AS INTEGER) AS reference_samples,
                l.gate_json -> 'benchmark_ratchet' ->> 'reference_kind' AS reference_kind,
-               CAST(l.gate_json -> 'hard_viability' -> 'head_to_head' ->> 'trading_rate'
-                    AS DOUBLE PRECISION) AS trading_rate,
+               COALESCE(
+                   CAST(l.gate_json -> 'hard_viability' -> 'head_to_head' ->> 'trading_rate'
+                        AS DOUBLE PRECISION),
+                   CAST(l.gate_json -> 'activity' ->> 'trading_rate'
+                        AS DOUBLE PRECISION)
+               ) AS trading_rate,
                CAST(l.gate_json -> 'population' ->> 'release_age' AS INTEGER) AS release_age,
                (SELECT count(*) FROM model_updates u
                  WHERE u.model_id = tm.model_id AND u.status = 'PROMOTED') AS promotions,

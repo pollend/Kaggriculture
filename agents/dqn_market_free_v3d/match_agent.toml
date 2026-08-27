@@ -1,0 +1,42 @@
+family_id = "dqn_market_free_v3d_match_policy"
+name = "Market Free Match Policy"
+entry_point = "agents.dqn_market_free_v3d.match_agent:make_agent"
+parameter_schema_version = 1
+episode_evaluator = "agents.dqn_market_free_v3d.main:evaluate_episode"
+
+# Training-only: rollout episodes are recorded as league pairings under this
+# identity so they are queryable like any match. It imports `training/`, so it
+# is never bundled for submission.
+#
+# `evaluation.py` and `diagnostics.py` are listed because `episode_evaluator`
+# above resolves through `main.__getattr__`, which imports `evaluation`, which
+# imports `diagnostics`. Neither is reachable from `match_agent:make_agent`, so
+# a fingerprint taken from the entry point alone would miss both.
+#
+# `training/reward.py` is listed because `training/collect.py` imports it: the
+# recorded reward stream is part of what this identity produced, so a change to
+# `MONEY_SCALE` or to the label itself has to mint a new revision rather than
+# reuse one. A revision, not a session guard: `ensure_session` does not digest
+# this file, and a running session keeps collecting under the edited reward.
+code_paths = [
+  "agents/__init__.py",
+  "agents/dqn_market_free_v3d/__init__.py",
+  "agents/dqn_market_free_v3d/diagnostics.py",
+  "agents/dqn_market_free_v3d/donor.py",
+  "agents/dqn_market_free_v3d/evaluation.py",
+  # `main.py` imports `field_roles` from here, and `diagnostics.py` imports
+  # `lots`. Both were missing, so a change to the herd composer or the lot
+  # matcher did not mint a new revision and rollouts from before and after it
+  # shared one identity.
+  "agents/dqn_market_free_v3d/herd.py",
+  "agents/dqn_market_free_v3d/lots.py",
+  "agents/dqn_market_free_v3d/match_agent.py",
+  "agents/dqn_market_free_v3d/main.py",
+  "agents/dqn_market_free_v3d/market_state.py",
+  "agents/dqn_market_free_v3d/order_space.py",
+  "agents/dqn_market_free_v3d/planting.py",
+  "agents/dqn_market_free_v3d/policy.py",
+  "agents/dqn_market_free_v3d/training/__init__.py",
+  "agents/dqn_market_free_v3d/training/collect.py",
+  "agents/dqn_market_free_v3d/training/reward.py",
+]

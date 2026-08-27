@@ -291,6 +291,107 @@ def test_pairing_sort_and_direction_are_looked_up_not_interpolated(connection):
     assert [row["pairing_id"] for row in filtered] == ["bad"]
 
 
+def _seed_two_families(connection) -> None:
+    """A second family and one more episode, with realistic seat specs.
+
+    The edge fixture is one family playing itself, which cannot show a split. The
+    market-free sessions this exists for are always two: the learner
+    (`*_match_policy`, `match_agent:make_agent`) and whatever filled the seat it
+    played, and the seat spec is the only place *which* opponent survives.
+    """
+
+    seed_reference_rows(connection, family_id="mirror")
+    connection.execute(
+        "INSERT INTO strategies VALUES ('strategy-2', '{}', 'test', NULL)"
+    )
+    connection.execute(
+        """
+        INSERT INTO agent_revisions (
+            revision_id, family_id, strategy_id, entry_point, agent_spec,
+            code_fingerprint, parameter_schema_version, params_json, source
+        ) VALUES ('r2', 'mirror', 'strategy-2', 'main:agent', 'c', 'fp', 1, '{}', 'test')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO league_pairings VALUES ('mixed', 'g', 2, 'population', 3, 'r0', 'r2', 'COMPLETE')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO episodes (
+            match_id, run_id, stage, seed, seat0_id, seat1_id, seat0_spec,
+            seat1_spec, steps, wallclock, failed
+        ) VALUES (
+            'mixed-ok', 's', 'league:g', 3, 'r0', 'r2',
+            'agents.x.match_agent:make_agent?weights=%2Fart%2Fslot_00%2Fmembers%2F0.npz',
+            'agents/x/main.py?weights=%2Fart%2Fforeign_09%2Fcheckpoints%2Fabc.npz',
+            720, 1.0, false
+        )
+        """
+    )
+    connection.execute("INSERT INTO pairing_episodes VALUES ('mixed', 0, 'mixed-ok')")
+    connection.execute(
+        """
+        INSERT INTO episode_players (
+            match_id, run_id, stage, seed, seat, strategy_id, opponent_id,
+            status, failed, reward, final_money, opponent_money,
+            money_difference, win, productive_action_percentage,
+            movement_percentage, idle_percentage, final_shed_items,
+            final_carried_items, metrics_json
+        ) VALUES
+            ('mixed-ok', 's', 'league:g', 3, 0, 'r0', 'r2', 'DONE', false,
+             4000, 4000, 1000, 3000, 1, 0.4, 0.3, 0.3, 0, 0, '{}'),
+            ('mixed-ok', 's', 'league:g', 3, 1, 'r2', 'r0', 'DONE', false,
+             1000, 1000, 4000, -3000, 0, 0.1, 0.2, 0.7, 0, 0, '{}')
+        """
+    )
+
+
+def test_family_trend_never_pools_the_two_seats(connection):
+    """Each family gets its own money, and the crashed episode is excluded whole.
+
+    Pooling is the failure this replaces: averaged over both seats the generation
+    reads 2,800, which is neither agent and moves when only the opponent changes.
+    """
+
+    _seed_two_families(connection)
+    trend = {row["family_id"]: row for row in lq.session_family_trend(connection, "s")}
+    assert set(trend) == {"family", "mirror"}
+    # 'family' plays three surviving seats: both of `ok` and seat 0 of `mixed-ok`.
+    # `crashed` carries a 99,999 seat row whose own `failed` flag is clear, and it
+    # must not reach any of these numbers.
+    assert trend["family"]["episodes"] == 3
+    assert float(trend["family"]["mean_money"]) == pytest.approx((3200 + 3000 + 4000) / 3)
+    assert trend["mirror"]["episodes"] == 1
+    assert float(trend["mirror"]["mean_money"]) == pytest.approx(1000)
+
+
+def test_opponent_pool_decodes_the_seat_spec(connection):
+    """The slot that minted each checkpoint, recovered from the encoded `weights=`.
+
+    `agent_revisions` files every mirror under one `training_opponent` role, so the
+    spec is the only record of *which* one -- and a slot from outside the session is
+    an import, which is what makes a cross-session comparison invalid.
+    """
+
+    _seed_two_families(connection)
+    pool = {
+        (row["slot"], row["artifact_kind"]): row
+        for row in lq.session_opponent_pool(connection, "s")
+        if row["slot"] is not None
+    }
+    assert pool[("slot_00", "members")]["seats"] == 1
+    assert pool[("foreign_09", "checkpoints")]["seats"] == 1
+    # The fixture's own specs are bare strings with no `weights=` at all; they are
+    # reported rather than dropped, so a session is never silently half-counted.
+    unmatched = [
+        row for row in lq.session_opponent_pool(connection, "s") if row["slot"] is None
+    ]
+    assert sum(row["seats"] for row in unmatched) == 2
+    assert all(row["artifact_kind"] is None for row in unmatched)
+
+
 def test_empty_id_lists_never_reach_the_database(connection):
     assert lq.session_rollups(connection, []) == []
     assert lq.session_leaders(connection, []) == []

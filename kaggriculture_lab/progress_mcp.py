@@ -116,7 +116,11 @@ TOOLS: tuple[dict[str, Any], ...] = (
         "title": "Get session progress",
         "description": (
             "Summarize one training session, including recent generation completion, rating "
-            "trend and deltas, latest leaders, hook evaluations, and models used by the session."
+            "trend and deltas, latest leaders, hook evaluations, and models used by the session. "
+            "`family_trend` is per-generation money and behaviour split by family -- read the "
+            "learner (`*_match_policy`) on its own, never pooled with the seat it played -- and "
+            "`opponent_pool` names the weights artifact that filled each seat, which is what "
+            "makes a cross-session money comparison valid or not."
         ),
         "inputSchema": {
             "type": "object",
@@ -378,6 +382,8 @@ class ProgressMCP:
                 )
             evaluations = lq.evaluation_rollup(connection, session_id=session_id)
             models = lq.session_models(connection, session_id)
+            family_trend = lq.session_family_trend(connection, session_id)
+            opponent_pool = lq.session_opponent_pool(connection, session_id)
         for generation in generations:
             pairings = int(generation["pairings"] or 0)
             complete = int(generation["completed_pairings"] or 0)
@@ -409,6 +415,8 @@ class ProgressMCP:
                 "median_conservative_delta": median_delta,
             },
             "latest_leaders": leaders,
+            "family_trend": family_trend,
+            "opponent_pool": opponent_pool,
             "episode_evaluations": evaluations,
             "models": models,
         }

@@ -234,8 +234,8 @@ class MarketFreeAgent:
             #   * after `history.observe`, so the turn's money has already settled
             #     last turn's order;
             #   * before the decision loop, so every sub-decision of this turn
-            #     scores against the same latent -- the turn is the unit reward is
-            #     paid on and the unit `n_step` counts;
+            #     scores against the same latent -- the turn is the unit the
+            #     reward-to-go is indexed by;
             #   * on the untouched `obs/farm/private`, not on `pending.view`, so the
             #     recurrence sees the turn as it opened rather than as its own
             #     queued orders left it.
