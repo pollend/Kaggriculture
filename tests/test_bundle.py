@@ -32,6 +32,8 @@ OWNED_AGENTS = [
     "agents/dqn_market_free_v3b/agent.toml",
     "agents/dqn_market_free_v3c/agent.toml",
     "agents/dqn_market_free_v3d/agent.toml",
+    "agents/dqn_market_free_v3e/agent.toml",
+    "agents/dqn_market_free_v3f/agent.toml",
     "agents/receding_horizon_planner/agent.toml",
 ]
 

@@ -1122,3 +1122,74 @@ league to read it.
 - Not changed: passes one, three and four, `WARM_SLOTS`, `warm_slot_species`, the
   ten `HERD_VIABILITY_DIM` state columns. The coop the donor's planner cannot reach
   is still this module's reason to exist.
+
+## v3e -- `market-free-mark-v1`
+
+The v3d reward is the bare cash delta plus the placed-animal potential and the
+terminal ruin charge, and it has a credit-timing hole: a harvest in the shed is
+worth exactly nothing in the label until the turn it sells, so the only place
+"sell" is crisp is the last `n_step = 24` turns, where replay bootstraps with
+discount zero and the target is realised cash alone. Measured on ruin-v2 and
+open-v1 (60 most recent seats each; learner is the `_match_policy` family,
+opponent pilkwang; the scripts read `episode_payloads.replay_gzip` directly):
+
+    metric                                     learner ruin-v2  pilkwang  learner open-v1  pilkwang
+    shed value at quotes, day 27                       12,925     9,808           10,548     8,974
+    unsold value at terminal, median                    1,540         0            2,449         0
+    sale price / day-0 quote, days 20-27, median         1.14      1.14             0.92      1.14
+    sale price / day-0 quote, days 28-29, median         1.17      1.26             1.03      1.26
+    share of units sold on days 28-29                    0.13      0.27
+    money on day 20                                     4,064    12,934
+
+It hoards, dumps late into the prices it has already depressed, and still leaves
+produce on the table. The dump itself is not the fault -- pilkwang dumps harder --
+the price is.
+
+v3e keeps the cash stream and adds one potential-based term, `STOCK_MARK_WEIGHT`
+(`training/reward.py`): held produce, shed plus carried, marked at its constant base
+price `donor.MARKET[item][0]` through `market_state.HELD_STOCK_BASIS`, the same
+linear-read-of-`turn_state` shape as the animal potential, so every stored pack
+relabels for free. A harvest is credited `+base` the turn it lands, a sale at `q`
+pays `q - base`, unsold stock is written off at the terminal, and holding costs
+`(1 - gamma) * phi` a turn (~0.12 over 300 turns on a 10k shed). Base is a constant,
+so there is no quote to pump, which is what ruled out v2's mark-to-market. The
+optimum is unchanged; what moves is when the label says it.
+
+Graded on three new per-episode columns from `diagnostics._sale_use`, routed onto
+`model_updates.metrics_json` through `_BATCH_LOT_KEYS`: `late_sale_share`,
+`sale_price_over_base` (1.0 is a sale at the mark), `unsold_terminal_value`; and on
+`own_mean_cash_return`, the cash-only sum `own_mean_return` stopped being when the
+animal potential landed. Wanted: late-phase price toward pilkwang's 1.14-1.26,
+terminal unsold median toward 0, `trading_rate` inside 0.30-0.47. A collapse of
+`trading_rate` or `unsold_terminal_value` climbing with `sale_price_over_base` --
+refusing every sale under base and eating the write-off -- means the mark is too
+loud: 0.5 next.
+
+Result, mark-v1 (seq 720, 35 updates, 10 promotions): the strongest run on record.
+Cold start to 34.2k contested money by seq 100, PROMOTED 40,202 at seq 600 against
+pilkwang's 109k (ruin-v2's best at the same seq was 25.9k). `sale_price_over_base`
+1.17 -> 1.39, `late_sale_share` 0.13 -> 0.28, `max_abs_q` 1-4 all run. Then flat:
+seq 300-700 is 21 updates at mean candidate 31.4k, sd 5.2k, own median 35-39k, so the
+two late promotions sit inside the noise. `trading_rate` averaged 0.195 against the
+0.20 floor and 20 of 25 rejections cite `activity_gate_failed` (seq 120 rejected at
+36,967, above the bar, for a rate of 0.196). `unsold_terminal_value` did *not* close:
+2.0-4.5k on every rejected update from seq 500 while the price climbed -- the "too
+loud" clause above, except halving the weight (mark-v3, `dqn_market_free_v3f`,
+`STOCK_MARK_WEIGHT = 0.5`) scored 13-17k against 32-35k at the same seq, worse on
+every column. mark-v2 (floor 0.10) drifted to 0.51 wire orders and 18-21k by seq 300.
+
+## v3e -- `market-free-mark-v4`
+
+Three moves, one session. `UNSOLD_WRITE_OFF_WEIGHT = 1.5` (`training/reward.py`):
+the potential leaves a hoarded unit reward-neutral (credited on landing, written off
+at T), so nothing in the label spoke against holding to the end; the excess half is
+charged on `target` only, like the ruin term, and moves the optimum on purpose.
+Reward-grade, so `SLOT_PREFIX` moves to `mark4`. `viability_min_orders_per_decision`
+0.20 -> 0.17, under mark-v1's band and above where mark-v2 collapsed.
+`resume_reset_after_rejections` 3 -> 2: tripping it resumes from the newest
+checkpoint rather than rolling back, so every rejection *under* the limit is the one
+that discards 960 steps -- mark-v1 threw away ~240 of its last 400 batches that way.
+Graded on `unsold_terminal_value` toward 0 with `sale_price_over_base` held at or
+above 1.3, candidate money clearing 40.2k, `trading_rate` staying above 0.17 with
+`wire_orders_per_decision` not falling under ~0.8.
+

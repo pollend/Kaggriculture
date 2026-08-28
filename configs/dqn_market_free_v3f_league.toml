@@ -1,0 +1,29 @@
+[league]
+league = "dqn_market_free_v3f"
+name = "dqn-market-free-v3f"
+
+# Trainer-only, same shape as the market scorer league: the trainer collects its
+# own full-length episodes, so there is no breedable population, no anchor
+# pairings and no hall of fame.
+manifest = "agents/dqn_market_free_v3f/agent.toml"
+anchor_manifests = []
+training_manifests = ["agents/dqn_market_free_v3f/agent.toml"]
+
+pairing_mode = "trainer_only"
+population_size = 0
+# Moves in lockstep with the manifest's `min_new_batches`: `batches_per_round` is
+# 1, so this many rounds is exactly one update per learner slot, and a generation
+# is exactly one turn of the graduation clock. Setting one without the other
+# either starves the update or collects rounds that produce nothing.
+#
+# Restored to 20 so each generation closes over 320 rollout episodes at
+# `episodes_per_batch = 16`. The larger aggregate is a cleaner signal for
+# generation-level replay weighting and gives each update more data before the
+# promotion/plateau machinery judges the slot.
+rounds_per_generation = 20
+hall_of_fame_rounds = 0
+episode_steps = 720
+seed = 2718
+jobs = 0
+tau = 0.5
+candidate_pool = 2
