@@ -71,6 +71,20 @@ with `held` the shed plus carried count from the state's own columns
 pump: buying product to lift the quote moves the cash and the mark by the same
 coins. Still potential-based, so the optimum is where the cash delta puts it.
 
+**The labor charge.** Hands live one day and are paid once, at hire, on the
+fibonacci ladder; they do nothing on their own -- the field planner hands each one
+a job or a PASS. A hand the job list cannot use is a wage with no return anywhere
+in the 24-turn window, and the cash delta alone cannot tell it from a hand that
+harvests. Through mark-v5, and again in mark-v9/v10, a demand-plus-two mask did
+that job; mark-v6 and mark-v11 expose the full ladder and leave it to this gradient.
+mark-v7/v8
+accidentally put that gradient on the decision *after* HIRE and scaled it until its
+mean was 4.886 reward units against -0.050 of cash. The corrected term looks from
+the opening state of turn `t` to the opening state of `t + 1`, and charges the
+excess wage on reward row `t`, where the causing HIRE decision lives. Read off the
+state's own labor columns so every stored pack relabels. **Not potential-based**:
+the nightly reset refunds nothing.
+
 Neither potential telescopes: `reward.sum()` is the season's profit less
 `phi[0] + (1 - gamma) * sum(phi[1:-1])`. `phi[0]` is zero (nothing is placed or
 held on turn 0); the drag is ~0.005 an episode for a 14-head herd and 0.24 on a
@@ -84,7 +98,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from agents.dqn_market_free_v3e.market_state import HELD_STOCK_BASIS, PLACED_ANIMAL_BASIS
+from agents.dqn_market_free_v3e import donor
+from agents.dqn_market_free_v3e.market_state import (
+    HAND_COUNT_INDEX,
+    HAND_COUNT_SCALE,
+    HELD_STOCK_BASIS,
+    HIRE_DEMAND_INDEX,
+    PLACED_ANIMAL_BASIS,
+)
 
 #: Discount the potential is paid under when a caller passes none. Replay's own
 #: `gamma`; the identity above is only exact when the two agree.
@@ -151,6 +172,19 @@ STOCK_MARK_WEIGHT = 1.0
 #: over the neutral write-off, so a dump at 0.5x base breaks even against holding;
 #: pilkwang's late dumps sit at 1.14-1.26x. The optimum moves, and it is meant to.
 UNSOLD_WRITE_OFF_WEIGHT = 1.5
+
+#: Small auxiliary charge on a HIRE above `labor.hire_demand`. At 0.1, relabelling
+#: mark-v8's first 640 episodes turns the old 4.886 / 122k-equivalent mean charge
+#: into about 0.122 / 3.05k: large enough to distinguish a wasted full crew, but no
+#: longer two orders of magnitude louder than the cash objective.
+LABOR_WASTE_WEIGHT = 0.1
+
+#: Wage of a crew of n from a standing start: `sum(fib(i) for i in range(n))`, the
+#: simulator's own ladder (`kaggriculture._do_hire`, `farmHandCostMult` 1). Long
+#: enough for any crew the wire can carry in a day.
+_FIB_PREFIX = np.concatenate(
+    ([0.0], np.cumsum([float(donor._fib(index)) for index in range(64)]))
+)
 
 
 def ruin_penalty(final_money: float) -> float:
@@ -219,6 +253,38 @@ def stock_mark(turn_state: np.ndarray | None) -> np.ndarray | None:
     return (states @ basis) / np.float32(MONEY_SCALE)
 
 
+def labor_waste(turn_state: np.ndarray | None) -> np.ndarray | None:
+    """Per-turn over-hire charge in reward units, at `LABOR_WASTE_WEIGHT`.
+
+    Reward row `t` belongs to the action taken from state `t`; its resulting crew is
+    visible in state `t + 1`. Both sides are valued at `demand[t]`, so a demand
+    change on the following observation cannot manufacture a wage. The final row
+    has no following state and receives no inferred auxiliary charge; its real cash
+    wage is still present in `raw_reward`.
+    """
+
+    if turn_state is None:
+        return None
+    states = np.asarray(turn_state, dtype=np.float32)
+    if states.ndim != 2 or states.shape[0] == 0:
+        return None
+    hands = np.rint(states[:, HAND_COUNT_INDEX] * HAND_COUNT_SCALE).astype(np.intp)
+    demand = np.rint(states[:, HIRE_DEMAND_INDEX] * HAND_COUNT_SCALE).astype(np.intp)
+    limit = _FIB_PREFIX.shape[0] - 1
+    hands = np.clip(hands, 0, limit)
+    demand = np.clip(demand, 0, limit)
+
+    def excess_wage(crew: np.ndarray, needed: np.ndarray) -> np.ndarray:
+        return _FIB_PREFIX[crew] - _FIB_PREFIX[np.minimum(crew, needed)]
+
+    charge = np.zeros(states.shape[0], dtype=np.float64)
+    if states.shape[0] > 1:
+        before = excess_wage(hands[:-1], demand[:-1])
+        after = excess_wage(hands[1:], demand[:-1])
+        charge[:-1] = np.maximum(0.0, after - before)
+    return (LABOR_WASTE_WEIGHT * charge / MONEY_SCALE).astype(np.float32)
+
+
 def episode_rewards(
     money: list[float],
     final_money: float,
@@ -228,8 +294,8 @@ def episode_rewards(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Turn an episode money trace into `(target, raw, money_array)`.
 
-    `raw` is the per-turn cash delta; `target` is `raw` plus the animal potential
-    and the stock mark when `turn_state` is given, and `raw` again when it is not. Keywords the older
+    `raw` is the per-turn cash delta; `target` is `raw` plus the animal potential,
+    the stock mark and the labor charge when `turn_state` is given, and `raw` again when it is not. Keywords the older
     shaping signature took are accepted and ignored so live rollouts, cloned
     replays and stored packs keep one call path.
     """
@@ -260,6 +326,9 @@ def episode_rewards(
     padded = np.concatenate([phi.astype(np.float64), [0.0]])
     shaping = discount * padded[1:] - padded[:-1]
     shaped = raw.astype(np.float64) + shaping
+    waste = labor_waste(turn_state)
+    if waste is not None:
+        shaped -= waste.astype(np.float64)
     # The excess write-off on whatever is still held at the last decision. `target`
     # only, like the ruin charge; `raw` stays the cash delta.
     excess = UNSOLD_WRITE_OFF_WEIGHT - 1.0

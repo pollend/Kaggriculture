@@ -250,6 +250,7 @@ class ReplayBuffer:
         seed: int = 0,
         reservoir_fraction: float = DEFAULT_RESERVOIR_FRACTION,
         priority_alpha: float = DEFAULT_PRIORITY_ALPHA,
+        priority_signal: str = "money",
         priority_beta: float = DEFAULT_PRIORITY_BETA,
         generation_weight_power: float = DEFAULT_GENERATION_WEIGHT_POWER,
         generation_weight_floor: float = DEFAULT_GENERATION_WEIGHT_FLOOR,
@@ -258,6 +259,10 @@ class ReplayBuffer:
             raise ValueError("reservoir_fraction must be in [0, 1)")
         if priority_alpha < 0.0:
             raise ValueError("priority_alpha must be non-negative")
+        if priority_signal not in ("money", "margin"):
+            raise ValueError(
+                f"priority_signal must be 'money' or 'margin': {priority_signal!r}"
+            )
         if not 0.0 <= priority_beta <= 1.0:
             raise ValueError("priority_beta must be in [0, 1]")
         if generation_weight_power < 0.0:
@@ -266,6 +271,7 @@ class ReplayBuffer:
             raise ValueError("generation_weight_floor must be in [0, 1]")
         self.capacity = capacity
         self.gamma = gamma
+        self.priority_signal = priority_signal
         self.n_step = n_step
         self.reservoir_capacity = int(capacity * reservoir_fraction)
         self.recent_capacity = capacity - self.reservoir_capacity
@@ -435,6 +441,33 @@ class ReplayBuffer:
         scores = np.asarray(
             [float(record.money[-1]) for record in pool], dtype=np.float64
         )
+        if self.priority_signal == "margin" and count:
+            # An episode's rank is what it earned *over its opponent*, not what a
+            # weak opponent handed it: under money alone the sampler put 0.42 of
+            # its mass on the luckiest decile (mark-v18), and with a mirror pool
+            # the luckiest episodes are the ones whose opponent was worst. An
+            # episode with no contest -- opponent errored, quiet network, or an
+            # artifact from before the metadata existed -- ranks strictly below
+            # every contested one, in stored order, rather than borrowing a rank
+            # from money nobody contested.
+            opponent = [getattr(record, "opponent_money", None) for record in pool]
+            contested = [value is not None for value in opponent]
+            margins = np.asarray(
+                [
+                    score - float(value)
+                    for score, value in zip(scores, opponent)
+                    if value is not None
+                ],
+                dtype=np.float64,
+            )
+            floor = (margins.min() if margins.size else 0.0) - 1.0
+            scores = np.asarray(
+                [
+                    score - float(value) if value is not None else floor
+                    for score, value in zip(scores, opponent)
+                ],
+                dtype=np.float64,
+            )
         if count == 0 or self.priority_alpha <= 0.0:
             probabilities = np.full(count, 1.0 / count) if count else np.zeros(0)
             weights = np.ones(count, dtype=np.float32)
@@ -532,6 +565,8 @@ class ReplayBuffer:
             "own_mean_cash_return": float(cash_returns.mean()),
             "sampled_mean_return": float(probabilities @ returns),
             "own_max_return": float(returns.max()),
+            # Under `priority_signal = "margin"` these two are margins, not money;
+            # the names keep their historical SQL meaning under "money".
             "own_mean_priority_money": float(scores.mean()),
             "sampled_mean_priority_money": float(probabilities @ scores),
             "own_max_priority_money": float(scores.max()),

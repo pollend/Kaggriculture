@@ -51,15 +51,23 @@ def episode_metrics(steps: list, seat: int) -> dict[str, Any]:
     previous_day: int | None = None
     previous_hires_today = 0
     hires_observed = 0
+    hand_actions = 0
+    hand_idle = 0
 
     for state in steps:
         seat_state = state[seat]
         action = seat_state.action if isinstance(seat_state.action, dict) else {}
-        unit_actions = [action.get("farmer", ["PASS"]), *(action.get("hands", []) or [])]
+        hands_actions = list(action.get("hands", []) or [])
+        unit_actions = [action.get("farmer", ["PASS"]), *hands_actions]
         for unit_action in unit_actions:
             op = unit_action[0] if isinstance(unit_action, list) and unit_action else "PASS"
             field_ops[str(op)] += 1
             total_unit_actions += 1
+        # Hands alone, so an idle crew is not diluted by a busy farmer.
+        for unit_action in hands_actions:
+            hand_actions += 1
+            if not (isinstance(unit_action, list) and unit_action) or unit_action[0] == "PASS":
+                hand_idle += 1
         for order in action.get("market", []) or []:
             if not isinstance(order, list) or not order:
                 continue
@@ -132,6 +140,8 @@ def episode_metrics(steps: list, seat: int) -> dict[str, Any]:
         "crop_peak_yield_observed": dict(crop_peak),
         "plants_lost_inferred": inferred_losses,
         "hires_observed_inferred": hires_observed,
+        "hand_actions": hand_actions,
+        "hand_idle_share": hand_idle / hand_actions if hand_actions else 0.0,
         "requested_sales": dict(requested_sales),
         "requested_seed_purchases": dict(requested_seeds),
         "average_requested_sale_price": sale_value_at_quote / sale_units_at_quote if sale_units_at_quote else 0.0,

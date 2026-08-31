@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +72,13 @@ class MemberEntry:
     #: The lineage this one was forked from, or None for an original member. Kept for
     #: provenance only -- nothing reads it to make a decision.
     forked_from: str | None = None
+    #: Weight-only initialization provenance. Unlike `forked_from`, this never
+    #: grants ownership of the source lineage or its replay history.
+    warm_started_from_checkpoint_id: str | None = None
+    warm_started_from_inference_path: str | None = None
+    warm_start_calibration_steps: int = 0
+    warm_start_calibration_initial_loss: float | None = None
+    warm_start_calibration_final_loss: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -242,6 +249,40 @@ def find_member(entries: list[MemberEntry], position: int) -> MemberEntry | None
     return None
 
 
+def warm_start_sources(directory: Path | str, members: int) -> list[MemberEntry]:
+    """Validate and return one inference-only source for every member position.
+
+    `directory` may name either a model artifact root or its `members/` child. A
+    configured warm start is strict: silently falling back to a quiet network for
+    one missing position would turn a ten-member experiment into two different
+    initialization regimes without saying which member was the control.
+    """
+
+    root = Path(directory)
+    artifacts = root.parent if root.name == "members" else root
+    path = index_path(artifacts)
+    if not path.is_file():
+        raise FileNotFoundError(f"warm-start member index is missing: {path}")
+    entries = read_index(artifacts)
+    by_position = {entry.position: entry for entry in entries}
+    expected = set(range(int(members)))
+    observed = set(by_position)
+    if observed != expected:
+        raise ValueError(
+            f"warm-start member positions must be {sorted(expected)}; got {sorted(observed)}"
+        )
+    for position in sorted(expected):
+        entry = by_position[position]
+        if not entry.checkpoint_id:
+            raise ValueError(f"warm-start member {position} has no checkpoint_id")
+        if not entry.inference_path or not Path(entry.inference_path).is_file():
+            raise FileNotFoundError(
+                f"warm-start member {position} inference artifact is missing: "
+                f"{entry.inference_path!r}"
+            )
+    return [by_position[position] for position in sorted(expected)]
+
+
 def _rank_key(candidate: dict[str, Any]) -> tuple:
     """Sort key: measured before unmeasured, trading before inert, then money.
 
@@ -284,6 +325,7 @@ def rank_and_prune(
     lineage_cap: int | None = None,
     incumbents: dict[int, str] | None = None,
     margin: float = 0.0,
+    exploit: int = 0,
 ) -> list[MemberEntry]:
     """Rank `candidates` and return the `members` that survive, one per position.
 
@@ -321,6 +363,11 @@ def rank_and_prune(
         raise ValueError(f"lineage_cap must be at least 1 when set; got {lineage_cap}")
     if margin < 0:
         raise ValueError(f"margin must be non-negative; got {margin}")
+    if exploit < 0 or exploit >= members:
+        if exploit != 0:
+            raise ValueError(
+                f"exploit must be in [0, members): got {exploit} of {members}"
+            )
 
     ordered = sorted(candidates, key=_rank_key)
 
@@ -441,8 +488,56 @@ def rank_and_prune(
                 inference_path=candidate.get("inference_path"),
                 trainer_path=candidate.get("trainer_path"),
                 forked_from=forked_from,
+                warm_started_from_checkpoint_id=candidate.get(
+                    "warm_started_from_checkpoint_id"
+                ),
+                warm_started_from_inference_path=candidate.get(
+                    "warm_started_from_inference_path"
+                ),
+                warm_start_calibration_steps=int(
+                    candidate.get("warm_start_calibration_steps") or 0
+                ),
+                warm_start_calibration_initial_loss=candidate.get(
+                    "warm_start_calibration_initial_loss"
+                ),
+                warm_start_calibration_final_loss=candidate.get(
+                    "warm_start_calibration_final_loss"
+                ),
             )
         )
+    # Boosting, PBT-style truncation selection: the `exploit` worst seats are
+    # re-seeded from the best checkpoints in play. Deliberately *after* the
+    # incumbency margin -- hysteresis protects a seat from a noisy rival, but a
+    # seat at the bottom of the roster is not being protected, it is being
+    # carried. Each boosted seat is a fork (fresh lineage, floor at the cutoff,
+    # weights copied from its source), and its score is cleared so next
+    # generation's rank measures the fork rather than inheriting its parent's
+    # number. Sources are the top `exploit` seats round-robin; a seat that is
+    # itself a source is never boosted, and unmeasured seats count as worst.
+    if exploit > 0 and len(entries) > exploit:
+        def seat_score(entry: MemberEntry) -> tuple:
+            return (entry.score is None, -(entry.score if entry.score is not None else 0.0))
+
+        by_rank = sorted(entries, key=lambda e: (seat_score(e), e.position))
+        sources = [e for e in by_rank[:exploit] if e.score is not None]
+        victims = [e for e in by_rank[-exploit:] if e not in sources]
+        if sources:
+            for index, victim in enumerate(victims):
+                source = sources[index % len(sources)]
+                fork_lineage = new_lineage_id(
+                    model_id, victim.position, generation, salt=f"exploit-{victim.position}"
+                )
+                entries[entries.index(victim)] = replace(
+                    victim,
+                    lineage_id=fork_lineage,
+                    checkpoint_id=source.checkpoint_id,
+                    score=None,
+                    batch_floor=int(cutoff),
+                    inference_path=source.inference_path,
+                    trainer_path=source.trainer_path,
+                    forked_from=source.lineage_id,
+                )
+
     return entries
 
 

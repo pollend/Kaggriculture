@@ -52,6 +52,7 @@ class MatchPolicyAgent:
                     # Absent on a spec written before the rate arm existed, which
                     # must keep reading the statistic it was measured with.
                     novelty=str(config.get("rare_sigma_novelty", "count")),
+                    exclude_hire=bool(config.get("rare_sigma_exclude_hire", False)),
                 )
         # Ape-X's per-actor temperature spread on the noise: one scale per seed
         # pair, so a batch carries both an exploratory and an effectively greedy

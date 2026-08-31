@@ -701,7 +701,7 @@ SYNC_ENVIRONMENT = True
 # gross sales while its hands passed on 55-66% of turns; bought 5 geese an episode
 # and placed 1.3 because `herd.py` never roled a goose onto a board of standing
 # pasture; and put 2.6 cows on the board where ladder winners put 8. So: goose
-# re-roling in `herd.py`; `labor.hire_cap` masking HIRE rungs above field demand;
+# re-roling in `herd.py`; the former demand-based HIRE mask in `labor.py`;
 # the animal potential in `training/reward.py`; `member_prune_margin = 0.25`
 # incumbent hysteresis on the prune (no crop-v1 lineage lived past 120 batches);
 # and `cross_slot_reseed_min_score` 6,000 -> 3,500 (never fired at 6,000, best
@@ -788,7 +788,116 @@ SYNC_ENVIRONMENT = True
 # mark-v4 moves three things: `UNSOLD_WRITE_OFF_WEIGHT` 1.5 in `training/reward.py`
 # (reward-grade, so the prefix moves), the floor to 0.17, and
 # `resume_reset_after_rejections` 3 -> 2.
-SESSION_ID = "market-free-mark-v4"
+# mark-v4 reached 41,389 at seq 900 (submitted) and then rejected 11 straight at
+# 24-35k. Three causes, measured: (1) the bar was one draw -- the same checkpoint
+# scored 28-38k, mean ~33k, on ten later generations of league seats, so every
+# candidate at its true level had to beat a number it could not itself repeat;
+# (2) rollout money flat at 40-45k from seq 400 with `mean_grad_norm` 0.011 and
+# `sigma_ratio_0` decayed 7.9 -> 1.6 -- small steps from a policy that stopped
+# exploring; (3) self-play share 0.83 by seq 800, so it trained against itself and
+# was graded against pilkwang. mark-v5 answers each: `promotion_incumbent_rematch`
+# with `benchmark_seed_stride = 100` (paired, fresh seeds every update), the mirror
+# held at 0.5, `noisy_sigma_scale_floor` 0.25 -> 0.5. Config only; the prefix and
+# the mark4 lineage carry.
+# mark-v5's rematch answered the bar question the other way: the incumbent
+# `71a187` re-measured 39.4-43.5k on fresh seeds every update (sd 1.3k), and all 22
+# children trained from it scored 19-36k. The arena is precise and every update
+# makes the greedy policy worse. mark-v6 tests the cheapest cause first:
+# `gradient_steps_per_batch` 48 -> 12, 240 steps an update instead of 960. Also
+# drops the hire demand cap (`labor.py`). Config and mask only; lineage carries.
+# mark-v7: `LABOR_WASTE_WEIGHT` in `training/reward.py` -- the hire demand cap that
+# mark-v6 took off the mask comes back as a per-turn charge on the wage of hands
+# above `labor.hire_demand`. Reward-grade, so the prefix moves and the run cold-starts.
+# mark-v7 at weight 1.0 lost the stake in 86-91% of seasons by seq 100: the fresh
+# head hired a full crew daily at 37-61% idle. mark-v8: `LABOR_WASTE_WEIGHT` 4.0.
+# mark-v8 made the failure louder, not earlier. Across its first 640 stored seats,
+# the labor term averaged 4.886 reward units (122,142 money-equivalent) against
+# -0.050 of cash, and every nonzero charge landed one decision after the HIRE that
+# caused it. Generation 0 -> 1 money fell 2,400 -> 1,085 while hires rose 328 ->
+# 380 and hand idle share rose 0.38 -> 0.45.
+#
+# mark-v9 fixes that temporal alignment, returns the demand-plus-two HIRE envelope,
+# applies the existing reserve to HIRE, and lowers the auxiliary weight to 0.1.
+# Fresh prefix: reward and action support both moved, so no checkpoint, replay
+# buffer, mirror pool, member roster, or optimizer state is inherited.
+#
+# mark-v10 keeps that successful reward/mask arm and changes only population
+# scheduling: two independent slots, five members in each, and the full 20-batch
+# learning budget for every member. A generation is therefore 5 x 20 = 100 rounds.
+# Fresh prefix/session so the one-member roster and its stored cutoffs cannot enter
+# the first ten-candidate prune.
+#
+# mark-v11 removes the demand-plus-two HIRE ceiling. The reserve, one-HIRE-action
+# rule, wire-slot limit and simulator `MAX_HANDS` remain. This expands action support,
+# so both slots cold-start under a fresh prefix; the five-member budget is unchanged.
+#
+# mark-v12: pilkwang out of both roles. `opponents = []` and `self_play_ratio` 1.0,
+# so collection is the quiet network for batch 0 and then the mirror pool, topped
+# up with the newest checkpoints (`self_play_latest_backfill`); `benchmarks = []`
+# and `promotion_score_signal = "rollout"`, so the gate scores, ranks and floors on
+# the recent rollouts (`updater._rollout_activity_result`). No contested read is
+# left in the run: `own_median_final_money` is a mirror number, and the ladder
+# standing is the only outside check. Prefix moves: the opponent distribution is
+# the reward distribution.
+#
+# mark-v13 returns to mark10/11's contested rollout and benchmark so the HIRE
+# experiment changes one learning mechanism rather than the opponent distribution.
+# The full HIRE ladder is open, but a low-weight demand-aware Q ordering replaces
+# the hard ceiling. Each of the two five-member slots starts from the matching
+# productive mark10 survivor roster, with no trainer or replay inheritance.
+#
+# mark-v14: pilkwang out of both roles, and the gate reads the *margin*. mark-v12
+# tried the first half and got neither: `configured_benchmarks` defaulted the empty
+# list back to the donor, so the arena still ran against pilkwang for contenders
+# and rejected the other four members on `missing_benchmark`; and a mid-run edit to
+# the mirror agent crashed the opponent in 7,712 rollouts, so the "mirror money"
+# that climbed 31k -> 44k was a farm alone in the market. `promotion_score_signal =
+# "margin"`: learner money less opponent money over the recent rollouts, opponent-
+# errored episodes excluded (`mean_money_difference`). A mirror pool moves, so money
+# against it is a moving target; the paired difference is the relative read. Every
+# number in this run is still a mirror read -- the ladder is the only outside check.
+#
+# mark-v14 ran 140 batches of pure mirror: margins within +-400 of zero from seq 41
+# on (two clones split the market), money 4.8k -> 1.9k, insolvency 0.31 -> 0.86,
+# and the ratchet was stuck on a batch-0 margin earned against the quiet network.
+# mark-v15 keeps the margin gate and puts pilkwang back into half the rollouts:
+# "difference from the opponent" with a real opponent. The quiet network no longer
+# counts as contested (`updater._contested_margins`). Still no benchmark arena.
+#
+# mark-v15 collapsed in generation 1: 300 hand-days in generation 0 on the open
+# ladder, then ~40 with 80% idle, money 1.2-2.0k, margin -134k flat. The margin gate
+# rejected correctly throughout. Five open-ladder arms, five collapses; mark-v16
+# puts `labor.hire_cap` (demand + 2) back on the mask and changes nothing else.
+#
+# mark-v16 collapsed at the first trained checkpoint: generation-0 rollouts (the
+# cold-start network) made 22-30k on 250 hire-days; every member's first 960-step
+# update played 10-14k on 77 and never recovered. Cap on, prior loss ~0, clone
+# skipping 3-6 rows an update -- none of the labelled suspects. mark-v17 bisects:
+# mark-v9's shape (one slot, one member, 20-round generations, promoted-only
+# mirror pool, no hire prior, no sigma exclusion) with only the margin gate kept.
+# Climbs => the 2x5 / backfill / prior bundle is the regression; collapses => the
+# gate is implicated.
+# mark-v18: mark-v17 with five members a slot again (100-round generations).
+# mark-v19: the training distribution follows the gate onto the margin.
+# `priority_signal = "margin"`: replay ranks an episode by money earned over its
+# opponent, uncontested episodes in the tail. mark-v18 measured the problem it
+# removes: sampled priority money 38-62k over a 22-30k buffer, top decile 0.42 of
+# the draw -- with a mirror pool, "best" episodes were mostly weakest-opponent
+# episodes. Weak change: no reward moved, the prefix and the mark18 lineage carry.
+# mark-v20: boosting on the roster. Each generation the two worst seats are
+# re-seeded as forks of the top checkpoints (`member_exploit_count`,
+# `members.rank_and_prune` exploit step). The margin bar had ratcheted onto one
+# lucky draw (-19,189) and 24 straight rejections followed; the roster now
+# redistributes the best weights regardless of what the release gate thinks.
+# mark-v21: the capital scaffolding, not another selection knob. Every arm since
+# mark-v9 converged to ~-100k margin because the herd was structurally capped:
+# `donor.ANIMAL_SLOTS` reserved 15 tiles (4 before land), one warm structure made
+# a multi-head buy wait out the BUILD -> PICKUP -> PLACE latency, and pickups
+# moved two head a species a turn. Widened to 24 slots (6 opening), three warm
+# structures, four pickups. The Q head's animal levers are unchanged -- it decides
+# species, count, wheat and sales -- the board can now hold what it buys.
+# Mask distribution moves (more BUY_ANIMAL room), so the prefix moves: cold start.
+SESSION_ID = "market-free-mark-v21"
 ARTIFACTS = ARTIFACTS_ROOT / "dqn_market_free_v3e"
 LEAGUE_CONFIG = Path("configs/dqn_market_free_v3e_league.toml")
 MANIFEST = Path("agents/dqn_market_free_v3e/agent.toml")
@@ -824,12 +933,9 @@ MANIFEST = Path("agents/dqn_market_free_v3e/agent.toml")
 # archive went away with reseeding -- so a slot's mirror pool is unchanged by how
 # many siblings it has. The slots are independent replicates, and ten of them
 # only ran the same experiment twice per wall-clock hour.
-# One learner. The run is a single agent now, so the roster is a checkpoint history
-# rather than a set of competing lineages, and `cross_slot_reseed` has nothing to
-# reach across. Five bought independent replicates as a hedge; rollback
-# (`lineage_source = "promoted"` plus `resume_reset_after_rejections`) replaces
-# that, and the lineage gets the whole 960-step generation instead of a fifth or a
-# twenty-fifth of it.
+# Two independent learner slots. Each owns its model id, five-member roster,
+# batches, checkpoints and mirror pool. `cross_slot_reseed` remains off, so this is
+# two genuine replicates rather than one population leaking winners into the other.
 LEARNERS = 1
 # Named for the reward it was fitted to. `_self_play_pool`, `lineage_checkpoint`,
 # `all_batches` and the slot LR state are all scoped by `model_id`, so renaming
@@ -931,7 +1037,13 @@ LEARNERS = 1
 # slot LR state, and the floor is what changed. Same rule as ruin2 -> mark1.
 # mark4: `UNSOLD_WRITE_OFF_WEIGHT` makes a stored return a different quantity.
 # Reward-grade sever; the 40,202 checkpoint stays on disk under mark1 for export.
-SLOT_PREFIX = "mark4"
+# mark7/mark8: the labor charge makes a stored return a different quantity.
+# mark9: its timing and scale move again, and the HIRE mask narrows.
+# mark10: the roster grows from one to five and its generation grows to preserve
+# the full learning budget. A fresh namespace keeps the comparison honest.
+# mark11: the HIRE mask expands to every affordable, wire-representable rung.
+# mark13: the same expansion, warm-started and protected by a soft training prior.
+SLOT_PREFIX = "mark21"
 MODEL_NAME = f"{SLOT_PREFIX}_00"
 
 # How many learners run their round hooks and their update at once, and how wide
@@ -941,19 +1053,19 @@ MODEL_NAME = f"{SLOT_PREFIX}_00"
 # tail is paid for in full. It equals `LEARNERS` from members-v1 on: five models
 # over five threads is one wave with no tail. It was ten over five before, which
 # is 2 x 5 -- also tail-free, but two waves to a round.
-# One slot, so the model-level thread pool is width 1 and the whole machine goes to
-# that slot's episode collection instead. A round is now one batch of
-# `episodes_per_batch = 16` rather than five in parallel, so the jobs that five
-# slots shared go to one: 32 cores, 16 episodes a batch, and the collection is
-# what the round time is made of.
+# Two slots run in one tail-free wave. Each collects 16 episodes with 16 jobs, so
+# the host sees 32 rollout workers at collection time. Updates can also run in
+# parallel, but member state remains scoped to the owning slot.
 CONCURRENCY = 1
 JOBS_PER_LEARNER = 16
+ROUNDS_PER_GENERATION = 100
 
 DONOR = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
 
-# The release objective, and still the only benchmark. Index 0 is what the ratchet
-# reads; a second entry would only add diagnostics the gate does not consult.
-BENCHMARKS = (DONOR,)
+# Restore mark10/11's external read. Mark12's pure-mirror arm remains preserved in
+# its own session and artifacts.
+# Empty from mark-v14: no benchmark arena. `DONOR` stays named for the ladder pack.
+BENCHMARKS: tuple[str, ...] = ()
 
 # Overrides only. `register_training_agent` materializes `agent.toml`'s
 # `[models.config]` and then applies this on top, so every key here is a
@@ -994,8 +1106,8 @@ FREE_CONFIG = {
     # this dict is what `ensure_session` digests.
     # Sized per member in units of that member's own generations, target ~2 of them.
     # At `member_batches = 20` a member collects 20 x 16 = 320 episodes a generation,
-    # so 640. One resident buffer now instead of twenty-five, so this is cheaper than
-    # any member-pool setting despite the larger number.
+    # so 640. There are five resident buffers per slot, but only two slots are live;
+    # the ten buffers equal the old two-slot-by-five-member target exactly.
     "buffer_episodes": 640,
     # Not pure self-play any more, and this is the change the run is named for.
     #
@@ -1019,6 +1131,8 @@ FREE_CONFIG = {
     # the gate. Accepted deliberately: `own_mean_final_money` becomes a contested
     # number rather than a mirror read, which is the direction the metric should
     # have moved anyway.
+    # Back in for mark-v15, at half the rollouts: the margin gate needs a market
+    # with someone in it. Not a benchmark -- `benchmarks` stays empty.
     "opponents": [DONOR],
     # The league population is this same family, and `league_opponents` excludes
     # it by construction, so leaving this on would only re-add anchors.
@@ -1028,10 +1142,9 @@ FREE_CONFIG = {
     # being non-empty, and a checkpoint is only written by a model update, so
     # generation 0 is noise-only warmup whatever this says.
     "self_play_after": 1,
-    # 25. The mirror draws from the 25 best promoted checkpoints of this one model,
-    # floored at the stake by `self_play_min_score`. Under the five-slot roster a
-    # slot could only mirror its own five; the whole run is one model now, so the
-    # pool is the run's own retained history and is both deeper and more varied.
+    # 25. Each slot mirrors only its own promoted checkpoints, floored at the stake
+    # by `self_play_min_score`. The two-slot experiment therefore keeps independent
+    # opponents as well as independent member rosters.
     "self_play_pool": 25,
     # Off, reversing the argument above it. `_self_play_pool`'s own docstring says a
     # rejected checkpoint "is exactly the kind of behaviour the next update should
@@ -1040,10 +1153,11 @@ FREE_CONFIG = {
     # children, promoted or not. Under the activity gate those children are the ones
     # that stopped trading. The starvation this was guarding against cannot happen
     # now that `opponents` is non-empty.
+    # On from mark-v14: with no outside opponent the pool is the whole opponent
+    # distribution, and a promoted-only pool at a cold start is empty for a generation.
     "self_play_latest_backfill": False,
     # Live for the first time: with a non-empty base `compose_opponents` actually
-    # mixes, and 0.65 is what every arm above 16k recorded.
-    "self_play_ratio": 0.65,
+    # mixes. It began at 0.65; the mark-v5 note below records the current 0.5.
     # The donor is a bootstrap, not a fixture, and the ramp is why it is safe to
     # have it in the rollout mix at all.
     #
@@ -1069,8 +1183,19 @@ FREE_CONFIG = {
     # `compose_opponents` clamps its ratio at 0.9 and so cannot express "no outside
     # opponent"; at 1.0 the caller drops the base instead. The mix therefore holds
     # at 0.9 from batch ~429 and goes to pure at 600.
-    "self_play_ratio_final": 1.0,
+    # 1.0 -> 0.5 for mark-v5, and `self_play_ratio` 0.65 -> 0.5 with it so the ramp
+    # is flat. At 1.0 mark-v4 trained on 83% mirror episodes by seq 800 (41-43k
+    # rollout median) while the gate measured it against pilkwang (~33k). Half the
+    # rollouts stay on the grader.
+    "self_play_ratio": 0.5,
+    "self_play_ratio_final": 0.5,
     "self_play_ratio_ramp_batches": 600,
+    # The bar is the incumbent re-measured on this update's seeds, not its stored
+    # score (`updater._incumbent_rematch`). Costs one more 100-seed arena an update.
+    "promotion_incumbent_rematch": True,
+    # 0 -> 100: fresh seeds every update. Pinned seeds made the stored score a
+    # fixed-test-set high-water mark; with the rematch both sides share each draw.
+    "benchmark_seed_stride": 100,
     # The floor the deleted archive carried, restored on the pool itself
     # (`updater._self_play_pool`). 3,000 is the stake, so this says a checkpoint that
     # cannot beat holding its cash never becomes a teacher. Off (0.0) everywhere
@@ -1130,10 +1255,21 @@ FREE_CONFIG = {
     # chose.
     "demo_fraction_final": 0.0,
     "behavior_clone_steps_per_update": 12,
+    # Mark13's HIRE ladder remains fully legal. These keys shape the Q ordering
+    # instead of narrowing the action mask, and calibrate imported mark10 outputs
+    # before the first 20-batch collection window.
+    "hire_prior_weight": 0.0,
+    "hire_prior_margin": 0.05,
+    "hire_prior_slack": 2,
+    "hire_prior_bootstrap_steps": 0,
     # Benchmark, not "rollout": the rollout arm reads `recent_mean_final_money`,
     # the *incumbent's* collection money while it filled this candidate's buffer.
     # It grades the parent, not the candidate.
-    "promotion_score_signal": "benchmark",
+    # "margin" from mark-v14 (`updater._PROMOTION_SCORE_SIGNALS`).
+    "promotion_score_signal": "margin",
+    # 20 batches x 16 episodes behind each margin read; the seat-difference sd is
+    # ~15k an episode, so ~850 on the mean. 1,000 is one noise width.
+    "promotion_tolerance_money": 1000.0,
     # 0.02 -> 0.20. The single most under-set number in the run.
     #
     # This is the only activity check there is, surfaced in the gate payload as
@@ -1160,49 +1296,32 @@ FREE_CONFIG = {
     # the floor, including money-improving ones. 0.17 is under the observed band and
     # above where mark-v2 collapsed.
     "viability_min_orders_per_decision": 0.17,
-    # Off. There are no sibling slots to reach across at `LEARNERS = 1`, and this is
-    # the machinery that destroyed `anchor-v1`: `admit_foreign` has no lineage dedup,
-    # its `max_adopt` default is `max(1, members - 1)` whose floor takes the only seat
-    # at one member, and the g0 prune forked all five slots from a single checkpoint
-    # that had scored 8,016 on one 100-seed draw and 1,260 on the next. Rollback
-    # replaces it as the recovery path.
+    # Off deliberately. There are now two sibling slots, but they are independent
+    # replicates; cross-slot admission would couple them and could copy one noisy
+    # arena winner into four seats of the other pool.
     "cross_slot_reseed": False,
     # Incumbent hysteresis on the member prune; see `member_prune_margin` in the
     # manifest. Without it no lineage lived past 120 batches.
+    # Rank episodes by margin over the opponent, not raw money; see SESSION_ID.
+    "priority_signal": "margin",
     "member_prune_margin": 0.25,
-    # One member. A single agent, and the roster machinery reduced to checkpoint
-    # retention rather than a tournament.
+    # Bottom two seats re-seeded from the top checkpoints every generation.
+    "member_exploit_count": 2,
+    # Five new checkpoints compete with the previous five at each generation
+    # boundary. `roster_candidates` reads `2 * members` distinct update cutoffs and
+    # `rank_and_prune` keeps five, including incumbent hysteresis and activity tier.
     #
-    # The invariant `members_per_slot * member_batches == rounds_per_generation` and
-    # `member_batches == min_new_batches` still has to hold, because
-    # `members.roster_candidates` reads `2 * members` distinct cutoffs and calls that
-    # "this generation and the previous one". At one member that is 1 x 20 = 20, so
-    # `member_batches` and `min_new_batches` are both 20 and the lineage takes one
-    # update a generation. anchor-v1 ran 1 x 10 against 20 rounds and the window
-    # silently covered half a generation; that is the trap this arithmetic exists to
-    # avoid.
-    #
-    # What one member buys over five is the gradient budget. A generation is
-    # `rounds_per_generation * batches_per_round * gradient_steps_per_batch` = 20 x 1
-    # x 48 = 960 steps, and member count divides it: five lineages get 192 each, which
-    # `agent.toml` records as what collapsed `members-v2` (the activity gate cleared
-    # on 8 of 105 updates), and `anchor-v2` reproduced at its first gate with three
-    # slots scoring the stake exactly. One lineage gets all 960, which is
-    # `rewardtogo-v2`'s budget and the best result since the mature archive was
-    # deleted.
-    #
-    # The hedge the five-slot roster bought is replaced by rollback, not discarded --
-    # see `lineage_source` and `resume_reset_after_rejections` below, and the resume
-    # branch in `updater.update` that a one-member roster now takes.
-    "members_per_slot": 1,
-    # 1 x 20 = the 20-round generation. Must equal `min_new_batches` in `agent.toml`.
+    # Unlike the failed five-way experiment, member count no longer divides a fixed
+    # 20-round budget. Every member still collects 20 batches and trains for
+    # 20 x 48 = 960 gradient steps. The scheduling invariant is now
+    # 5 members x 20 batches = 100 rounds, while `member_batches` still equals the
+    # manifest's `min_new_batches` so one update fires at every member boundary.
+    "members_per_slot": 5,
+    # 5 x 20 = the 100-round generation. Must equal `min_new_batches` in `agent.toml`.
     "member_batches": 20,
-    # "promoted", not "latest" -- the rollback, and the reason the resume branch in
-    # `updater.update` had to change. `lineage_checkpoint` is what reads this key, and
-    # it was dead code in this fork: defined and called from nowhere, because
-    # `_member_checkpoint` took the resume unconditionally. A one-member roster now
-    # routes back through it, so the lineage resumes from its best *promoted*
-    # checkpoint by benchmark money rather than from whatever it last produced.
+    # "promoted", not "latest". This is the one-member compatibility path; at five
+    # members `_member_checkpoint` resumes the member roster and generation pruning
+    # provides rollback by retaining a better parent.
     #
     # The known failure of "promoted" is `terminal-selfplay-ladder-v1`: it released
     # two checkpoints, rejected the next 24 updates, and every one of those trained
@@ -1212,11 +1331,7 @@ FREE_CONFIG = {
     # brake at all, and because the activity gate at 0.20 plus the donor should make
     # promotions happen rather than stall.
     "lineage_source": "promoted",
-    # Snapback after three consecutive rejections: reset to the release rather than
-    # keep walking a lineage that has stopped earning its place. Inert under member
-    # pools (the prune did this job); live now. 3 rather than 2 so a single noisy
-    # arena draw cannot trigger it -- benchmark money is the noisy signal, and a
-    # checkpoint has scored 8,016 and 1,260 on consecutive draws in this run.
+    # Snapback is inert under member pools; the prune does this job.
     # 3 -> 2 for mark-v4. Tripping this does not roll back -- it hands the resume to
     # the newest checkpoint (`updater.lineage_checkpoint`); the rollback is every
     # rejection *under* it, each resuming the promoted checkpoint and discarding its
@@ -1228,9 +1343,7 @@ FREE_CONFIG = {
     # arena's own confidence interval of it promotes. A strict all-time ratchet
     # against a 100-seed arena rejected the same policy measured twice.
     # 25, matching the retained checkpoint history: the bar a candidate must clear is
-    # the best of the last 25 releases rather than the last 6. A wider window is a
-    # stricter, less noise-sensitive ratchet, which is what a single lineage with no
-    # sibling to compare against needs.
+    # the best of the last 25 releases rather than the last 6.
     "promotion_reference_window": 25,
     "promotion_tolerance_ci": True,
     # Insolvent seasons train at full weight. See `agent.toml`.
@@ -1270,7 +1383,9 @@ FREE_CONFIG = {
     # Note the probe ladder is clipped by `scale_limit`, not by this, so it still
     # bottoms out at 0.5 and the resolver extrapolates to the floor when the whole
     # ladder over-explores. That is the saturated case, which is the case v2 was in.
-    "noisy_sigma_scale_floor": 0.25,
+    # 0.25 -> 0.5 for mark-v5: mark-v4's `sigma_ratio_0` fell 7.9 -> 1.6 over 1,100
+    # batches with `noisy_flip_to_order_rate` 0.02-0.07 and returns flat from seq 400.
+    "noisy_sigma_scale_floor": 0.5,
     # Unchanged at 2.0. The problem measured on v2 was entirely on the *lower*
     # bound, and raising this to widen the downward range would also hand back the
     # upward runaway it is here to prevent -- a controller reaching high sigma at a
@@ -1330,6 +1445,10 @@ FREE_CONFIG = {
     # [1.0, 0.61, 0.37, 0.23, 0.138, 0.084, 0.051, 0.031], so rungs 5-8 carry a
     # sigma scale under 0.14. The ladder is the attenuator, not the pair count.
     "rare_sigma_pairs": 2,
+    # Base NoisyNet exploration remains. Only the extra visit-count widening is
+    # pinned off HIRE, whose newly opened quantity rows otherwise receive the
+    # largest directed perturbations before their returns are known.
+    "rare_sigma_exclude_hire": False,
     # `learning_rate` is deliberately *not* overridden: the manifest's 2e-4 stands.
     # `market-free-weighted-v1` promoted nothing and showed Q-scale inflation at a
     # higher peak, and nothing since has earned it back.
@@ -1385,6 +1504,10 @@ FREE_CONFIG = {
     "batch_size": 128,
     "burn_in_turns": 20,
     "train_turns": 40,
+    # 48 -> 12 for mark-v6: 240 steps an update. 22 of 22 children of `71a187`
+    # scored under it at 960 steps; if the child now stays near 41k the loss was
+    # overshoot, if it still falls the objective is the problem. `target_sync` 1920
+    # is now eight updates rather than two.
     "gradient_steps_per_batch": 48,
     # `target_sync` is deliberately *not* overridden: the manifest's 1920 stands.
     # The faster 480-step sync `market-free-weighted-v1` used let the bootstrap
@@ -1449,6 +1572,9 @@ TRAINING_AGENTS = [
         "model_config": {
             **FREE_CONFIG,
             "seed": 2718 + 1009 * index,
+            # mark-v13 warm-started each slot from its mark10 roster. Off for
+            # mark-v14: those rosters were trained under the hire cap, and a trained
+            # head on a newly opened ladder is the mark-v6 collapse.
         },
     }
     for index in range(LEARNERS)
@@ -1480,6 +1606,7 @@ def _effective_config() -> LeagueConfig:
         base,
         training_agents=tuple(TrainingAgentSpec.from_dict(item) for item in TRAINING_AGENTS),
         training_concurrency=CONCURRENCY,
+        rounds_per_generation=ROUNDS_PER_GENERATION,
     )
 
 
@@ -1500,7 +1627,8 @@ def _ensure_session() -> None:
 
 
 def _model_status() -> None:
-    print(model_status(REPO_ROOT / MANIFEST, name=MODEL_NAME))
+    for item in TRAINING_AGENTS:
+        print(model_status(REPO_ROOT / MANIFEST, name=item["name"]))
 
 
 def main() -> int:

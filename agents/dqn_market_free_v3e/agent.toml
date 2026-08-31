@@ -49,20 +49,11 @@ code_paths = [
 [[models]]
 model_id = "dqn_market_free_v3e.raw_order_q_v1"
 trainer = "agents.dqn_market_free_v3e.train:trainer"
-# `rounds_per_generation / members_per_slot`: one update per member per
-# generation. Must track `member_batches` below: it is
-# what actually fires the update, so the two drifting apart means members train on
-# each other's batches.
-# 4: `rounds_per_generation / members_per_slot` = 20 / 5. Must equal
-# `member_batches` below -- it is what actually fires the update, and
-# `members.roster_candidates` additionally relies on the product
-# `members_per_slot * member_batches == rounds_per_generation` for its `2 * members`
-# cutoff window to mean "this generation and the previous one".
-# 20: `rounds_per_generation / members_per_slot` = 20 / 1. Must equal
-# `member_batches` below, and the product
-# `members_per_slot * member_batches == rounds_per_generation` is what makes
-# `members.roster_candidates`' `2 * members` cutoff window mean "this generation
-# and the previous one".
+# One full update per member. This must equal `member_batches` below; it is what
+# actually fires the update, so the two drifting apart means members train on each
+# other's batches. With five members and 100 rounds, 20 batches per member makes
+# `roster_candidates`' `2 * members` cutoffs exactly the current five and previous
+# five checkpoints.
 min_new_batches = 20
 
 [models.config]
@@ -78,13 +69,9 @@ league_opponents = true
 # v1's 400-at-720-rows because the rows per episode grew with the decision rate and
 # the memory is the product of the two.
 #
-# Back to 400 with `members_per_slot = 2`. This is sized per *member*, so it has to
-# move with `member_batches`: at 4 batches a member collected 64 episodes a
-# generation and 160 was 2.5 generations of its own history, but at 10 it collects
-# 160 and 160 would be exactly one. 400 restores the 2.5, and it restores the
-# regime rewardtogo ran at -- that run read `episodes_in_buffer` 511 against this
-# run's 215. Memory is unchanged: resident buffers are `CONCURRENCY` x
-# `members_per_slot`, so 5 x 5 x 160 and 5 x 2 x 400 are both 4,000 episodes.
+# Sized per member. At 20 batches x 16 episodes, one member adds 320 episodes per
+# generation; 640 keeps two generations of that member's own history. Runtime
+# residency is the driver's live slots x members x this value, not one shared pool.
 buffer_episodes = 640
 reservoir_fraction = 0.35
 warmup_episodes = 16
@@ -123,6 +110,11 @@ priority_alpha = 0.7
 # the weighted gradient equals the uniform one, so prioritisation buys only
 # variance. Beta is the bias dial.
 priority_beta = 0.5
+
+# "money" ranks episodes by terminal money (historical); "margin" by money earned
+# over the opponent, with uncontested episodes in the rank tail. The driver sets
+# "margin" from mark-v19.
+priority_signal = "money"
 
 # Aggregate generation weighting, applied to the per-chunk loss after replay has
 # already ranked own episodes by final money. The best generation in the loaded
@@ -328,6 +320,11 @@ rare_sigma_pairs = 4
 # first few rounds, when the policy was still random. 1.0 keeps counts forever.
 rare_sigma_decay = 0.9
 
+# Keep directed rare-action widening off the HIRE quantity rows. Ordinary
+# NoisyNet exploration remains; this only prevents newly opened fibonacci rungs
+# receiving an extra visit-count multiplier before their return is known.
+rare_sigma_exclude_hire = false
+
 # Demonstrations from stored league replays, pinned and never evicted. The manifest
 # remains the reward-only control.
 demonstration_episodes = 0
@@ -356,6 +353,16 @@ demonstration_source = "league"
 # dial rather than a rebuild. Ignored by the league source.
 demonstration_pack = ""
 
+# Soft demand-aware ordering for HIRE. A weight of zero is the manifest control:
+# every affordable rung stays legal and the TD objective is unchanged. Mark13 sets
+# weight 0.10, margin 0.05 and slack 2. The bootstrap pass is used only with a
+# configured inference-only member warm start and runs before that member's first
+# rollout, updating final HIRE output means on ladder demonstration states.
+hire_prior_weight = 0.0
+hire_prior_margin = 0.05
+hire_prior_slack = 2
+hire_prior_bootstrap_steps = 0
+
 # Single release rule for this family. A checkpoint must complete the benchmark,
 # clear the activity floor, and match or beat this slot's best promoted benchmark
 # money before it becomes active. Lower-scoring non-idle checkpoints are still
@@ -373,10 +380,7 @@ demonstration_pack = ""
 # benchmark money with `max_abs_q` 81.8 for sixteen generations. A diverged member
 # now simply loses to its siblings and is dropped.
 #
-# 1 reproduces the old single-lineage slot exactly. 2 x 10 = the 20-round
-# generation, which is why `min_new_batches` above is 10.
-#
-# Was 5, and 5 is what collapsed `market-free-members-v2`. Splitting a slot's 20
+# Five collapsed `market-free-members-v2` only because splitting a slot's 20
 # rounds five ways gave each lineage `member_batches` x `gradient_steps_per_batch`
 # = 4 x 48 = **192** gradient steps an update, against the 960 the single-lineage
 # `market-free-rewardtogo-v2` slot got from the same generation. Measured on the
@@ -388,25 +392,11 @@ demonstration_pack = ""
 # reward and the gate are identical between those two runs; the per-lineage
 # training budget is the whole difference.
 #
-# 2 is the compromise that keeps the mechanism: 480 steps a member, half of
-# rewardtogo's, with two lineages still competing and the prune still able to drop
-# a diverged one. If 480 also proves too thin, the next move is `members_per_slot
-# = 1` -- which is rewardtogo's config -- not a further split.
-# 1. A single agent: the roster is checkpoint retention, not a tournament.
-#
-# 5 was tried twice. `members-v2` recorded 4 x 48 = 192 gradient steps a lineage an
-# update against rewardtogo's 960, with the activity gate clearing on 8 of 105
-# updates; `anchor-v2` reproduced it at its first gate, three slots of five scoring
-# the 3,000 stake exactly with a greedy trading rate of 0.000. Member count divides
-# a fixed 960-step generation, so a bigger roster is strictly a smaller per-lineage
-# budget, and an undertrained head argmaxes to NOOP (`ACTIONS[0]`).
-#
-# At 1 the prune drops nobody, which is why `updater.update` routes a one-member
-# roster back through `lineage_checkpoint`: the reject-streak snapback is the
-# recovery mechanism when there is no sibling to lose to. `anchor-v1` had neither
-# and could only drift forward. Keep `member_batches` and `min_new_batches` at 20
-# with this, or the prune window silently shrinks below a generation.
-members_per_slot = 1
+# The new schedule removes that confound: five members x 20 batches is a 100-round
+# generation, so every lineage receives 20 x 48 = 960 gradient steps. At the
+# boundary, the five resulting checkpoints and the previous five are ranked
+# together and the best five survive.
+members_per_slot = 5
 
 # Batches one member collects before its update fires. **Must equal
 # `min_new_batches` above**, which is what actually triggers the update and which
@@ -419,10 +409,19 @@ members_per_slot = 1
 # member gets a different number of rounds in different generations.
 #
 # Read this together with `gradient_steps_per_batch`: the product is what a lineage
-# actually learns from in a generation, and it is the number that matters, not the
-# roster size. The arithmetic below balancing to 20 rounds is a scheduling
-# constraint, not evidence the budget is adequate.
+# actually learns from in a generation. Five members x 20 batches balances the
+# 100-round generation without reducing that per-lineage budget.
+
+# Boosting: how many of the worst seats are re-seeded as forks of the top
+# checkpoints at each prune. 0 keeps pure rank-and-hysteresis.
+member_exploit_count = 4
+
 member_batches = 20
+
+# Optional model artifact root (or its `members/` child) containing one compatible
+# inference checkpoint per member position. Empty is the ordinary cold start.
+# Only `.npz` weights cross this boundary; trainer state, replay and lineage do not.
+member_warm_start_dir = ""
 
 # How many positions one lineage may occupy after a prune. Empty is pure top-N: a
 # strong lineage can take the whole slot, which is the selection pressure being
@@ -546,6 +545,10 @@ eval_seeds = 100
 promotion_seed_base = 1000000
 # Pin the benchmark seed window so repeated checkpoint scores are comparable.
 benchmark_seed_stride = 0
+# Re-measure the active checkpoint on the candidate's seeds and use that as the
+# bar instead of its stored score. Pairs with a non-zero stride; the driver sets
+# both. Off keeps the stored high-water mark.
+promotion_incumbent_rematch = false
 
 
 # Catches the attractor this gate exists for: a policy that refuses to trade can

@@ -253,6 +253,15 @@ OWNED_ANIMAL_SLICE = slice(60, 60 + len(ANIMALS))
 HOMELESS_ANIMAL_SLICE = slice(65, 65 + len(ANIMALS))
 ANIMAL_COUNT_SCALE = 10.0
 
+#: The labor columns `training/reward.py` reads for the over-hire charge, all
+#: scaled by `1 / donor.MAX_HANDS`: the crew standing this turn, the day's hires
+#: so far, and `labor.hire_demand` -- the crew the board's jobs justify. Pinned by
+#: test like the animal slices, for the same reason.
+HAND_COUNT_INDEX = 52
+HIRES_TODAY_INDEX = 53
+HIRE_DEMAND_INDEX = 108
+HAND_COUNT_SCALE = float(donor.MAX_HANDS)
+
 #: float64 [MARKET_STATE_DIM]. Dotted with a turn state it gives the purchase
 #: price of every animal standing on a structure that turn: owned less homeless,
 #: per species, times `donor.ANIMALS[...]["cost"]`. `training/reward.py` reads it

@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from agents.dqn_market_free_v3e.order_space import ACTION_COUNT, NOOP_INDEX
+from agents.dqn_market_free_v3e.order_space import ACTION_COUNT, ACTIONS, NOOP_INDEX
 
 #: Filename stem written beside `rollout_policies/`, keyed the same way.
 COUNTS_SUFFIX = ".npz"
@@ -120,6 +120,7 @@ def sigma_scale_vector(
     gain: float,
     cap: float,
     novelty: str = "count",
+    exclude_hire: bool = False,
 ) -> np.ndarray:
     """Per-action multiplier on the head's noise draw: `1 + gain * novelty`.
 
@@ -155,6 +156,8 @@ def sigma_scale_vector(
     scale = 1.0 + float(gain) * _NOVELTY[novelty](chosen, opportunities)
     scale = np.clip(scale, 1.0, max(1.0, float(cap)))
     scale[NOOP_INDEX] = 1.0
+    if exclude_hire:
+        scale[[index for index, action in enumerate(ACTIONS) if action.op == "HIRE"]] = 1.0
     scale[opportunities <= 0.0] = 1.0
     return scale.astype(np.float32)
 

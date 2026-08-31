@@ -608,6 +608,107 @@ def test_best_promoted_rollout_score_reads_recent_and_own_money():
     )
 
 
+def test_member_position_follows_the_batch_stamps_not_the_cutoff_arithmetic():
+    from types import SimpleNamespace
+
+    from agents.dqn_market_free_v3e.training.updater import _member_position_for_batches
+
+    def batch(position):
+        return SimpleNamespace(metadata={"member_position": position} if position is not None else {})
+
+    # Majority wins; the skewed arithmetic (fallback) is ignored.
+    assert _member_position_for_batches(
+        [batch(1), batch(1), batch(4)], fallback=4, members=5
+    ) == 1
+    # Ties break to the smallest position, deterministically.
+    assert _member_position_for_batches(
+        [batch(2), batch(0)], fallback=3, members=5
+    ) == 0
+    # No stamps (pre-member artifacts): the arithmetic stands.
+    assert _member_position_for_batches([batch(None)], fallback=3, members=5) == 3
+    # A stamp outside the roster (shrink) falls back too.
+    assert _member_position_for_batches([batch(9)], fallback=2, members=5) == 2
+
+
+def test_episode_opponent_money_aligns_with_rollout_order():
+    from types import SimpleNamespace
+
+    import agents.dqn_market_free_v3e.training.updater as updater_module
+
+    def rollout(spec, learner_seat, learner_money, opponent_money, failed=False):
+        seats = [SimpleNamespace(reward=None, failed=False), SimpleNamespace(reward=None, failed=False)]
+        seats[learner_seat] = SimpleNamespace(reward=learner_money, failed=False)
+        seats[1 - learner_seat] = SimpleNamespace(reward=opponent_money, failed=failed)
+        record = SimpleNamespace(money=np.asarray([3000.0, learner_money], dtype=np.float32))
+        return SimpleNamespace(
+            opponent_spec=spec, learner_seat=learner_seat, match=SimpleNamespace(seats=seats), record=record
+        )
+
+    quiet = "agents/dqn_market_free_v3e/main.py?weights=%2Fx%2Fviability_baselines%2Fquiet.npz"
+    rollouts = [
+        rollout("pilkwang.py", 0, 20_000.0, 120_000.0),
+        rollout(quiet, 0, 40_000.0, 3_000.0),
+        rollout("mirror.py", 1, 9_000.0, 0.0, failed=True),
+        rollout("mirror.py", 1, 9_000.0, 7_000.0),
+    ]
+    values = updater_module._episode_opponent_money(rollouts)
+    assert values == [120_000.0, None, None, 7_000.0]
+    # The gate's margins derive from the same list.
+    assert updater_module._contested_margins(rollouts) == [-100_000.0, 2_000.0]
+
+
+def test_contested_margins_skip_errored_seats_and_the_quiet_network():
+    from types import SimpleNamespace
+
+    from agents.dqn_market_free_v3e.training.updater import _contested_margins
+
+    def rollout(spec, learner_seat, learner_money, opponent_money, failed=False):
+        seats = [SimpleNamespace(reward=None, failed=False), SimpleNamespace(reward=None, failed=False)]
+        seats[learner_seat] = SimpleNamespace(reward=learner_money, failed=False)
+        seats[1 - learner_seat] = SimpleNamespace(reward=opponent_money, failed=failed)
+        record = SimpleNamespace(money=np.asarray([3000.0, learner_money], dtype=np.float32))
+        return SimpleNamespace(
+            opponent_spec=spec, learner_seat=learner_seat, match=SimpleNamespace(seats=seats), record=record
+        )
+
+    pilkwang = "agents/competitor_pilkwang_kaggriculture_structured_economic_policy/main.py"
+    mirror = "agents/dqn_market_free_v3e/main.py?weights=%2Fartifacts%2Fabc.npz"
+    quiet = "agents/dqn_market_free_v3e/main.py?weights=%2Fartifacts%2Fviability_baselines%2Fquiet.npz"
+    margins = _contested_margins(
+        [
+            rollout(pilkwang, 0, 20_000.0, 120_000.0),
+            rollout(mirror, 1, 9_000.0, 7_000.0),
+            rollout(quiet, 0, 40_000.0, 3_000.0),
+            rollout(mirror, 0, 9_000.0, 0.0, failed=True),
+            rollout(mirror, 1, 9_000.0, None),
+        ]
+    )
+    assert margins == [-100_000.0, 2_000.0]
+
+
+def test_the_margin_signal_reads_the_paired_difference_and_floors_the_pool_on_money():
+    from agents.dqn_market_free_v3e.training.updater import (
+        _PROMOTION_SCORE_SIGNALS,
+        _best_promoted_checkpoint_score,
+        _checkpoint_score_sql,
+    )
+
+    assert "margin" in _PROMOTION_SCORE_SIGNALS
+    sql = _checkpoint_score_sql("margin")
+    assert "mean_money_difference" in sql and "final_money" not in sql
+
+    class Reader:
+        def fetchone(self, sql, parameters):
+            assert "metrics_json ->> 'mean_money_difference'" in sql
+            assert "AND promoted" in sql
+            return (-412.0, "checkpoint-margin")
+
+    assert _best_promoted_checkpoint_score(Reader(), "model", "margin") == (
+        -412.0,
+        "checkpoint-margin",
+    )
+
+
 def test_activation_reasons_block_non_idle_benchmark_regressions():
     from agents.dqn_market_free_v3e.training.updater import _activation_reasons
 
@@ -691,6 +792,60 @@ def test_activity_gate_lineage_can_follow_the_latest_checkpoint(monkeypatch):
     context.config["lineage_source"] = "newest"
     with pytest.raises(ValueError, match="lineage_source"):
         updater_module.lineage_checkpoint(context, reader)
+
+
+def test_incumbent_rematch_replaces_the_stored_bar_with_a_fresh_read(monkeypatch):
+    from types import SimpleNamespace
+
+    from agents.dqn_market_free_v3e.training import updater as updater_module
+
+    calls = []
+
+    def fake_arena(weights_path, opponent, seeds, jobs, seed_start=0):
+        calls.append((str(weights_path), opponent, seeds, jobs, seed_start))
+        return {"a_money_mean": 33_000.0, "pairs": seeds}
+
+    monkeypatch.setattr(updater_module, "_arena_evaluate", fake_arena)
+    active = SimpleNamespace(checkpoint_id="abc", inference_artifact_path="/tmp/abc.npz")
+    money, result = updater_module._incumbent_rematch(active, "pilkwang.py", 100, 4, 1_000_100)
+    assert money == 33_000.0
+    assert result["pairs"] == 100
+    # Same seeds as the candidate, so the comparison is paired.
+    assert calls == [("/tmp/abc.npz", "pilkwang.py", 100, 4, 1_000_100)]
+
+    # No incumbent, no benchmark, or no money read: fall back to the stored bar.
+    assert updater_module._incumbent_rematch(None, "pilkwang.py", 100, 4, 0) == (None, None)
+    assert updater_module._incumbent_rematch(active, None, 100, 4, 0) == (None, None)
+    monkeypatch.setattr(updater_module, "_arena_evaluate", lambda *a, **k: {"errors": {"x": 1}})
+    money, result = updater_module._incumbent_rematch(active, "pilkwang.py", 100, 4, 0)
+    assert money is None and result == {"errors": {"x": 1}}
+
+
+def test_a_run_with_no_benchmark_reads_activity_off_the_rollouts():
+    from types import SimpleNamespace
+
+    from agents.dqn_market_free_v3e.diagnostics import OrderDiagnostics
+    from agents.dqn_market_free_v3e.training.updater import (
+        _order_viability,
+        _rollout_activity_result,
+    )
+
+    def record(decisions, effective):
+        diagnostics = OrderDiagnostics(
+            decisions=decisions, effective_decisions=effective, emitting_decisions=effective
+        )
+        return SimpleNamespace(order_diagnostics=diagnostics)
+
+    result = _rollout_activity_result([record(100, 30), record(100, 10)])
+    assert result["pairs"] == 1 and result["errors"] == {}
+    assert result["order_diagnostics"]["trading_rate"] == pytest.approx(0.2)
+    config = {"viability_min_orders_per_decision": 0.17}
+    assert _order_viability(result, config, require_activity=True)["passed"]
+    assert not _order_viability(
+        _rollout_activity_result([record(100, 5), record(100, 5)]), config, require_activity=True
+    )["passed"]
+    # An empty buffer is an empty arena.
+    assert not _order_viability(_rollout_activity_result([]), config, require_activity=True)["passed"]
 
 
 def test_activation_reasons_accept_a_candidate_inside_the_tolerance():
@@ -1580,8 +1735,9 @@ def test_a_buy_animal_beyond_free_housing_is_shut():
     """
 
     obs, farm, private, field = _mask_state(money=100_000)
-    assert len(donor._reserved_animal_slots(farm)[0]) == 4, "the opening quadrant"
-    assert animal_room(obs, farm, private) == {a: 4 for a in herd.ANIMALS}
+    opening = donor.ANIMAL_SLOTS["NW"]
+    assert len(donor._reserved_animal_slots(farm)[0]) == opening, "the opening quadrant"
+    assert animal_room(obs, farm, private) == {a: opening for a in herd.ANIMALS}
 
     # More head waiting in the shed than the board can ever house.
     crowded = {**private, "shed": {**(private.get("shed") or {}), "COW": 50}}
@@ -1597,13 +1753,14 @@ def test_the_rung_is_capped_at_free_housing_not_shut_wholesale():
 
     obs, farm, private, field = _mask_state(money=100_000)
     crowded = {**private, "shed": {**(private.get("shed") or {}), "COW": 2}}
-    assert animal_room(obs, farm, crowded) == {a: 2 for a in herd.ANIMALS}
+    room = donor.ANIMAL_SLOTS["NW"] - 2
+    assert animal_room(obs, farm, crowded) == {a: room for a in herd.ANIMALS}
 
     pending = PendingTurn(obs, farm, crowded, field, None)
     mask = feasible_actions(obs, farm, crowded, field, None, pending=pending)
     rows = _BUY_ANIMAL_ROWS["COW"]
     for index, quantity in enumerate(_ROW_QUANTITY[rows]):
-        assert bool(mask[rows][index]) == (int(quantity) <= 2), quantity
+        assert bool(mask[rows][index]) == (int(quantity) <= room), quantity
 
 
 def test_a_turn_cannot_stuff_more_animals_than_it_has_tiles():
@@ -1615,7 +1772,12 @@ def test_a_turn_cannot_stuff_more_animals_than_it_has_tiles():
     rows = _BUY_ANIMAL_ROWS["COW"]
     assert feasible_actions(obs, farm, private, field, None, pending=pending)[rows].all()
 
-    pending.apply(Order(op="BUY_ANIMAL", item="COW", quantity=4))
+    # Fill the whole opening reservation across turns of the wire.
+    remaining = donor.ANIMAL_SLOTS["NW"]
+    while remaining > 0:
+        rung = 4 if remaining >= 4 else (2 if remaining >= 2 else 1)
+        pending.apply(Order(op="BUY_ANIMAL", item="COW", quantity=rung))
+        remaining -= rung
     mask = feasible_actions(obs, farm, private, field, None, pending=pending)
     # Every species, not just the one bought: COW and SHEEP share the pasture and a
     # bare COOP is re-roled by `herd._species_for`, so the ground is gone for all.
@@ -1661,8 +1823,10 @@ def test_buying_land_widens_the_animal_rows():
             tiles[y][x] = None
     wide = {**farm, "tiles": tiles, "unlocked_quadrants": ["NW", "NE"]}
 
-    assert len(donor._reserved_animal_slots(farm)[0]) == 4
-    assert len(donor._reserved_animal_slots(wide)[0]) == 4 + donor.ANIMAL_SLOTS["NE"]
+    assert len(donor._reserved_animal_slots(farm)[0]) == donor.ANIMAL_SLOTS["NW"]
+    assert len(donor._reserved_animal_slots(wide)[0]) == (
+        donor.ANIMAL_SLOTS["NW"] + donor.ANIMAL_SLOTS["NE"]
+    )
     assert animal_room(obs, wide, private)["COW"] > animal_room(obs, farm, private)["COW"]
 
 
@@ -1682,7 +1846,10 @@ def test_land_pressure_reads_the_plan_not_just_the_board():
     roles = herd.field_roles(obs, farm, private)
     thin_roles = {(0, 0): ("CROP", "WHEAT"), (1, 0): ("CROP", "WHEAT")}
 
-    assert land_expansion_pressure(obs, farm, roles) == 1.0
+    # A fully planted farm: every non-reserved tile is a productive role. The
+    # widened `ANIMAL_SLOTS` reservation keeps a few planted tiles out of the
+    # role map, so "full" reads just under 1.0 rather than exactly 1.0.
+    assert land_expansion_pressure(obs, farm, roles) >= 0.9
     assert land_expansion_pressure(obs, farm, thin_roles) == pytest.approx(2 / 25)
     assert land_score(obs, farm, private, farm["money"], 0, thin_roles) < 0.15
     assert not should_buy_land(obs, farm, private, thin_roles)
@@ -1864,6 +2031,38 @@ def test_priority_draw_ranks_episodes_by_final_money_not_shaped_return():
     empirical = float(np.mean([final_money[int(index)] for index in drawn]))
     assert empirical == pytest.approx(stats["sampled_mean_priority_money"], abs=500.0)
     assert empirical > float(np.mean(final_money))
+
+
+def test_margin_priority_ranks_contested_episodes_and_tails_the_rest():
+    from agents.dqn_market_free_v3e.training.replay import ReplayBuffer
+
+    # Three episodes: a modest win over a strong opponent, a loss to a strong
+    # opponent, and a rich season nobody contested. Money order is the reverse of
+    # margin order on the first and last.
+    records = [
+        _priority_episode(0, 20_000.0, 0.5),
+        _priority_episode(1, 9_000.0, 0.2),
+        _priority_episode(2, 40_000.0, 1.4),
+    ]
+    records[0].opponent_money = 18_000.0   # margin +2,000
+    records[1].opponent_money = 14_000.0   # margin -5,000
+    records[2].opponent_money = None       # uncontested
+
+    margin = ReplayBuffer(capacity=8, seed=3, priority_alpha=0.7, priority_signal="margin")
+    margin.add(records)
+    _pool, scores, probabilities, _w = margin._own_priorities()
+    assert scores[0] == pytest.approx(2_000.0)
+    assert scores[1] == pytest.approx(-5_000.0)
+    assert scores[2] < scores[1]
+    assert probabilities[0] > probabilities[1] > probabilities[2]
+
+    money = ReplayBuffer(capacity=8, seed=3, priority_alpha=0.7)
+    money.add([_priority_episode(i, m, r) for i, (m, r) in enumerate([(20_000.0, 0.5), (9_000.0, 0.2), (40_000.0, 1.4)])])
+    _pool, money_scores, money_probabilities, _w = money._own_priorities()
+    assert money_probabilities[2] > money_probabilities[0] > money_probabilities[1]
+
+    with pytest.raises(ValueError):
+        ReplayBuffer(capacity=8, priority_signal="madeup")
 
 
 def test_generation_weight_scales_chunk_loss_without_reward_scaling():
@@ -2993,6 +3192,38 @@ def test_batch_lot_metrics_average_the_batches_the_update_consumed():
     )
     assert metrics["animal_waste_cost"] == pytest.approx(2000.0)
     assert metrics["animal_gain_credit"] == pytest.approx(200.0)
+
+
+def test_labor_reward_metrics_put_the_auxiliary_label_beside_cash():
+    from agents.dqn_market_free_v3e.market_state import (
+        HAND_COUNT_INDEX,
+        HAND_COUNT_SCALE,
+        HIRE_DEMAND_INDEX,
+    )
+    from agents.dqn_market_free_v3e.training.reward import (
+        LABOR_WASTE_WEIGHT,
+        MONEY_SCALE,
+    )
+    from agents.dqn_market_free_v3e.training.updater import _labor_reward_metrics
+
+    record = _episode(turns=4)
+    record.turn_state[:] = 0.0
+    record.turn_state[:, HAND_COUNT_INDEX] = (
+        np.asarray([0, 6, 6, 0], dtype=np.float32) / HAND_COUNT_SCALE
+    )
+    record.turn_state[:, HIRE_DEMAND_INDEX] = 4.0 / HAND_COUNT_SCALE
+    record.raw_reward[:] = np.asarray([0.1, 0.0, 0.0, 0.0], dtype=np.float32)
+
+    prefix = [0.0]
+    for index in range(7):
+        prefix.append(prefix[-1] + float(donor._fib(index)))
+    expected = LABOR_WASTE_WEIGHT * (prefix[6] - prefix[4]) / MONEY_SCALE
+
+    metrics = _labor_reward_metrics([record])
+    assert metrics["own_mean_labor_waste_return"] == pytest.approx(expected)
+    assert metrics["own_mean_labor_waste_money"] == pytest.approx(expected * MONEY_SCALE)
+    assert metrics["own_labor_waste_to_abs_cash_return"] == pytest.approx(expected / 0.1)
+    assert all(value is None for value in _labor_reward_metrics([]).values())
 
 
 def test_batch_lot_metrics_skip_batches_that_carry_no_lot_columns():
@@ -4413,6 +4644,39 @@ def test_the_prune_drops_a_diverged_lineage_and_forks_a_strong_one():
     )] == [entry.lineage_id for entry in kept]
 
 
+def test_boosting_reseeds_the_worst_seats_from_the_top_checkpoints():
+    from agents.dqn_market_free_v3e.training.members import rank_and_prune
+
+    candidates = [
+        {"checkpoint_id": f"c{i}", "lineage_id": lin, "score": score, "batch_floor": 0,
+         "inference_path": f"/x/{lin}.npz", "trainer_path": f"/x/{lin}.pt"}
+        for i, (lin, score) in enumerate(
+            [("A", 10_000.0), ("B", 8_000.0), ("C", 6_000.0), ("D", 400.0), ("E", 100.0)]
+        )
+    ]
+    kept = rank_and_prune(
+        candidates, 5, model_id="m", generation=3, cutoff=300, exploit=2
+    )
+    assert [entry.position for entry in kept] == [0, 1, 2, 3, 4]
+    # Top three untouched.
+    assert [entry.lineage_id for entry in kept[:3]] == ["A", "B", "C"]
+    assert all(entry.forked_from is None for entry in kept[:3])
+    # Bottom two are forks of the top two: fresh identity, cleared score, floored.
+    boosted = kept[3:]
+    assert [entry.forked_from for entry in boosted] == ["A", "B"]
+    for entry in boosted:
+        assert entry.score is None
+        assert entry.batch_floor == 300
+        assert entry.lineage_id not in {"A", "B", "C", "D", "E"}
+    assert boosted[0].inference_path == "/x/A.npz"
+    assert boosted[1].inference_path == "/x/B.npz"
+    # exploit 0 is the old behaviour exactly.
+    plain = rank_and_prune(candidates, 5, model_id="m", generation=3, cutoff=300)
+    assert [entry.lineage_id for entry in plain] == ["A", "B", "C", "D", "E"]
+    with pytest.raises(ValueError):
+        rank_and_prune(candidates, 5, model_id="m", generation=3, cutoff=300, exploit=5)
+
+
 def test_an_inert_member_ranks_below_every_trading_sibling():
     """Money alone selects *for* silence -- a member that never trades keeps its
     stake, so it outranks a sibling that traded and lost. That is what collapsed
@@ -4505,17 +4769,102 @@ def test_a_member_index_round_trips_through_disk(tmp_path):
     assert read_index(tmp_path) == []
     entries = [
         MemberEntry(position=1, lineage_id="b", score=2.0, batch_floor=40),
-        MemberEntry(position=0, lineage_id="a", score=1.0),
+        MemberEntry(
+            position=0,
+            lineage_id="a",
+            score=1.0,
+            warm_started_from_checkpoint_id="source",
+            warm_started_from_inference_path="/source.npz",
+            warm_start_calibration_steps=100,
+        ),
     ]
     write_index(tmp_path, entries)
     loaded = read_index(tmp_path)
     assert [entry.position for entry in loaded] == [0, 1]
     assert find_member(loaded, 1).lineage_id == "b"
     assert find_member(loaded, 1).batch_floor == 40
+    assert find_member(loaded, 0).warm_started_from_checkpoint_id == "source"
+    assert find_member(loaded, 0).warm_start_calibration_steps == 100
     assert find_member(loaded, 9) is None
     # A corrupt sidecar reads as a cold start rather than taking a generation down.
     (tmp_path / "members" / "index.json").write_text("{not json")
     assert read_index(tmp_path) == []
+
+
+def test_warm_start_requires_one_inference_source_per_member(tmp_path):
+    from agents.dqn_market_free_v3e.training.members import (
+        MemberEntry,
+        warm_start_sources,
+        write_index,
+    )
+
+    for position in range(2):
+        path = tmp_path / "members" / f"{position}.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"weights")
+    write_index(
+        tmp_path,
+        [
+            MemberEntry(
+                position=position,
+                lineage_id=f"old-{position}",
+                checkpoint_id=f"checkpoint-{position}",
+                inference_path=str(tmp_path / "members" / f"{position}.npz"),
+                trainer_path=str(tmp_path / "members" / f"{position}.pt"),
+            )
+            for position in range(2)
+        ],
+    )
+    sources = warm_start_sources(tmp_path / "members", 2)
+    assert [entry.checkpoint_id for entry in sources] == ["checkpoint-0", "checkpoint-1"]
+
+    (tmp_path / "members" / "1.npz").unlink()
+    with pytest.raises(FileNotFoundError, match="member 1 inference"):
+        warm_start_sources(tmp_path, 2)
+
+
+def test_warm_start_calibration_changes_only_hire_output_means(monkeypatch):
+    from agents.dqn_market_free_v3e.training import updater as updater_module
+
+    demos = [_episode(seed=index) for index in range(4)]
+    monkeypatch.setattr(
+        updater_module,
+        "load_ladder_demonstrations",
+        lambda *_args, **_kwargs: (demos, None),
+    )
+    source = OrderQNetwork.random(seed=19)
+    calibrated, metrics = updater_module._calibrate_warm_start_hires(
+        source,
+        {
+            "device": "cpu",
+            "noisy": False,
+            "demonstration_source": "ladder",
+            "demonstration_pack": "unused-by-test",
+            "demonstration_episodes": len(demos),
+            "hire_prior_bootstrap_steps": 1,
+            "hire_prior_margin": 0.05,
+            "hire_prior_slack": 2,
+            "batch_size": 2,
+            "burn_in_turns": 20,
+            "train_turns": 40,
+            "n_step": 24,
+            "learning_rate": 0.001,
+            "seed": 7,
+        },
+        position=0,
+    )
+
+    from agents.dqn_market_free_v3e.training.updater import HIRE_ACTION_ROWS
+
+    before_w, before_b = source.layers[-1]
+    after_w, after_b = calibrated.layers[-1]
+    non_hire = np.ones(ACTION_COUNT, dtype=np.bool_)
+    non_hire[HIRE_ACTION_ROWS] = False
+    assert_array_equal(after_w[:, non_hire], before_w[:, non_hire])
+    assert_array_equal(after_b[non_hire], before_b[non_hire])
+    assert not np.array_equal(after_w[:, HIRE_ACTION_ROWS], before_w[:, HIRE_ACTION_ROWS])
+    assert metrics["steps"] == 1
+    assert metrics["initial_loss"] is not None
 
 
 def test_the_buffer_sees_only_this_members_own_batches():
@@ -5094,19 +5443,19 @@ def test_the_generated_arms_differ_only_in_what_they_are_testing():
         "promotion_reference_window"
     ]
 
-def test_hire_rungs_above_the_fields_demand_are_shut():
-    """`labor.hire_cap` bounds the HIRE ladder on the v2 path; v1's is untouched.
+def test_the_hire_ladder_is_capped_at_demand_plus_slack_and_keeps_the_cash_reserve():
+    """`labor.hire_cap` bounds the live HIRE ladder; the reserve bounds the wallet.
 
-    An empty board with no seed justifies `MIN_HANDS + HIRE_SLACK` hands, not the
-    donor's floor of 10 -- that floor is the 18,300-coin wage bill `labor.py`
-    measures. `hires_today` already counts against it.
+    An empty board justifies `MIN_HANDS + HIRE_SLACK` hands, not the donor's floor
+    of 10, and lifting the cap collapsed five arms. The unpended v1 mask is
+    compatibility-only and keeps the raw-wallet, `MAX_HANDS` behaviour.
     """
 
     from agents.dqn_market_free_v3e import labor
 
     pending, (obs, farm, private, field) = _pending(money=40_000)
     cap = labor.hire_cap(obs, farm, private, herd.field_roles(obs, farm, private))
-    assert labor.MIN_HANDS <= cap < 10
+    assert cap == labor.MIN_HANDS + labor.HIRE_SLACK < 10
     assert pending.hire_cap == cap
     mask = feasible_actions(obs, farm, private, field, None, pending=pending)
     open_hands = [
@@ -5116,16 +5465,129 @@ def test_hire_rungs_above_the_fields_demand_are_shut():
 
     pending.hires_today = cap - 1
     mask = feasible_actions(obs, farm, private, field, None, pending=pending)
-    open_hands = [
+    assert [
         ACTIONS[index].quantity for index in np.flatnonzero(mask) if ACTIONS[index].op == "HIRE"
-    ]
-    assert open_hands == [1]
+    ] == [1]
 
     # The v1 branch keeps affordability alone.
-    mask_v1 = feasible_actions(obs, farm, private, field, None)
+    legacy = feasible_actions(obs, farm, private, field, None)
     assert max(
-        ACTIONS[index].quantity for index in np.flatnonzero(mask_v1) if ACTIONS[index].op == "HIRE"
+        ACTIONS[index].quantity for index in np.flatnonzero(legacy) if ACTIONS[index].op == "HIRE"
     ) == int(donor.MAX_HANDS)
+
+    # The reserve applies to HIRE on the live path: at the absolute floor v2 shuts
+    # every rung while the compatibility mask still sees raw cash.
+    reserved, (obs, farm, private, field) = _pending(money=250)
+    live = feasible_actions(obs, farm, private, field, None, pending=reserved)
+    legacy = feasible_actions(obs, farm, private, field, None)
+    assert not any(ACTIONS[index].op == "HIRE" for index in np.flatnonzero(live))
+    assert any(ACTIONS[index].op == "HIRE" for index in np.flatnonzero(legacy))
+
+    poor, (obs, farm, private, field) = _pending(money=0)
+    mask = feasible_actions(obs, farm, private, field, None, pending=poor)
+    assert not any(ACTIONS[index].op == "HIRE" for index in np.flatnonzero(mask))
+
+def test_the_hire_prior_labels_only_feasible_quantities_above_demand_plus_slack():
+    from agents.dqn_market_free_v3e.market_state import (
+        HAND_COUNT_SCALE,
+        HIRES_TODAY_INDEX,
+        HIRE_DEMAND_INDEX,
+    )
+    from agents.dqn_market_free_v3e.training.updater import (
+        HIRE_ACTION_QUANTITIES,
+        HIRE_ACTION_ROWS,
+        _excess_hire_mask,
+    )
+
+    states = torch.zeros((1, STATE_DIM), dtype=torch.float32)
+    states[:, HIRES_TODAY_INDEX] = 2.0 / HAND_COUNT_SCALE
+    states[:, HIRE_DEMAND_INDEX] = 4.0 / HAND_COUNT_SCALE
+    feasible = torch.zeros((1, ACTION_COUNT), dtype=torch.bool)
+    feasible[:, 0] = True
+    feasible[:, HIRE_ACTION_ROWS] = True
+
+    excess = _excess_hire_mask(states, feasible, slack=2)
+    labelled = HIRE_ACTION_QUANTITIES[excess[0, HIRE_ACTION_ROWS].numpy()].tolist()
+    assert labelled == [
+        int(quantity) for quantity in HIRE_ACTION_QUANTITIES if int(quantity) > 4
+    ]
+    assert not bool(excess[0, 0])
+
+
+def test_the_hire_prior_is_a_soft_ordering_with_gradients_only_on_excess_rows():
+    from agents.dqn_market_free_v3e.market_state import (
+        HAND_COUNT_SCALE,
+        HIRES_TODAY_INDEX,
+        HIRE_DEMAND_INDEX,
+    )
+    from agents.dqn_market_free_v3e.training.updater import (
+        HIRE_ACTION_ROWS,
+        _hire_conservative_terms,
+    )
+
+    states = torch.zeros((1, STATE_DIM), dtype=torch.float32)
+    states[:, HIRES_TODAY_INDEX] = 2.0 / HAND_COUNT_SCALE
+    states[:, HIRE_DEMAND_INDEX] = 4.0 / HAND_COUNT_SCALE
+    feasible = torch.zeros((1, ACTION_COUNT), dtype=torch.bool)
+    feasible[:, 0] = True
+    feasible[:, HIRE_ACTION_ROWS] = True
+    logits = torch.zeros((1, ACTION_COUNT), dtype=torch.float32, requires_grad=True)
+
+    per_state, excess, _safe = _hire_conservative_terms(
+        logits, states, feasible, margin=0.05, slack=2
+    )
+    assert per_state.item() == pytest.approx(0.05)
+    per_state.mean().backward()
+    assert logits.grad is not None
+    assert torch.all(logits.grad.masked_select(excess) > 0)
+    assert torch.count_nonzero(logits.grad.masked_select(~excess)) == 0
+
+    below = logits.detach().clone()
+    below[excess] = -0.051
+    zero, _excess, _safe = _hire_conservative_terms(
+        below, states, feasible, margin=0.05, slack=2
+    )
+    assert zero.item() == 0.0
+
+
+def test_behavior_clone_skips_only_an_excess_hire_target():
+    from agents.dqn_market_free_v3e.market_state import (
+        HAND_COUNT_SCALE,
+        HIRES_TODAY_INDEX,
+        HIRE_DEMAND_INDEX,
+    )
+    from agents.dqn_market_free_v3e.training.updater import (
+        HIRE_ACTION_ROWS,
+        HIRE_ACTION_QUANTITIES,
+        _behavior_clone_keep_mask,
+    )
+
+    states = torch.zeros((3, STATE_DIM), dtype=torch.float32)
+    states[:, HIRE_DEMAND_INDEX] = 4.0 / HAND_COUNT_SCALE
+    states[1, HIRE_DEMAND_INDEX] = 10.0 / HAND_COUNT_SCALE
+    feasible = torch.ones((3, ACTION_COUNT), dtype=torch.bool)
+    hire_ten = int(HIRE_ACTION_ROWS[np.flatnonzero(HIRE_ACTION_QUANTITIES == 10)[0]])
+    chosen = torch.tensor([hire_ten, hire_ten, 0])
+    assert _behavior_clone_keep_mask(states, feasible, chosen, slack=2).tolist() == [
+        False,
+        True,
+        True,
+    ]
+
+
+def test_rare_sigma_can_pin_hire_without_disabling_other_widening():
+    from agents.dqn_market_free_v3e.training.rare import sigma_scale_vector
+    from agents.dqn_market_free_v3e.training.updater import HIRE_ACTION_ROWS
+
+    chosen = np.ones(ACTION_COUNT, dtype=np.float64)
+    opportunities = np.full(ACTION_COUNT, 100.0, dtype=np.float64)
+    chosen[1] = 0.0
+    chosen[HIRE_ACTION_ROWS] = 0.0
+    scale = sigma_scale_vector(
+        chosen, opportunities, gain=0.5, cap=3.0, exclude_hire=True
+    )
+    assert scale[1] > 1.0
+    assert_array_equal(scale[HIRE_ACTION_ROWS], np.ones(len(HIRE_ACTION_ROWS)))
 
 
 def test_the_animal_columns_are_where_the_potential_reads_them():
@@ -5246,6 +5708,46 @@ def test_an_incumbent_lineage_keeps_its_seat_inside_the_margin():
 # --- the stock mark (v3e) ---------------------------------------------------------
 
 
+def test_the_labor_columns_are_where_the_charge_reads_them():
+    """`HAND_COUNT_INDEX` / `HIRES_TODAY_INDEX` / `HIRE_DEMAND_INDEX` pinned against the builder.
+
+    Two hands on the board move column 52 by 2/13 and nothing else the charge
+    reads; two hires today move column 53 alone; one more due job than seven
+    moves `hire_demand` (column 108) by 1/13.
+    """
+
+    from agents.dqn_market_free_v3e import labor, market_state
+    from agents.dqn_market_free_v3e.market_state import (
+        HAND_COUNT_INDEX,
+        HAND_COUNT_SCALE,
+        HIRE_DEMAND_INDEX,
+        HIRES_TODAY_INDEX,
+    )
+
+    def features(state):
+        obs, farm, private, field = state
+        return market_state.market_state_features(obs, farm, private, herd.field_roles(obs, farm, private), field)
+
+    assert HAND_COUNT_SCALE == float(donor.MAX_HANDS)
+    base_state = _mask_state()
+    base = features(base_state)
+    hands_state = _mask_state()
+    hands_state[1]["hands"] = [[0, 0], [0, 0]]
+    delta = features(hands_state) - base
+    assert delta[HAND_COUNT_INDEX] == pytest.approx(2 / HAND_COUNT_SCALE)
+    assert delta[HIRES_TODAY_INDEX] == pytest.approx(0.0)
+    assert delta[HIRE_DEMAND_INDEX] == pytest.approx(0.0)
+
+    hires_state = _mask_state(hires_today=2)
+    delta = features(hires_state) - base
+    assert delta[HIRES_TODAY_INDEX] == pytest.approx(2 / HAND_COUNT_SCALE)
+    assert delta[HAND_COUNT_INDEX] == pytest.approx(0.0)
+
+    obs, farm, private, field = base_state
+    demand = labor.hire_demand(obs, farm, private, herd.field_roles(obs, farm, private))
+    assert base[HIRE_DEMAND_INDEX] == pytest.approx(demand / HAND_COUNT_SCALE)
+
+
 def test_the_stock_columns_are_where_the_potential_reads_them():
     """`SHED_PRODUCT_SLICE` / `CARRIED_PRODUCT_SLICE` pinned against the builder.
 
@@ -5339,6 +5841,59 @@ def test_a_sale_at_base_is_reward_neutral_and_unsold_stock_is_written_off():
     )
     # Sold on the last decision: nothing held, nothing excess-charged.
     assert float(target[-1]) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_over_hire_is_charged_once_at_the_wage_of_the_excess():
+    from agents.dqn_market_free_v3e.market_state import (
+        HAND_COUNT_INDEX,
+        HAND_COUNT_SCALE,
+        HIRE_DEMAND_INDEX,
+        MARKET_STATE_DIM,
+    )
+    from agents.dqn_market_free_v3e.training.reward import (
+        LABOR_WASTE_WEIGHT,
+        MONEY_SCALE,
+        episode_rewards,
+        labor_waste,
+    )
+
+    assert LABOR_WASTE_WEIGHT == 0.1
+    prefix = [0.0]
+    for index in range(20):
+        prefix.append(prefix[-1] + float(donor._fib(index)))
+
+    def states(hands, demand=4):
+        out = np.zeros((len(hands), MARKET_STATE_DIM), dtype=np.float32)
+        out[:, HAND_COUNT_INDEX] = np.asarray(hands, dtype=np.float32) / HAND_COUNT_SCALE
+        demands = np.broadcast_to(np.asarray(demand, dtype=np.float32), (len(hands),))
+        out[:, HIRE_DEMAND_INDEX] = demands / HAND_COUNT_SCALE
+        return out
+
+    flat = [3000.0] * 4
+    # Six hands against a demand of four: the two excess rungs (fib 5 + 8) are
+    # charged on the action row before the larger crew is observed. Stable excess
+    # is free and the nightly reset refunds nothing.
+    excess = LABOR_WASTE_WEIGHT * (prefix[6] - prefix[4]) / MONEY_SCALE
+    charge = labor_waste(states([0, 6, 6, 0]))
+    assert charge.tolist() == pytest.approx([excess, 0.0, 0.0, 0.0], rel=1e-5)
+    target, raw, _ = episode_rewards(flat, 3000.0, 0.999, turn_state=states([0, 6, 6, 0]))
+    assert raw.tolist() == pytest.approx([0.0] * 4)
+    assert target.tolist() == pytest.approx([-excess, 0.0, 0.0, 0.0], rel=1e-5)
+    # Hiring up to demand is free.
+    assert labor_waste(states([0, 4, 4, 0])).tolist() == pytest.approx([0.0] * 4)
+    # A second hire in the same day pays its increment only.
+    assert labor_waste(states([0, 4, 6, 6])).tolist() == pytest.approx(
+        [0.0, excess, 0.0, 0.0], rel=1e-5
+    )
+    # Value the transition using demand on the causing action, not a changed demand
+    # in the following observation.
+    assert labor_waste(states([4, 6, 6, 0], [4, 6, 4, 4])).tolist() == pytest.approx(
+        [excess, 0.0, 0.0, 0.0], rel=1e-5
+    )
+    # No following state means no inferred final-row charge.
+    assert labor_waste(states([6])).tolist() == pytest.approx([0.0])
+    # Nothing to read, nothing charged.
+    assert labor_waste(None) is None
 
 
 def test_sale_use_reads_timing_price_and_the_terminal_holding():

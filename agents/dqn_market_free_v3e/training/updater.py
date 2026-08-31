@@ -43,9 +43,16 @@ from agents.dqn_market_free_v3e.diagnostics import (
     behavior_from_replay,
 )
 from agents.dqn_market_free_v3e.evaluation import INSOLVENT_MONEY, STARTING_MONEY
-from agents.dqn_market_free_v3e.market_state import MARKET_STATE_DIM as STATE_DIM
+from agents.dqn_market_free_v3e.labor import HIRE_SLACK
+from agents.dqn_market_free_v3e.market_state import (
+    HAND_COUNT_SCALE,
+    HIRES_TODAY_INDEX,
+    HIRE_DEMAND_INDEX,
+    MARKET_STATE_DIM as STATE_DIM,
+)
 from agents.dqn_market_free_v3e.order_space import (
     ACTION_COUNT,
+    ACTIONS,
     MASKED_SCORE,
     NOOP_INDEX,
 )
@@ -79,6 +86,7 @@ from agents.dqn_market_free_v3e.training.members import (
     rank_and_prune,
     read_index,
     roster_candidates,
+    warm_start_sources,
     write_index,
 )
 from agents.dqn_market_free_v3e.training.members import (
@@ -94,7 +102,7 @@ from agents.dqn_market_free_v3e.training.replay import (
     DEFAULT_RESERVOIR_FRACTION,
     ReplayBuffer,
 )
-from agents.dqn_market_free_v3e.training.reward import relabel
+from agents.dqn_market_free_v3e.training.reward import MONEY_SCALE, labor_waste, relabel
 from agents.dqn_market_scorer.training.device import move_optimizer, resolve_device
 from agents.dqn_market_scorer.training.progress import _opponent_policy, _policy_identity
 
@@ -134,7 +142,12 @@ LOGGER = logging.getLogger(__name__)
 LEARNER_MANIFEST = "agents/dqn_market_free_v3e/match_agent.toml"
 SOURCE_KIND = "free_market_rollout"
 _PROMOTION_RULES = {"activity_gate"}
-_PROMOTION_SCORE_SIGNALS = {"benchmark", "rollout"}
+# "margin": the learner's money less the opponent's over the recent rollouts,
+# opponent-errored episodes excluded (`mean_money_difference` in batch metadata).
+# Under a mirror pool, money alone is a moving target -- a stronger pool makes the
+# same policy read worse -- and a dead opponent makes any policy read better;
+# the paired difference is the relative read that survives both.
+_PROMOTION_SCORE_SIGNALS = {"benchmark", "rollout", "margin"}
 # Which checkpoint collection and training continue from under the activity gate.
 # "promoted": the slot's best promoted checkpoint (the manifest control).
 # "latest": the newest checkpoint, promoted or not -- the shared scorer rule.
@@ -279,6 +292,10 @@ def _checkpoint_score_sql(score_signal: str) -> str:
             CAST(metrics_json ->> 'own_mean_final_money' AS DOUBLE PRECISION)
         )
         """
+    if score_signal == "margin":
+        return """
+        CAST(metrics_json ->> 'mean_money_difference' AS DOUBLE PRECISION)
+        """
     raise ValueError(
         f"promotion_score_signal must be one of {sorted(_PROMOTION_SCORE_SIGNALS)}: {score_signal}"
     )
@@ -390,6 +407,35 @@ def _promotion_tolerance(
         if bar > 0.0:
             tolerance = min(tolerance, fraction * bar)
     return tolerance
+
+
+def _incumbent_rematch(
+    active, benchmark: str | None, seeds: int, jobs: int, seed_start: int
+) -> tuple[float | None, dict[str, Any] | None]:
+    """Fresh arena money for the active checkpoint on the candidate's own seeds.
+
+    The stored best is a high-water mark, and a high-water mark is the arena's
+    luckiest draw: `mark-v4`'s bar was one 41,389 read of a checkpoint that then
+    scored 28-38k (mean ~33k) on ten later generations of league seats, so every
+    candidate at the checkpoint's true level had to beat a number the checkpoint
+    itself could not. Re-measuring the incumbent beside the candidate, on the same
+    seeds, makes the comparison paired: both sides carry this draw's luck, and the
+    bar is what the release is worth *now* rather than what it once drew.
+
+    None when there is no incumbent, no benchmark, or the arena came back without
+    a money read; the caller then falls back to the stored best.
+    """
+
+    if active is None or benchmark is None:
+        return None, None
+    path = getattr(active, "inference_artifact_path", None)
+    if not path:
+        return None, None
+    result = _arena_evaluate(Path(path), benchmark, int(seeds), int(jobs), int(seed_start))
+    money = result.get("a_money_mean") if isinstance(result, dict) else None
+    if money is None:
+        return None, result
+    return float(money), result
 
 
 def _activation_reasons(
@@ -521,6 +567,35 @@ def lineage_checkpoint(context, reader) -> LineageCheckpoint | None:
     return None
 
 
+def _member_position_for_batches(batches, *, fallback: int, members: int) -> int:
+    """The member position most of `batches` were collected for.
+
+    Majority vote over the `member_position` stamps, ties to the smallest
+    position for determinism; `fallback` when no batch carries a stamp. A vote
+    outside `[0, members)` (a roster shrink) also falls back.
+    """
+
+    votes: dict[int, int] = {}
+    for batch in batches:
+        metadata = getattr(batch, "metadata", None)
+        if not isinstance(metadata, dict):
+            continue
+        value = metadata.get("member_position")
+        if value is None:
+            continue
+        try:
+            position = int(value)
+        except (TypeError, ValueError):
+            continue
+        votes[position] = votes.get(position, 0) + 1
+    if not votes:
+        return int(fallback)
+    best = max(sorted(votes), key=lambda item: votes[item])
+    if not 0 <= best < int(members):
+        return int(fallback)
+    return best
+
+
 def _batch_lineage(batch) -> str:
     """The member lineage that collected `batch`, or `""` for a pre-member row.
 
@@ -601,7 +676,10 @@ def _self_play_pool(
     # -- ten arms of ten since `members-v1` finished within 600 coins of the stake.
     # Off by default (0.0) so no other fork's pool changes.
     min_score = float(context.config.get("self_play_min_score", 0.0) or 0.0)
-    floor_sql = f"\n              AND {score_sql} >= %s" if min_score > 0.0 else ""
+    # The floor is a money floor (3,000 is the stake) whatever the pool is ranked
+    # by: a margin can be positive at 2,000 coins against a broke mirror.
+    floor_signal_sql = _checkpoint_score_sql("rollout") if score_signal == "margin" else score_sql
+    floor_sql = f"\n              AND {floor_signal_sql} >= %s" if min_score > 0.0 else ""
     floor_params = [min_score] if min_score > 0.0 else []
     if after_checkpoint_id:
         rows = reader.fetchall(
@@ -894,6 +972,59 @@ def initial_network(config: dict[str, Any]) -> OrderQNetwork:
     return OrderQNetwork(network.layers, sigma, gru=network.gru)
 
 
+#: Basename of the cold-start opponent `_quiet_opponent` materialises. A margin
+#: over it is a margin over an empty market, so `_contested_margins` skips it.
+QUIET_OPPONENT_FILE = "quiet.npz"
+
+
+def _episode_opponent_money(rollouts: Sequence[Any]) -> list[float | None]:
+    """The opponent's final money per rollout, or None where there was no contest.
+
+    None means the opponent's seat errored, carried no money read, or was the
+    quiet network -- a farm nobody ran. Aligned with the rollout (and therefore
+    the saved `.npz` episode) order, which is what lets `fill_buffer` hand each
+    record its own opponent back. `SeatResult.reward` is the seat's final money
+    (`kaggriculture.py`, the env's reward).
+    """
+
+    values: list[float | None] = []
+    for rollout in rollouts:
+        spec = str(getattr(rollout, "opponent_spec", "") or "")
+        if QUIET_OPPONENT_FILE in spec:
+            values.append(None)
+            continue
+        seats = list(getattr(rollout.match, "seats", []) or [])
+        opponent_seat = 1 - int(rollout.learner_seat)
+        if opponent_seat >= len(seats):
+            values.append(None)
+            continue
+        opponent = seats[opponent_seat]
+        if getattr(opponent, "failed", False) or getattr(opponent, "reward", None) is None:
+            values.append(None)
+            continue
+        values.append(float(opponent.reward))
+    return values
+
+
+def _contested_margins(rollouts: Sequence[Any]) -> list[float]:
+    """Learner money less opponent money, one entry per contested rollout.
+
+    Contested means the opponent's seat completed and its agent was a real
+    policy: a seat whose agent errored is a farm nobody ran, and the quiet
+    network emits nothing by construction. Either one makes any policy read as
+    winning, which is the failure the margin signal exists to remove -- mark-v14's
+    batch-0 margins against the quiet network became a bar no contested read could
+    clear. Derived from `_episode_opponent_money` so the gate's margin and the
+    per-episode metadata cannot disagree.
+    """
+
+    return [
+        float(rollout.record.money[-1]) - value
+        for rollout, value in zip(rollouts, _episode_opponent_money(rollouts))
+        if value is not None
+    ]
+
+
 def _quiet_opponent(context, config: dict[str, Any]) -> str:
     """The cold-start network as a rollout opponent, materialised on first use.
 
@@ -1028,6 +1159,88 @@ def _records_diagnostics(records: list[EpisodeRecord]) -> OrderDiagnostics:
     return diagnostics
 
 
+def _recent_money_difference(batches: Sequence[Any]) -> tuple[float | None, int]:
+    """Mean `mean_money_difference` over the batches this update consumed, and the
+    contested-episode count behind it. Read back off `training_batches.metadata_json`
+    like the lot columns, so the gate's margin and the batches' cannot disagree.
+    Batches with no contested episode contribute nothing rather than zero."""
+
+    total = 0.0
+    weight = 0
+    for batch in batches:
+        metadata = getattr(batch, "metadata", None)
+        if not isinstance(metadata, dict):
+            continue
+        value = metadata.get("mean_money_difference")
+        count = int(metadata.get("contested_episodes", 0) or 0)
+        if value is None or count <= 0:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(numeric):
+            continue
+        total += numeric * count
+        weight += count
+    return (total / weight if weight else None), weight
+
+
+def _rollout_activity_result(records: list[EpisodeRecord]) -> dict[str, Any]:
+    """The recent rollouts in the shape `_order_viability` reads an arena in.
+
+    For a run with no benchmark (`benchmarks = []`, `promotion_score_signal =
+    "rollout"`): the activity floor still has to be measured on something, and the
+    FIFO segment is the same policy the rollout score is read from. `pairs` is the
+    seat-pair count so an empty buffer fails the gate the way an empty arena does.
+    """
+
+    return {
+        "opponent": None,
+        "pairs": len(records) // 2,
+        "errors": {},
+        "order_diagnostics": _records_diagnostics(records).as_dict(),
+    }
+
+
+def _labor_reward_metrics(records: list[EpisodeRecord]) -> dict[str, float | None]:
+    """Magnitude of the auxiliary labor label beside the cash objective.
+
+    The ratio divides the mean labor charge by the mean absolute *episode* cash
+    return. Taking the absolute value after each episode sum keeps profitable and
+    losing seasons from cancelling each other and recreating mark-v8's misleading
+    near-zero denominator.
+    """
+
+    labor_returns: list[float] = []
+    absolute_cash_returns: list[float] = []
+    for record in records:
+        waste = labor_waste(record.turn_state)
+        if waste is None:
+            continue
+        labor_returns.append(float(np.sum(waste, dtype=np.float64)))
+        absolute_cash_returns.append(
+            abs(float(np.sum(record.raw_reward, dtype=np.float64)))
+        )
+
+    if not labor_returns:
+        return {
+            "own_mean_labor_waste_return": None,
+            "own_mean_labor_waste_money": None,
+            "own_labor_waste_to_abs_cash_return": None,
+        }
+
+    mean_labor = float(np.mean(labor_returns))
+    mean_absolute_cash = float(np.mean(absolute_cash_returns))
+    return {
+        "own_mean_labor_waste_return": mean_labor,
+        "own_mean_labor_waste_money": mean_labor * MONEY_SCALE,
+        "own_labor_waste_to_abs_cash_return": (
+            mean_labor / mean_absolute_cash if mean_absolute_cash > 0.0 else None
+        ),
+    }
+
+
 #: Q-units of clearance the large-margin clone loss asks for between a demonstrated
 #: action and its best alternative, before the loss goes to exactly zero.
 #:
@@ -1043,6 +1256,19 @@ def _records_diagnostics(records: list[EpisodeRecord]) -> OrderDiagnostics:
 #: `max_abs_q` climbs on a demonstration-seeded slot while `mean_loss` stays flat,
 #: which is the margin outrunning the reward rather than ranking against it.
 BEHAVIOR_CLONE_MARGIN = 0.3
+
+#: HIRE output rows and their resulting hand counts, aligned positionally. Kept
+#: here rather than reaching into `order_space._HIRE_ROWS`: the training prior is
+#: a consumer of the public action schema, and a private mask-implementation array
+#: should not become part of that interface by accident.
+HIRE_ACTION_ROWS = np.asarray(
+    [index for index, action in enumerate(ACTIONS) if action.op == "HIRE"],
+    dtype=np.intp,
+)
+HIRE_ACTION_QUANTITIES = np.asarray(
+    [int(ACTIONS[index].quantity) for index in HIRE_ACTION_ROWS],
+    dtype=np.intp,
+)
 
 #: The lot-accounting columns lifted out of batch metadata and onto the update.
 #:
@@ -1391,6 +1617,88 @@ def _large_margin_loss(
     return torch.relu((logits + offset).max(dim=1).values - expert).mean()
 
 
+def _excess_hire_mask(
+    states: torch.Tensor,
+    feasible: torch.Tensor,
+    slack: int = HIRE_SLACK,
+) -> torch.Tensor:
+    """Feasible HIRE rows that would end above `hire_demand + slack`.
+
+    This is a training label, never an action mask. The live policy still receives
+    `feasible` unchanged. `hires_today` is the right crew count at an order
+    decision: hands last exactly one day, and only one HIRE decision may be queued
+    in a turn, so the state immediately before that decision contains every hand
+    whose next fibonacci rung the action would buy.
+    """
+
+    if states.ndim != 2 or feasible.ndim != 2:
+        raise ValueError("hire-prior states and feasible masks must be rank 2")
+    if states.shape[0] != feasible.shape[0] or feasible.shape[1] != ACTION_COUNT:
+        raise ValueError(
+            "hire-prior batch geometry disagrees: "
+            f"states={tuple(states.shape)} feasible={tuple(feasible.shape)}"
+        )
+    excess = torch.zeros_like(feasible, dtype=torch.bool)
+    if not len(HIRE_ACTION_ROWS):
+        return excess
+    rows = torch.as_tensor(HIRE_ACTION_ROWS, dtype=torch.long, device=states.device)
+    quantities = torch.as_tensor(
+        HIRE_ACTION_QUANTITIES, dtype=torch.long, device=states.device
+    )
+    hires = torch.round(states[:, HIRES_TODAY_INDEX] * HAND_COUNT_SCALE).to(torch.long)
+    demand = torch.round(states[:, HIRE_DEMAND_INDEX] * HAND_COUNT_SCALE).to(torch.long)
+    above = hires.unsqueeze(1) + quantities.unsqueeze(0) > demand.unsqueeze(1) + int(slack)
+    excess[:, rows] = above & feasible[:, rows]
+    return excess
+
+
+def _hire_conservative_terms(
+    logits: torch.Tensor,
+    states: torch.Tensor,
+    feasible: torch.Tensor,
+    *,
+    margin: float,
+    slack: int = HIRE_SLACK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`(loss_per_state, excess_mask, safe_q)` for the soft HIRE prior.
+
+    Safe Q is detached deliberately. The auxiliary may lower an unsupported excess
+    HIRE row, but it must not inflate NOOP or another convenient baseline to satisfy
+    the ordering. TD learning remains the only path that assigns absolute value.
+    """
+
+    if logits.shape != feasible.shape:
+        raise ValueError(
+            f"hire-prior logits {tuple(logits.shape)} != feasible {tuple(feasible.shape)}"
+        )
+    excess = _excess_hire_mask(states, feasible, slack)
+    safe = feasible & ~excess
+    # NOOP is always feasible in live records. Keep a defensive fallback for a
+    # malformed historical row so the prior cannot create a NaN during relabel.
+    no_safe = ~safe.any(dim=1)
+    if bool(no_safe.any()):
+        safe = safe.clone()
+        safe[no_safe, NOOP_INDEX] = True
+    safe_q = logits.masked_fill(~safe, MASKED_SCORE).max(dim=1).values.detach()
+    penalties = torch.relu(logits + float(margin) - safe_q.unsqueeze(1))
+    penalties = penalties * excess.to(logits.dtype)
+    counts = excess.sum(dim=1)
+    per_state = penalties.sum(dim=1) / counts.clamp_min(1).to(logits.dtype)
+    return per_state, excess, safe_q
+
+
+def _behavior_clone_keep_mask(
+    states: torch.Tensor,
+    feasible: torch.Tensor,
+    chosen: torch.Tensor,
+    slack: int = HIRE_SLACK,
+) -> torch.Tensor:
+    """Rows whose expert target does not contradict the conservative HIRE prior."""
+
+    excess = _excess_hire_mask(states, feasible, slack)
+    return ~excess.gather(1, chosen.unsqueeze(1)).squeeze(1)
+
+
 def _behavior_clone_step(
     online,
     optimizer: torch.optim.Optimizer,
@@ -1401,6 +1709,8 @@ def _behavior_clone_step(
     train: int,
     clip: float,
     margin: float = BEHAVIOR_CLONE_MARGIN,
+    hire_prior_slack: int = HIRE_SLACK,
+    counters: dict[str, int] | None = None,
 ) -> float:
     """Fit the action head to a stored expert action for one chunk batch.
 
@@ -1440,9 +1750,19 @@ def _behavior_clone_step(
     logits = online(torch.cat((states, hidden), dim=1))
     # Infeasible actions carry no probability, so the clone never spends its
     # capacity learning to rank orders the game would refuse.
-    logits = logits.masked_fill(~torch.from_numpy(batch.mask).to(device), MASKED_SCORE)
+    feasible = torch.from_numpy(batch.mask).to(device)
+    logits = logits.masked_fill(~feasible, MASKED_SCORE)
     chosen = torch.from_numpy(batch.chosen).to(device)
-    loss = _large_margin_loss(logits, chosen, margin)
+    keep = _behavior_clone_keep_mask(states, feasible, chosen, hire_prior_slack)
+    skipped = ~keep
+    if counters is not None:
+        counters["rows"] = counters.get("rows", 0) + int(chosen.numel())
+        counters["skipped_excess_hire"] = counters.get(
+            "skipped_excess_hire", 0
+        ) + int(skipped.sum().item())
+    if not bool(keep.any()):
+        return 0.0
+    loss = _large_margin_loss(logits[keep], chosen[keep], margin)
     loss.backward()
     # The optimizer's own parameters, not `online.parameters()`, and both halves of
     # that matter. `clone_optimizer` excludes every sigma, so `zero_grad` never
@@ -2058,6 +2378,15 @@ def fill_buffer(
             if isinstance(metadata, dict) and metadata.get("generation_id") is not None
             else None
         )
+        opponent_money = (
+            metadata.get("episode_opponent_money")
+            if isinstance(metadata, dict)
+            else None
+        )
+        if not isinstance(opponent_money, list) or len(opponent_money) != len(records):
+            # Old artifacts and evaluation batches carry no per-episode list; a
+            # length mismatch would silently hand records the wrong opponent.
+            opponent_money = None
         generation_weight = 1.0
         if (
             buffer.generation_weight_power > 0.0
@@ -2094,9 +2423,131 @@ def fill_buffer(
                 record.generation_weight = generation_weight
                 record.terminal_quality_weight = terminal_weight
                 record.episode_weight = generation_weight * terminal_weight
+                if opponent_money is not None and opponent_money[index] is not None:
+                    record.opponent_money = float(opponent_money[index])
                 records_by_id[key] = record
     buffer.load_planned(recent_ids, reservoir_ids, evicted_seen, records_by_id)
     return skipped_evicted
+
+
+def _calibrate_warm_start_hires(
+    seed_network: OrderQNetwork,
+    config: dict[str, Any],
+    position: int,
+) -> tuple[OrderQNetwork, dict[str, float | int | None]]:
+    """Apply the soft HIRE ordering before a warm-start member's first rollout.
+
+    Mark10 never trained rows its demand envelope masked. Opening those rows and
+    waiting twenty batches for the first update reproduces mark-v6: arbitrary
+    outputs meet NoisyNet before a label. This one-time pass uses the configured
+    ladder states, freezes the GRU, shared trunk, sigma and every safe baseline,
+    and updates only the final output means through the conservative hinge.
+    """
+
+    steps = int(config.get("hire_prior_bootstrap_steps", 0))
+    if steps < 0:
+        raise ValueError("hire_prior_bootstrap_steps must be non-negative")
+    noisy = _noisy(config)
+    device = resolve_device(str(config.get("device", "auto")))
+    online = net_module.build(
+        hidden_size=int(config.get("gru_hidden", net_module.HIDDEN_SIZE)),
+        noisy=noisy.build_kind,
+        sigma0=noisy.sigma0,
+    ).to(device)
+    online = net_module.from_numpy(seed_network, online)
+    net_module.set_noise(online, False)
+    if steps == 0:
+        return net_module.to_numpy(online), {
+            "steps": 0,
+            "initial_loss": None,
+            "final_loss": None,
+        }
+
+    if str(config.get("demonstration_source", "league")) != "ladder":
+        raise ValueError(
+            "hire-prior bootstrap requires demonstration_source = 'ladder'"
+        )
+    pack = str(config.get("demonstration_pack", "")).strip()
+    if not pack:
+        raise ValueError("hire-prior bootstrap requires demonstration_pack")
+    limit = int(config.get("demonstration_episodes", 0))
+    if limit < 1:
+        raise ValueError("hire-prior bootstrap requires demonstration_episodes > 0")
+
+    demos, _stats = load_ladder_demonstrations(pack, gru=seed_network.gru, limit=limit)
+    buffer = ReplayBuffer(
+        capacity=max(1, limit),
+        gamma=float(config.get("gamma", 0.999)),
+        n_step=int(config.get("n_step", replay_module.DEFAULT_N_STEP)),
+        seed=int(config.get("seed", 0)) + int(position),
+        reservoir_fraction=0.0,
+        priority_alpha=0.0,
+        priority_beta=0.0,
+    )
+    buffer.add(demos, pinned=True)
+
+    for parameter in online.parameters():
+        parameter.requires_grad_(False)
+    output = online.head[-1]
+    if isinstance(output, net_module.NoisyLinear):
+        output_parameters = [output.weight_mu, output.bias_mu]
+    elif isinstance(output, nn.Linear):
+        output_parameters = [output.weight, output.bias]
+    else:
+        raise TypeError(f"unsupported HIRE calibration output layer {type(output).__name__}")
+    for parameter in output_parameters:
+        parameter.requires_grad_(True)
+    optimizer = torch.optim.Adam(
+        output_parameters,
+        lr=float(
+            config.get(
+                "hire_prior_bootstrap_learning_rate",
+                config.get("behavior_clone_learning_rate", config.get("learning_rate", 1e-4)),
+            )
+        ),
+    )
+
+    chunks = int(config.get("batch_size", 32))
+    burn_in = int(config.get("burn_in_turns", replay_module.DEFAULT_BURN_IN))
+    train_turns = int(config.get("train_turns", replay_module.DEFAULT_TRAIN))
+    margin = float(config.get("hire_prior_margin", 0.05))
+    slack = int(config.get("hire_prior_slack", HIRE_SLACK))
+    losses: list[float] = []
+    for _ in range(steps):
+        batch = buffer.sample_sequences(
+            chunks,
+            burn_in=burn_in,
+            train=train_turns,
+            demo_fraction=1.0,
+            prioritized=False,
+        )
+        train_hidden, _post = _roll_chunk(
+            online, batch, device, burn_in, train_turns, grad=False
+        )
+        rows = torch.from_numpy(batch.decision_turn).to(device)
+        states = torch.from_numpy(batch.state).to(device)
+        hidden = train_hidden.reshape(-1, online.hidden_size)[rows]
+        logits = online(torch.cat((states, hidden), dim=1))
+        feasible = torch.from_numpy(batch.mask).to(device)
+        per_row, _excess, _safe_q = _hire_conservative_terms(
+            logits, states, feasible, margin=margin, slack=slack
+        )
+        share = torch.from_numpy(batch.turn_share).to(device)
+        per_turn = torch.zeros(
+            chunks * train_turns, device=device, dtype=per_row.dtype
+        ).index_add_(0, rows, per_row * share)
+        loss = per_turn.view(chunks, train_turns).mean()
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        losses.append(float(loss.detach()))
+
+    calibrated = net_module.to_numpy(online)
+    return calibrated, {
+        "steps": steps,
+        "initial_loss": losses[0] if losses else None,
+        "final_loss": losses[-1] if losses else None,
+    }
 
 
 class FreeMarketCollector:
@@ -2120,15 +2571,33 @@ class FreeMarketCollector:
         entries = read_index(context.artifacts)
         entry = find_member(entries, position)
 
-        # Cold start: no index yet, so mint one. Every member begins from the same
-        # `initial_network` -- the silent policy -- and they separate immediately,
-        # because from this round on each collects and trains on its own batches
-        # under its own noise draws. Seeding them differently would be a second
-        # variable on top of the one this change is testing.
+        # Cold start: no index yet, so mint one. A configured mark13 warm start is
+        # inference-only: it creates a fresh lineage and deliberately leaves the
+        # source trainer, replay floor and checkpoint ownership behind.
         if entry is None or not entry.inference_path or not Path(entry.inference_path).is_file():
             weights, _trainer = member_paths(context.artifacts, position)
             weights.parent.mkdir(parents=True, exist_ok=True)
-            if not weights.is_file():
+            warm_directory = str(config.get("member_warm_start_dir", "")).strip()
+            source_entry: MemberEntry | None = None
+            calibration: dict[str, float | int | None] = {
+                "steps": 0,
+                "initial_loss": None,
+                "final_loss": None,
+            }
+            if warm_directory:
+                sources = warm_start_sources(warm_directory, members)
+                # Load every position now, before the first rollout, so one stale
+                # or schema-incompatible survivor fails the experiment as a whole
+                # rather than becoming a quiet member four rounds later.
+                source_networks = [
+                    OrderQNetwork.load(str(item.inference_path)) for item in sources
+                ]
+                source_entry = sources[position]
+                seed_network, calibration = _calibrate_warm_start_hires(
+                    source_networks[position], config, position
+                )
+                seed_network.save(weights)
+            elif not weights.is_file():
                 initial_network(config).save(weights)
             entry = MemberEntry(
                 position=position,
@@ -2136,6 +2605,23 @@ class FreeMarketCollector:
                 inference_path=str(weights),
                 batch_floor=0,
                 generation=int(getattr(context, "generation_index", 0) or 0),
+                warm_started_from_checkpoint_id=(
+                    source_entry.checkpoint_id if source_entry is not None else None
+                ),
+                warm_started_from_inference_path=(
+                    source_entry.inference_path if source_entry is not None else None
+                ),
+                warm_start_calibration_steps=int(calibration["steps"] or 0),
+                warm_start_calibration_initial_loss=(
+                    float(calibration["initial_loss"])
+                    if calibration["initial_loss"] is not None
+                    else None
+                ),
+                warm_start_calibration_final_loss=(
+                    float(calibration["final_loss"])
+                    if calibration["final_loss"] is not None
+                    else None
+                ),
             )
             others = [item for item in entries if item.position != position]
             write_index(context.artifacts, [*others, entry])
@@ -2177,6 +2663,7 @@ class FreeMarketCollector:
         # through v28 played and stays the default, so leaving this unset keeps a
         # run byte-identical to those. See `rare.sigma_scale_vector`.
         rare_novelty = str(config.get("rare_sigma_novelty", "count"))
+        rare_exclude_hire = bool(config.get("rare_sigma_exclude_hire", False))
         if rare_novelty not in rare.NOVELTY_KINDS:
             raise ValueError(
                 f"rare_sigma_novelty must be one of {list(rare.NOVELTY_KINDS)}: {rare_novelty}"
@@ -2301,6 +2788,7 @@ class FreeMarketCollector:
                 rare_sigma_gain=rare_gain if rare_counts is not None else 0.0,
                 rare_sigma_cap=rare_sigma_cap,
                 rare_sigma_novelty=rare_novelty,
+                rare_sigma_exclude_hire=rare_exclude_hire,
                 rare_sigma_path=rare_path if rare_counts is not None else None,
                 rare_sigma_pairs=rare_sigma_pairs,
             )
@@ -2344,6 +2832,16 @@ class FreeMarketCollector:
             order_diagnostics = _records_diagnostics(records)
             final_money = [float(record.money[-1]) for record in records]
             played = [rollout.opponent_spec for rollout in rollouts]
+            # Learner money less opponent money, contested episodes only: a seat
+            # whose agent errored is a farm nobody ran, and a margin over it is a
+            # margin over an empty market. `SeatResult.reward` is the seat's final
+            # money (`kaggriculture.py`, the env's reward).
+            episode_opponent_money = _episode_opponent_money(rollouts)
+            money_difference = [
+                float(record.money[-1]) - value
+                for record, value in zip(records, episode_opponent_money)
+                if value is not None
+            ]
             # Recorded whether or not the widening is on: the point of the columns is
             # to compare a run that has it against the runs that did not.
             batch_chosen, batch_opportunities = rare.visit_counts(records)
@@ -2436,6 +2934,9 @@ class FreeMarketCollector:
                     # not calibrated alike, so a money series is only comparable
                     # across batches that agree on this column.
                     "rare_sigma_novelty": rare_novelty if rare_gain > 0.0 else None,
+                    "rare_sigma_exclude_hire": (
+                        rare_exclude_hire if rare_gain > 0.0 else None
+                    ),
                     # Counted from the widest end of the ladder, so the clean arm
                     # is the greedy tail. A money series filters on both columns
                     # together.
@@ -2537,6 +3038,15 @@ class FreeMarketCollector:
                     },
                     "mean_final_money": float(np.mean(final_money)),
                     "max_final_money": float(np.max(final_money)),
+                    "mean_money_difference": (
+                        float(np.mean(money_difference)) if money_difference else None
+                    ),
+                    "contested_episodes": len(money_difference),
+                    # Per-episode, aligned with the `.npz` index; None where the
+                    # opponent errored or was the quiet network. What lets the
+                    # replay buffer rank an episode by its margin rather than by
+                    # money a weak opponent handed it.
+                    "episode_opponent_money": episode_opponent_money,
                     # A 10k high-performer count, not a solvency count -- see
                     # `own_solvent_fraction`. `broke_episodes` is the ruin one.
                     "solvent_episodes": int(sum(1 for value in final_money if value > 10_000)),
@@ -2663,6 +3173,7 @@ class FreeMarketSelector:
             lineage_cap=None if cap in (None, "", 0) else int(cap),
             incumbents=incumbents,
             margin=prune_margin,
+            exploit=int(config.get("member_exploit_count", 0) or 0),
         )
 
         # Materialize each survivor into its position's slot before the index names
@@ -2741,6 +3252,7 @@ class FreeMarketUpdater:
                 config.get("reservoir_fraction", DEFAULT_RESERVOIR_FRACTION)
             ),
             priority_alpha=float(config.get("priority_alpha", DEFAULT_PRIORITY_ALPHA)),
+            priority_signal=str(config.get("priority_signal", "money")),
             priority_beta=float(config.get("priority_beta", DEFAULT_PRIORITY_BETA)),
             generation_weight_power=float(
                 config.get("generation_weight_power", DEFAULT_GENERATION_WEIGHT_POWER)
@@ -2755,7 +3267,20 @@ class FreeMarketUpdater:
         # carries decide what the buffer is even allowed to see.
         members = member_count(config)
         per_member = _member_batches(config)
-        position = member_for_cutoff(int(context.cutoff_batch_seq), per_member, members)
+        # The member that *collected* the new batches, read off their own stamps.
+        # `member_for_cutoff` is arithmetic on the global batch counter and holds
+        # only while every generation writes exactly `members * per_member`
+        # batches; one generation cut short (a restart mid-generation) skews it
+        # permanently, and an update then aims at a member whose lineage owns none
+        # of the window -- at a fresh fork that is 0 own episodes and an ERROR
+        # retried on every batch (mark-v19, 2026-08-30, 20 errors in 7 minutes).
+        # The batches know who played them; trust the majority stamp, fall back to
+        # the arithmetic only when no stamp exists (pre-member artifacts).
+        position = _member_position_for_batches(
+            context.new_batches,
+            fallback=member_for_cutoff(int(context.cutoff_batch_seq), per_member, members),
+            members=members,
+        )
         member_entries = read_index(context.artifacts)
         member = find_member(member_entries, position)
         member_lineage = (
@@ -3063,6 +3588,22 @@ class FreeMarketUpdater:
         # worse state than 30 out of 256 rows was.
         weight_ess: list[float] = []
         clone_losses: list[float] = []
+        clone_counters: dict[str, int] = {}
+        hire_prior_weight = float(config.get("hire_prior_weight", 0.0))
+        hire_prior_margin = float(config.get("hire_prior_margin", 0.05))
+        hire_prior_slack = int(config.get("hire_prior_slack", HIRE_SLACK))
+        if hire_prior_weight < 0.0 or hire_prior_margin < 0.0 or hire_prior_slack < 0:
+            raise ValueError(
+                "hire_prior_weight, hire_prior_margin and hire_prior_slack "
+                "must be non-negative"
+            )
+        hire_prior_losses: list[float] = []
+        excess_hire_rows = torch.zeros((), dtype=torch.int64, device=device)
+        feasible_hire_rows = torch.zeros((), dtype=torch.int64, device=device)
+        selected_excess_hires = torch.zeros((), dtype=torch.int64, device=device)
+        selected_hires = torch.zeros((), dtype=torch.int64, device=device)
+        excess_hire_q_gap_sum = torch.zeros((), dtype=torch.float32, device=device)
+        excess_hire_q_gap_rows = torch.zeros((), dtype=torch.int64, device=device)
         # Divergence detector. The label is reward-to-go in units of
         # `reward.MONEY_SCALE`, so a correct Q is bounded by the best season in
         # the buffer -- under 2 for this policy, ~6 for the ladder pack -- and
@@ -3107,6 +3648,8 @@ class FreeMarketUpdater:
                     train_turns,
                     grad_clip_norm,
                     clone_margin,
+                    hire_prior_slack,
+                    clone_counters,
                 )
             )
             behavior_clone_steps += 1
@@ -3219,12 +3762,23 @@ class FreeMarketUpdater:
             state_tensor = torch.from_numpy(batch.state).to(device)
             chosen = torch.from_numpy(batch.chosen).to(device)
             hidden_rows = train_hidden.reshape(-1, online.hidden_size)[rows]
-            predicted = (
-                online(torch.cat((state_tensor, hidden_rows), dim=1))
-                .gather(1, chosen.unsqueeze(1))
-                .squeeze(1)
-            )
+            all_q = online(torch.cat((state_tensor, hidden_rows), dim=1))
+            predicted = all_q.gather(1, chosen.unsqueeze(1)).squeeze(1)
             per_row = loss_fn(predicted, goal)
+
+            feasible = torch.from_numpy(batch.mask).to(device)
+            if hire_prior_weight > 0.0:
+                prior_row, excess, safe_q = _hire_conservative_terms(
+                    all_q,
+                    state_tensor,
+                    feasible,
+                    margin=hire_prior_margin,
+                    slack=hire_prior_slack,
+                )
+            else:
+                prior_row = torch.zeros_like(per_row)
+                excess = _excess_hire_mask(state_tensor, feasible, hire_prior_slack)
+                safe_q = all_q.masked_fill(~feasible, MASKED_SCORE).max(dim=1).values.detach()
 
             # A two-level mean, and the level that matters is the inner one.
             #
@@ -3246,12 +3800,19 @@ class FreeMarketUpdater:
                 batch_size * train_turns, device=device, dtype=per_row.dtype
             ).index_add_(0, rows, per_row * share)
             per_chunk = per_turn.view(batch_size, train_turns).mean(dim=1)
+            prior_per_turn = torch.zeros_like(per_turn).index_add_(
+                0, rows, prior_row * share
+            )
+            prior_per_chunk = prior_per_turn.view(batch_size, train_turns).mean(dim=1)
             # `.mean()`, not `/ weight.sum()`. The weights are normalised to a
             # maximum of 1, so a plain mean is bounded above by the unweighted
             # loss and the effective step can only ever shrink. Renormalising by
             # the weight sum would put the scale back and hand the correction a
             # way to enlarge the step on a batch that happened to draw badly.
-            loss = (per_chunk * torch.from_numpy(batch.weight).to(device)).mean()
+            chunk_weight = torch.from_numpy(batch.weight).to(device)
+            td_loss = (per_chunk * chunk_weight).mean()
+            hire_prior_loss = (prior_per_chunk * chunk_weight).mean()
+            loss = td_loss + hire_prior_weight * hire_prior_loss
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             # Backpropagating through `train_turns` GRU steps is a new way to
@@ -3262,8 +3823,27 @@ class FreeMarketUpdater:
             optimizer.step()
             grad_norms.append(float(grad_norm))
             losses.append(float(loss.detach()))
-            unweighted_losses.append(float(per_chunk.detach().mean()))
+            hire_prior_losses.append(float(hire_prior_loss.detach()))
+            unweighted_losses.append(
+                float((per_chunk + hire_prior_weight * prior_per_chunk).detach().mean())
+            )
             rows_per_chunk.append(batch.state.shape[0] / float(batch_size))
+            with torch.no_grad():
+                hire_rows = torch.as_tensor(
+                    HIRE_ACTION_ROWS, dtype=torch.long, device=device
+                )
+                feasible_hire_rows += feasible[:, hire_rows].sum()
+                excess_hire_rows += excess.sum()
+                chosen_hire = torch.zeros_like(chosen, dtype=torch.bool)
+                for hire_row in HIRE_ACTION_ROWS:
+                    chosen_hire |= chosen == int(hire_row)
+                selected_hires += chosen_hire.sum()
+                selected_excess_hires += excess.gather(
+                    1, chosen.unsqueeze(1)
+                ).sum()
+                gap = safe_q.unsqueeze(1) - all_q.detach()
+                excess_hire_q_gap_sum += gap.masked_select(excess).sum()
+                excess_hire_q_gap_rows += excess.sum()
             # Numpy, so this costs no GPU sync. The denominator is the *chunk*
             # count now, not the row count: an effective sample size of 8 out of 32
             # chunks is a far worse state than 30 out of 256 rows was, so the two
@@ -3406,8 +3986,20 @@ class FreeMarketUpdater:
         # One arena answers both questions this gate still asks: did the candidate
         # complete a benchmark, and did it trade at all? Money is recorded here for
         # offline selection, not for online rejection.
-        benchmarks = configured_benchmarks(config)
+        # An explicit `benchmarks = []` means no arena. `configured_benchmarks`
+        # defaults an empty list to the donor, which is right for a config that
+        # never mentioned the key and wrong for one that set it empty on purpose
+        # (mark-v12 ran a pilkwang gate for eleven hours because of that default).
+        if "benchmarks" in config and not config["benchmarks"]:
+            benchmarks: list[str] = []
+        else:
+            benchmarks = configured_benchmarks(config)
         benchmark = benchmarks[0] if benchmarks else None
+        if benchmark is None and _promotion_score_signal(config) == "benchmark":
+            raise ValueError(
+                "benchmarks is empty: promotion_score_signal must be \"rollout\" or "
+                "\"margin\" so the gate has a score and an activity read"
+            )
         # Two tiers, because arenas are the slow part and there are now `members`
         # updates a generation per slot rather than one. Every member pays a cheap
         # arena to earn its rank; only a member that beats the slot's standing best
@@ -3486,9 +4078,23 @@ class FreeMarketUpdater:
 
         active = context.active_checkpoint
         benchmark_result = challenger_benchmarks[0] if challenger_benchmarks else None
+        # No benchmark configured: the rollouts are the only measurement, so they
+        # carry the activity floor, the member rank, and (below) the score.
+        rollout_result = _rollout_activity_result(recent) if benchmark is None else None
+        recent_mean_money_difference, contested_episodes = _recent_money_difference(
+            context.new_batches
+        )
+        if rollout_result is not None:
+            rank_money = (
+                recent_mean_money_difference
+                if promotion_score_signal == "margin"
+                else recent_mean_final_money
+            )
         activity = (
             _order_viability(benchmark_result, config, require_activity=True)
             if benchmark_result is not None
+            else _order_viability(rollout_result, config, require_activity=True)
+            if rollout_result is not None
             else {
                 "passed": False,
                 "checks": {},
@@ -3510,7 +4116,10 @@ class FreeMarketUpdater:
         }
         rejection_reasons: list[str] = []
         if benchmark_result is None:
-            rejection_reasons.append("missing_benchmark")
+            # No arena for this candidate. A missing measurement only counts against
+            # it when one was configured; a benchmark-less run measures elsewhere.
+            if benchmark is not None:
+                rejection_reasons.append("missing_benchmark")
         elif benchmark_result.get("errors"):
             rejection_reasons.append("benchmark_errors")
         elif int(benchmark_result.get("pairs", 0)) <= 0:
@@ -3524,9 +4133,32 @@ class FreeMarketUpdater:
             promotion_score_signal,
             window=int(config.get("promotion_reference_window", 0)),
         )
+        # `promotion_incumbent_rematch`: the bar is the incumbent re-measured on
+        # this update's seeds rather than its stored score. Only paid when there is
+        # a candidate arena to pair it with, and only under the benchmark signal.
+        rematch: dict[str, Any] | None = None
+        if (
+            bool(config.get("promotion_incumbent_rematch", False))
+            and promotion_score_signal == "benchmark"
+            and benchmark_result is not None
+        ):
+            rematch_money, rematch_result = _incumbent_rematch(
+                active, benchmark, eval_seeds, jobs, benchmark_seed_start
+            )
+            rematch = {
+                "checkpoint_id": active.checkpoint_id if active is not None else None,
+                "money": rematch_money,
+                "stored_best_money": best_money,
+                "stored_best_checkpoint_id": best_checkpoint_id,
+                "result": rematch_result,
+            }
+            if rematch_money is not None:
+                best_money, best_checkpoint_id = rematch_money, active.checkpoint_id
         candidate_money = (
             benchmark_score.get("candidate_money")
             if promotion_score_signal == "benchmark"
+            else recent_mean_money_difference
+            if promotion_score_signal == "margin"
             else recent_mean_final_money
         )
         promotion_tolerance = _promotion_tolerance(
@@ -3557,6 +4189,7 @@ class FreeMarketUpdater:
                 "best_promoted_checkpoint_id": best_checkpoint_id,
                 "tolerance_money": promotion_tolerance,
                 "reference_window": int(config.get("promotion_reference_window", 0)),
+                "incumbent_rematch": rematch,
                 "reasons": activation_reasons,
             },
             "challenger_benchmarks": challenger_benchmarks,
@@ -3614,6 +4247,32 @@ class FreeMarketUpdater:
             "behavior_clone_steps_this_update": clone_steps_to_run,
             "mean_behavior_clone_loss": (
                 float(np.mean(clone_losses)) if clone_losses else None
+            ),
+            "behavior_clone_rows": clone_counters.get("rows", 0),
+            "behavior_clone_rows_skipped_excess_hire": clone_counters.get(
+                "skipped_excess_hire", 0
+            ),
+            "hire_prior_weight": hire_prior_weight,
+            "hire_prior_margin": hire_prior_margin,
+            "hire_prior_slack": hire_prior_slack,
+            "mean_hire_prior_loss": (
+                float(np.mean(hire_prior_losses)) if hire_prior_losses else None
+            ),
+            "excess_hire_feasible_fraction": (
+                float(excess_hire_rows.item()) / float(feasible_hire_rows.item())
+                if feasible_hire_rows.item() > 0
+                else None
+            ),
+            "excess_hire_selected_fraction": (
+                float(selected_excess_hires.item()) / float(selected_hires.item())
+                if selected_hires.item() > 0
+                else None
+            ),
+            "mean_excess_hire_safe_q_gap": (
+                float(excess_hire_q_gap_sum.item())
+                / float(excess_hire_q_gap_rows.item())
+                if excess_hire_q_gap_rows.item() > 0
+                else None
             ),
             "mean_loss": float(np.mean(losses)) if losses else None,
             # `mean_loss` is the weighted objective actually optimised. This is
@@ -3696,6 +4355,11 @@ class FreeMarketUpdater:
             "own_mean_final_money": (
                 float(np.mean([record.money[-1] for record in own])) if own else None
             ),
+            # The auxiliary label beside the objective it is meant to clarify.
+            # mark-v8's old term averaged 4.886 reward units while cash averaged
+            # -0.050, so this must be visible on every update rather than recovered
+            # after the run from episode artifacts.
+            **_labor_reward_metrics(own),
             # The same money over the FIFO segment only. This is what the slot's
             # plateau detector reads; `own_mean_final_money` stays as it was so a
             # series spanning the change is still one readable curve and the two
@@ -3703,6 +4367,10 @@ class FreeMarketUpdater:
             # share, so it also says how much history the buffer is carrying.
             "recent_episodes": len(recent),
             "recent_mean_final_money": recent_mean_final_money,
+            # Learner less opponent over this update's batches, contested episodes
+            # only. What `promotion_score_signal = "margin"` scores and ranks on.
+            "mean_money_difference": recent_mean_money_difference,
+            "contested_episodes": contested_episodes,
             # NOT solvency, despite the name: this is `money[-1] > 10_000`, and the
             # stake is 3,000. An episode that ended at 9,999 -- a 3.3x return -- counts
             # against it. It is a *high-performer* rate. The name is kept because it is
@@ -3830,6 +4498,21 @@ class FreeMarketUpdater:
             "members": members,
             "lineage_id": member_lineage,
             "forked_from": member.forked_from if member is not None else None,
+            "warm_started_from_checkpoint_id": (
+                member.warm_started_from_checkpoint_id if member is not None else None
+            ),
+            "warm_started_from_inference_path": (
+                member.warm_started_from_inference_path if member is not None else None
+            ),
+            "warm_start_calibration_steps": (
+                member.warm_start_calibration_steps if member is not None else 0
+            ),
+            "warm_start_calibration_initial_loss": (
+                member.warm_start_calibration_initial_loss if member is not None else None
+            ),
+            "warm_start_calibration_final_loss": (
+                member.warm_start_calibration_final_loss if member is not None else None
+            ),
             "batch_floor": member_floor,
             "rank_score": member_rank_score,
             "rank_active": member_rank_active,
@@ -3878,6 +4561,25 @@ class FreeMarketUpdater:
                     inference_path=str(member_weights),
                     trainer_path=str(member_trainer),
                     forked_from=member.forked_from if member is not None else None,
+                    warm_started_from_checkpoint_id=(
+                        member.warm_started_from_checkpoint_id if member is not None else None
+                    ),
+                    warm_started_from_inference_path=(
+                        member.warm_started_from_inference_path if member is not None else None
+                    ),
+                    warm_start_calibration_steps=(
+                        member.warm_start_calibration_steps if member is not None else 0
+                    ),
+                    warm_start_calibration_initial_loss=(
+                        member.warm_start_calibration_initial_loss
+                        if member is not None
+                        else None
+                    ),
+                    warm_start_calibration_final_loss=(
+                        member.warm_start_calibration_final_loss
+                        if member is not None
+                        else None
+                    ),
                 ),
             ],
         )

@@ -106,6 +106,12 @@ class EpisodeRecord:
     #: a different run can choose a different weighting law without rewriting
     #: rollout files.
     episode_weight: float = 1.0
+    #: Ephemeral too, and None rather than 0.0: the opponent's final money for a
+    #: contested episode, set by `fill_buffer` from the batch's per-episode
+    #: metadata. None for demonstrations, old artifacts, and seasons whose
+    #: opponent errored or was the quiet network. `replay._own_priorities` reads
+    #: it under `priority_signal = "margin"`.
+    opponent_money: float | None = None
     #: The two factors multiplied into `episode_weight`, recorded separately so
     #: diagnostics can distinguish old-generation discounting from terminal-quality
     #: discounting.
@@ -591,6 +597,7 @@ def learner_spec(
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
     rare_sigma_novelty: str = "count",
+    rare_sigma_exclude_hire: bool = False,
     rare_sigma_path: Path | str | None = None,
 ) -> str:
     """Address the exploring learner as an ordinary agent spec.
@@ -628,6 +635,8 @@ def learner_spec(
         # byte-identical spec strings and churns no revisions.
         if rare_sigma_novelty != "count":
             query["rare_sigma_novelty"] = str(rare_sigma_novelty)
+        if rare_sigma_exclude_hire:
+            query["rare_sigma_exclude_hire"] = "1"
     if trace_path is not None:
         query["trace_path"] = str(trace_path)
     if policy_revision_id is not None:
@@ -651,6 +660,7 @@ def collect_episode(
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
     rare_sigma_novelty: str = "count",
+    rare_sigma_exclude_hire: bool = False,
     rare_sigma_path: Path | str | None = None,
 ) -> OrderRollout | None:
     """Play one episode with an exploring learner and record it."""
@@ -670,6 +680,7 @@ def collect_episode(
         rare_sigma_gain=rare_sigma_gain,
         rare_sigma_cap=rare_sigma_cap,
         rare_sigma_novelty=rare_sigma_novelty,
+        rare_sigma_exclude_hire=rare_sigma_exclude_hire,
         rare_sigma_path=rare_sigma_path,
     )
     seats = (spec, opponent_spec) if learner_seat == 0 else (opponent_spec, spec)
@@ -752,6 +763,7 @@ def collect_batch(
     rare_sigma_gain: float = 0.0,
     rare_sigma_cap: float = 0.0,
     rare_sigma_novelty: str = "count",
+    rare_sigma_exclude_hire: bool = False,
     rare_sigma_path: Path | str | None = None,
     rare_sigma_pairs: int = 0,
 ) -> list[OrderRollout]:
@@ -792,6 +804,7 @@ def collect_batch(
                 pair_gain,
                 rare_sigma_cap,
                 rare_sigma_novelty,
+                rare_sigma_exclude_hire,
                 rare_sigma_path,
             )
         )

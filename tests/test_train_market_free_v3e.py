@@ -1,4 +1,4 @@
-"""Pins on `train_market_free_v3d.py`'s constants.
+"""Pins on `train_market_free_v3e.py`'s constants.
 
 `train_market_free.py` has had these since `landheuristic-v43`; this driver had
 none, and it is the file another session is most likely to edit under a live run.
@@ -10,7 +10,7 @@ failure if flipped back.
 
 from __future__ import annotations
 
-import train_market_free_v3d as driver
+import train_market_free_v3e as driver
 from agents.dqn_market_free_v3e.training.reward import MONEY_SCALE
 
 
@@ -30,16 +30,13 @@ def test_the_session_and_prefix_name_the_n_step_run():
 
 def test_the_overrides_the_review_settled_on_are_still_set():
     config = driver.FREE_CONFIG
-    # The rollback pair. Live only because a one-member roster routes the resume
-    # through `lineage_checkpoint`; under member pools both of these are dead config.
+    # The rollback pair remains the one-member compatibility behavior; the active
+    # five-member run recovers through its current-versus-previous pool instead.
     assert config["lineage_source"] == "promoted"
-    assert config["resume_reset_after_rejections"] == 3
+    assert config["resume_reset_after_rejections"] == 2
     # Sized per *member* and in units of that member's own generations, so it tracks
-    # `member_batches`: the target is ~2.5 generations of its own history. At 10
-    # batches a member collects 160 episodes a generation, so 400; at 4 it collects
-    # 64, so 160. A flat 400 at 4 batches would be 6 generations and 2.5x the
-    # resident memory. The one-generation regime is what failed, and both settings
-    # here are clear of it.
+    # `member_batches`: the target is two generations of its own history. At 20
+    # batches a member collects 320 episodes a generation, so 640 keeps two.
     import tomllib
     from pathlib import Path
 
@@ -47,9 +44,10 @@ def test_the_overrides_the_review_settled_on_are_still_set():
     episodes_per_batch = int(manifest["episodes_per_batch"])
     episodes_per_generation = config["member_batches"] * episodes_per_batch
     assert config["buffer_episodes"] >= 2 * episodes_per_generation
-    assert config["buffer_episodes"] <= 3 * episodes_per_generation
-    # The candidate itself is measured, never the incumbent's collection window.
-    assert config["promotion_score_signal"] == "benchmark"
+    assert config["buffer_episodes"] <= 2 * episodes_per_generation
+    # mark-v14: no benchmark arena; the margin over the mirror is the release read.
+    assert config["benchmarks"] == list(driver.BENCHMARKS) == []
+    assert config["promotion_score_signal"] == "margin"
     assert config["promotion_reference_window"] > 0
     assert config["promotion_tolerance_ci"] is True
     # Insolvent seasons are the negative examples.
@@ -81,13 +79,14 @@ def test_the_mirror_pool_has_an_outside_anchor_and_a_money_floor():
     """
 
     config = driver.FREE_CONFIG
-    # A counterparty that actually trades. Empty here is the mirror-only path:
-    # `compose_opponents` short-circuits to `list(base) or list(pool)`.
-    assert config["opponents"], "an empty base forces pure self-play"
-    assert driver.DONOR in config["opponents"]
-    # Dead while the base was empty; live now, and 0.65 is what every arm above 16k ran.
-    assert 0.0 < config["self_play_ratio"] <= 0.9
-    # A rejected child is the behaviour the next update should not imitate.
+    # mark-v14 runs the mirror-only path on purpose -- pilkwang out of both roles --
+    # and the history above is the risk it takes: every earlier empty-`opponents`
+    # arm floored at the stake. Against that: the money floor on the pool, the newest
+    # checkpoints as teachers, and a margin gate a dead mirror cannot inflate.
+    # mark-v15: pilkwang in half the rollouts (the margin needs a market with
+    # someone in it -- mark-v14's pure mirror read +-0), no benchmark arena.
+    assert config["opponents"] == [driver.DONOR] and config["benchmarks"] == []
+    assert config["self_play_ratio"] == config["self_play_ratio_final"] == 0.5
     assert config["self_play_latest_backfill"] is False
     # No teacher below the stake. 3,000 is what a policy that never trades scores.
     assert config["self_play_min_score"] >= 3000.0
@@ -97,7 +96,7 @@ def test_the_activity_floor_sits_in_the_regime_that_makes_money():
     # Contested money is monotone in this quantity over all recorded gates, and every
     # arm that cleared 10k ran 0.40-0.86. crop-v2 cleared the old 0.02 at 0.051 while
     # scoring 616 coins. It gates promotion, `member_rank_active` and the prune tier.
-    assert driver.FREE_CONFIG["viability_min_orders_per_decision"] >= 0.20
+    assert driver.FREE_CONFIG["viability_min_orders_per_decision"] >= 0.17
 
 
 def test_the_roster_arithmetic_keeps_the_prune_window_two_generations():
@@ -127,40 +126,52 @@ def test_the_roster_arithmetic_keeps_the_prune_window_two_generations():
         "another's batches"
     )
     assert config["members_per_slot"] * config["member_batches"] == rounds
+    assert driver._effective_config().rounds_per_generation == rounds
+    assert rounds == driver.ROUNDS_PER_GENERATION == 100
+    assert config["members_per_slot"] == 5
+    assert config["member_batches"] * config["gradient_steps_per_batch"] == 960
 
 
-def test_a_single_agent_has_no_cross_slot_reseed_and_keeps_its_snapback():
-    """The two halves of "one agent with rollback".
-
-    `admit_foreign` has no lineage dedup and its `max_adopt` default is
-    `max(1, members - 1)`, whose floor takes the only seat at one member -- anchor-v1
-    forked all five slots from a single checkpoint at the g0 prune that way, off a
-    source scoring 8,016 on one 100-seed draw and 1,260 on the next. With one learner
-    there is nothing to reach across anyway, so it is off, and the reject-streak
-    snapback is the recovery path instead.
-    """
+def test_one_slot_five_members():
+    """mark-v18: one slot, five members, the full 20-batch budget each."""
 
     config = driver.FREE_CONFIG
-    assert driver.LEARNERS == 1
+    assert driver.LEARNERS == driver.CONCURRENCY == 1
+    assert len(driver.TRAINING_AGENTS) == 1
+    assert config["members_per_slot"] == 5
     assert config["cross_slot_reseed"] is False
-    assert config["resume_reset_after_rejections"] >= 2, "2 or more, so one noisy arena draw cannot snap back"
     # The retained checkpoint history, used as both the mirror pool and the bar.
     assert config["self_play_pool"] == 25
     assert config["promotion_reference_window"] == 25
 
 
-def test_the_rollback_path_is_reachable_at_one_member():
-    """`lineage_checkpoint` was defined and called from nowhere in this fork.
+def test_mark21_widens_the_herd_scaffolding():
+    assert driver.SESSION_ID == "market-free-mark-v21"
+    assert driver.SLOT_PREFIX == "mark21"
+    from agents.dqn_market_free_v3e import donor, herd
+    assert sum(donor.ANIMAL_SLOTS.values()) == 24 and donor.ANIMAL_SLOTS["NW"] == 6
+    assert herd.WARM_SLOTS == 3
+    assert driver.FREE_CONFIG["priority_signal"] == "margin"
+    assert driver.FREE_CONFIG["member_exploit_count"] == 2
+    # The other session's hire prior and sigma exclusion are off: neither was in
+    # a run that climbed, and the cap is back on the mask.
+    assert driver.FREE_CONFIG["hire_prior_weight"] == 0.0
+    assert driver.FREE_CONFIG["hire_prior_bootstrap_steps"] == 0
+    assert driver.FREE_CONFIG["rare_sigma_exclude_hire"] is False
+    assert driver.FREE_CONFIG["promotion_score_signal"] == "margin"
+    # The mark10 rosters were trained under the hire cap; warm-starting them onto
+    # the open ladder is the mark-v6 collapse. Cold, both slots.
+    for agent in driver.TRAINING_AGENTS:
+        assert "member_warm_start_dir" not in agent["model_config"]
 
-    `_member_checkpoint` took the resume unconditionally, and its docstring justifies
-    dropping the streak fields by saying pruning supersedes them -- which is false at
-    a roster of one, where the prune has a single seat and drops nobody.
-    """
+
+def test_the_five_member_path_queries_current_and_previous_five():
+    """The member implementation asks storage for twice the configured pool."""
 
     from pathlib import Path
 
-    updater = Path("agents/dqn_market_free_v3e/training/updater.py").read_text()
-    assert "lineage_checkpoint(context, reader)\n            if members <= 1" in updater
+    members = Path("agents/dqn_market_free_v3e/training/members.py").read_text()
+    assert "[model_id, 2 * members, model_id]" in members
 
 
 def test_the_manifest_agrees_with_the_driver_on_the_anchor_keys():

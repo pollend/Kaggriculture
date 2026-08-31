@@ -853,10 +853,11 @@ def should_buy_land(
 #: small beside the wallet; the absolute floor is what does it at the start, where
 #: 3,000 coins times any sane fraction is less than a single melon seed.
 #:
-#: A floor, not a strategy: it shuts *buy* rows only, never SELL, HIRE or the
-#: terminator, so it can only stop the policy spending -- and the reserve is
-#: measured against the money the turn opened with, so a turn that sells first
-#: raises its own ceiling rather than being locked out by its opening balance.
+#: A floor, not a strategy: it shuts spending rows only, never SELL or the
+#: terminator. On the live v2 path that now includes HIRE; the v1 compatibility
+#: mask keeps its historical raw-wallet semantics. The reserve is measured against
+#: the money the turn opened with, so a turn that sells first raises its own ceiling
+#: rather than being locked out by its opening balance.
 #:
 #: Watch `broke_frac` in the batch metadata. If it does not fall below v1's 0.184,
 #: this is too small; if `orders_per_turn` collapses toward 1, it is too large.
@@ -916,7 +917,6 @@ class PendingTurn:
         "animal_room",
         "seeds_bought",
         "hires_today",
-        "hire_cap",
         "slots",
         "max_slots",
         "ops",
@@ -967,12 +967,6 @@ class PendingTurn:
         )
         self.seeds_bought: dict[str, int] = {}
         self.hires_today = int(farm.get("hires_today", 0) or 0)
-        #: Most hands this turn may end the day with -- `labor.hire_cap`, read once
-        #: off the opening board. `feasible_actions` shuts the `HIRE` rungs that
-        #: would carry `hires_today` past it.
-        self.hire_cap = labor.hire_cap(
-            obs, farm, private, roles if roles is not None else herd.field_roles(obs, farm, private)
-        )
         self.slots = 0
         self.max_slots = int(donor._cfg(config, "maxMarketOrdersPerTurn", donor.MAX_MARKET_ORDERS))
         self.ops: list[str] = []
@@ -1281,9 +1275,9 @@ def feasible_actions(
 ) -> np.ndarray:
     """[ACTION_COUNT] bool: True where the simulator would commit at least one unit.
 
-    Feasibility, not preference. Every rule is read straight off `_commit_unit`,
-    `_do_hire` and `_do_buy_land`, so a False means the game would refuse the order
-    outright -- never that it is unwise.
+    Mostly feasibility. Simulator rules come straight from `_commit_unit`,
+    `_do_hire` and `_do_buy_land`; the feed and HIRE working-capital reserves are
+    explicitly labelled policy guards.
 
     **Forbidding an order the game would accept requires a proof that the order
     cannot be worth taking.** Not a measurement that it usually is not: a proof. One
@@ -1349,9 +1343,9 @@ def feasible_actions(
         liquidating = False
     else:
         # Everything the turn has already committed. `spendable` is what separates
-        # the two paths: affordability is still tested against `money`, because that
-        # is what the simulator will refuse on, while the reserve floor rides on top
-        # as a policy limit and only ever narrows the buy rows.
+        # the two paths: simulator affordability is represented by `money`, while
+        # the reserve floor rides on top as a policy limit and narrows every spend,
+        # including HIRE.
         money = pending.money
         shed = pending.shed
 
@@ -1448,8 +1442,8 @@ def feasible_actions(
             continue
         # The herd's feed, held back from what may be sold.
         #
-        # **This is a policy rule, not a proof, and it is the second one in this
-        # function** -- `labor.hire_cap` below is the first. It does not meet the
+        # **This is a policy rule, not a proof, and one of two in this function**
+        # (the HIRE demand envelope is the other; `labor.py`). It does not meet the
         # preamble's bar: selling wheat while holding animals is not provably
         # worthless, because the agent may intend to buy it back, or to let the herd
         # go. It is here because the outcome it prices is invisible everywhere else.
@@ -1589,16 +1583,16 @@ def feasible_actions(
     # `HIRE 4` is its own index on the same ladder, so no reachable outcome is lost,
     # only the mislabelled route to it.
     #
-    # Hiring is spending, but it is not a *buy*: hands are the only thing the wallet
-    # converts into field work, and shutting them behind the reserve floor would
-    # starve the farm to protect a cash pile that exists to fund the farm. So this
-    # row tests `money`, like v1, and the floor above does not reach it.
+    # The v2 path keeps the same working-capital floor as every other spend. The
+    # unpended v1 compatibility path stays on the raw wallet; inference does not use
+    # it, and its element-wise mask contract predates the reserve.
     hire_mult = float(donor._cfg(config, "farmHandCostMult", 1))
     if hires_today + int(_HIRE_HANDS[-1]) < _FIB_PREFIX.shape[0]:
         costs = hire_mult * (
             _FIB_PREFIX[hires_today + _HIRE_HANDS] - _FIB_PREFIX[hires_today]
         )
-        mask[_HIRE_ROWS] = money >= costs
+        hire_wallet = spendable if pending is not None else money
+        mask[_HIRE_ROWS] = hire_wallet >= costs
 
     # One hire action per turn. `HIRE 7` then `HIRE 3` reaches the wire as ten
     # identical `["HIRE"]` entries, indistinguishable from the single `HIRE 10` row
@@ -1609,13 +1603,6 @@ def feasible_actions(
     # the split hires and every later `order_step` slid.
     if pending is not None and "HIRE" in pending.ops:
         mask[_HIRE_ROWS] = False
-
-    # Hands beyond what the field's jobs can use. A policy cap rather than a
-    # feasibility one, and the only one besides the reserve floor: `labor.py` has
-    # the measurement. The v1 branch is left alone -- it is pinned element-wise
-    # against v1's mask and inference never reaches it.
-    if pending is not None:
-        mask[_HIRE_ROWS] &= (hires_today + _HIRE_HANDS) <= int(pending.hire_cap)
 
     # Nothing may be queued that the wire cannot carry. One slot per order, except
     # `HIRE n`, which is n separate `["HIRE"]` entries on the same turn -- so the

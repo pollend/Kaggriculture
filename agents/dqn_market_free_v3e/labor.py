@@ -11,17 +11,10 @@ its hands passed on 55-66% of their turns. Ladder winners spend 13,700 on the sa
 head count and sell 172,000, because their hands have work.
 
 `hire_demand` is the donor's own demand term with the floor removed: the jobs due
-now plus the risk load, at seven jobs a hand. `hire_cap` adds a small slack so a
-turn that buys seed can also hire the hands to plant it -- the job list is read at
-the turn's opening board, before this turn's purchases are in the shed -- and is
-what `order_space.feasible_actions` shuts the `HIRE` rungs above.
-
-This is a policy cap, not a feasibility one, and `feasible_actions`' preamble says
-such caps do not belong there. It goes in anyway, for the reason the reserve floor
-already does: a cash charge with no term for an idle hand cannot teach the
-difference between a hand that harvests and one that stands in the field, and
-with 24-turn n-step credit the harvest a hand would have brought is outside the
-window the wage is charged in.
+now plus the risk load, at seven jobs a hand. The live mask deliberately does not
+turn that estimate into an action ceiling. Mark-v13 instead uses the same signal
+as a conservative training prior: a larger crew remains legal and TD evidence may
+promote it, while an unexplored high rung begins below a safe alternative.
 """
 
 from __future__ import annotations
@@ -60,6 +53,14 @@ def hire_demand(obs: dict, farm: dict, private: dict, roles: dict) -> int:
 
 
 def hire_cap(obs: dict, farm: dict, private: dict, roles: dict) -> int:
-    """Most hands a turn may end the day with: demand plus the planting slack."""
+    """Most hands a turn may end the day with: demand plus the planting slack.
+
+    Back on the mask from mark-v16. Five arms ran the ladder open -- mark-v6, v7,
+    v8, v11, v15 -- and every one hired a full crew daily in generation 0 and
+    then swung to no crew at all; the only cold start this week that climbed
+    (mark-v9, 23-33k) ran this cap. The prior and the labor charge price the
+    excess inside the envelope; the envelope keeps the fibonacci wage off its
+    vertical part while the head is still learning.
+    """
 
     return min(int(donor.MAX_HANDS), hire_demand(obs, farm, private, roles) + HIRE_SLACK)
